@@ -1,0 +1,1809 @@
+const std = @import("std");
+const log = std.log.scoped(.LSPManager);
+const server_mod = @import("lsp/server.zig");
+const LSPServer = server_mod.LSPServer;
+const DocumentSymbol = LSPServer.DocumentSymbol;
+const zls_embedded = @import("lsp/zls_embedded.zig");
+const protocol = @import("../kernel/protocol.zig");
+const Installer = @import("lsp/installer.zig").Installer;
+const external = @import("lsp/external.zig");
+const Transport = @import("../lsp/transport.zig");
+const supervisor_mod = @import("lsp/supervisor.zig");
+const LSPSupervisor = supervisor_mod.LSPSupervisor;
+
+pub const LSPManager = struct {
+    allocator: std.mem.Allocator,
+
+    /// Map of language id → server. Mutated only on the supervisor's worker
+    /// thread (or `deinit` after shutdown). Reads from the UI thread must
+    /// take `manager_mutex` for the duration they use the *LSPServer pointer.
+    servers: std.StringHashMap(*LSPServer),
+
+    open_documents: std.StringHashMap(void),
+
+    /// Protects `servers` and `open_documents`. Held briefly. Long operations
+    /// (LSPServer.start, which can wait up to 30s) drop the lock so the UI
+    /// thread can still do quick reads (e.g. `getActiveServerStatus`).
+    manager_mutex: std.Io.Mutex = .init,
+
+    on_tokens_ready: ?*const fn () void = null,
+    on_diagnostics: ?*const fn (uri: []const u8, diagnostics: []const LSPServer.Diagnostic) void = null,
+
+    zig_env: ?ZigEnv = null,
+
+    install_lock: std.Io.Mutex = .init,
+    io: std.Io,
+    /// Parent process environment block, forwarded to embedded LSP servers so
+    /// they can see env vars like ZIG_LIB_DIR / ZIG_GLOBAL_CACHE / PATH.
+    environ_block: std.process.Environ.Block,
+
+    supervisor: LSPSupervisor,
+
+    /// Watchdog thread that periodically checks each running server's health
+    /// flags and queues a restart on the supervisor when one has died. Held
+    /// here so we can join on shutdown.
+    watchdog_thread: ?std.Thread = null,
+    watchdog_stop: std.atomic.Value(bool) = .{ .raw = false },
+
+    /// Global "the editor is shutting down" flag wired into every LSPServer
+    /// we create. When set during `deinit`, in-flight `server.start` init
+    /// waits abort immediately (instead of sitting on the 30 s timeout),
+    /// which is the difference between a snappy quit and a stalled one.
+    global_shutdown: std.atomic.Value(bool) = .{ .raw = false },
+
+    /// Languages whose server is being started (or about to be) right now.
+    /// `start_server` commands spawn one thread per language so multiple
+    /// servers boot in parallel — without this set, two concurrent starts
+    /// for the same lang would race to put the same key in `servers`.
+    /// `ensure_and_open` also waits on this set to make sure its didOpen
+    /// fires *after* the parallel start finishes for the same lang.
+    in_progress_starts: std.StringHashMapUnmanaged(void) = .empty,
+    in_progress_mutex: std.Io.Mutex = .init,
+    in_progress_cond: std.Io.Condition = .init,
+
+    /// Per-language backoff state for auto-restart. Bumps after every restart
+    /// and resets after a healthy steady-state period. Stored on the manager
+    /// so the supervisor's worker thread can read/write without sharing state
+    /// with the LSPServer (which gets destroyed across restarts).
+    restart_state: std.StringHashMapUnmanaged(RestartState) = .empty,
+    restart_state_mutex: std.Io.Mutex = .init,
+
+    pub const RestartState = struct {
+        attempts: u32 = 0,
+        last_attempt_ms: i64 = 0,
+    };
+
+    pub const ZigEnv = struct {
+        zig_exe: []const u8,
+        lib_dir: []const u8,
+        global_cache_dir: []const u8,
+    };
+
+    pub const Diagnostic = LSPServer.Diagnostic;
+    pub const Location = LSPServer.Location;
+    pub const CompletionItem = LSPServer.CompletionItem;
+    pub const TextEdit = LSPServer.TextEdit;
+
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_block: std.process.Environ.Block) LSPManager {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .environ_block = environ_block,
+            .servers = std.StringHashMap(*LSPServer).init(allocator),
+            .open_documents = std.StringHashMap(void).init(allocator),
+            // The supervisor's `ctx` will be filled in via `startSupervisor`
+            // once the manager is in its final memory location. Until then
+            // the supervisor exists but has no worker thread, so calling
+            // `enqueue` returns `error.SupervisorShutdown` — safe.
+            .supervisor = LSPSupervisor.init(
+                allocator,
+                io,
+                undefined,
+                .{ .execute = supervisorExecute },
+            ),
+        };
+    }
+
+    /// Spawn the supervisor worker thread and the health watchdog. Called
+    /// once by Core after the manager is in its final memory location (the
+    /// supervisor stores a pointer to the manager as its ctx).
+    pub fn startSupervisor(self: *LSPManager) !void {
+        self.supervisor.ctx = @ptrCast(self);
+        try self.supervisor.start();
+        self.watchdog_stop.store(false, .release);
+        self.watchdog_thread = try std.Thread.spawn(.{}, watchdogMain, .{self});
+    }
+
+    /// Periodic health check. Every `watchdog_interval_ms` we scan each
+    /// running server; if its `server_healthy` is false and it's not in a
+    /// backoff window, enqueue a restart on the supervisor.
+    const watchdog_interval_ms: u64 = 3000;
+    /// Cap restart attempts so a server that keeps crashing doesn't pin a
+    /// CPU re-starting it forever. After this many attempts in a row, we
+    /// stop trying until the user does something (open a new file, run the
+    /// "LSP: Restart Server" command, etc.).
+    const max_restart_attempts: u32 = 5;
+    /// Base backoff in ms. Doubled on each consecutive attempt, capped at
+    /// `max_backoff_ms`.
+    const base_backoff_ms: i64 = 1_000;
+    const max_backoff_ms: i64 = 30_000;
+    /// If a server has been healthy for this long, reset the attempt count
+    /// — a successful recovery shouldn't burn future budget.
+    const recovery_window_ms: i64 = 60_000;
+
+    fn watchdogMain(self: *LSPManager) void {
+        log.info("[LSP WATCHDOG] started", .{});
+        defer log.info("[LSP WATCHDOG] exited", .{});
+
+        while (!self.watchdog_stop.load(.acquire)) {
+            std.Io.sleep(self.io, .fromMilliseconds(@intCast(watchdog_interval_ms)), .awake) catch return;
+            if (self.watchdog_stop.load(.acquire)) return;
+
+            // Snapshot under the manager lock so we don't hold it during the
+            // restart enqueue (which itself takes locks).
+            self.manager_mutex.lockUncancelable(self.io);
+            var unhealthy: std.ArrayListUnmanaged(struct { lang: []u8, root: ?[]u8 }) = .empty;
+            defer {
+                for (unhealthy.items) |u| {
+                    self.allocator.free(u.lang);
+                    if (u.root) |r| self.allocator.free(r);
+                }
+                unhealthy.deinit(self.allocator);
+            }
+
+            var it = self.servers.iterator();
+            while (it.next()) |entry| {
+                const server = entry.value_ptr.*;
+                const running = server.server_running.load(.acquire);
+                const healthy = server.server_healthy.load(.acquire);
+                if (running and !healthy) {
+                    const lang = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                    const root: ?[]u8 = if (server.current_root_path) |p|
+                        self.allocator.dupe(u8, p) catch null
+                    else
+                        null;
+                    unhealthy.append(self.allocator, .{ .lang = lang, .root = root }) catch {
+                        self.allocator.free(lang);
+                        if (root) |r| self.allocator.free(r);
+                    };
+                }
+            }
+            self.manager_mutex.unlock(self.io);
+
+            for (unhealthy.items) |entry| {
+                if (!self.shouldRetryRestart(entry.lang)) {
+                    log.warn("[LSP WATCHDOG] {s} hit max restart attempts; giving up until user intervention", .{entry.lang});
+                    continue;
+                }
+                const lang_dup = self.allocator.dupe(u8, entry.lang) catch continue;
+                const root_dup: ?[]u8 = if (entry.root) |r| self.allocator.dupe(u8, r) catch null else null;
+                log.info("[LSP WATCHDOG] queueing restart of {s}", .{entry.lang});
+                self.supervisor.enqueueDedup(.{ .restart_server = .{ .lang = lang_dup, .root = root_dup } }) catch {
+                    self.allocator.free(lang_dup);
+                    if (root_dup) |r| self.allocator.free(r);
+                };
+            }
+        }
+    }
+
+    /// Returns true if we should attempt another restart for `lang`. Tracks
+    /// per-lang attempt counts and applies exponential backoff. Also resets
+    /// the count if the server has been healthy in the last
+    /// `recovery_window_ms`.
+    fn shouldRetryRestart(self: *LSPManager, lang: []const u8) bool {
+        const now_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+        self.restart_state_mutex.lockUncancelable(self.io);
+        defer self.restart_state_mutex.unlock(self.io);
+
+        const gop = self.restart_state.getOrPut(self.allocator, lang) catch return false;
+        if (!gop.found_existing) {
+            const key = self.allocator.dupe(u8, lang) catch {
+                _ = self.restart_state.remove(lang);
+                return false;
+            };
+            gop.key_ptr.* = key;
+            gop.value_ptr.* = .{};
+        }
+
+        // Recovery: if it's been healthy for a while since the last attempt,
+        // reset the counter so we get a fresh budget.
+        if (gop.value_ptr.last_attempt_ms != 0 and
+            (now_ms - gop.value_ptr.last_attempt_ms) > recovery_window_ms)
+        {
+            gop.value_ptr.attempts = 0;
+        }
+
+        if (gop.value_ptr.attempts >= max_restart_attempts) return false;
+
+        const since = now_ms - gop.value_ptr.last_attempt_ms;
+        // Exponential backoff: 1s, 2s, 4s, 8s, 16s (capped at 30s).
+        const backoff = @min(base_backoff_ms * (@as(i64, 1) << @intCast(gop.value_ptr.attempts)), max_backoff_ms);
+        if (gop.value_ptr.last_attempt_ms != 0 and since < backoff) return false;
+
+        gop.value_ptr.attempts += 1;
+        gop.value_ptr.last_attempt_ms = now_ms;
+        return true;
+    }
+
+    /// Mark `lang` as "currently starting". Returns true if we claimed the
+    /// slot, false if another thread is already starting this lang.
+    fn beginStart(self: *LSPManager, lang: []const u8) bool {
+        self.in_progress_mutex.lockUncancelable(self.io);
+        defer self.in_progress_mutex.unlock(self.io);
+        const gop = self.in_progress_starts.getOrPut(self.allocator, lang) catch return false;
+        if (gop.found_existing) return false;
+        const owned = self.allocator.dupe(u8, lang) catch {
+            _ = self.in_progress_starts.remove(lang);
+            return false;
+        };
+        gop.key_ptr.* = owned;
+        return true;
+    }
+
+    fn endStart(self: *LSPManager, lang: []const u8) void {
+        self.in_progress_mutex.lockUncancelable(self.io);
+        defer self.in_progress_mutex.unlock(self.io);
+        if (self.in_progress_starts.fetchRemove(lang)) |kv| {
+            self.allocator.free(kv.key);
+        }
+        self.in_progress_cond.broadcast(self.io);
+    }
+
+    fn waitForStart(self: *LSPManager, lang: []const u8) void {
+        self.in_progress_mutex.lockUncancelable(self.io);
+        defer self.in_progress_mutex.unlock(self.io);
+        while (self.in_progress_starts.contains(lang)) {
+            if (self.global_shutdown.load(.acquire)) return;
+            self.in_progress_cond.waitUncancelable(self.io, &self.in_progress_mutex);
+        }
+    }
+
+    /// Worker function used by the parallel-start spawn path. Owns `lang`
+    /// and `root` and frees them after the start completes (success or
+    /// fail). Set as a thread entry point.
+    fn runParallelStart(self: *LSPManager, lang_owned: []u8, root_owned: ?[]u8) void {
+        defer self.allocator.free(lang_owned);
+        defer if (root_owned) |r| self.allocator.free(r);
+        defer self.endStart(lang_owned);
+
+        self.startServerInternal(lang_owned, root_owned) catch |err| {
+            log.warn("[LSP parallel-start] {s} failed: {}", .{ lang_owned, err });
+        };
+    }
+
+    fn supervisorExecute(ctx: *anyopaque, cmd: supervisor_mod.Command) void {
+        const self: *LSPManager = @ptrCast(@alignCast(ctx));
+        switch (cmd) {
+            .start_server => |c| {
+                // Spawn the actual start on a fresh thread so multiple LSP
+                // servers can initialize in parallel. The worker returns
+                // immediately and is free to process the next command (e.g.
+                // a start for a different language).
+                if (!self.beginStart(c.lang)) return; // already starting
+                const lang_dup = self.allocator.dupe(u8, c.lang) catch {
+                    self.endStart(c.lang);
+                    return;
+                };
+                const root_dup: ?[]u8 = if (c.root) |r|
+                    self.allocator.dupe(u8, r) catch null
+                else
+                    null;
+                const t = std.Thread.spawn(.{}, runParallelStart, .{ self, lang_dup, root_dup }) catch {
+                    self.endStart(c.lang);
+                    self.allocator.free(lang_dup);
+                    if (root_dup) |r| self.allocator.free(r);
+                    return;
+                };
+                t.detach();
+            },
+            .stop_server => |lang| {
+                self.stopServerLangSync(lang);
+            },
+            .restart_server => |c| {
+                self.stopServerLangSync(c.lang);
+                self.startServerInternal(c.lang, c.root) catch |err| {
+                    log.warn("supervisor: restart {s} failed: {}", .{ c.lang, err });
+                };
+            },
+            .ensure_and_open => |c| {
+                self.ensureAndOpenSync(c.lang, c.root, c.file_path, c.content) catch |err| {
+                    log.warn("supervisor: ensure-and-open for {s} failed: {}", .{ c.file_path, err });
+                };
+            },
+            .add_workspace_folder => |c| {
+                self.addWorkspaceFolderSync(c.lang, c.root) catch |err| {
+                    log.warn("supervisor: addWorkspaceFolder {s} for {s} failed: {}", .{ c.root, c.lang, err });
+                };
+            },
+            .deferred_request => |c| {
+                self.runDeferredRequestSync(c.lang, c.file_path, c.kind, c.line, c.col) catch |err| {
+                    log.warn("supervisor: deferred {s} for {s} failed: {}", .{ @tagName(c.kind), c.file_path, err });
+                };
+            },
+        }
+    }
+
+    /// Runs on the supervisor thread, AFTER any preceding `ensure_and_open`
+    /// has been processed (FIFO). The document is guaranteed to be opened
+    /// on the server by this point, so the textDocument request can fire.
+    fn runDeferredRequestSync(self: *LSPManager, lang: []const u8, file_path: []const u8, kind: supervisor_mod.Command.DeferredKind, line: u32, col: u32) !void {
+        self.manager_mutex.lockUncancelable(self.io);
+        const srv = self.servers.get(lang);
+        self.manager_mutex.unlock(self.io);
+        const server = srv orelse return; // server died between enqueue and exec
+
+        const uri = try pathToUri(self.allocator, self.io, file_path);
+        defer self.allocator.free(uri);
+
+        switch (kind) {
+            .hover => try server.requestHover(uri, line, col),
+            .completion => try server.requestCompletion(uri, line, col),
+            .formatting => try server.requestFormatting(uri),
+            .definition => try server.requestDefinition(uri, line, col),
+            .references => try server.requestReferences(uri, line, col),
+            .document_symbols => try server.requestDocumentSymbols(uri),
+        }
+    }
+
+    /// Install one or more language servers in the background. Pass `all=true`
+    /// to install every supported server. Otherwise pass a specific language
+    /// name ("python", "typescript", "javascript", "go", "rust").
+    ///
+    /// This is opt-in — startup no longer auto-installs LSP servers. Callers
+    /// invoke this from the `stem lsp install` CLI subcommand.
+    pub fn installLanguageServer(self: *LSPManager, name: []const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        self.install_lock.lockUncancelable(self.io);
+        defer self.install_lock.unlock(self.io);
+
+        const want_all = std.mem.eql(u8, name, "all");
+        const want_py = want_all or std.mem.eql(u8, name, "python");
+        const want_ts = want_all or std.mem.eql(u8, name, "typescript") or std.mem.eql(u8, name, "javascript");
+        const want_go = want_all or std.mem.eql(u8, name, "go");
+        const want_rs = want_all or std.mem.eql(u8, name, "rust");
+        const want_cpp = want_all or std.mem.eql(u8, name, "cpp") or std.mem.eql(u8, name, "c") or std.mem.eql(u8, name, "c++");
+        const want_ruby = want_all or std.mem.eql(u8, name, "ruby");
+        const want_cs = want_all or std.mem.eql(u8, name, "csharp") or std.mem.eql(u8, name, "c#");
+        const want_java = want_all or std.mem.eql(u8, name, "java");
+
+        if (!(want_py or want_ts or want_go or want_rs or want_cpp or want_ruby or want_cs or want_java)) {
+            log.warn("Unknown language server: {s}. Supported: python, typescript, go, rust, cpp, ruby, csharp, java, all.", .{name});
+            return error.UnknownLanguage;
+        }
+
+        if (want_py) {
+            if (installer.ensurePyright(true)) |path| {
+                log.info("Pyright installed at {s}", .{path});
+                self.allocator.free(path);
+            } else |err| log.warn("Pyright install failed: {}", .{err});
+        }
+        if (want_ts) {
+            if (installer.ensureTypeScriptLS(true)) |path| {
+                log.info("TypeScript LS installed at {s}", .{path});
+                self.allocator.free(path);
+            } else |err| log.warn("TypeScript LS install failed: {}", .{err});
+        }
+        if (want_go) {
+            if (installer.ensureGopls(true)) |path| {
+                log.info("gopls installed at {s}", .{path});
+                self.allocator.free(path);
+            } else |err| log.warn("gopls install failed: {} (Go must be installed)", .{err});
+        }
+        if (want_rs) {
+            if (installer.ensureRustAnalyzer(true)) |path| {
+                log.info("rust-analyzer installed at {s}", .{path});
+                self.allocator.free(path);
+            } else |err| log.warn("rust-analyzer install failed: {}", .{err});
+        }
+        if (want_cpp) {
+            // clangd is detected on PATH only; we don't auto-install LLVM.
+            if (installer.ensureClangd(false)) |path| {
+                log.info("clangd available at {s}", .{path});
+                self.allocator.free(path);
+            } else |err| log.warn("clangd not on PATH: {} (install LLVM via your package manager)", .{err});
+        }
+        if (want_ruby) {
+            if (installer.ensureRubyLsp(true)) |path| {
+                log.info("ruby-lsp installed at {s}", .{path});
+                self.allocator.free(path);
+            } else |err| log.warn("ruby-lsp install failed: {} (Ruby + gem must be installed)", .{err});
+        }
+        if (want_cs) {
+            if (installer.ensureOmniSharp(true)) |path| {
+                log.info("OmniSharp installed at {s}", .{path});
+                self.allocator.free(path);
+            } else |err| log.warn("OmniSharp install failed: {}", .{err});
+        }
+        if (want_java) {
+            if (installer.ensureJdtls(true)) |path| {
+                log.info("jdtls installed at {s}", .{path});
+                self.allocator.free(path);
+            } else |err| log.warn("jdtls install failed: {} (java must be installed)", .{err});
+        }
+    }
+
+    pub fn deinit(self: *LSPManager) void {
+        // Signal global shutdown FIRST. This causes any LSP server start
+        // currently waiting on init to bail out immediately, which in turn
+        // unblocks the supervisor's worker so it can exit promptly.
+        self.global_shutdown.store(true, .release);
+
+        // Tell the watchdog to stop. The watchdog thread is mostly asleep,
+        // so the join is bounded by `watchdog_interval_ms` (3 s) anyway,
+        // but we still cap the wait so an OS scheduling hiccup can't stall
+        // exit indefinitely.
+        self.watchdog_stop.store(true, .release);
+        if (self.watchdog_thread) |t| {
+            if (!supervisor_mod.joinTimeout(self.allocator, self.io, t, 4000)) {
+                log.warn("LSP watchdog did not exit in 4s; detaching", .{});
+            }
+            self.watchdog_thread = null;
+        }
+
+        // Drain the supervisor next. Its worker.join is also bounded so
+        // we never sit longer than ~3 s here.
+        self.supervisor.shutdown();
+
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            var server = server_ptr.*;
+            server.deinit();
+        }
+        self.servers.deinit();
+
+        var doc_it = self.open_documents.keyIterator();
+        while (doc_it.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.open_documents.deinit();
+
+        var rs_it = self.restart_state.keyIterator();
+        while (rs_it.next()) |k| self.allocator.free(k.*);
+        self.restart_state.deinit(self.allocator);
+
+        // Drain the in-progress parallel starts. Their `runParallelStart`
+        // calls `endStart` which removes their key, so once the map is
+        // empty all detached start threads have finished writing to it
+        // and it's safe to free. global_shutdown is already set, so each
+        // start aborts immediately on its init wait poll (≤100 ms).
+        self.in_progress_mutex.lockUncancelable(self.io);
+        const drain_start_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+        while (self.in_progress_starts.count() > 0) {
+            const elapsed = std.Io.Clock.real.now(self.io).toMilliseconds() - drain_start_ms;
+            if (elapsed > 3000) {
+                log.warn("LSP in_progress_starts did not drain in 3s; leaking {d} entries", .{self.in_progress_starts.count()});
+                // Leak: parallel-start threads still alive will write to a
+                // freed map. Acceptable at process exit only.
+                break;
+            }
+            self.in_progress_mutex.unlock(self.io);
+            std.Io.sleep(self.io, .fromMilliseconds(20), .awake) catch break;
+            self.in_progress_mutex.lockUncancelable(self.io);
+        }
+        var ip_it = self.in_progress_starts.keyIterator();
+        while (ip_it.next()) |k| self.allocator.free(k.*);
+        self.in_progress_starts.deinit(self.allocator);
+        self.in_progress_mutex.unlock(self.io);
+
+        if (self.zig_env) |env| {
+            self.allocator.free(env.zig_exe);
+            self.allocator.free(env.lib_dir);
+            self.allocator.free(env.global_cache_dir);
+        }
+    }
+
+    fn stopServerLangSync(self: *LSPManager, lang: []const u8) void {
+        self.manager_mutex.lockUncancelable(self.io);
+        const maybe = self.servers.fetchRemove(lang);
+        // Also drop any open_documents whose URIs correspond to this lang —
+        // a future open will re-send the didOpen via the supervisor.
+        if (maybe != null) {
+            var pruned: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer pruned.deinit(self.allocator);
+            var dit = self.open_documents.keyIterator();
+            while (dit.next()) |k| {
+                if (uriMatchesLang(k.*, lang)) {
+                    pruned.append(self.allocator, k.*) catch {};
+                }
+            }
+            for (pruned.items) |k| {
+                _ = self.open_documents.fetchRemove(k);
+                self.allocator.free(k);
+            }
+        }
+        self.manager_mutex.unlock(self.io);
+
+        if (maybe) |kv| {
+            var srv = kv.value;
+            srv.stop();
+            srv.deinit();
+        }
+    }
+
+    fn uriMatchesLang(uri: []const u8, lang: []const u8) bool {
+        // Match by extension at the end of the URI.
+        const exts: []const struct { lang: []const u8, exts: []const []const u8 } = &.{
+            .{ .lang = "zig", .exts = &.{".zig"} },
+            .{ .lang = "python", .exts = &.{".py"} },
+            .{ .lang = "typescript", .exts = &.{ ".ts", ".tsx", ".jsx" } },
+            .{ .lang = "javascript", .exts = &.{".js"} },
+            .{ .lang = "rust", .exts = &.{".rs"} },
+            .{ .lang = "go", .exts = &.{".go"} },
+            .{ .lang = "cpp", .exts = &.{ ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hxx", ".hh" } },
+            .{ .lang = "java", .exts = &.{".java"} },
+            .{ .lang = "ruby", .exts = &.{ ".rb", ".rake" } },
+            .{ .lang = "csharp", .exts = &.{".cs"} },
+        };
+        for (exts) |row| {
+            if (!std.mem.eql(u8, row.lang, lang)) continue;
+            for (row.exts) |e| {
+                if (std.mem.endsWith(u8, uri, e)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Synchronous: ensure a server exists for `lang` with `root`, then send
+    /// the didOpen. Called from the supervisor thread.
+    fn ensureAndOpenSync(self: *LSPManager, lang: []const u8, root: ?[]const u8, file_path: []const u8, content: []const u8) !void {
+        // If a parallel `start_server` is in flight for this lang, wait for
+        // it to finish before deciding whether to start one ourselves —
+        // otherwise we'd race and either double-start or miss the put.
+        self.waitForStart(lang);
+
+        // Decide whether a fresh start, a workspace-folder addition, or a
+        // plain didOpen is appropriate.
+        self.manager_mutex.lockUncancelable(self.io);
+        const existing = self.servers.get(lang);
+        const healthy = if (existing) |s|
+            s.server_healthy.load(.acquire) and s.server_running.load(.acquire) and s.is_initialized.load(.acquire)
+        else
+            false;
+        const current_root_owned: ?[]u8 = if (existing) |s|
+            if (s.current_root_path) |p| self.allocator.dupe(u8, p) catch null else null
+        else
+            null;
+        self.manager_mutex.unlock(self.io);
+        defer if (current_root_owned) |p| self.allocator.free(p);
+
+        if (existing == null) {
+            try self.startServerInternal(lang, root);
+        } else if (!healthy) {
+            log.info("[supervisor] {s} server unhealthy, restarting", .{lang});
+            self.stopServerLangSync(lang);
+            try self.startServerInternal(lang, root);
+        } else if (root != null and current_root_owned != null) {
+            const new_root_trimmed = std.mem.trimEnd(u8, root.?, "/");
+            const cur_trimmed = std.mem.trimEnd(u8, current_root_owned.?, "/");
+            if (!std.mem.eql(u8, new_root_trimmed, cur_trimmed)) {
+                // Add as additional workspace folder (cheaper than restart).
+                self.addWorkspaceFolderSync(lang, root.?) catch |err| {
+                    log.warn("[supervisor] addWorkspaceFolder failed, falling back to restart: {}", .{err});
+                    self.stopServerLangSync(lang);
+                    try self.startServerInternal(lang, root);
+                };
+            }
+        }
+
+        // Send the didOpen + initial token request.
+        self.manager_mutex.lockUncancelable(self.io);
+        const srv = self.servers.get(lang) orelse {
+            self.manager_mutex.unlock(self.io);
+            return;
+        };
+        const uri = try pathToUri(self.allocator, self.io, file_path);
+        errdefer self.allocator.free(uri);
+
+        if (self.open_documents.contains(uri)) {
+            self.allocator.free(uri);
+            self.manager_mutex.unlock(self.io);
+            return;
+        }
+        try self.open_documents.put(uri, {});
+        // Drop the lock before the (still fast but pipe-write) send.
+        self.manager_mutex.unlock(self.io);
+
+        srv.sendDidOpen(uri, lang, 1, content) catch |err| {
+            log.warn("[supervisor] sendDidOpen failed for {s}: {}", .{ file_path, err });
+            return;
+        };
+
+        // Prefill highlighting from the on-disk token cache (if any) so the
+        // user sees LSP-quality colors immediately instead of waiting for
+        // the server to index. The real `semanticTokens/full` response
+        // arrives later and overwrites with the fresh data.
+        _ = srv.tryLoadCachedTokens(uri);
+
+        srv.requestSemanticTokens(uri) catch |err| {
+            log.warn("[supervisor] requestSemanticTokens on open failed: {}", .{err});
+        };
+    }
+
+    /// Send `workspace/didChangeWorkspaceFolders` to add `root` to the
+    /// running server. Most modern LSPs (gopls, pyright, tsserver,
+    /// rust-analyzer, zls) accept this and avoid the cost of a restart.
+    fn addWorkspaceFolderSync(self: *LSPManager, lang: []const u8, root: []const u8) !void {
+        self.manager_mutex.lockUncancelable(self.io);
+        const srv = self.servers.get(lang);
+        self.manager_mutex.unlock(self.io);
+        if (srv) |s| try s.sendDidChangeWorkspaceFolders(root, &.{});
+    }
+
+    /// Stop ALL running servers. Asynchronous: each lang's stop is queued on
+    /// the supervisor so the caller (UI thread) doesn't block on
+    /// thread-joins. Use `waitForSupervisorIdle` if you need to be sure
+    /// they're done (e.g. during shutdown).
+    pub fn stopServer(self: *LSPManager) void {
+        log.info("[LSP MANAGER] Stopping all LSP servers (async)...", .{});
+        self.manager_mutex.lockUncancelable(self.io);
+        var langs = std.ArrayList([]u8).initCapacity(self.allocator, 4) catch return;
+        defer langs.deinit(self.allocator);
+        var it = self.servers.keyIterator();
+        while (it.next()) |k| {
+            const owned = self.allocator.dupe(u8, k.*) catch continue;
+            langs.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+            };
+        }
+        self.manager_mutex.unlock(self.io);
+
+        for (langs.items) |lang_owned| {
+            self.supervisor.enqueue(.{ .stop_server = lang_owned }) catch {
+                self.allocator.free(lang_owned);
+            };
+        }
+    }
+
+    /// Stop a single language's server. Asynchronous: the actual stop runs on
+    /// the supervisor's worker thread.
+    pub fn stopServerLang(self: *LSPManager, lang: []const u8) void {
+        log.info("[LSP MANAGER] Stopping {s} server (async)...", .{lang});
+        const lang_owned = self.allocator.dupe(u8, lang) catch return;
+        self.supervisor.enqueueDedup(.{ .stop_server = lang_owned }) catch {
+            self.allocator.free(lang_owned);
+        };
+    }
+
+    /// Resolve `~/.stem/cache/tokens`, creating it on demand. Returned slice
+    /// is owned by the caller (typically transferred to an LSPServer that
+    /// frees it in deinit).
+    fn computeTokenCacheDir(self: *LSPManager) !?[]u8 {
+        const env: std.process.Environ = .{ .block = self.environ_block };
+        const home = env.getPosix("HOME") orelse return null;
+        const dir = try std.fs.path.join(self.allocator, &.{ home, ".stem", "cache", "tokens" });
+        std.Io.Dir.cwd().createDirPath(self.io, dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                self.allocator.free(dir);
+                return null;
+            },
+        };
+        return dir;
+    }
+
+    pub fn isServerHealthy(self: *LSPManager, lang: []const u8) bool {
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        if (self.servers.get(lang)) |server| {
+            return server.server_healthy.load(.monotonic) and server.server_running.load(.acquire);
+        }
+        return false;
+    }
+
+    /// Returns true when the server for this file's language is initialized
+    /// AND we've already sent the didOpen for this file. Used by callers
+    /// like hover/completion that need both to be true before issuing the
+    /// request. Cheap — just a couple of map lookups.
+    pub fn isDocumentReady(self: *LSPManager, file_path: []const u8) bool {
+        const lang = getLangFromPath(file_path) orelse return false;
+        const uri = pathToUri(self.allocator, self.io, file_path) catch return false;
+        defer self.allocator.free(uri);
+
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        const srv = self.servers.get(lang) orelse return false;
+        if (!srv.is_initialized.load(.acquire)) return false;
+        if (!srv.server_healthy.load(.acquire)) return false;
+        return self.open_documents.contains(uri);
+    }
+
+    /// Bounded poll: returns true if the document becomes ready within
+    /// `timeout_ms`, false on timeout. Caller-initiated waits (e.g. hover
+    /// triggered by the user) tolerate a short wait since pre-spawn usually
+    /// makes this instant; first-cold-hover may pay up to `timeout_ms`.
+    pub fn waitDocumentReady(self: *LSPManager, file_path: []const u8, timeout_ms: i64) bool {
+        const start_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+        while (true) {
+            if (self.isDocumentReady(file_path)) return true;
+            const elapsed = std.Io.Clock.real.now(self.io).toMilliseconds() - start_ms;
+            if (elapsed >= timeout_ms) return false;
+            std.Io.sleep(self.io, .fromMilliseconds(25), .awake) catch return false;
+        }
+    }
+
+    /// Async public API: enqueue a start command. Returns immediately. Safe
+    /// to call even if a server is already running (a no-op start is cheap).
+    pub fn startServer(self: *LSPManager, lang: []const u8, root_path: ?[]const u8) !void {
+        const lang_owned = try self.allocator.dupe(u8, lang);
+        errdefer self.allocator.free(lang_owned);
+        const root_owned: ?[]u8 = if (root_path) |p| try self.allocator.dupe(u8, p) else null;
+        errdefer if (root_owned) |p| self.allocator.free(p);
+        try self.supervisor.enqueueDedup(.{ .start_server = .{ .lang = lang_owned, .root = root_owned } });
+    }
+
+    /// Synchronous workhorse. Called from the supervisor thread. The UI
+    /// thread must not call this directly — use `startServer` instead.
+    fn startServerInternal(self: *LSPManager, lang: []const u8, root_path: ?[]const u8) !void {
+        self.manager_mutex.lockUncancelable(self.io);
+        const exists = self.servers.get(lang) != null;
+        self.manager_mutex.unlock(self.io);
+        if (exists) {
+            log.info("[LSP MANAGER] {s} server already registered, skipping start", .{lang});
+            return;
+        }
+
+        log.info("[LSP MANAGER] Starting {s} server with root_path={s}", .{ lang, root_path orelse "null" });
+
+        if (std.mem.eql(u8, lang, "zig")) {
+            self.startEmbeddedZLS(root_path) catch |err| {
+                log.err("Failed to start ZLS: {}", .{err});
+                log.info("[LSP ERROR] Failed to start ZLS: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] ZLS (zig) server started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "python")) {
+            self.startPyright(root_path) catch |err| {
+                log.err("Failed to start Pyright: {}", .{err});
+                log.info("[LSP ERROR] Failed to start Pyright: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] Pyright (python) server started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "javascript") or std.mem.eql(u8, lang, "typescript")) {
+            self.startTypeScriptLS(root_path) catch |err| {
+                log.err("Failed to start TypeScript LS: {}", .{err});
+                log.info("[LSP ERROR] Failed to start TypeScript LS: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] TypeScript LS server started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "go")) {
+            self.startGopls(root_path) catch |err| {
+                log.err("Failed to start gopls: {}", .{err});
+                log.info("[LSP ERROR] Failed to start gopls: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] gopls (go) server started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "rust")) {
+            self.startRustAnalyzer(root_path) catch |err| {
+                log.err("Failed to start rust-analyzer: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] rust-analyzer (rust) server started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "cpp") or std.mem.eql(u8, lang, "c")) {
+            self.startClangd(root_path) catch |err| {
+                log.err("Failed to start clangd: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] clangd (C/C++) server started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "ruby")) {
+            self.startRubyLsp(root_path) catch |err| {
+                log.err("Failed to start ruby-lsp: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] ruby-lsp (ruby) server started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "csharp")) {
+            self.startOmniSharp(root_path) catch |err| {
+                log.err("Failed to start OmniSharp: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] OmniSharp (C#) server started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "java")) {
+            self.startJdtls(root_path) catch |err| {
+                log.err("Failed to start jdtls: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] jdtls (Java) server started successfully", .{});
+        } else {
+            log.info("[LSP MANAGER] Unknown language '{s}', no LSP server available", .{lang});
+        }
+    }
+
+    fn startEmbeddedZLS(self: *LSPManager, root_path: ?[]const u8) !void {
+        if (self.zig_env == null) {
+            self.zig_env = detectZigEnv(self.allocator, self.io) catch null;
+        }
+
+        var server = try LSPServer.init(self.allocator, self.io, "zig");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(zls_embedded.runEmbeddedZLS, .{self.environ_block});
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("zig", server);
+    }
+
+    fn startPyright(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startPyright called", .{});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const script_path = installer.ensurePyright(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "python");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runPyrightThread, .{ script_path, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("python", server);
+    }
+
+    fn runPyrightThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, script_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(script_path);
+        const args = [_][]const u8{ "node", script_path, "--stdio" };
+        log.info("Starting Pyright node process: {s} {s}", .{ "node", script_path });
+        external.runExternalServer(allocator, input, output, "node", &args, environ_block) catch |err| {
+            log.info("Pyright server failed: {}", .{err});
+        };
+    }
+
+    fn startTypeScriptLS(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startTypeScriptLS called with root_path={s}", .{root_path orelse "null"});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const script_path = installer.ensureTypeScriptLS(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "typescript");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runTypeScriptLSThread, .{ script_path, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("typescript", server);
+    }
+
+    fn runTypeScriptLSThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, script_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(script_path);
+        const args = [_][]const u8{ "node", script_path, "--stdio" };
+        log.info("Starting TypeScript LS node process: {s} {s}", .{ "node", script_path });
+        external.runExternalServer(allocator, input, output, "node", &args, environ_block) catch |err| {
+            log.info("TypeScript LS server failed: {}", .{err});
+        };
+    }
+
+    fn startGopls(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startGopls called with root_path={s}", .{root_path orelse "null"});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const binary_path = installer.ensureGopls(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "go");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runGoplsThread, .{ binary_path, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("go", server);
+    }
+
+    fn runGoplsThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, binary_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(binary_path);
+        const args = [_][]const u8{binary_path};
+        log.info("Starting gopls process: {s}", .{binary_path});
+        external.runExternalServer(allocator, input, output, binary_path, &args, environ_block) catch |err| {
+            log.info("gopls server failed: {}", .{err});
+        };
+    }
+
+    fn startRustAnalyzer(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startRustAnalyzer called with root_path={s}", .{root_path orelse "null"});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const binary_path = installer.ensureRustAnalyzer(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "rust");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runRustAnalyzerThread, .{ binary_path, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("rust", server);
+    }
+
+    fn runRustAnalyzerThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, binary_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(binary_path);
+        const args = [_][]const u8{binary_path};
+        log.info("Starting rust-analyzer process: {s}", .{binary_path});
+        external.runExternalServer(allocator, input, output, binary_path, &args, environ_block) catch |err| {
+            log.info("rust-analyzer server failed: {}", .{err});
+        };
+    }
+
+    fn startClangd(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startClangd called with root_path={s}", .{root_path orelse "null"});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const binary_path = installer.ensureClangd(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "cpp");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runClangdThread, .{ binary_path, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("cpp", server);
+    }
+
+    fn runClangdThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, binary_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(binary_path);
+        const args = [_][]const u8{binary_path};
+        log.info("Starting clangd process: {s}", .{binary_path});
+        external.runExternalServer(allocator, input, output, binary_path, &args, environ_block) catch |err| {
+            log.info("clangd server failed: {}", .{err});
+        };
+    }
+
+    fn startRubyLsp(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startRubyLsp called with root_path={s}", .{root_path orelse "null"});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const binary_path = installer.ensureRubyLsp(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "ruby");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runRubyLspThread, .{ binary_path, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("ruby", server);
+    }
+
+    fn runRubyLspThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, binary_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(binary_path);
+        const args = [_][]const u8{binary_path};
+        log.info("Starting ruby-lsp process: {s}", .{binary_path});
+        external.runExternalServer(allocator, input, output, binary_path, &args, environ_block) catch |err| {
+            log.info("ruby-lsp server failed: {}", .{err});
+        };
+    }
+
+    fn startOmniSharp(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startOmniSharp called with root_path={s}", .{root_path orelse "null"});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const binary_path = installer.ensureOmniSharp(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "csharp");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runOmniSharpThread, .{ binary_path, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("csharp", server);
+    }
+
+    fn runOmniSharpThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, binary_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(binary_path);
+        // OmniSharp wants `-lsp` to speak the LSP protocol (it also has a
+        // legacy STDIO protocol that isn't compatible).
+        const args = [_][]const u8{ binary_path, "-lsp" };
+        log.info("Starting OmniSharp process: {s}", .{binary_path});
+        external.runExternalServer(allocator, input, output, binary_path, &args, environ_block) catch |err| {
+            log.info("OmniSharp server failed: {}", .{err});
+        };
+    }
+
+    fn startJdtls(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startJdtls called with root_path={s}", .{root_path orelse "null"});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const launcher_jar = installer.ensureJdtls(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "java");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runJdtlsThread, .{ launcher_jar, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("java", server);
+    }
+
+    fn runJdtlsThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, launcher_jar: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(launcher_jar);
+        // jdtls is launched via `java -jar <launcher>` with a bunch of JVM
+        // tuning flags that the upstream docs recommend. We keep it minimal
+        // here; users with large projects can override via env JAVA_TOOL_OPTIONS.
+        const args = [_][]const u8{
+            "java",
+            "-Declipse.application=org.eclipse.jdt.ls.core.id1",
+            "-Dosgi.bundles.defaultStartLevel=4",
+            "-Declipse.product=org.eclipse.jdt.ls.core.product",
+            "--add-modules=ALL-SYSTEM",
+            "--add-opens=java.base/java.util=ALL-UNNAMED",
+            "--add-opens=java.base/java.lang=ALL-UNNAMED",
+            "-jar",
+            launcher_jar,
+        };
+        log.info("Starting jdtls: java -jar {s}", .{launcher_jar});
+        external.runExternalServer(allocator, input, output, "java", &args, environ_block) catch |err| {
+            log.info("jdtls server failed: {} (is Java on PATH?)", .{err});
+        };
+    }
+
+    fn getServer(self: *LSPManager, lang: []const u8) ?*LSPServer {
+        return self.servers.get(lang);
+    }
+
+    fn getServerForFile(self: *LSPManager, file_path: []const u8) ?*LSPServer {
+        const lang = getLangFromPath(file_path) orelse return null;
+        return self.servers.get(lang);
+    }
+
+    pub fn getLangFromPath(path: []const u8) ?[]const u8 {
+        if (std.mem.endsWith(u8, path, ".zig")) return "zig";
+        if (std.mem.endsWith(u8, path, ".py")) return "python";
+        if (std.mem.endsWith(u8, path, ".ts") or std.mem.endsWith(u8, path, ".tsx") or std.mem.endsWith(u8, path, ".jsx")) return "typescript";
+        if (std.mem.endsWith(u8, path, ".js")) return "javascript";
+        if (std.mem.endsWith(u8, path, ".rs")) return "rust";
+        if (std.mem.endsWith(u8, path, ".go")) return "go";
+        // C and C++: clangd handles both; we report a single "cpp" lang
+        // for the LSP so one server services both. Headers (`.h`) are
+        // ambiguous; we send them through clangd which figures it out.
+        if (std.mem.endsWith(u8, path, ".c") or std.mem.endsWith(u8, path, ".h")) return "cpp";
+        if (std.mem.endsWith(u8, path, ".cpp") or std.mem.endsWith(u8, path, ".cc") or
+            std.mem.endsWith(u8, path, ".cxx") or std.mem.endsWith(u8, path, ".hpp") or
+            std.mem.endsWith(u8, path, ".hxx") or std.mem.endsWith(u8, path, ".hh")) return "cpp";
+        if (std.mem.endsWith(u8, path, ".java")) return "java";
+        if (std.mem.endsWith(u8, path, ".rb") or std.mem.endsWith(u8, path, ".rake")) return "ruby";
+        if (std.mem.endsWith(u8, path, ".cs")) return "csharp";
+        return null;
+    }
+
+    /// Non-blocking: if a healthy initialized server already has the right
+    /// root, send `didOpen` synchronously (a fast MemPipe write). Otherwise
+    /// queue the open onto the supervisor so the UI thread doesn't wait for
+    /// server boot/restart.
+    pub fn documentOpened(self: *LSPManager, file_path: []const u8, content: []const u8) !void {
+        log.info("LSPManager: documentOpened {s}", .{file_path});
+        const lang = getLangFromPath(file_path) orelse return;
+
+        const uri = try pathToUri(self.allocator, self.io, file_path);
+        errdefer self.allocator.free(uri);
+
+        // Fast path: server already exists, healthy, initialized, and either
+        // the root matches or there's no root concept. Send the didOpen
+        // inline. We hold the manager lock for the entire send to make sure
+        // a concurrent supervisor `stop_server` can't tear the server down
+        // mid-write.
+        self.manager_mutex.lockUncancelable(self.io);
+        if (self.open_documents.contains(uri)) {
+            self.manager_mutex.unlock(self.io);
+            self.allocator.free(uri);
+            return;
+        }
+
+        const new_root_raw = self.findProjectRoot(file_path, lang) catch null;
+        defer if (new_root_raw) |p| self.allocator.free(p);
+        const new_root_trim: ?[]const u8 = if (new_root_raw) |p| std.mem.trimEnd(u8, p, "/") else null;
+
+        if (self.servers.get(lang)) |srv| {
+            const healthy = srv.server_healthy.load(.acquire) and srv.server_running.load(.acquire) and srv.is_initialized.load(.acquire);
+            if (healthy) {
+                const cur_trim: ?[]const u8 = if (srv.current_root_path) |p| std.mem.trimEnd(u8, p, "/") else null;
+                const roots_match = (new_root_trim == null and cur_trim == null) or
+                    (new_root_trim != null and cur_trim != null and std.mem.eql(u8, new_root_trim.?, cur_trim.?));
+                if (roots_match) {
+                    // Send the didOpen under the manager lock so a concurrent
+                    // stop can't deinit the server before send completes.
+                    srv.sendDidOpen(uri, lang, 1, content) catch |err| {
+                        self.manager_mutex.unlock(self.io);
+                        self.allocator.free(uri);
+                        return err;
+                    };
+                    try self.open_documents.put(uri, {});
+                    self.manager_mutex.unlock(self.io);
+                    srv.requestSemanticTokens(uri) catch |err| {
+                        log.warn("requestSemanticTokens on open failed: {}", .{err});
+                    };
+                    return;
+                }
+            }
+        }
+        self.manager_mutex.unlock(self.io);
+
+        // Slow path: queue an ensure_and_open command for the supervisor and
+        // return immediately. The didOpen will fire as soon as the server
+        // is ready.
+        const lang_owned = try self.allocator.dupe(u8, lang);
+        errdefer self.allocator.free(lang_owned);
+        const root_owned: ?[]u8 = if (new_root_raw) |p| try self.allocator.dupe(u8, p) else null;
+        errdefer if (root_owned) |p| self.allocator.free(p);
+        const file_owned = try self.allocator.dupe(u8, file_path);
+        errdefer self.allocator.free(file_owned);
+        const content_owned = try self.allocator.dupe(u8, content);
+        errdefer self.allocator.free(content_owned);
+
+        self.allocator.free(uri); // supervisor will rebuild from file_path
+
+        self.supervisor.enqueue(.{ .ensure_and_open = .{
+            .lang = lang_owned,
+            .root = root_owned,
+            .file_path = file_owned,
+            .content = content_owned,
+        } }) catch |err| {
+            log.warn("supervisor enqueue failed: {}", .{err});
+            return err;
+        };
+    }
+
+    pub fn documentChanged(self: *LSPManager, file_path: []const u8, content: []const u8, version: i64) !void {
+        // Hot path on every keystroke. Snapshot the server pointer under the
+        // lock, drop it, then do the (potentially large) didChange write
+        // without holding the manager lock.
+        self.manager_mutex.lockUncancelable(self.io);
+        const server_opt = self.getServerForFile(file_path);
+        self.manager_mutex.unlock(self.io);
+        const server = server_opt orelse return;
+        if (!server.server_running.load(.acquire)) return;
+        const uri = try pathToUri(self.allocator, self.io, file_path);
+        defer self.allocator.free(uri);
+        try server.sendDidChange(uri, version, content);
+        server.requestSemanticTokens(uri) catch |err| {
+            log.warn("Failed to request semantic tokens after change for {s}: {}", .{ file_path, err });
+        };
+    }
+
+    pub fn documentSaved(self: *LSPManager, file_path: []const u8) !void {
+        self.manager_mutex.lockUncancelable(self.io);
+        const server_opt = self.getServerForFile(file_path);
+        self.manager_mutex.unlock(self.io);
+        const server = server_opt orelse return;
+        if (!server.server_running.load(.acquire)) return;
+        const uri = try pathToUri(self.allocator, self.io, file_path);
+        defer self.allocator.free(uri);
+        try server.sendDidSave(uri);
+    }
+
+    pub fn documentClosed(self: *LSPManager, file_path: []const u8) !void {
+        const uri = try pathToUri(self.allocator, self.io, file_path);
+        defer self.allocator.free(uri);
+
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+
+        if (self.open_documents.fetchRemove(uri)) |kv| {
+            self.allocator.free(kv.key);
+        }
+
+        if (self.getServerForFile(file_path)) |server| {
+            if (server.server_running.load(.acquire)) {
+                try server.sendDidClose(uri);
+            }
+        }
+    }
+
+    pub fn requestHover(self: *LSPManager, file_path: []const u8, line: u32, col: u32) !void {
+        try self.dispatchRequest(file_path, .hover, line, col);
+    }
+
+    /// Common dispatch: take the fast path (send the request inline if the
+    /// server is ready) or enqueue a `deferred_request` so the supervisor
+    /// runs it after the document has been opened. Either way the UI thread
+    /// returns immediately — no waiting on init.
+    fn dispatchRequest(self: *LSPManager, file_path: []const u8, kind: supervisor_mod.Command.DeferredKind, line: u32, col: u32) !void {
+        const lang = getLangFromPath(file_path) orelse return;
+
+        // Try the fast path under the manager lock.
+        self.manager_mutex.lockUncancelable(self.io);
+        const maybe_srv = self.servers.get(lang);
+        const ready = if (maybe_srv) |s|
+            s.is_initialized.load(.acquire) and s.server_healthy.load(.acquire) and s.server_running.load(.acquire)
+        else
+            false;
+        const uri_in_open = if (ready) blk: {
+            const u = pathToUri(self.allocator, self.io, file_path) catch break :blk false;
+            defer self.allocator.free(u);
+            break :blk self.open_documents.contains(u);
+        } else false;
+        if (ready and uri_in_open) {
+            const server = maybe_srv.?;
+            const uri = try pathToUri(self.allocator, self.io, file_path);
+            defer self.allocator.free(uri);
+            switch (kind) {
+                .hover => try server.requestHover(uri, line, col),
+                .completion => try server.requestCompletion(uri, line, col),
+                .formatting => try server.requestFormatting(uri),
+                .definition => try server.requestDefinition(uri, line, col),
+                .references => try server.requestReferences(uri, line, col),
+                .document_symbols => try server.requestDocumentSymbols(uri),
+            }
+            self.manager_mutex.unlock(self.io);
+            return;
+        }
+        self.manager_mutex.unlock(self.io);
+
+        // Slow path: queue the request. The supervisor will execute it
+        // after any preceding `ensure_and_open` finishes, so the doc is
+        // guaranteed open by then.
+        const lang_dup = try self.allocator.dupe(u8, lang);
+        errdefer self.allocator.free(lang_dup);
+        const path_dup = try self.allocator.dupe(u8, file_path);
+        errdefer self.allocator.free(path_dup);
+        try self.supervisor.enqueue(.{ .deferred_request = .{
+            .lang = lang_dup,
+            .file_path = path_dup,
+            .kind = kind,
+            .line = line,
+            .col = col,
+        } });
+    }
+
+    pub fn popHoverResult(self: *LSPManager) ?[]u8 {
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            server.hover_mutex.lockUncancelable(self.io);
+            defer server.hover_mutex.unlock(self.io);
+            if (server.hover_result) |res| {
+                log.info("popHoverResult found: {s}", .{res});
+                server.hover_result = null;
+                return res;
+            }
+        }
+        return null;
+    }
+
+    pub fn requestFormatting(self: *LSPManager, file_path: []const u8) !void {
+        try self.dispatchRequest(file_path, .formatting, 0, 0);
+    }
+
+    pub fn popFormatResult(self: *LSPManager) ?[]const TextEdit {
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            server.format_mutex.lockUncancelable(self.io);
+            defer server.format_mutex.unlock(self.io);
+            if (server.format_result) |res| {
+                server.format_result = null;
+                return res;
+            }
+        }
+        return null;
+    }
+
+    pub fn requestDefinition(self: *LSPManager, file_path: []const u8, line: u32, col: u32) !void {
+        try self.dispatchRequest(file_path, .definition, line, col);
+    }
+
+    pub fn popDefinitionResult(self: *LSPManager) ?Location {
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            server.definition_mutex.lockUncancelable(self.io);
+            defer server.definition_mutex.unlock(self.io);
+            if (server.definition_result) |res| {
+                server.definition_result = null;
+                return res;
+            }
+        }
+        return null;
+    }
+
+    pub fn requestReferences(self: *LSPManager, file_path: []const u8, line: u32, col: u32) !void {
+        try self.dispatchRequest(file_path, .references, line, col);
+    }
+
+    pub fn popReferencesResult(self: *LSPManager) ?[]Location {
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            server.references_mutex.lockUncancelable(self.io);
+            defer server.references_mutex.unlock(self.io);
+            if (server.references_result) |res| {
+                server.references_result = null;
+                return res;
+            }
+        }
+        return null;
+    }
+
+    pub fn freeReferences(self: *LSPManager, refs: []Location) void {
+        for (refs) |r| {
+            self.allocator.free(r.file_path);
+        }
+        self.allocator.free(refs);
+    }
+
+    pub fn requestCompletion(self: *LSPManager, file_path: []const u8, line: u32, col: u32) !void {
+        try self.dispatchRequest(file_path, .completion, line, col);
+    }
+
+    pub fn popCompletionResult(self: *LSPManager) ?[]CompletionItem {
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            server.completion_mutex.lockUncancelable(self.io);
+            defer server.completion_mutex.unlock(self.io);
+            if (server.completion_result) |res| {
+                server.completion_result = null;
+                return res;
+            }
+        }
+        return null;
+    }
+
+    pub fn freeCompletionItems(self: *LSPManager, items: []CompletionItem) void {
+        for (items) |item| {
+            self.allocator.free(item.label);
+            if (item.detail) |d| self.allocator.free(d);
+        }
+        self.allocator.free(items);
+    }
+
+    pub fn requestDocumentSymbols(self: *LSPManager, file_path: []const u8) !void {
+        try self.dispatchRequest(file_path, .document_symbols, 0, 0);
+    }
+
+    pub fn popDocumentSymbolsResult(self: *LSPManager) ?[]DocumentSymbol {
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            server.document_symbols_mutex.lockUncancelable(self.io);
+            defer server.document_symbols_mutex.unlock(self.io);
+            if (server.document_symbols_result) |res| {
+                server.document_symbols_result = null;
+                return res;
+            }
+        }
+        return null;
+    }
+
+    pub fn freeDocumentSymbols(self: *LSPManager, symbols: []DocumentSymbol) void {
+        for (symbols) |sym| {
+            self.allocator.free(sym.name);
+            if (sym.container_name) |c| self.allocator.free(c);
+        }
+        self.allocator.free(symbols);
+    }
+
+    pub fn copyVisibleTokens(self: *LSPManager, allocator: std.mem.Allocator, file_path: []const u8, first_line: usize, last_line: usize) ![]protocol.SyntaxToken {
+        // Hot path: called per pane per render. Hold the manager lock only
+        // for the lookup, then release before the token copy (which takes
+        // the server's own file_tokens_mutex). The supervisor can't deinit
+        // a server while we're using its pointer here because it would
+        // need this same mutex to remove it from the map first.
+        self.manager_mutex.lockUncancelable(self.io);
+        const server_opt = self.getServerForFile(file_path);
+        self.manager_mutex.unlock(self.io);
+        const server = server_opt orelse return &.{};
+
+        const uri = try pathToUri(allocator, self.io, file_path);
+        defer allocator.free(uri);
+        return server.copyVisibleTokens(allocator, uri, first_line, last_line);
+    }
+
+    pub fn refreshSemanticTokens(self: *LSPManager, file_path: []const u8) void {
+        const lang = getLangFromPath(file_path) orelse return;
+
+        self.manager_mutex.lockUncancelable(self.io);
+        const maybe_server = self.servers.get(lang);
+        self.manager_mutex.unlock(self.io);
+        const server = maybe_server orelse return;
+
+        if (!server.server_healthy.load(.acquire) and server.server_running.load(.acquire)) {
+            // Hand off the recovery to the supervisor; this returns
+            // immediately so we don't freeze the caller.
+            log.info("[LSP AUTO-RECOVERY] {s} server unhealthy, queueing restart...", .{lang});
+            const root = if (server.current_root_path) |p|
+                self.allocator.dupe(u8, p) catch null
+            else
+                null;
+
+            const lang_owned = self.allocator.dupe(u8, lang) catch {
+                if (root) |r| self.allocator.free(r);
+                return;
+            };
+            self.supervisor.enqueueDedup(.{ .restart_server = .{ .lang = lang_owned, .root = root } }) catch {
+                self.allocator.free(lang_owned);
+                if (root) |r| self.allocator.free(r);
+            };
+            return;
+        }
+
+        if (server.server_running.load(.acquire) and server.is_initialized.load(.acquire)) {
+            const uri = pathToUri(self.allocator, self.io, file_path) catch return;
+            defer self.allocator.free(uri);
+
+            self.manager_mutex.lockUncancelable(self.io);
+            const already_open = self.open_documents.contains(uri);
+            self.manager_mutex.unlock(self.io);
+
+            if (!already_open) {
+                log.info("[LSP REFRESH] Document not tracked as open, sending didOpen for {s}", .{file_path});
+                const content = std.Io.Dir.cwd().readFileAlloc(self.io, file_path, self.allocator, .limited(10 * 1024 * 1024)) catch |err| {
+                    log.warn("[LSP REFRESH] Failed to read file for didOpen: {}", .{err});
+                    return;
+                };
+                defer self.allocator.free(content);
+
+                server.sendDidOpen(uri, lang, 1, content) catch return;
+                const uri_dup = self.allocator.dupe(u8, uri) catch return;
+                self.manager_mutex.lockUncancelable(self.io);
+                defer self.manager_mutex.unlock(self.io);
+                self.open_documents.put(uri_dup, {}) catch {
+                    self.allocator.free(uri_dup);
+                    return;
+                };
+            }
+
+            server.requestSemanticTokens(uri) catch |err| {
+                log.warn("Failed to request semantic tokens on refresh for {s}: {}", .{ uri, err });
+            };
+        }
+    }
+
+    pub fn getActiveServerStatus(self: *LSPManager, allocator: std.mem.Allocator) !?[]u8 {
+        var list = try std.ArrayList(u8).initCapacity(allocator, 0);
+        errdefer list.deinit(allocator);
+
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        var first = true;
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            if (server.server_running.load(.acquire)) {
+                if (!first) try list.appendSlice(allocator, ", ");
+                try list.appendSlice(allocator, server.lang);
+                first = false;
+            }
+        }
+
+        if (list.items.len == 0) {
+            list.deinit(allocator);
+            return null;
+        }
+        return try list.toOwnedSlice(allocator);
+    }
+
+    pub fn getDiagnostics(self: *LSPManager, allocator: std.mem.Allocator) ![]Diagnostic {
+        var all_diagnostics = try std.ArrayList(Diagnostic).initCapacity(allocator, 8);
+        defer all_diagnostics.deinit(allocator);
+
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            server.diagnostics_mutex.lockUncancelable(self.io);
+            defer server.diagnostics_mutex.unlock(self.io);
+
+            var diag_it = server.diagnostics.valueIterator();
+            while (diag_it.next()) |list| {
+                for (list.*) |d| {
+                    try all_diagnostics.append(allocator, .{
+                        .start_line = d.start_line,
+                        .start_col = d.start_col,
+                        .end_line = d.end_line,
+                        .end_col = d.end_col,
+                        .severity = d.severity,
+                        .message = try allocator.dupe(u8, d.message),
+                    });
+                }
+            }
+        }
+        return all_diagnostics.toOwnedSlice(allocator);
+    }
+
+    /// Return diagnostics scoped to a single file path. Caller frees via
+    /// `freeDiagnostics`.
+    pub fn getDiagnosticsForFile(self: *LSPManager, allocator: std.mem.Allocator, file_path: []const u8) ![]Diagnostic {
+        const uri = pathToUri(self.allocator, self.io, file_path) catch return &.{};
+        defer self.allocator.free(uri);
+
+        var matches = try std.ArrayList(Diagnostic).initCapacity(allocator, 8);
+        defer matches.deinit(allocator);
+
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            server.diagnostics_mutex.lockUncancelable(self.io);
+            defer server.diagnostics_mutex.unlock(self.io);
+
+            if (server.diagnostics.get(uri)) |list| {
+                for (list) |d| {
+                    try matches.append(allocator, .{
+                        .start_line = d.start_line,
+                        .start_col = d.start_col,
+                        .end_line = d.end_line,
+                        .end_col = d.end_col,
+                        .severity = d.severity,
+                        .message = try allocator.dupe(u8, d.message),
+                    });
+                }
+            }
+        }
+        return matches.toOwnedSlice(allocator);
+    }
+
+    pub fn freeDiagnostics(allocator: std.mem.Allocator, diagnostics: []Diagnostic) void {
+        for (diagnostics) |d| {
+            allocator.free(d.message);
+        }
+        allocator.free(diagnostics);
+    }
+
+    fn detectZigEnv(allocator: std.mem.Allocator, io: std.Io) !?ZigEnv {
+        // `zig env` writes a ZON literal by default whose string fields use
+        // ad-hoc quoting we can't safely regex over (a path with `"` in it
+        // breaks the parser). Use the structured `--json` form instead.
+        const result = std.process.run(allocator, io, .{
+            .argv = &.{ "zig", "env", "--json" },
+        }) catch return null;
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+
+        if (result.term.exited != 0) return null;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{
+            .ignore_unknown_fields = true,
+        }) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const obj = parsed.value.object;
+
+        const exe_val = obj.get("zig_exe") orelse return null;
+        const lib_val = obj.get("lib_dir") orelse return null;
+        const cache_val = obj.get("global_cache_dir") orelse return null;
+        if (exe_val != .string or lib_val != .string or cache_val != .string) return null;
+
+        const zig_exe = try allocator.dupe(u8, exe_val.string);
+        errdefer allocator.free(zig_exe);
+        const lib_dir = try allocator.dupe(u8, lib_val.string);
+        errdefer allocator.free(lib_dir);
+        const global_cache_dir = try allocator.dupe(u8, cache_val.string);
+
+        return ZigEnv{ .zig_exe = zig_exe, .lib_dir = lib_dir, .global_cache_dir = global_cache_dir };
+    }
+
+    fn pathToUri(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+        return @import("../lsp/client.zig").pathToUri(allocator, io, path);
+    }
+
+    pub fn findProjectRoot(self: *LSPManager, file_path: []const u8, lang: []const u8) ![]const u8 {
+        const start_dir_raw = std.fs.path.dirname(file_path) orelse return self.allocator.dupe(u8, ".");
+        // Resolve symlinks so the walk-up doesn't loop or escape past the
+        // intended root via `../` in a symlinked path.
+        var realpath_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const start_dir = if (std.Io.Dir.realPathFileAbsolute(self.io, start_dir_raw, &realpath_buf)) |n|
+            realpath_buf[0..n]
+        else |_|
+            start_dir_raw;
+        var current_dir = try self.allocator.dupe(u8, start_dir);
+
+        if (std.mem.eql(u8, lang, "rust")) {
+            return self.findRustProjectRoot(start_dir);
+        }
+
+        const markers = if (std.mem.eql(u8, lang, "go"))
+            &[_][]const u8{"go.mod"}
+        else if (std.mem.eql(u8, lang, "zig"))
+            &[_][]const u8{"build.zig"}
+        else if (std.mem.eql(u8, lang, "javascript") or std.mem.eql(u8, lang, "typescript"))
+            &[_][]const u8{ "package.json", "tsconfig.json", "jsconfig.json" }
+        else if (std.mem.eql(u8, lang, "python"))
+            &[_][]const u8{ "pyproject.toml", "requirements.txt", ".git" }
+        else
+            &[_][]const u8{".git"};
+
+        while (true) {
+            for (markers) |marker| {
+                const marker_path = try std.fs.path.join(self.allocator, &.{ current_dir, marker });
+                defer self.allocator.free(marker_path);
+
+                std.Io.Dir.accessAbsolute(self.io, marker_path, .{}) catch {
+                    continue;
+                };
+
+                log.info("findProjectRoot: Found root at {s} (marker: {s})", .{ current_dir, marker });
+                return current_dir;
+            }
+
+            const parent = std.fs.path.dirname(current_dir);
+            if (parent == null or std.mem.eql(u8, current_dir, parent.?)) {
+                self.allocator.free(current_dir);
+                break;
+            }
+
+            const new_dir = try self.allocator.dupe(u8, parent.?);
+            self.allocator.free(current_dir);
+            current_dir = new_dir;
+        }
+
+        return self.allocator.dupe(u8, start_dir);
+    }
+
+    fn findRustProjectRoot(self: *LSPManager, start_dir: []const u8) ![]const u8 {
+        var current_dir = try self.allocator.dupe(u8, start_dir);
+        var first_cargo_toml: ?[]u8 = null;
+
+        while (true) {
+            {
+                const lock_path = try std.fs.path.join(self.allocator, &.{ current_dir, "Cargo.lock" });
+                defer self.allocator.free(lock_path);
+
+                var exists = true;
+                std.Io.Dir.accessAbsolute(self.io, lock_path, .{}) catch {
+                    exists = false;
+                };
+
+                if (exists) {
+                    log.info("findRustProjectRoot: Found workspace root at {s} (Cargo.lock)", .{current_dir});
+                    if (first_cargo_toml) |p| self.allocator.free(p);
+                    return current_dir;
+                }
+            }
+
+            {
+                const toml_path = try std.fs.path.join(self.allocator, &.{ current_dir, "Cargo.toml" });
+                defer self.allocator.free(toml_path);
+
+                var exists = true;
+                std.Io.Dir.accessAbsolute(self.io, toml_path, .{}) catch {
+                    exists = false;
+                };
+
+                if (exists) {
+                    if (first_cargo_toml == null) {
+                        first_cargo_toml = try self.allocator.dupe(u8, current_dir);
+                        log.info("findRustProjectRoot: Found potential root at {s} (Cargo.toml)", .{current_dir});
+                    }
+                }
+            }
+
+            const parent = std.fs.path.dirname(current_dir);
+            if (parent == null or std.mem.eql(u8, current_dir, parent.?)) {
+                self.allocator.free(current_dir);
+                break;
+            }
+
+            const new_dir = try self.allocator.dupe(u8, parent.?);
+            self.allocator.free(current_dir);
+            current_dir = new_dir;
+        }
+
+        if (first_cargo_toml) |path| {
+            log.info("findRustProjectRoot: Using fallback root at {s}", .{path});
+            return path;
+        }
+
+        log.info("findRustProjectRoot: No Cargo.toml found, using start dir {s}", .{start_dir});
+        return self.allocator.dupe(u8, start_dir);
+    }
+};

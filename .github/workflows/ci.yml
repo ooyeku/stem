@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  build:
+    name: build-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: zig fmt --check
+        run: zig fmt --check build.zig build.zig.zon src
+
+      - name: zig build
+        run: zig build
+
+      - name: zig build test
+        run: zig build test --summary all
+
+  cross-compile:
+    name: cross-${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-macos
+          - x86_64-macos
+          - aarch64-linux-gnu
+          - x86_64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: zig build for ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+
+  safety-guards:
+    name: defensive-coding-guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Block unsafe primitives in src/
+        run: |
+          set -e
+          # New code must not introduce unbounded @enumFromInt on byte input.
+          # The `safe.intToEnum` helper exists for this — see src/kernel/safe.zig.
+          # Exclusions: the helper itself, generated enums where the value is
+          # provably in range. List exceptions in .ci/safety-allowlist.txt.
+          if [ -f .ci/safety-allowlist.txt ]; then
+            EXCLUDE=$(cat .ci/safety-allowlist.txt | grep -v '^#' | grep -v '^$' | sed 's/^/--exclude=/' | tr '\n' ' ')
+          else
+            EXCLUDE=""
+          fi
+
+          # Grep for unsafe casts in protocol decode / LSP message handlers.
+          # These must use safe.intToEnum / safe.intToCodepoint / safe.jsonToU32.
+          PATTERNS=(
+            "@enumFromInt\s*\(\s*bytes\["
+            "@enumFromInt\s*\(\s*payload_data\["
+            "@intCast\s*\(\s*cp\s*\)"
+          )
+
+          FAIL=0
+          for p in "${PATTERNS[@]}"; do
+            echo "Checking for: $p"
+            HITS=$(grep -rn -E "$p" src/ --include="*.zig" $EXCLUDE || true)
+            if [ -n "$HITS" ]; then
+              echo "::error::Unsafe cast pattern '$p' found:"
+              echo "$HITS"
+              FAIL=1
+            fi
+          done
+          exit $FAIL
+
+  test-ratio:
+    name: test-coverage-ratio
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Warn if test density slips
+        run: |
+          set -e
+          # Soft ratio check: total `test "..."` blocks per 1000 lines of zig.
+          # This is a directional metric, not a hard quality gate — it just
+          # makes a downward trend visible in the PR check.
+          TESTS=$(grep -rn '^test \"' src --include="*.zig" | wc -l)
+          LINES=$(find src -name '*.zig' | xargs wc -l | tail -1 | awk '{print $1}')
+          RATIO=$(awk "BEGIN { printf \"%.1f\", ($TESTS * 1000) / $LINES }")
+          echo "Tests: $TESTS"
+          echo "Lines: $LINES"
+          echo "Tests per 1000 lines: $RATIO"
+          # Don't fail — this is informational. Real gates live in the
+          # safety-guards job above.

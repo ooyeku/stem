@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag/version label for the build (e.g. v0.6.0)"
+        required: true
+
+env:
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-macos
+            runner: macos-latest
+            zig_target: aarch64-macos
+            archive_ext: tar.gz
+          - target: x86_64-macos
+            runner: macos-latest
+            zig_target: x86_64-macos
+            archive_ext: tar.gz
+          - target: x86_64-linux
+            runner: ubuntu-latest
+            zig_target: x86_64-linux-gnu
+            archive_ext: tar.gz
+          - target: aarch64-linux
+            runner: ubuntu-latest
+            zig_target: aarch64-linux-gnu
+            archive_ext: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig_target }}
+
+      - name: Stage artifact
+        run: |
+          set -eux
+          VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          STAGE="yap-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$STAGE/bin" "$STAGE/lib/yap/plugins"
+          cp zig-out/bin/yap "$STAGE/bin/"
+          for lib in zig-out/lib/libgit.* zig-out/lib/libmarkdown_viewer.* zig-out/lib/libplugin_manager.*; do
+            [ -f "$lib" ] && cp "$lib" "$STAGE/lib/yap/plugins/"
+          done
+          cp README.md "$STAGE/" || true
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          echo "ARCHIVE=$STAGE.tar.gz" >> "$GITHUB_ENV"
+          echo "CHECKSUM=$STAGE.tar.gz.sha256" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yap-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.CHECKSUM }}
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+
+      - name: Render Homebrew formula
+        run: |
+          set -eux
+          VERSION="${GITHUB_REF_NAME#v}"
+          for target in aarch64-macos x86_64-macos aarch64-linux x86_64-linux; do
+            archive="dist/yap-v${VERSION}-${target}.tar.gz"
+            sha=$(shasum -a 256 "$archive" | awk '{print $1}')
+            case "$target" in
+              aarch64-macos) export SHA_ARM_MAC=$sha ;;
+              x86_64-macos)  export SHA_X86_MAC=$sha ;;
+              aarch64-linux) export SHA_ARM_LINUX=$sha ;;
+              x86_64-linux)  export SHA_X86_LINUX=$sha ;;
+            esac
+          done
+          sed -e "s|@VERSION@|${VERSION}|g" \
+              -e "s|@SHA256_AARCH64_MACOS@|${SHA_ARM_MAC}|g" \
+              -e "s|@SHA256_X86_64_MACOS@|${SHA_X86_MAC}|g" \
+              -e "s|@SHA256_AARCH64_LINUX@|${SHA_ARM_LINUX}|g" \
+              -e "s|@SHA256_X86_64_LINUX@|${SHA_X86_LINUX}|g" \
+              scripts/yap.rb.template > dist/yap.rb
+          cat dist/yap.rb
+
+      - name: Upload formula artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula
+          path: dist/yap.rb
+
+      # To publish to ooyeku/homebrew-tap automatically, uncomment and set
+      # HOMEBREW_TAP_TOKEN to a PAT with `repo` scope on that tap repo.
+      #
+      # - name: Push to homebrew-tap
+      #   env:
+      #     GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      #   run: |
+      #     set -eux
+      #     git clone "https://x-access-token:${GH_TOKEN}@github.com/ooyeku/homebrew-tap.git" tap
+      #     mkdir -p tap/Formula
+      #     cp dist/yap.rb tap/Formula/yap.rb
+      #     cd tap
+      #     git config user.email "ci@yap.local"
+      #     git config user.name  "yap release bot"
+      #     git add Formula/yap.rb
+      #     git commit -m "yap ${GITHUB_REF_NAME}"
+      #     git push

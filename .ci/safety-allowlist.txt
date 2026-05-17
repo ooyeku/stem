@@ -1,0 +1,6 @@
+# Files and patterns exempted from the defensive-coding guards in CI.
+# Each line is a glob exclusion fed to grep. Prefer fixing the unsafe
+# pattern over adding to this list.
+# 
+# Format: --exclude=<path-substring>
+src/kernel/safe.zig

@@ -1,0 +1,15 @@
+# IDE and editor files
+.claude
+.idea
+.vscode
+
+# Zig build artifacts
+.zig-cache
+zig-out
+
+# Debug logs
+debug.log
+*.log
+
+# Zig package manager cache
+zig-pkg

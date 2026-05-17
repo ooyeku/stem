@@ -1,0 +1,22 @@
+.{
+    .name = .plugin_manager,
+    .version = "0.0.0",
+    .fingerprint = 0x3886b2596fbaae81,
+    .minimum_zig_version = "0.15.1",
+    .dependencies = .{
+        // Same vaxis dependency as main stem project
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis.git#68d6ea1d94fa0e5575e3af505bebab29a15acb96",
+            .hash = "vaxis-0.5.1-BWNV_AAyCQAyuU8AUmRpkPzTW51DmXQ2nG6I-EyrROg_",
+        },
+        // Same vigil dependency as main stem project (path relative to plugin)
+        .vigil = .{
+            .path = "../../../vendor/vigil",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
