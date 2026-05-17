@@ -560,9 +560,9 @@ pub const Message = union(enum) {
     const TAG_TERMINAL_EXECUTE: u8 = 6;
     const TAG_TERMINAL_OUTPUT: u8 = 7;
     const TAG_TERMINAL_RESULT: u8 = 8;
-    const TAG_QUIT: u8 = 9;
+    pub const TAG_QUIT: u8 = 9;
     const TAG_TICK: u8 = 10;
-    const TAG_PLUGIN_MSG: u8 = 11;
+    pub const TAG_PLUGIN_MSG: u8 = 11;
     const TAG_FOCUS: u8 = 12;
 
     pub fn encode(self: Message, allocator: std.mem.Allocator) ![]u8 {

@@ -888,11 +888,11 @@ pub const Core = struct {
                             };
 
                             if (self.plugin_manager.plugins.get(pm.plugin_id)) |plugin| {
-                                if (plugin.bus) |*plugin_bus| {
-                                    const encoded = resp.encode(self.allocator) catch continue;
+                                if (plugin.inbox) |plugin_inbox| {
+                                    const outer = protocol.Message{ .plugin_message = resp };
+                                    const encoded = outer.encode(self.allocator) catch continue;
                                     defer self.allocator.free(encoded);
-                                    // Request/reply → interactive priority.
-                                    plugin_bus.sendInteractive(encoded) catch {};
+                                    plugin_inbox.send(encoded) catch {};
                                 }
                             }
                         } else if (pm.message_type == .get_buffer_content) {
@@ -907,11 +907,11 @@ pub const Core = struct {
                                 .correlation_id = pm.correlation_id,
                             };
                             if (self.plugin_manager.plugins.get(pm.plugin_id)) |plugin| {
-                                if (plugin.bus) |*plugin_bus| {
-                                    const encoded = resp.encode(self.allocator) catch continue;
+                                if (plugin.inbox) |plugin_inbox| {
+                                    const outer = protocol.Message{ .plugin_message = resp };
+                                    const encoded = outer.encode(self.allocator) catch continue;
                                     defer self.allocator.free(encoded);
-                                    // Request/reply → interactive priority.
-                                    plugin_bus.sendInteractive(encoded) catch {};
+                                    plugin_inbox.send(encoded) catch {};
                                 }
                             }
                         } else if (pm.message_type == .switch_buffer) {

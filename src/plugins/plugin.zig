@@ -1,8 +1,6 @@
 const std = @import("std");
 const vigil = @import("vigil");
-const interface = @import("interface.zig");
-const context = @import("context.zig");
-const MessageBus = @import("../kernel/message_bus.zig").MessageBus;
+const abi = @import("abi.zig");
 
 /// Tracks recent crashes so the restart supervisor can rate-limit
 /// restarts. Inspired by Erlang/OTP's "max restarts per period" policy
@@ -27,43 +25,48 @@ pub const CrashHistory = struct {
 };
 
 pub const RestartPolicy = struct {
-    /// Max crashes within `window_ms` before the supervisor gives up.
     max_restarts_in_window: u32 = 3,
     window_ms: i64 = 60_000,
-    /// Delay before the next restart attempt, in milliseconds. Linear
-    /// backoff: attempt N waits `restart_backoff_ms * N`.
     restart_backoff_ms: i64 = 250,
 };
 
+/// Host-side state for one loaded plugin. **None of these fields cross
+/// the plugin boundary.** Plugins never see a `*Plugin`; they get a
+/// `PluginHandle` (u64), and host accessor functions in `host_abi.zig`
+/// look up the `*Plugin` for any operation.
 pub const Plugin = struct {
     id: []const u8,
+    /// Same as `id` but null-terminated, so `stem_plugin_id` can return
+    /// a C string without re-duping per call.
+    id_c: ?[*:0]const u8 = null,
     path: []const u8,
 
     lib: std.DynLib,
 
-    interface: interface.PluginInterface,
+    interface: abi.PluginInterface,
+
+    /// Host-assigned. Set in `loadPlugin` and passed to every host
+    /// accessor the plugin calls.
+    handle: abi.PluginHandle = .{ .id = 0 },
 
     thread: ?std.Thread = null,
+    /// Plugin's own inbox. Host's `pluginMain` drains it and forwards
+    /// each message to the plugin via `interface.handle_message`.
     inbox: ?*vigil.Inbox = null,
-    /// Bus for the plugin manager to send TO this plugin's inbox. Built
-    /// once when the plugin is loaded; lifetime tied to `inbox`.
-    bus: ?MessageBus = null,
-    ctx: ?*context.PluginContext = null,
-
-    /// Restart bookkeeping. The crashed plugin's worker thread sets
-    /// `restart_requested` when its policy allows another attempt; the
-    /// manager's tick handler observes the flag and performs the actual
-    /// reload (the manager owns DynLib/inbox/ctx lifetimes that the
-    /// dead worker can't safely touch).
-    restart_policy: RestartPolicy = .{},
-    crash_history: CrashHistory = .{},
-    restart_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// Earliest wall-clock ms at which we'd retry — populated when
-    /// `restart_requested` is set so the backoff is honored.
-    next_restart_after_ms: i64 = 0,
+    /// Routing targets used by host-side `stem_send_to_core` and
+    /// `stem_send_to_ui` exports.
+    core_inbox: ?*vigil.Inbox = null,
+    ui_inbox: ?*vigil.Inbox = null,
 
     state: PluginState = .unloaded,
     load_time: i64 = 0,
+
+    /// Restart bookkeeping; populated by the worker on crash and read
+    /// by `PluginManager.tickRestarts`.
+    restart_policy: RestartPolicy = .{},
+    crash_history: CrashHistory = .{},
+    restart_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    next_restart_after_ms: i64 = 0,
 
     pub const PluginState = enum {
         unloaded,
@@ -75,27 +78,23 @@ pub const Plugin = struct {
     };
 
     pub fn deinit(self: *Plugin, allocator: std.mem.Allocator) void {
-        if (self.state == .running) {
-            self.state = .unloading;
+        if (self.state == .running) self.state = .unloading;
+
+        if (self.inbox) |ib| ib.close();
+
+        if (self.thread) |thread| thread.join();
+
+        // Best-effort plugin teardown.
+        if (self.interface.deactivate) |deactivate_fn| {
+            deactivate_fn(self.handle);
         }
 
-        if (self.inbox) |ib| {
-            ib.close();
+        if (self.id_c) |c| {
+            // id_c is a null-terminated dupe of id+'\0'; one allocation
+            // sized id.len+1. Free with the same length used when alloc'd.
+            allocator.free(c[0 .. self.id.len + 1]);
+            self.id_c = null;
         }
-
-        if (self.thread) |thread| {
-            thread.join();
-        }
-
-        if (self.ctx) |c| {
-            if (self.interface.deinit) |deinit_fn| {
-                const opaque_ctx: *anyopaque = @ptrCast(c);
-                deinit_fn(opaque_ctx);
-            }
-            c.deinit();
-            allocator.destroy(c);
-        }
-
         allocator.free(self.id);
         allocator.free(self.path);
         self.lib.close();
@@ -107,11 +106,7 @@ test "CrashHistory.record then recentCount" {
     h.record(1_000);
     h.record(1_500);
     h.record(10_000);
-    // Window 5000ms ending at now=10000: only the entries at 10000 and
-    // (10000 - 5000 ≤ t) so 10000 itself. The 1500 / 1000 entries
-    // are >5000ms old.
     try std.testing.expectEqual(@as(u32, 1), h.recentCount(10_000, 5_000));
-    // Wider window picks them all up.
     try std.testing.expectEqual(@as(u32, 3), h.recentCount(10_000, 10_000));
 }
 
@@ -121,8 +116,6 @@ test "CrashHistory: ring buffer wraps" {
     h.record(2);
     h.record(3);
     h.record(4);
-    h.record(5); // overwrites slot 0 (the `1`)
-    // The four most-recent timestamps are 2,3,4,5 — all <= 5 within a
-    // 4-unit window from now=5.
+    h.record(5);
     try std.testing.expectEqual(@as(u32, 4), h.recentCount(5, 4));
 }

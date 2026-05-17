@@ -10,6 +10,7 @@ const UIManager = @import("ui_manager.zig").UIManager;
 const crash_isolation = @import("crash_isolation.zig");
 const MessageBus = @import("../kernel/message_bus.zig").MessageBus;
 const telemetry = @import("../services/telemetry.zig");
+const host_abi = @import("host_abi.zig");
 
 pub const PluginManager = struct {
     allocator: std.mem.Allocator,
@@ -44,6 +45,9 @@ pub const PluginManager = struct {
         // Install SIGSEGV/SIGBUS handlers as soon as we know we're going
         // to be loading plugins. Idempotent across managers/threads.
         _ = crash_isolation.install();
+        // Initialize the host-side plugin handle registry. Required
+        // before any plugin is loaded so accessors can look up handles.
+        host_abi.init(allocator);
         return .{
             .allocator = allocator,
             .io = io,
@@ -289,23 +293,6 @@ pub const PluginManager = struct {
             return error.IncompatiblePlugin;
         }
 
-        // ABI version is just an integer — it doesn't catch struct-layout
-        // skew. If the plugin and stem disagree on @sizeOf(PluginContext),
-        // every field access from the plugin lands on the wrong offset and
-        // init segfaults. Refuse to load instead of crashing later.
-        if (lib.lookup(*const fn () callconv(.c) usize, "stem_plugin_context_sizeof")) |size_fn| {
-            const plugin_size = size_fn();
-            const stem_size = @sizeOf(context.PluginContext);
-            if (plugin_size != stem_size) {
-                log.err(
-                    "Plugin at {s} sees PluginContext as {d} bytes, stem sees {d}. " ++
-                        "Struct-layout mismatch — rebuild the plugin against this stem.",
-                    .{ plugin_path, plugin_size, stem_size },
-                );
-                return error.IncompatiblePlugin;
-            }
-        }
-
         const id_name = std.mem.span(plugin_interface.name);
         if (self.plugins.contains(id_name)) {
             log.err("Plugin with ID '{s}' already loaded", .{id_name});
@@ -318,11 +305,19 @@ pub const PluginManager = struct {
         const id = try self.allocator.dupe(u8, id_name);
         errdefer self.allocator.free(id);
 
+        // Null-terminated dupe so `stem_plugin_id` can return a C string
+        // without re-allocating per call. One alloc, freed in Plugin.deinit.
+        const id_c_buf = try self.allocator.alloc(u8, id.len + 1);
+        errdefer self.allocator.free(id_c_buf);
+        @memcpy(id_c_buf[0..id.len], id);
+        id_c_buf[id.len] = 0;
+
         const path_dupe = try self.allocator.dupe(u8, plugin_path);
         errdefer self.allocator.free(path_dupe);
 
         plugin.* = .{
             .id = id,
+            .id_c = id_c_buf[0..id.len :0].ptr,
             .path = path_dupe,
             .lib = lib,
             .interface = plugin_interface.*,
@@ -330,35 +325,19 @@ pub const PluginManager = struct {
             .load_time = std.Io.Clock.real.now(self.io).toSeconds(),
         };
 
-        // Allocate inbox + ctx with errdefers so a failure between here and
-        // the final `put` doesn't leak them. Without these errdefers, the
-        // path_dupe / id / plugin errdefers above would clean up, but the
-        // inbox and ctx allocations would silently leak.
         const inbox = try vigil.inbox(self.allocator);
         errdefer inbox.close();
 
-        const ctx = try self.allocator.create(context.PluginContext);
-        errdefer self.allocator.destroy(ctx);
-        ctx.* = context.PluginContext.init(
-            self.allocator,
-            plugin.id,
-            inbox,
-            self.core_inbox.?,
-            // Plugins keep a raw Inbox handle for now — the SDK ABI is
-            // a separate concern from stem's internal MessageBus layer.
-            self.ui_bus.inbox,
-            self.allocator,
-        );
-        plugin.ctx = ctx;
         plugin.inbox = inbox;
-        // Per-plugin bus: gives us priority-aware sends + telemetry on
-        // every event/response delivered to this plugin. `bus` lives in
-        // the Plugin struct so it dies with the plugin.
-        plugin.bus = MessageBus.init(self.allocator, inbox, plugin.id);
+        plugin.core_inbox = self.core_inbox;
+        plugin.ui_inbox = self.ui_bus.inbox;
 
-        // Spawn the worker BEFORE inserting into the registry. If spawn fails
-        // we don't want the map to retain a *Plugin whose backing struct will
-        // be destroyed by the `errdefer destroy(plugin)` above.
+        // v3 ABI: assign a handle and register it BEFORE the worker
+        // spawns so the plugin can call host accessors immediately on
+        // entry to `activate`.
+        plugin.handle = try host_abi.registerHandle(plugin);
+        errdefer host_abi.unregisterHandle(plugin.handle);
+
         const thread = try std.Thread.spawn(.{}, pluginMain, .{plugin});
         plugin.thread = thread;
 
@@ -410,31 +389,32 @@ pub const PluginManager = struct {
 
     fn pluginMain(plugin: *Plugin) void {
         plugin.state = .running;
-        const ctx = plugin.ctx.?;
+        const handle = plugin.handle;
 
         // Install the SIGSEGV/SIGBUS handler on first use. Idempotent
         // across threads.
         _ = crash_isolation.install();
 
-        if (plugin.interface.init) |init_fn| {
-            const InitCall = struct {
-                fn run(call_ctx: *anyopaque, fn_ptr: *const fn (*anyopaque) i32, rc_out: *i32) void {
-                    rc_out.* = fn_ptr(call_ctx);
+        // v3: plugin's `activate` takes a PluginHandle (extern u64) and
+        // returns i32. No Zig structs cross the boundary.
+        if (plugin.interface.activate) |activate_fn| {
+            const ActivateCall = struct {
+                fn run(h: interface.PluginHandle, fn_ptr: *const fn (interface.PluginHandle) callconv(.c) i32, rc_out: *i32) void {
+                    rc_out.* = fn_ptr(h);
                 }
             };
-            const opaque_ctx: *anyopaque = @ptrCast(ctx);
             var rc: i32 = 0;
-            const res = crash_isolation.runIsolated(.{ opaque_ctx, init_fn, &rc }, InitCall.run);
+            const res = crash_isolation.runIsolated(.{ handle, activate_fn, &rc }, ActivateCall.run);
             if (res == .crashed) {
                 plugin.state = .failed;
                 telemetry.recordPluginCrash(plugin.id);
-                log.err("Plugin {s} CRASHED during init (signal={d}); marked dead", .{ plugin.id, crash_isolation.lastCrashSignal() });
+                log.err("Plugin {s} CRASHED during activate (signal={d}); marked dead", .{ plugin.id, crash_isolation.lastCrashSignal() });
                 markForRestart(plugin);
                 return;
             }
             if (rc != 0) {
                 plugin.state = .failed;
-                log.err("Plugin {s} init failed", .{plugin.id});
+                log.err("Plugin {s} activate returned {d}", .{ plugin.id, rc });
                 return;
             }
         }
@@ -448,48 +428,62 @@ pub const PluginManager = struct {
             };
             defer msg.deinit();
 
-            if (msg.payload) |payload| {
-                const decoded = protocol.Message.decode(payload) catch continue;
+            const payload = msg.payload orelse continue;
+            // payload is a wire-encoded outer `protocol.Message`. We
+            // peek at the tag to find plugin_messages and quit signals;
+            // anything else is ignored. For plugin_message we hand the
+            // plugin the inner bytes (skipping the outer tag byte) —
+            // the plugin's SDK decodes those into a PluginMessage on
+            // its own side.
+            if (payload.len == 0) continue;
+            const tag = payload[0];
+            if (tag == protocol.Message.TAG_QUIT) {
+                plugin.state = .unloading;
+                break;
+            }
+            if (tag != protocol.Message.TAG_PLUGIN_MSG) continue;
+            if (payload.len < 2) continue;
 
-                switch (decoded) {
-                    .plugin_message => |pm| {
-                        if (plugin.interface.handleMessage) |handler| {
-                            const HandleCall = struct {
-                                fn run(call_ctx: *anyopaque, fn_ptr: *const fn (*anyopaque, *const protocol.PluginMessage) i32, msg_ref: *const protocol.PluginMessage) void {
-                                    _ = fn_ptr(call_ctx, msg_ref);
-                                }
-                            };
-                            const opaque_ctx: *anyopaque = @ptrCast(ctx);
-                            const res = crash_isolation.runIsolated(.{ opaque_ctx, handler, &pm }, HandleCall.run);
-                            if (res == .crashed) {
-                                plugin.state = .failed;
-                                telemetry.recordPluginCrash(plugin.id);
-                                log.err("Plugin {s} CRASHED during handleMessage (signal={d}); marked dead", .{ plugin.id, crash_isolation.lastCrashSignal() });
-                                markForRestart(plugin);
-                                break;
-                            }
-                        }
-                    },
-                    .quit => {
-                        plugin.state = .unloading;
-                        break;
-                    },
-                    else => {},
+            const inner = payload[1..];
+            if (plugin.interface.handle_message) |handler| {
+                const HandleCall = struct {
+                    fn run(
+                        h: interface.PluginHandle,
+                        fn_ptr: *const fn (interface.PluginHandle, [*]const u8, usize) callconv(.c) i32,
+                        ptr: [*]const u8,
+                        len: usize,
+                    ) void {
+                        _ = fn_ptr(h, ptr, len);
+                    }
+                };
+                const res = crash_isolation.runIsolated(
+                    .{ handle, handler, inner.ptr, inner.len },
+                    HandleCall.run,
+                );
+                if (res == .crashed) {
+                    plugin.state = .failed;
+                    telemetry.recordPluginCrash(plugin.id);
+                    log.err("Plugin {s} CRASHED during handle_message (signal={d}); marked dead", .{ plugin.id, crash_isolation.lastCrashSignal() });
+                    markForRestart(plugin);
+                    break;
                 }
             }
         }
 
-        if (plugin.interface.deinit) |deinit_fn| {
-            const DeinitCall = struct {
-                fn run(call_ctx: *anyopaque, fn_ptr: *const fn (*anyopaque) void) void {
-                    fn_ptr(call_ctx);
+        if (plugin.interface.deactivate) |deactivate_fn| {
+            const DeactivateCall = struct {
+                fn run(h: interface.PluginHandle, fn_ptr: *const fn (interface.PluginHandle) callconv(.c) void) void {
+                    fn_ptr(h);
                 }
             };
-            const opaque_ctx: *anyopaque = @ptrCast(ctx);
-            // Best-effort: if deinit crashes we can't do anything useful;
+            // Best-effort: if deactivate crashes we can't do anything useful;
             // the plugin is already on its way out.
-            _ = crash_isolation.runIsolated(.{ opaque_ctx, deinit_fn }, DeinitCall.run);
+            _ = crash_isolation.runIsolated(.{ handle, deactivate_fn }, DeactivateCall.run);
         }
+
+        // Release the handle so the registry doesn't grow unbounded
+        // across restarts.
+        host_abi.unregisterHandle(handle);
     }
 
     const PluginCommandContext = struct {
@@ -643,19 +637,19 @@ pub const PluginManager = struct {
                 const value = self.plugin_configs.get(composite_key);
 
                 if (self.plugins.get(msg.plugin_id)) |plugin| {
-                    if (plugin.bus) |*bus| {
+                    if (plugin.inbox) |inbox| {
                         const response = protocol.PluginMessage{
                             .plugin_id = msg.plugin_id,
                             .message_type = .config_response,
                             .payload = .{ .config_value = .{ .key = key, .value = value } },
                             .correlation_id = msg.correlation_id,
                         };
-                        const encoded = response.encode(self.allocator) catch return;
+                        // v3: encode outer wrapper so the worker sees a
+                        // protocol.Message it can route to handle_message.
+                        const outer = protocol.Message{ .plugin_message = response };
+                        const encoded = outer.encode(self.allocator) catch return;
                         defer self.allocator.free(encoded);
-                        // best-effort: plugin inbox may be closed if plugin already shut down.
-                        // Reply to a request → interactive class so the plugin
-                        // resumes promptly.
-                        bus.sendInteractive(encoded) catch {};
+                        inbox.send(encoded) catch {};
                     }
                 }
             },
@@ -741,10 +735,11 @@ pub const PluginManager = struct {
                 };
 
                 if (self.plugins.get(msg.plugin_id)) |p| {
-                    if (p.bus) |*pbus| {
-                        const encoded = try response.encode(self.allocator);
+                    if (p.inbox) |inbox| {
+                        const outer = protocol.Message{ .plugin_message = response };
+                        const encoded = try outer.encode(self.allocator);
                         defer self.allocator.free(encoded);
-                        pbus.sendInteractive(encoded) catch {};
+                        inbox.send(encoded) catch {};
                     }
                 }
             },
@@ -876,18 +871,16 @@ pub const PluginManager = struct {
             for (subscribers.items) |plugin_id| {
                 if (self.plugins.get(plugin_id)) |plugin| {
                     if (plugin.state == .running) {
-                        if (plugin.bus) |*bus| {
+                        if (plugin.inbox) |inbox| {
                             const notif = protocol.PluginMessage{
                                 .plugin_id = plugin_id,
                                 .message_type = .event_notification,
                                 .payload = .{ .event_notification = .{ .event = event, .data = data } },
                             };
-                            const encoded = notif.encode(self.allocator) catch continue;
+                            const outer = protocol.Message{ .plugin_message = notif };
+                            const encoded = outer.encode(self.allocator) catch continue;
                             defer self.allocator.free(encoded);
-                            // best-effort: plugin inbox may be closed if plugin already shut down.
-                            // Events are coalescible — a flood of cursor-moved
-                            // doesn't need to all land in priority lane.
-                            bus.sendCoalescible(encoded) catch {};
+                            inbox.send(encoded) catch {};
                         }
                     }
                 }

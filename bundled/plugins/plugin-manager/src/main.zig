@@ -1,128 +1,87 @@
+//! Plugin Manager — provides the `[Plugin Dashboard]` virtual buffer,
+//! exposes load/unload command stubs, and listens for inter-plugin
+//! `git.updated` events to demonstrate the pub/sub bus.
+//!
+//! Migrated to plugin SDK v3:
+//!   - `activate(handle)` replaces `init(ctx)`.
+//!   - The `handle` (u64) is the only thing crossing the ABI boundary.
+//!   - `handle_message` re-uses the SDK's `dispatch` helper.
+
 const std = @import("std");
 const stem = @import("stem");
 
-// Plugin state
-var plugin_ctx: ?*stem.PluginContext = null;
+fn activate(handle: stem.PluginHandle) callconv(.c) i32 {
+    stem.bind(handle);
 
-fn init(ctx: *stem.PluginContext) i32 {
-    plugin_ctx = ctx;
-
-    // Register plugin stats command
-    stem.registerCommand(
-        ctx,
-        "plugin-manager.stats",
-        "[Plugin Manager] Show Stats",
-        "Display plugin system statistics",
-        cmdShowStats,
-    ) catch return -1;
-
-    // Register load/unload commands
-    stem.registerCommand(
-        ctx,
-        "plugin.load",
-        "[Plugin] Load",
-        "Load a plugin from path",
-        cmdLoadPlugin,
-    ) catch return -1;
-
-    stem.registerCommand(
-        ctx,
-        "plugin.unload",
-        "[Plugin] Unload",
-        "Unload a plugin by ID",
-        cmdUnloadPlugin,
-    ) catch return -1;
-
-    // Subscribe to inter-plugin event
-    stem.subscribeCustomEvent(ctx, "git.updated", onGitUpdated) catch return -1;
-
+    stem.registerCommand(handle, "plugin-manager.stats", "[Plugin Manager] Show Stats", "Display plugin system statistics", cmdShowStats) catch return -1;
+    stem.registerCommand(handle, "plugin.load", "[Plugin] Load", "Load a plugin from path", cmdLoadPlugin) catch return -1;
+    stem.registerCommand(handle, "plugin.unload", "[Plugin] Unload", "Unload a plugin by ID", cmdUnloadPlugin) catch return -1;
+    stem.subscribeCustomEvent(handle, "git.updated", onGitUpdated) catch return -1;
     return 0;
 }
 
-fn onGitUpdated(ctx: *stem.PluginContext, data: []const u8) void {
-    stem.log(ctx, "Received inter-plugin event 'git.updated' with branch: {s}", .{data});
+fn deactivate(handle: stem.PluginHandle) callconv(.c) void {
+    _ = handle;
+    stem.unbind();
 }
 
-fn deinit(ctx: *stem.PluginContext) void {
-    stem.deinitSdk(ctx);
-    plugin_ctx = null;
+fn handleMessage(handle: stem.PluginHandle, ptr: [*]const u8, len: usize) callconv(.c) i32 {
+    return stem.dispatch(handle, ptr, len);
 }
 
-fn handleMessage(ctx: *stem.PluginContext, msg: *const stem.PluginMessage) i32 {
-    // Handle standard messages (command execution, etc.)
-    if (stem.handleStandardMessages(ctx, msg)) {
-        return 0;
-    }
-    return 0;
+fn onGitUpdated(handle: stem.PluginHandle, data: []const u8) void {
+    stem.log(handle, "Received inter-plugin event 'git.updated' with branch: {s}", .{data});
 }
 
-// Command callback - requests plugin list then shows it
-fn cmdShowStats(ctx: *stem.PluginContext) void {
-    stem.requestPluginList(ctx, onPluginListReceived) catch |err| {
-        stem.log(ctx, "Failed to request plugin list: {s}", .{@errorName(err)});
+fn cmdShowStats(handle: stem.PluginHandle) void {
+    stem.requestPluginList(handle, onPluginListReceived) catch |err| {
+        stem.log(handle, "Failed to request plugin list: {s}", .{@errorName(err)});
     };
 }
 
-fn onPluginListReceived(ctx: *stem.PluginContext, data: []const u8) void {
-    const plugins = stem.decodePluginList(ctx.allocator, data) catch |err| {
-        stem.log(ctx, "Failed to decode plugin list: {s}", .{@errorName(err)});
+fn onPluginListReceived(handle: stem.PluginHandle, data: []const u8) void {
+    const alloc = std.heap.page_allocator;
+    const plugins = stem.decodePluginList(alloc, data) catch |err| {
+        stem.log(handle, "Failed to decode plugin list: {s}", .{@errorName(err)});
         return;
     };
-    defer ctx.allocator.free(plugins);
+    defer alloc.free(plugins);
 
-    // Format content as a Markdown table
-    var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
-    const writer = &aw.writer;
-
-    writer.writeAll("# Plugin Manager Dashboard\n\n") catch {};
-    writer.writeAll("Real-time information about all loaded plugins.\n\n") catch {};
-    writer.writeAll("| ID | Name | Status | Uptime | Widgets | Description |\n") catch {};
-    writer.writeAll("| :--- | :--- | :--- | :--- | :--- | :--- |\n") catch {};
-
+    const w = &aw.writer;
+    w.writeAll("# Plugin Manager Dashboard\n\n") catch {};
+    w.writeAll("Real-time information about all loaded plugins.\n\n") catch {};
+    w.writeAll("| ID | Name | Status | Uptime | Widgets | Description |\n") catch {};
+    w.writeAll("| :--- | :--- | :--- | :--- | :--- | :--- |\n") catch {};
     for (plugins) |p| {
         const status = if (p.is_running) "**Running**" else "Stopped";
-        const uptime_fmt = if (p.uptime_s < 60)
-            std.fmt.allocPrint(ctx.allocator, "{d}s", .{p.uptime_s}) catch "0s"
-        else if (p.uptime_s < 3600)
-            std.fmt.allocPrint(ctx.allocator, "{d}m {d}s", .{ p.uptime_s / 60, p.uptime_s % 60 }) catch "0s"
-        else
-            std.fmt.allocPrint(ctx.allocator, "{d}h {d}m", .{ p.uptime_s / 3600, (p.uptime_s % 3600) / 60 }) catch "0s";
-        defer if (p.uptime_s >= 0) ctx.allocator.free(uptime_fmt);
-
-        writer.print("| `{s}` | {s} | {s} | {s} | {d} | {s} |\n", .{
-            p.id,
-            p.name,
-            status,
-            uptime_fmt,
-            p.widget_count,
-            p.description,
+        const uptime_buf = std.fmt.allocPrint(alloc, "{d}s", .{p.uptime_s}) catch "?";
+        defer if (uptime_buf.len > 1) alloc.free(uptime_buf);
+        w.print("| `{s}` | {s} | {s} | {s} | {d} | {s} |\n", .{
+            p.id, p.name, status, uptime_buf, p.widget_count, p.description,
         }) catch {};
     }
-
-    writer.writeAll("\n## Usage\n") catch {};
-    writer.writeAll("- `plugin-manager.stats`: Refresh this dashboard\n") catch {};
-    writer.writeAll("- `plugin.load <path>`: Load a plugin\n") catch {};
-    writer.writeAll("- `plugin.unload <id>`: Unload a plugin\n") catch {};
-    writer.writeAll("- `q`: Close this dashboard\n") catch {};
-
-    stem.openBuffer(ctx, "[Plugin Dashboard]", aw.written()) catch {};
+    w.writeAll("\n## Usage\n") catch {};
+    w.writeAll("- `plugin-manager.stats`: Refresh this dashboard\n") catch {};
+    w.writeAll("- `plugin.load <path>`: Load a plugin\n") catch {};
+    w.writeAll("- `plugin.unload <id>`: Unload a plugin\n") catch {};
+    w.writeAll("- `q`: Close this dashboard\n") catch {};
+    stem.openBuffer(handle, "[Plugin Dashboard]", aw.written()) catch {};
 }
 
-// Command callbacks
-fn cmdLoadPlugin(ctx: *stem.PluginContext) void {
-    stem.log(ctx, "Plugin loading via path is enabled. Use the command palette to provide arguments.", .{});
+fn cmdLoadPlugin(handle: stem.PluginHandle) void {
+    stem.log(handle, "Plugin loading via path is enabled. Use the command palette to provide arguments.", .{});
 }
 
-fn cmdUnloadPlugin(ctx: *stem.PluginContext) void {
-    stem.log(ctx, "Plugin unloading via ID is enabled. Use the command palette to provide arguments.", .{});
+fn cmdUnloadPlugin(handle: stem.PluginHandle) void {
+    stem.log(handle, "Plugin unloading via ID is enabled. Use the command palette to provide arguments.", .{});
 }
 
-// Export the plugin entry point
 pub export const plugin_entry = stem.createPlugin(.{
     .name = "plugin_manager",
     .description = "Core plugin for managing and displaying loaded plugins",
-    .init = init,
-    .deinit = deinit,
-    .handleMessage = handleMessage,
+    .activate = activate,
+    .deactivate = deactivate,
+    .handle_message = handleMessage,
 });

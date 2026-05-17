@@ -1,0 +1,47 @@
+# Example plugin manifest (Phase 1).
+#
+# The current loader (Phase 0) ignores this file — plugin metadata is
+# still discovered from the `plugin_entry` symbol. Phase 1's manifest-
+# driven loader will read this BEFORE loading the binary so commands +
+# keybinds appear in the palette even if the plugin's dylib is
+# missing, and so the permissions checker can deny capability requests
+# that aren't declared here.
+#
+# Format is stable from Phase 1 onward; documenting it now so plugin
+# authors can write to it ahead of the loader.
+
+[plugin]
+name = "git"
+version = "0.3.0"
+description = "Git integration for Stem"
+runtime = "dylib"          # one of: dylib | exec | wasm
+entry = "libgit.dylib"     # relative to the plugin's directory
+
+[plugin.permissions]
+# Executable names this plugin is allowed to spawn. Wildcards are
+# rejected; declare each binary explicitly.
+spawn = ["git"]
+
+# Filesystem grants: "<mode>:<path-glob>". Paths are relative to the
+# editor cwd. Read-only by default.
+filesystem = ["read:."]
+
+# Event topic patterns this plugin subscribes to. Globs are allowed.
+events = ["buffer.*", "file.saved", "cursor.moved"]
+
+[[plugin.commands]]
+id = "git.status"
+title = "[Git] Status"
+description = "Show repository status"
+keybinding = "Space g s"
+
+[[plugin.commands]]
+id = "git.diff"
+title = "[Git] Diff"
+description = "Show changes in current file"
+keybinding = "Space g d"
+
+[[plugin.commands]]
+id = "git.diff_staged"
+title = "[Git] Diff Staged"
+description = "Show staged changes"

@@ -272,6 +272,14 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addOptions("config", options);
     exe.root_module.link_libc = true;
+    // Plugin v3 ABI exports (stem_send_to_core, stem_log, etc.) live in
+    // `src/plugins/host_abi.zig` as `export fn …`. Nothing INSIDE the
+    // stem binary calls them — the plugin .dylibs resolve them via the
+    // dynamic linker at dlopen time. macOS/Mach-O ld strips
+    // non-referenced exports by default. `rdynamic = true` maps to
+    // `-export_dynamic` on macOS / `-rdynamic` on Linux, forcing the
+    // symbols into the export trie so dlopen'd plugins can bind to them.
+    exe.rdynamic = true;
     const vaxis_dep = b.dependency("vaxis", .{
         .target = target,
         .optimize = optimize,
@@ -333,6 +341,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     plugin_manager.root_module.link_libc = true;
+    // Plugin v3 ABI: plugins reference host-exported `stem_*` C symbols
+    // (defined in src/plugins/host_abi.zig) that get resolved at
+    // dlopen-time against the running stem binary. macOS needs
+    // `-undefined dynamic_lookup` to tell the linker to leave those
+    // symbols unresolved at build time.
+    if (target.result.os.tag == .macos or target.result.os.tag == .ios) {
+        plugin_manager.linker_allow_shlib_undefined = true;
+    } else {
+        plugin_manager.linker_allow_shlib_undefined = true;
+    }
     b.installArtifact(plugin_manager);
     // Create stem SDK module for plugins
     const stem_plugin_module = b.createModule(.{
@@ -352,6 +370,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     git_plugin.root_module.link_libc = true;
+    git_plugin.linker_allow_shlib_undefined = true;
     git_plugin.root_module.addImport("stem", stem_plugin_module);
     b.installArtifact(git_plugin);
     // Build markdown-viewer plugin as a dynamic library
@@ -365,6 +384,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     md_plugin.root_module.link_libc = true;
+    md_plugin.linker_allow_shlib_undefined = true;
     md_plugin.root_module.addImport("stem", stem_plugin_module);
     b.installArtifact(md_plugin);
 
