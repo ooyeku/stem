@@ -407,6 +407,23 @@ pub fn build(b: *std.Build) void {
     const query_check_step = b.step("query-check", "Verify every shipped tree-sitter query compiles");
     query_check_step.dependOn(&run_query_check.step);
 
+    // Plugin probe — dlopens a plugin and runs its `init` outside the
+    // editor so we can debug plugin segfaults with a real stack trace.
+    const plugin_probe = b.addExecutable(.{
+        .name = "plugin-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/plugin_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "stem", .module = mod },
+                .{ .name = "vigil", .module = vigil_dep.module("vigil") },
+            },
+        }),
+    });
+    plugin_probe.root_module.link_libc = true;
+    b.installArtifact(plugin_probe);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);

@@ -1,7 +1,16 @@
 const std = @import("std");
 const protocol = @import("../kernel/protocol.zig");
 
-pub const PLUGIN_VERSION: u32 = 1;
+/// Plugin ABI version. Bump this when the wire format between stem and
+/// plugins changes — the manager refuses to load a plugin whose stamped
+/// version doesn't match, so users get a clean "version mismatch" error
+/// instead of mystery silent failures.
+///
+/// Changelog:
+///   1 → 2: PluginMessage gained a `correlation_id: u64` field between
+///          `message_type` and `payload_len` on the wire. Plugins built
+///          against v1 send messages that the v2 core decodes as garbage.
+pub const PLUGIN_VERSION: u32 = 2;
 
 pub const PluginInterface = extern struct {
     version: u32 = PLUGIN_VERSION,

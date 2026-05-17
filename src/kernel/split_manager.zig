@@ -69,14 +69,20 @@ pub const SplitManager = struct {
     }
 
     fn freeNode(self: *SplitManager, node: *SplitNode) void {
+        freeNodeStatic(self.allocator, node);
+    }
+
+    /// Free helper usable from static contexts (e.g. parseNode's errdefer
+    /// before a SplitManager exists). Walks the subtree and frees each node.
+    fn freeNodeStatic(allocator: std.mem.Allocator, node: *SplitNode) void {
         switch (node.*) {
             .container => |c| {
-                self.freeNode(c.first);
-                self.freeNode(c.second);
+                freeNodeStatic(allocator, c.first);
+                freeNodeStatic(allocator, c.second);
             },
             .pane => {},
         }
-        self.allocator.destroy(node);
+        allocator.destroy(node);
     }
 
     pub fn getFocusedPane(self: *SplitManager) *Pane {
@@ -747,7 +753,7 @@ pub const SplitManager = struct {
             const first_json = json[first_pos + 8 ..];
             const first_end = findMatchingBrace(first_json) orelse return error.InvalidFormat;
             const first = try parseNode(allocator, first_json[0 .. first_end + 1], depth + 1);
-            errdefer allocator.destroy(first);
+            errdefer freeNodeStatic(allocator, first);
 
             const second_search_start = first_pos + 8 + first_end + 1;
             const remaining = json[second_search_start..];

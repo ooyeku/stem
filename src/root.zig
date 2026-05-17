@@ -1,6 +1,9 @@
 const std = @import("std");
 
 pub const piece_table = @import("core/piece_table.zig");
+pub const interface = @import("plugins/interface.zig");
+pub const context = @import("plugins/context.zig");
+pub const crash_isolation = @import("plugins/crash_isolation.zig");
 pub const state = @import("core/state.zig");
 pub const vfs = @import("kernel/vfs.zig");
 pub const schema = @import("config/schema.zig");
@@ -38,6 +41,7 @@ test {
     _ = @import("lsp/client.zig");
 
     _ = @import("plugins/ui_manager.zig");
+    _ = @import("plugins/plugin.zig");
 
     _ = @import("services/lsp_manager_test.zig");
     _ = @import("services/terminal.zig");
@@ -65,6 +69,12 @@ test {
     _ = @import("services/lsp/supervisor.zig");
 
     _ = @import("tools/search.zig");
+    _ = @import("tools/scope.zig");
+    _ = @import("tools/format.zig");
+    _ = @import("cli.zig");
+    _ = @import("kernel/message_bus.zig");
+    _ = @import("kernel/request_reply.zig");
+    _ = @import("services/telemetry.zig");
 
     // Corpus-style regression tests for fuzz handlers. The `zig build fuzz`
     // step runs them as proper fuzzers; these test blocks just exercise a

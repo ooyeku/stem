@@ -1,5 +1,5 @@
 ; Minimal tree-sitter highlight query for C. Maps the most common nodes
-; onto yap's small capture vocabulary (see SyntaxManager.mapCaptureToType).
+; onto stem's small capture vocabulary (see SyntaxManager.mapCaptureToType).
 ; Based on tree-sitter-c's upstream highlights.scm.
 
 (comment) @comment

@@ -23,6 +23,13 @@ fn runGit(allocator: std.mem.Allocator, opts: GitRunOptions) !std.process.RunRes
     });
 }
 
+/// Exported so the editor can verify the plugin and stem agree on
+/// `@sizeOf(stem.PluginContext)`. A mismatch would mean the two TUs
+/// have different layouts → silent miscompile → init segfault.
+export fn stem_plugin_context_sizeof() usize {
+    return @sizeOf(stem.PluginContext);
+}
+
 fn init(ctx: *stem.PluginContext) i32 {
     plugin_ctx = ctx;
 

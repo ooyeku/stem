@@ -32,7 +32,7 @@ class TodoList
 end
 
 list = TodoList.new
-list.add("write yap docs", tags: %i[docs writing])
+list.add("write stem docs", tags: %i[docs writing])
 list.add("fix highlighter bug", tags: %i[bug urgent])
 list.add("ship release", tags: %i[release])
 list.complete(2)

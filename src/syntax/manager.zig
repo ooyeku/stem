@@ -700,15 +700,22 @@ pub const SyntaxManager = struct {
     }
 
     pub fn parse(self: *SyntaxManager, source: []const u8, resource_id: ?u64) !void {
-        // Snapshot tree+lang under the lock so the parse itself can run
-        // without blocking readers (highlight calls).
+        // Copy the previous tree under the lock so the parse itself can
+        // run without blocking readers (highlight calls). A raw pointer
+        // snapshot would race with the background worker, which can
+        // `ts_tree_delete` the prior tree mid-parse — UAF inside the
+        // C parser. `ts_tree_copy` is a cheap refcount bump.
         self.treeLock();
         const lang = self.current_lang;
-        const prev_tree = self.tree;
+        const prev_tree_copy: ?*c.TSTree = if (self.tree) |t| c.ts_tree_copy(t) else null;
         self.treeUnlock();
-        if (lang == .markdown or lang == .unknown) return;
+        if (lang == .markdown or lang == .unknown) {
+            if (prev_tree_copy) |t| c.ts_tree_delete(t);
+            return;
+        }
 
-        const new_tree = c.ts_parser_parse_string(self.parser, prev_tree, source.ptr, @intCast(source.len));
+        const new_tree = c.ts_parser_parse_string(self.parser, prev_tree_copy, source.ptr, @intCast(source.len));
+        if (prev_tree_copy) |t| c.ts_tree_delete(t);
 
         self.treeLock();
         defer self.treeUnlock();

@@ -1,5 +1,5 @@
 {
-  description = "yap — modern modal terminal editor in Zig";
+  description = "stem — modern modal terminal editor in Zig";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -14,7 +14,7 @@
         zigPkg = zig.packages.${system}."0.16.0" or zig.packages.${system}.master;
       in {
         packages.default = pkgs.stdenv.mkDerivation {
-          pname = "yap";
+          pname = "stem";
           version = "0.6.0-dev";
 
           src = ./.;
@@ -34,22 +34,22 @@
 
           installPhase = ''
             # `zig build install` already wrote to $out/bin and $out/lib
-            mkdir -p $out/lib/yap/plugins
-            cp -r $out/lib/*.dylib $out/lib/*.so $out/lib/yap/plugins/ 2>/dev/null || true
+            mkdir -p $out/lib/stem/plugins
+            cp -r $out/lib/*.dylib $out/lib/*.so $out/lib/stem/plugins/ 2>/dev/null || true
           '';
 
           meta = with pkgs.lib; {
             description = "Modern, approachable modal text editor for the terminal";
-            homepage = "https://github.com/ooyeku/yap";
+            homepage = "https://github.com/ooyeku/stem";
             license = licenses.mit;
             platforms = platforms.unix;
-            mainProgram = "yap";
+            mainProgram = "stem";
           };
         };
 
         apps.default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/yap";
+          program = "${self.packages.${system}.default}/bin/stem";
         };
 
         devShells.default = pkgs.mkShell {

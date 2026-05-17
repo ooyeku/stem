@@ -1,0 +1,43 @@
+# Homebrew formula template for stem.
+#
+# This is a *template*. Each release, replace the @VERSION@ / @SHA256_*@ markers
+# with values from the published release artifacts, then commit the rendered
+# file to a tap repository (e.g. ooyeku/homebrew-tap as `Formula/stem.rb`).
+#
+# Users then install with:
+#   brew tap ooyeku/tap
+#   brew install stem
+
+class Stem < Formula
+  desc "Modern modal text editor for the terminal"
+  homepage "https://github.com/ooyeku/stem"
+  version "@VERSION@"
+  license "MIT"
+
+  if Hardware::CPU.arm?
+    url "https://github.com/ooyeku/stem/releases/download/v#{version}/stem-v#{version}-aarch64-macos.tar.gz"
+    sha256 "@SHA256_AARCH64_MACOS@"
+  else
+    url "https://github.com/ooyeku/stem/releases/download/v#{version}/stem-v#{version}-x86_64-macos.tar.gz"
+    sha256 "@SHA256_X86_64_MACOS@"
+  end
+
+  on_linux do
+    if Hardware::CPU.arm?
+      url "https://github.com/ooyeku/stem/releases/download/v#{version}/stem-v#{version}-aarch64-linux.tar.gz"
+      sha256 "@SHA256_AARCH64_LINUX@"
+    else
+      url "https://github.com/ooyeku/stem/releases/download/v#{version}/stem-v#{version}-x86_64-linux.tar.gz"
+      sha256 "@SHA256_X86_64_LINUX@"
+    end
+  end
+
+  def install
+    bin.install "bin/stem"
+    (lib/"stem/plugins").install Dir["lib/stem/plugins/*"] if Dir.exist?("lib/stem/plugins")
+  end
+
+  test do
+    assert_match "stem", shell_output("#{bin}/stem --help")
+  end
+end

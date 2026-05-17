@@ -825,6 +825,12 @@ pub const PluginMessage = struct {
     plugin_id: []const u8,
     message_type: PluginMessageType,
     payload: PluginPayload,
+    /// Correlation ID for request/response matching. 0 = uncorrelated
+    /// (events, fire-and-forget commands). Set by the SDK on outgoing
+    /// requests and echoed back by core on the matching response, so a
+    /// plugin can have multiple in-flight requests without their replies
+    /// being mis-routed.
+    correlation_id: u64 = 0,
 
     pub const PluginMessageType = enum(u8) {
         register_command = 0,
@@ -1161,7 +1167,8 @@ pub const PluginMessage = struct {
             },
         }
         const payload_slice = aw.written();
-        const total_len = 1 + 4 + id_len + 1 + 4 + payload_slice.len;
+        // Wire layout: [tag][id_len:u32][id][type:u8][correlation:u64][payload_len:u32][payload]
+        const total_len = 1 + 4 + id_len + 1 + 8 + 4 + payload_slice.len;
         const buf = try allocator.alloc(u8, total_len);
 
         buf[0] = Message.TAG_PLUGIN_MSG;
@@ -1171,7 +1178,10 @@ pub const PluginMessage = struct {
         const type_idx = 5 + id_len;
         buf[type_idx] = @intFromEnum(self.message_type);
 
-        const len_idx = type_idx + 1;
+        const corr_idx = type_idx + 1;
+        std.mem.writeInt(u64, buf[corr_idx..][0..8], self.correlation_id, .big);
+
+        const len_idx = corr_idx + 8;
         std.mem.writeInt(u32, buf[len_idx..][0..4], @intCast(payload_slice.len), .big);
 
         const payload_idx = len_idx + 4;
@@ -1185,13 +1195,17 @@ pub const PluginMessage = struct {
     pub fn decode(bytes: []const u8) !PluginMessage {
         if (bytes.len < 4) return error.InvalidMessage;
         const id_len = std.mem.readInt(u32, bytes[0..4], .big);
-        if (bytes.len < 4 + id_len + 1 + 4) return error.InvalidMessage;
+        // header bytes after id: type(1) + correlation(8) + payload_len(4) = 13
+        if (bytes.len < 4 + id_len + 13) return error.InvalidMessage;
 
         const id = bytes[4..][0..id_len];
         const type_idx = 4 + id_len;
         const msg_type: PluginMessageType = safe.intToEnum(PluginMessageType, bytes[type_idx]) orelse return error.InvalidMessage;
 
-        const len_idx = type_idx + 1;
+        const corr_idx = type_idx + 1;
+        const correlation_id = std.mem.readInt(u64, bytes[corr_idx..][0..8], .big);
+
+        const len_idx = corr_idx + 8;
         const payload_len = std.mem.readInt(u32, bytes[len_idx..][0..4], .big);
 
         const payload_idx = len_idx + 4;
@@ -1589,6 +1603,7 @@ pub const PluginMessage = struct {
             .plugin_id = id,
             .message_type = msg_type,
             .payload = payload,
+            .correlation_id = correlation_id,
         };
     }
 };
@@ -1915,6 +1930,37 @@ test "plugin message encode decode get_state" {
     const decoded = try PluginMessage.decode(bytes[1..]);
     try std.testing.expectEqualStrings("state-reader", decoded.plugin_id);
     try std.testing.expectEqual(PluginMessage.PluginMessageType.get_state, decoded.message_type);
+}
+
+test "plugin message round-trips correlation_id" {
+    const allocator = std.testing.allocator;
+
+    const pm = PluginMessage{
+        .plugin_id = "p1",
+        .message_type = .get_state,
+        .payload = .{ .state_request = {} },
+        .correlation_id = 0xDEADBEEF_CAFEBABE,
+    };
+    const bytes = try pm.encode(allocator);
+    defer allocator.free(bytes);
+
+    const decoded = try PluginMessage.decode(bytes[1..]);
+    try std.testing.expectEqual(@as(u64, 0xDEADBEEF_CAFEBABE), decoded.correlation_id);
+}
+
+test "plugin message default correlation_id is 0" {
+    const allocator = std.testing.allocator;
+
+    const pm = PluginMessage{
+        .plugin_id = "p1",
+        .message_type = .get_state,
+        .payload = .{ .state_request = {} },
+    };
+    const bytes = try pm.encode(allocator);
+    defer allocator.free(bytes);
+
+    const decoded = try PluginMessage.decode(bytes[1..]);
+    try std.testing.expectEqual(@as(u64, 0), decoded.correlation_id);
 }
 
 test "plugin message encode decode event subscribe" {

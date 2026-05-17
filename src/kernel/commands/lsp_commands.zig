@@ -78,14 +78,15 @@ pub const LspCommands = struct {
         core.lsp_manager.stopServer();
 
         if (s.file_path) |path| {
-            if (std.mem.endsWith(u8, path, ".zig")) {
+            const LSPManager = @import("../../services/lsp_manager.zig").LSPManager;
+            if (LSPManager.getLangFromPath(path)) |lang| {
                 const root_path = std.fs.path.dirname(path);
-                try core.lsp_manager.startServer("zig", root_path);
+                try core.lsp_manager.startServer(lang, root_path);
 
                 const content = s.buffer.toString(core.allocator) catch return;
                 defer core.allocator.free(content);
                 try core.lsp_manager.documentOpened(path, content);
-                log.info("[LSP RESTART] ZLS restarted successfully for: {s}", .{path});
+                log.info("[LSP RESTART] {s} server restarted for: {s}", .{ lang, path });
             }
         }
     }

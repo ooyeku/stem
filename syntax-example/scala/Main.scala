@@ -27,7 +27,7 @@ object Main {
 
   def main(args: Array[String]): Unit = {
     val sample = JsonObj(Map(
-      "name"    -> JsonStr("yap"),
+      "name"    -> JsonStr("stem"),
       "stars"   -> JsonNum(42),
       "active"  -> JsonBool(true),
       "tags"    -> JsonArr(List(JsonStr("zig"), JsonStr("editor"))),

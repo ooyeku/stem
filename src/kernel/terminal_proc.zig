@@ -37,7 +37,7 @@ pub fn executeTerminalCommand(core: anytype) !void {
         return;
     }
 
-    const inbox = core.core_inbox orelse {
+    const bus = core.core_bus orelse {
         const output = core.terminal_service.runSync(command, cwd) catch |err| {
             const err_msg = std.fmt.allocPrint(core.allocator, "Error: {}\n", .{err}) catch return;
             defer core.allocator.free(err_msg);
@@ -52,7 +52,7 @@ pub fn executeTerminalCommand(core: anytype) !void {
     };
 
     core.terminal_running = true;
-    _ = core.terminal_service.runAsync(command, cwd, inbox) catch |err| {
+    _ = core.terminal_service.runAsync(command, cwd, bus) catch |err| {
         const err_msg = std.fmt.allocPrint(core.allocator, "Error starting command: {}\n", .{err}) catch return;
         defer core.allocator.free(err_msg);
         try core.terminal_output.appendSlice(core.allocator, err_msg);

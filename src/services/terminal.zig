@@ -3,6 +3,7 @@ const vigil = @import("vigil");
 const protocol = @import("../kernel/protocol.zig");
 const builtin = @import("builtin");
 const platform = @import("../kernel/platform.zig");
+const MessageBus = @import("../kernel/message_bus.zig").MessageBus;
 
 const is_windows = builtin.os.tag == .windows;
 
@@ -154,7 +155,7 @@ pub const TerminalService = struct {
         allocator: std.mem.Allocator,
         command: []const u8,
         cwd: ?[]const u8,
-        inbox: *vigil.Inbox,
+        bus: *MessageBus,
         job_id: u64,
         config: TerminalConfig,
         cancelled: *std.atomic.Value(bool),
@@ -163,7 +164,7 @@ pub const TerminalService = struct {
         environ_block: std.process.Environ.Block,
     };
 
-    pub fn runAsync(self: *TerminalService, command: []const u8, cwd: ?[]const u8, inbox: *vigil.Inbox) !JobHandle {
+    pub fn runAsync(self: *TerminalService, command: []const u8, cwd: ?[]const u8, bus: *MessageBus) !JobHandle {
         const job_id = self.next_job_id;
         self.next_job_id += 1;
 
@@ -179,23 +180,19 @@ pub const TerminalService = struct {
         pid_set_flag.* = std.atomic.Value(bool).init(false);
         errdefer self.allocator.destroy(pid_set_flag);
 
-        const handle = JobHandle{
-            .id = job_id,
-            .pid = null,
-            .cancelled = false,
-            .cancelled_flag = cancelled_flag,
-            .pid_storage = pid_storage,
-            .pid_set_flag = pid_set_flag,
-        };
+        const command_dupe = try self.allocator.dupe(u8, command);
+        errdefer self.allocator.free(command_dupe);
 
-        self.current_job = handle;
+        const cwd_dupe: ?[]const u8 = if (cwd) |dir| try self.allocator.dupe(u8, dir) else null;
+        errdefer if (cwd_dupe) |d| self.allocator.free(d);
 
         const ctx = try self.allocator.create(AsyncContext);
+        errdefer self.allocator.destroy(ctx);
         ctx.* = .{
             .allocator = self.allocator,
-            .command = try self.allocator.dupe(u8, command),
-            .cwd = if (cwd) |dir| try self.allocator.dupe(u8, dir) else null,
-            .inbox = inbox,
+            .command = command_dupe,
+            .cwd = cwd_dupe,
+            .bus = bus,
             .job_id = job_id,
             .config = self.config,
             .cancelled = cancelled_flag,
@@ -207,6 +204,19 @@ pub const TerminalService = struct {
         const thread = try std.Thread.spawn(.{}, runAsyncWorker, .{ctx});
         thread.detach();
 
+        // From this point the worker owns ctx (and the atomics/dupes
+        // it holds pointers to). Publish the handle only after spawn
+        // succeeds — otherwise an earlier `try` failure would leave
+        // current_job pointing at atomics our errdefers just freed.
+        const handle = JobHandle{
+            .id = job_id,
+            .pid = null,
+            .cancelled = false,
+            .cancelled_flag = cancelled_flag,
+            .pid_storage = pid_storage,
+            .pid_set_flag = pid_set_flag,
+        };
+        self.current_job = handle;
         return handle;
     }
 
@@ -242,8 +252,8 @@ pub const TerminalService = struct {
             const err_msg = std.fmt.allocPrint(ctx.allocator, "Failed to spawn process: {}\n", .{err}) catch return;
             defer ctx.allocator.free(err_msg);
             // best-effort: parent UI may have already exited; nothing else to do
-            sendOutputChunk(ctx.inbox, err_msg, ctx.allocator) catch {};
-            sendResult(ctx.inbox, false, 1, ctx.allocator) catch {};
+            sendOutputChunk(ctx.bus, err_msg, ctx.allocator) catch {};
+            sendResult(ctx.bus, false, 1, ctx.allocator) catch {};
             return;
         };
         defer child.kill(io);
@@ -253,7 +263,24 @@ pub const TerminalService = struct {
             ctx.pid_set.store(true, .release);
         }
 
-        const stdout = child.stdout orelse return;
+        // Drain stdout and stderr concurrently. Sequential draining
+        // deadlocks: the child blocks writing to whichever pipe we
+        // aren't reading once its buffer fills (~64 KiB), so it can't
+        // close the pipe we are reading, so we never see EOF.
+        var stderr_state: StderrPumpState = .{
+            .ctx = ctx,
+            .environ_block = ctx.environ_block,
+            .stderr = child.stderr,
+        };
+        const stderr_thread: ?std.Thread = if (stderr_state.stderr != null)
+            std.Thread.spawn(.{}, pumpStderrAsync, .{&stderr_state}) catch null
+        else
+            null;
+
+        const stdout = child.stdout orelse {
+            if (stderr_thread) |t| t.join();
+            return;
+        };
         var total_bytes: usize = 0;
         var was_truncated = false;
 
@@ -267,33 +294,20 @@ pub const TerminalService = struct {
                 was_truncated = true;
                 const remaining = ctx.config.max_output_bytes - total_bytes;
                 if (remaining > 0) {
-                    sendOutputChunk(ctx.inbox, chunk_buf[0..remaining], ctx.allocator) catch {};
+                    sendOutputChunk(ctx.bus, chunk_buf[0..remaining], ctx.allocator) catch {};
                 }
-                sendOutputChunk(ctx.inbox, "\n[Output truncated - exceeded size limit]\n", ctx.allocator) catch {};
+                sendOutputChunk(ctx.bus, "\n[Output truncated - exceeded size limit]\n", ctx.allocator) catch {};
                 break;
             }
 
             total_bytes += bytes_read;
-            sendOutputChunk(ctx.inbox, chunk_buf[0..bytes_read], ctx.allocator) catch {};
+            sendOutputChunk(ctx.bus, chunk_buf[0..bytes_read], ctx.allocator) catch {};
         }
 
-        if (child.stderr) |stderr| {
-            var stderr_iterations: usize = 0;
-            const max_stderr_iterations: usize = 10000;
-            while (!ctx.cancelled.load(.acquire) and stderr_iterations < max_stderr_iterations) {
-                var iovec = [_][]u8{&chunk_buf};
-                const bytes_read = stderr.readStreaming(io, &iovec) catch break;
-                if (bytes_read == 0) break;
-                if (!was_truncated and total_bytes + bytes_read <= ctx.config.max_output_bytes) {
-                    total_bytes += bytes_read;
-                    sendOutputChunk(ctx.inbox, chunk_buf[0..bytes_read], ctx.allocator) catch {};
-                }
-                stderr_iterations += 1;
-            }
-        }
+        if (stderr_thread) |t| t.join();
 
         const term = child.wait(io) catch {
-            sendResult(ctx.inbox, false, -1, ctx.allocator) catch {};
+            sendResult(ctx.bus, false, -1, ctx.allocator) catch {};
             return;
         };
 
@@ -305,19 +319,50 @@ pub const TerminalService = struct {
 
         const exit_msg = std.fmt.allocPrint(ctx.allocator, "\n[Exit: {}]\n", .{exit_code}) catch return;
         defer ctx.allocator.free(exit_msg);
-        sendOutputChunk(ctx.inbox, exit_msg, ctx.allocator) catch {};
+        sendOutputChunk(ctx.bus, exit_msg, ctx.allocator) catch {};
 
-        sendResult(ctx.inbox, exit_code == 0, exit_code, ctx.allocator) catch {};
+        sendResult(ctx.bus, exit_code == 0, exit_code, ctx.allocator) catch {};
     }
 
-    fn sendOutputChunk(inbox: *vigil.Inbox, data: []const u8, allocator: std.mem.Allocator) !void {
+    const StderrPumpState = struct {
+        ctx: *AsyncContext,
+        environ_block: std.process.Environ.Block,
+        stderr: ?std.Io.File,
+    };
+
+    fn pumpStderrAsync(state: *StderrPumpState) void {
+        const stderr = state.stderr orelse return;
+        var threaded = std.Io.Threaded.init(state.ctx.allocator, .{
+            .environ = .{ .block = state.environ_block },
+        });
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        var buf: [4096]u8 = undefined;
+        while (!state.ctx.cancelled.load(.acquire)) {
+            var iovec = [_][]u8{&buf};
+            const n = stderr.readStreaming(io, &iovec) catch break;
+            if (n == 0) break;
+            // Forward stderr alongside stdout so the user sees diagnostic
+            // output mixed with normal output (matches how a terminal
+            // renders them). Output-cap is enforced loosely; precise
+            // accounting would require atomic coordination with the
+            // stdout loop, not worth the complexity for a terminal pane.
+            sendOutputChunk(state.ctx.bus, buf[0..n], state.ctx.allocator) catch {};
+        }
+    }
+
+    fn sendOutputChunk(bus: *MessageBus, data: []const u8, allocator: std.mem.Allocator) !void {
         const msg = protocol.Message{ .terminal_output_chunk = data };
         const bytes = try msg.encode(allocator);
         defer allocator.free(bytes);
-        try inbox.send(bytes);
+        // Terminal output is the textbook bulk traffic: high-volume, the
+        // user is happy to drop chunks if the producer outpaces the
+        // consumer (a `find /` would otherwise OOM the UI thread).
+        try bus.sendBulk(bytes);
     }
 
-    fn sendResult(inbox: *vigil.Inbox, success: bool, exit_code: i32, allocator: std.mem.Allocator) !void {
+    fn sendResult(bus: *MessageBus, success: bool, exit_code: i32, allocator: std.mem.Allocator) !void {
         const msg = protocol.Message{
             .terminal_result = .{
                 .output = "",
@@ -327,7 +372,9 @@ pub const TerminalService = struct {
         };
         const bytes = try msg.encode(allocator);
         defer allocator.free(bytes);
-        try inbox.send(bytes);
+        // Result is the "exit status" handshake — interactive priority so
+        // the UI sees it ahead of any straggling output chunks.
+        try bus.sendInteractive(bytes);
     }
 
     pub fn cancelCurrentJob(self: *TerminalService) bool {
@@ -363,11 +410,20 @@ pub const TerminalService = struct {
     }
 
     pub fn clearCurrentJob(self: *TerminalService) void {
+        if (self.current_job) |job| {
+            // Free the heap-allocated atomics the handle owned. Safe here
+            // because clearCurrentJob is called from core only after the
+            // worker has sent its terminal_result message — past that
+            // point the worker no longer touches these.
+            if (job.cancelled_flag) |f| self.allocator.destroy(f);
+            if (job.pid_storage) |p| self.allocator.destroy(p);
+            if (job.pid_set_flag) |p| self.allocator.destroy(p);
+        }
         self.current_job = null;
     }
 
-    pub fn run(self: *TerminalService, command: []const u8, inbox: *vigil.Inbox) !void {
-        _ = try self.runAsync(command, inbox);
+    pub fn run(self: *TerminalService, command: []const u8, bus: *MessageBus) !void {
+        _ = try self.runAsync(command, null, bus);
     }
 };
 

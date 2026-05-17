@@ -4,6 +4,7 @@
 const std = @import("std");
 const protocol = @import("../protocol.zig");
 const logger_service = @import("../../services/logger.zig");
+const telemetry = @import("../../services/telemetry.zig");
 
 pub const SystemCommands = struct {
     pub fn cmdModeInsert(core: anytype) anyerror!void {
@@ -82,6 +83,91 @@ pub const SystemCommands = struct {
         );
 
         try core.openVirtualBuffer("[PLUGINS]", text.items);
+    }
+
+    /// Render the live message-bus telemetry snapshot into the `[STATS]`
+    /// virtual buffer. Refreshable via `refreshStatsBufferIfOpen` from
+    /// the core tick handler so the numbers tick up while the buffer
+    /// is the active view.
+    pub fn cmdShowStats(core: anytype) anyerror!void {
+        const body = try renderStatsBuffer(core.allocator);
+        defer core.allocator.free(body);
+        try core.openVirtualBuffer("[STATS]", body);
+        try core.sendUpdate();
+    }
+
+    /// If the active buffer is `[STATS]`, re-render its contents in
+    /// place so it acts as a live monitor.
+    pub fn refreshStatsBufferIfOpen(core: anytype) void {
+        const idx = core.buffer_manager.active_index;
+        if (idx >= core.buffer_manager.buffers.items.len) return;
+        const buf = &core.buffer_manager.buffers.items[idx];
+        if (!std.mem.eql(u8, buf.name, "[STATS]")) return;
+
+        const body = renderStatsBuffer(core.allocator) catch return;
+        defer core.allocator.free(body);
+        // openVirtual replaces the existing buffer's content when the
+        // name matches, so we route through it for a clean refresh.
+        core.buffer_manager.openVirtual("[STATS]", body) catch {};
+    }
+
+    fn renderStatsBuffer(allocator: std.mem.Allocator) ![]u8 {
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+
+        const snap = telemetry.snapshot();
+        try w.print(
+            \\# stem — Message Bus Stats
+            \\
+            \\Live snapshot of the Vigil-backed runtime messaging layer.
+            \\Refreshes on each tick while this buffer is the active view.
+            \\
+            \\## Global
+            \\
+            \\- Bytes shipped through MessageBus: {d}
+            \\- Coalesce events (renders/ticks superseded): {d}
+            \\- Plugin crashes (since startup): {d}
+            \\- Supervisor restarts: {d}
+            \\
+            \\## Per-bus
+            \\
+            \\
+        , .{ snap.bytes_sent, snap.coalesce_events, snap.plugin_crashes, snap.supervisor_restarts });
+
+        const per_bus = try telemetry.snapshotPerBus(allocator);
+        defer {
+            for (per_bus) |b| allocator.free(b.bus_name);
+            allocator.free(per_bus);
+        }
+
+        if (per_bus.len == 0) {
+            try w.writeAll("- _No traffic yet._\n");
+        } else {
+            try w.writeAll("| Bus | Sent | Dropped (full) | Dropped (backpressure) |\n");
+            try w.writeAll("|---|---:|---:|---:|\n");
+            for (per_bus) |b| {
+                try w.print(
+                    "| `{s}` | {d} | {d} | {d} |\n",
+                    .{ b.bus_name, b.stats.sent, b.stats.dropped_full, b.stats.dropped_backpressure },
+                );
+            }
+        }
+
+        try w.writeAll(
+            \\
+            \\## How to read this
+            \\
+            \\- `sent`: messages that landed in the destination's priority queue.
+            \\- `dropped (full)`: mailbox at capacity. Indicates a stuck consumer.
+            \\- `dropped (backpressure)`: bulk/background producer outpacing consumer.
+            \\  Common during heavy terminal output or scan results — desired.
+            \\- `coalesce events`: renders or ticks superseded by a newer one
+            \\  in the same slot. Higher = more redundant work avoided.
+            \\
+        );
+
+        return aw.toOwnedSlice();
     }
 
     pub fn cmdJobList(core: anytype) anyerror!void {

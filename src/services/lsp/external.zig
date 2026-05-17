@@ -41,6 +41,16 @@ pub fn runExternalServer(
         .stdout = .pipe,
         .stderr = .pipe,
     });
+    // If anything after the spawn fails before we reach `child.wait` below,
+    // we'd otherwise leak a child process (zombie) and its three pipes. Kill
+    // and reap so the caller can give up cleanly. Note: this errdefer also
+    // fires if a thread-spawn fails — in which case any threads we already
+    // spawned (writer_thread) will see EOF on the pipe and exit on their
+    // own, since the child's pipes close when it's killed.
+    errdefer {
+        child.kill(io);
+        _ = child.wait(io) catch {};
+    }
 
     // Spawn a kill-watchdog: if our input pump exits (our side closed the
     // pipe — i.e. stem is stopping this server) and the child still hasn't
@@ -56,6 +66,9 @@ pub fn runExternalServer(
         t.detach();
         break :blk w;
     };
+    // If we error out before reaching `cancelled = true` below, tell the
+    // watchdog to bail rather than waiting forever for pump_done.
+    errdefer if (watch) |w| w.cancelled.store(true, .release);
 
     const writer_thread = try std.Thread.spawn(.{}, pumpInput, .{ input_pipe, child.stdin.?, environ_block, watch });
     const reader_thread = try std.Thread.spawn(.{}, pumpOutput, .{ child.stdout.?, output_pipe, environ_block });

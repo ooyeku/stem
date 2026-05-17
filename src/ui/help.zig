@@ -1,60 +1,34 @@
-pub const ansi_help_text =
-    "\n" ++
-    "   \x1b[1;36mYAP EDITOR\x1b[0m   \x1b[3mModal terminal editor\x1b[0m\n" ++
-    "\n" ++
-    "   \x1b[1mUSAGE\x1b[0m\n" ++
-    "       \x1b[32myap\x1b[0m [paths...] [options]\n" ++
-    "       \x1b[32myap\x1b[0m <command> [args...]\n" ++
-    "\n" ++
-    "   \x1b[1mCORE\x1b[0m\n" ++
-    "       \x1b[32myap\x1b[0m                         Start with empty buffer\n" ++
-    "       \x1b[32myap\x1b[0m <path>...               Open files or directories (recursive)\n" ++
-    "       \x1b[32myap\x1b[0m --open, -o <path>       Open specific path (repeatable)\n" ++
-    "\n" ++
-    "   \x1b[1mTOOLS\x1b[0m\n" ++
-    "       \x1b[32myap\x1b[0m --find, -f <query>      Search for text in files (grep)\n" ++
-    "       \x1b[32myap\x1b[0m --vfind <query>         Visual search (interactive results)\n" ++
-    "       \x1b[32myap\x1b[0m --scope <file> <q>      Search within specific file\n" ++
-    "       \x1b[32myap\x1b[0m config <cmd>            Manage configuration (get/set/list)\n" ++
-    "       \x1b[32myap\x1b[0m logs [--clear]          Manage logs\n" ++
-    "\n" ++
-    "   \x1b[1mOPTIONS\x1b[0m\n" ++
-    "      -h, --help                  Show this help message\n" ++
-    "\n" ++
-    "      \x1b[3mSearch Flags:\x1b[0m\n" ++
-    "      --path, -p <path>           Add search path\n" ++
-    "      --ext, -e <ext>             Filter by extension\n" ++
-    "      --exclude, -x <pat>         Exclude pattern (glob)\n" ++
-    "      --before, -B <num>          Context lines before\n" ++
-    "      --after, -A <num>           Context lines after\n" ++
-    "\n";
-
+/// CLI surface summary shown inside the editor's `:help` view. The
+/// authoritative source for CLI behaviour is `src/cli.zig`; this is a
+/// lightweight in-editor reference. Run `stem --help` for the full,
+/// always-up-to-date listing.
 pub const cli_help_text =
     \\# Stem Editor
     \\
-    \\Modal terminal editor.
+    \\Modal terminal editor. Run `stem --help` in a shell for the full CLI.
     \\
     \\## Usage
     \\
-    \\- `stem [paths...] [options]`
+    \\- `stem [paths...]`           : Open files or directories
+    \\- `stem <command> [args...]`  : Run a subcommand
     \\
-    \\## Core Commands
+    \\## Commands
     \\
-    \\- `stem`                        : Start with empty buffer
-    \\- `stem <path>...`              : Open files or directories (recursive)
-    \\- `stem --open <path>`          : Open specific path
+    \\- `stem find <query>`         : Grep file contents
+    \\- `stem vfind <query>`        : Interactive search picker
+    \\- `stem scope <file> <q>`     : Context around matches in one file
+    \\- `stem config <action>`      : list / get / set / unset
+    \\- `stem logs [view|clear]`    : Inspect or wipe logs
+    \\- `stem lsp <install|list>`   : Manage language servers
+    \\- `stem help` / `-h`          : Show help
+    \\- `stem version` / `-V`       : Print version
     \\
-    \\## Tools
-    \\
-    \\- `stem --find <query>`         : Search text (grep)
-    \\- `stem --vfind <query>`        : Visual search
-    \\- `stem --scope <file> <q>`     : Search in file
-    \\- `stem config ...`             : Manage config
-    \\- `stem logs`                   : View logs
-    \\
-    \\## Options
-    \\- `-h, --help`                 : Show help
-    \\- `-p, -e, -x, -B, -A`         : Search filters
+    \\## Search Flags
+    \\- `-p, --path <dir>`          : Restrict to path (repeatable)
+    \\- `-e, --ext <ext>`           : Filter by extension (repeatable)
+    \\- `-x, --exclude <pat>`       : Skip paths containing this substring
+    \\- `-B, --before <n>`          : Lines of context before (`scope`)
+    \\- `-A, --after  <n>`          : Lines of context after  (`scope`)
     \\
 ;
 

@@ -5,15 +5,15 @@
 #   curl -fsSL https://raw.githubusercontent.com/ooyeku/stem/main/scripts/install.sh | sh
 #
 # Optional environment variables:
-#   YAP_VERSION   Specific version to install (e.g. v0.6.0). Defaults to latest.
-#   YAP_PREFIX    Install prefix. Defaults to /usr/local if writable
-#                 (or sudo is available), else $HOME/.local.
+#   STEM_VERSION   Specific version to install (e.g. v0.6.0). Defaults to latest.
+#   STEM_PREFIX    Install prefix. Defaults to /usr/local if writable
+#                  (or sudo is available), else $HOME/.local.
 
 set -eu
 
 REPO="ooyeku/stem"
-VERSION="${YAP_VERSION:-}"
-PREFIX="${YAP_PREFIX:-}"
+VERSION="${STEM_VERSION:-}"
+PREFIX="${STEM_PREFIX:-}"
 
 err()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*"; }
@@ -55,7 +55,7 @@ if [ -z "$VERSION" ]; then
         VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases" 2>/dev/null \
             | grep -E '"tag_name":' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
     fi
-    [ -n "$VERSION" ] || err "could not resolve latest version. Set YAP_VERSION=vX.Y.Z to install a specific tag."
+    [ -n "$VERSION" ] || err "could not resolve latest version. Set STEM_VERSION=vX.Y.Z to install a specific tag."
 fi
 info "Installing stem $VERSION for $target"
 
@@ -70,24 +70,30 @@ if ! curl -fsSL "$url" -o "$tmp/$archive"; then
 
 The release '$VERSION' may not have a prebuilt binary for $target.
 Visit https://github.com/${REPO}/releases to see what's available, or
-set YAP_VERSION=vX.Y.Z to choose a different tag."
+set STEM_VERSION=vX.Y.Z to choose a different tag."
 fi
 
 # Optional checksum verification — only if shasum/sha256sum is available and the
 # .sha256 file is present in the release.
 if curl -fsSL "$url.sha256" -o "$tmp/$archive.sha256" 2>/dev/null; then
     if command -v shasum >/dev/null 2>&1; then
-        (cd "$tmp" && shasum -a 256 -c "$archive.sha256")
+        (cd "$tmp" && shasum -a 256 -c "$archive.sha256") || err "checksum verification failed"
+        info "Verified SHA-256 checksum."
     elif command -v sha256sum >/dev/null 2>&1; then
-        (cd "$tmp" && sha256sum -c "$archive.sha256")
+        (cd "$tmp" && sha256sum -c "$archive.sha256") || err "checksum verification failed"
+        info "Verified SHA-256 checksum."
+    else
+        info "warning: neither shasum nor sha256sum found; skipping checksum verification."
     fi
+else
+    info "warning: $url.sha256 not available; skipping checksum verification."
 fi
 
 (cd "$tmp" && tar -xzf "$archive")
 staged="$(find "$tmp" -maxdepth 1 -type d -name 'stem-*' | head -n1)"
 [ -n "$staged" ] || err "could not find extracted directory"
 
-# Pick a prefix if one wasn't passed via YAP_PREFIX.
+# Pick a prefix if one wasn't passed via STEM_PREFIX.
 if [ -z "$PREFIX" ]; then
     if [ -w "/usr/local" ] || { [ ! -e "/usr/local" ] && [ -w "/usr" ]; }; then
         PREFIX="/usr/local"

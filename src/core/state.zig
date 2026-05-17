@@ -61,14 +61,18 @@ pub const EditorState = struct {
             return err;
         };
 
-        self.buffer.deinit();
+        // Dupe new path before swapping in the new buffer / freeing the
+        // old path — otherwise an OOM here would leave self.file_path
+        // dangling (UAF on next read, double-free in deinit).
+        const new_path = try self.allocator.dupe(u8, path);
 
+        self.buffer.deinit();
         self.buffer = PieceTable.init(self.allocator, content[0..read_n]);
 
         if (self.file_path) |old_path| {
             self.allocator.free(old_path);
         }
-        self.file_path = try self.allocator.dupe(u8, path);
+        self.file_path = new_path;
 
         self.cursor_row = 0;
         self.cursor_col = 0;
@@ -106,10 +110,13 @@ pub const EditorState = struct {
             return err;
         };
 
+        // Dupe-then-free pattern: if dupe OOMs we'd otherwise leave
+        // self.file_path dangling.
         if (self.file_path) |old_path| {
             if (!std.mem.eql(u8, old_path, path)) {
+                const new_path = try self.allocator.dupe(u8, path);
                 self.allocator.free(old_path);
-                self.file_path = try self.allocator.dupe(u8, path);
+                self.file_path = new_path;
             }
         } else {
             self.file_path = try self.allocator.dupe(u8, path);

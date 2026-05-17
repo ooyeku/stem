@@ -156,7 +156,9 @@ pub fn graphemeWidth(text: []const u8) i3 {
 }
 
 pub fn stringWidth(text: []const u8) i32 {
-    return @intCast(vaxis.gwidth.gwidth(text, .unicode));
+    const w = vaxis.gwidth.gwidth(text, .unicode);
+    if (w > std.math.maxInt(i32)) return std.math.maxInt(i32);
+    return @intCast(w);
 }
 
 test "grapheme count with ASCII" {

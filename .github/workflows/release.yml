@@ -52,11 +52,11 @@ jobs:
         run: |
           set -eux
           VERSION="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
-          STAGE="yap-${VERSION}-${{ matrix.target }}"
-          mkdir -p "$STAGE/bin" "$STAGE/lib/yap/plugins"
-          cp zig-out/bin/yap "$STAGE/bin/"
+          STAGE="stem-${VERSION}-${{ matrix.target }}"
+          mkdir -p "$STAGE/bin" "$STAGE/lib/stem/plugins"
+          cp zig-out/bin/stem "$STAGE/bin/"
           for lib in zig-out/lib/libgit.* zig-out/lib/libmarkdown_viewer.* zig-out/lib/libplugin_manager.*; do
-            [ -f "$lib" ] && cp "$lib" "$STAGE/lib/yap/plugins/"
+            [ -f "$lib" ] && cp "$lib" "$STAGE/lib/stem/plugins/"
           done
           cp README.md "$STAGE/" || true
           tar -czf "$STAGE.tar.gz" "$STAGE"
@@ -67,7 +67,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: yap-${{ matrix.target }}
+          name: stem-${{ matrix.target }}
           path: |
             ${{ env.ARCHIVE }}
             ${{ env.CHECKSUM }}
@@ -104,7 +104,7 @@ jobs:
           set -eux
           VERSION="${GITHUB_REF_NAME#v}"
           for target in aarch64-macos x86_64-macos aarch64-linux x86_64-linux; do
-            archive="dist/yap-v${VERSION}-${target}.tar.gz"
+            archive="dist/stem-v${VERSION}-${target}.tar.gz"
             sha=$(shasum -a 256 "$archive" | awk '{print $1}')
             case "$target" in
               aarch64-macos) export SHA_ARM_MAC=$sha ;;
@@ -118,14 +118,14 @@ jobs:
               -e "s|@SHA256_X86_64_MACOS@|${SHA_X86_MAC}|g" \
               -e "s|@SHA256_AARCH64_LINUX@|${SHA_ARM_LINUX}|g" \
               -e "s|@SHA256_X86_64_LINUX@|${SHA_X86_LINUX}|g" \
-              scripts/yap.rb.template > dist/yap.rb
-          cat dist/yap.rb
+              scripts/stem.rb.template > dist/stem.rb
+          cat dist/stem.rb
 
       - name: Upload formula artifact
         uses: actions/upload-artifact@v4
         with:
           name: homebrew-formula
-          path: dist/yap.rb
+          path: dist/stem.rb
 
       # To publish to ooyeku/homebrew-tap automatically, uncomment and set
       # HOMEBREW_TAP_TOKEN to a PAT with `repo` scope on that tap repo.
@@ -137,10 +137,10 @@ jobs:
       #     set -eux
       #     git clone "https://x-access-token:${GH_TOKEN}@github.com/ooyeku/homebrew-tap.git" tap
       #     mkdir -p tap/Formula
-      #     cp dist/yap.rb tap/Formula/yap.rb
+      #     cp dist/stem.rb tap/Formula/stem.rb
       #     cd tap
-      #     git config user.email "ci@yap.local"
-      #     git config user.name  "yap release bot"
-      #     git add Formula/yap.rb
-      #     git commit -m "yap ${GITHUB_REF_NAME}"
+      #     git config user.email "ci@stem.local"
+      #     git config user.name  "stem release bot"
+      #     git add Formula/stem.rb
+      #     git commit -m "stem ${GITHUB_REF_NAME}"
       #     git push

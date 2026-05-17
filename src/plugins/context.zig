@@ -2,6 +2,7 @@ const std = @import("std");
 const vigil = @import("vigil");
 const protocol = @import("../kernel/protocol.zig");
 const protocol_msg = @import("../kernel/protocol.zig").Message;
+const RequestTracker = @import("../kernel/request_reply.zig").RequestTracker;
 
 pub const PluginContext = struct {
     allocator: std.mem.Allocator,
@@ -15,6 +16,15 @@ pub const PluginContext = struct {
 
     plugin_allocator: std.mem.Allocator,
     message_allocator: std.mem.Allocator,
+
+    /// Tracks in-flight requests this plugin has issued to core
+    /// (`requestEditorState`, `getConfig`, `getBufferContent`,
+    /// `requestPluginList`). Each `register` returns a u64 correlation
+    /// ID that's threaded onto the wire; on the matching response the
+    /// SDK calls `deliver` and the right callback fires. This replaces
+    /// the previous global-callback-slot design which silently dropped
+    /// replies when two requests of the same kind overlapped.
+    requests: RequestTracker,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -33,6 +43,7 @@ pub const PluginContext = struct {
             .storage = .{},
             .plugin_allocator = plugin_allocator,
             .message_allocator = allocator,
+            .requests = RequestTracker.init(allocator),
         };
     }
 
@@ -51,6 +62,7 @@ pub const PluginContext = struct {
     }
 
     pub fn deinit(self: *PluginContext) void {
+        self.requests.deinit();
         self.storage.deinit(self.allocator);
     }
 };

@@ -78,8 +78,14 @@ pub const Core = struct {
     arena_pool: ArenaPool,
     storage: *StorageManager,
     buffer_manager: BufferManager,
-    ui_inbox: *vigil.Inbox,
+    /// Bus used by Core to send to the UI thread (renders, quit, etc.).
+    /// Replaces a raw `*vigil.Inbox`; gives us priority routing,
+    /// render-coalescing, and stats.
+    ui_bus: *@import("message_bus.zig").MessageBus,
     core_inbox: ?*vigil.Inbox = null,
+    /// Bus for sending TO Core's own inbox (used by terminal workers,
+    /// plugin manager forwards, etc.). Set in `run()`.
+    core_bus: ?*@import("message_bus.zig").MessageBus = null,
     version: u64 = 0,
     mode: protocol.Mode = .select,
     previous_mode: protocol.Mode = .select,
@@ -209,7 +215,7 @@ pub const Core = struct {
     /// `deinit` waits briefly for this to reach zero.
     scan_workers_running: std.atomic.Value(u32) = .{ .raw = 0 },
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_block: std.process.Environ.Block, ui_inbox: *vigil.Inbox, storage: *StorageManager, initial_files: []const []const u8) !Core {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_block: std.process.Environ.Block, ui_bus: *@import("message_bus.zig").MessageBus, storage: *StorageManager, initial_files: []const []const u8) !Core {
         var initial_terminal_output = std.ArrayListUnmanaged(u8).empty;
         try initial_terminal_output.appendSlice(allocator, "Terminal Ready\n");
         errdefer initial_terminal_output.deinit(allocator);
@@ -227,8 +233,8 @@ pub const Core = struct {
             .arena_pool = ArenaPool.init(allocator, io),
             .storage = storage,
             .buffer_manager = BufferManager.init(allocator, io),
-            .ui_inbox = ui_inbox,
-            .file_manager = FileManager.init(allocator, io),
+            .ui_bus = ui_bus,
+            .file_manager = try FileManager.init(allocator, io),
             .terminal_input = .empty,
             .terminal_output = initial_terminal_output,
             .version = 0,
@@ -252,7 +258,7 @@ pub const Core = struct {
             .initial_files = initial_files,
         };
 
-        core.plugin_manager = PluginManager.init(allocator, io, environ_block, ui_inbox, core.command_registry);
+        core.plugin_manager = PluginManager.init(allocator, io, environ_block, ui_bus, core.command_registry);
         return core;
     }
 
@@ -748,6 +754,7 @@ pub const Core = struct {
 
         try R.register("help.show", "Help: Show", "Show editor help", Wrap(SystemCommands.cmdShowHelp).run, null);
         try R.register("plugin.show", "[Plugin Manager] List Plugins", "Show loaded plugins", Wrap(SystemCommands.cmdShowPlugins).run, null);
+        try R.register("stats.show", "Stats: Message Bus", "Live view of stem's Vigil-backed message bus stats", Wrap(SystemCommands.cmdShowStats).run, null);
         try R.register("job.list", "Jobs: List Active", "Show all active background jobs (Space+j)", Wrap(SystemCommands.cmdJobList).run, null);
         try R.register("view.logs", "View: Logs", "Open log viewer", Wrap(SystemCommands.cmdViewLogs).run, null);
         try R.register("view.clear_logs", "View: Clear Logs", "Clear all logs", Wrap(SystemCommands.cmdClearLogs).run, null);
@@ -769,10 +776,12 @@ pub const Core = struct {
         try R.register("build.output", "Zig: Show Build Output", "Show the last build output", Wrap(BuildCommands.cmdBuildOutput).run, null);
     }
 
-    pub fn run(self: *Core, inbox: *vigil.Inbox) !void {
+    pub fn run(self: *Core, bus: *@import("message_bus.zig").MessageBus) !void {
         // Language servers are installed on-demand via `stem lsp install <name>`,
         // not eagerly at startup. ZLS is bundled and needs no install.
+        const inbox = bus.inbox;
         self.core_inbox = inbox;
+        self.core_bus = bus;
         self.plugin_manager.core_inbox = inbox;
         try self.registerCommands();
 
@@ -872,14 +881,18 @@ pub const Core = struct {
                                 .plugin_id = pm.plugin_id,
                                 .message_type = .state_response,
                                 .payload = .{ .state = state_view },
+                                // Echo back so the SDK's RequestTracker
+                                // can match this reply to the originating
+                                // `requestEditorState` call.
+                                .correlation_id = pm.correlation_id,
                             };
 
                             if (self.plugin_manager.plugins.get(pm.plugin_id)) |plugin| {
-                                if (plugin.inbox) |plugin_inbox| {
+                                if (plugin.bus) |*plugin_bus| {
                                     const encoded = resp.encode(self.allocator) catch continue;
                                     defer self.allocator.free(encoded);
-                                    // best-effort: plugin inbox may be closed if plugin already shut down
-                                    plugin_inbox.send(encoded) catch {};
+                                    // Request/reply → interactive priority.
+                                    plugin_bus.sendInteractive(encoded) catch {};
                                 }
                             }
                         } else if (pm.message_type == .get_buffer_content) {
@@ -891,13 +904,14 @@ pub const Core = struct {
                                 .plugin_id = pm.plugin_id,
                                 .message_type = .buffer_content_response,
                                 .payload = .{ .buffer_content_response = .{ .id = active_buf.id, .content = content } },
+                                .correlation_id = pm.correlation_id,
                             };
                             if (self.plugin_manager.plugins.get(pm.plugin_id)) |plugin| {
-                                if (plugin.inbox) |plugin_inbox| {
+                                if (plugin.bus) |*plugin_bus| {
                                     const encoded = resp.encode(self.allocator) catch continue;
                                     defer self.allocator.free(encoded);
-                                    // best-effort: plugin inbox may be closed if plugin already shut down
-                                    plugin_inbox.send(encoded) catch {};
+                                    // Request/reply → interactive priority.
+                                    plugin_bus.sendInteractive(encoded) catch {};
                                 }
                             }
                         } else if (pm.message_type == .switch_buffer) {
@@ -931,6 +945,16 @@ pub const Core = struct {
                         // Drain any paths discovered by background directory
                         // scanners into the buffer list. Bounded per tick.
                         self.drainScanPaths();
+
+                        // Restart crashed plugins under the per-plugin
+                        // RestartPolicy. Bounded: at most one reload per
+                        // tick so a flapping plugin can't monopolize core.
+                        self.plugin_manager.tickRestarts();
+
+                        // If the user is currently looking at the [STATS]
+                        // dashboard, refresh its content so the counters
+                        // tick up live.
+                        SystemCommands.refreshStatsBufferIfOpen(self);
 
                         // Periodically write recovery copies of any modified
                         // buffers so an OS crash / power loss / segfault
@@ -2399,7 +2423,11 @@ pub const Core = struct {
         const s = self.state();
         const path = s.file_path orelse return;
 
-        if (!std.mem.endsWith(u8, path, ".zig")) return;
+        // Route through the canonical LSP language detector — autocomplete
+        // is no longer Zig-only. Any language LSPManager can serve is
+        // eligible; languages without a running server return gracefully
+        // in the dispatcher.
+        if (LSPManager.getLangFromPath(path) == null) return;
 
         try self.ensureLspDocument();
         try self.lsp_manager.requestCompletion(path, @intCast(s.cursor_row), @intCast(s.cursor_col));
@@ -2509,7 +2537,10 @@ pub const Core = struct {
     pub fn sendLspDocChanged(self: *Core) !void {
         const s = self.state();
         if (s.file_path) |path| {
-            if (std.mem.endsWith(u8, path, ".zig")) {
+            // Was Zig-only; any language we have an LSP for needs
+            // incremental sync so the server's diagnostics / hover /
+            // completion stay aligned with the buffer.
+            if (LSPManager.getLangFromPath(path) != null) {
                 const content = try s.buffer.toString(self.allocator);
                 defer self.allocator.free(content);
                 self.lsp_doc_version += 1;
@@ -2914,25 +2945,14 @@ pub const Core = struct {
                 if (active_buf.file_path) |old| self.allocator.free(old);
                 active_buf.file_path = try self.allocator.dupe(u8, full_path);
 
-                if (std.mem.endsWith(u8, full_path, ".zig") or std.mem.endsWith(u8, full_path, ".py") or
-                    std.mem.endsWith(u8, full_path, ".ts") or std.mem.endsWith(u8, full_path, ".tsx") or
-                    std.mem.endsWith(u8, full_path, ".jsx") or std.mem.endsWith(u8, full_path, ".js") or
-                    std.mem.endsWith(u8, full_path, ".go"))
-                {
+                // Save-as: spin up the LSP for the new file's language if
+                // there is one. Was a hand-rolled 5-language ladder; now
+                // delegates to the canonical detector.
+                if (LSPManager.getLangFromPath(full_path)) |lang_id| {
                     const project_root = try self.findProjectRoot(full_path);
                     defer if (project_root) |p| self.allocator.free(p);
 
                     const root = if (project_root) |p| p else self.file_manager.cwd;
-                    const lang_id = if (std.mem.endsWith(u8, full_path, ".zig"))
-                        "zig"
-                    else if (std.mem.endsWith(u8, full_path, ".py"))
-                        "python"
-                    else if (std.mem.endsWith(u8, full_path, ".js"))
-                        "javascript"
-                    else if (std.mem.endsWith(u8, full_path, ".go"))
-                        "go"
-                    else
-                        "typescript";
                     try self.lsp_manager.startServer(lang_id, root);
 
                     const content = try self.state().buffer.toString(self.allocator);
@@ -3932,39 +3952,44 @@ pub const Core = struct {
 
         const bytes = try msg.encode(self.allocator);
         defer self.allocator.free(bytes);
-        try self.ui_inbox.send(bytes);
+        // Renders coalesce: only the freshest snapshot matters. The
+        // `version` field (bumped above) is the slot identity so the
+        // bus can tell when it's actually replacing an earlier frame.
+        try self.ui_bus.sendCoalesced(.render, bytes, self.version);
     }
 
     fn checkHover(self: *Core) !bool {
         const s = self.state();
-        if (s.file_path) |path| {
-            const is_lsp_file = std.mem.endsWith(u8, path, ".zig") or
-                std.mem.endsWith(u8, path, ".go") or
-                std.mem.endsWith(u8, path, ".py") or
-                std.mem.endsWith(u8, path, ".ts") or
-                std.mem.endsWith(u8, path, ".tsx") or
-                std.mem.endsWith(u8, path, ".js") or
-                std.mem.endsWith(u8, path, ".jsx");
+        const path = s.file_path orelse return false;
 
-            if (is_lsp_file) {
-                if (self.syntax_manager.getNodeAt(s.cursor_row, s.cursor_col)) |node| {
-                    const type_str = self.syntax_manager.getNodeType(node);
+        // Route through the authoritative LSP language detector instead
+        // of a hard-coded extension list. Any language LSPManager can
+        // serve (zig, python, ts/tsx/jsx, js, rust, go, c/cpp/headers,
+        // java, ruby/rake, c#) is hover-eligible; languages without a
+        // running server fall through gracefully in the dispatcher.
+        if (LSPManager.getLangFromPath(path) == null) return false;
 
-                    if (std.mem.eql(u8, type_str, "identifier") or
-                        std.mem.eql(u8, type_str, "type_identifier") or
-                        std.mem.eql(u8, type_str, "field_identifier") or
-                        std.mem.eql(u8, type_str, "builtin_type"))
-                    {
-                        try self.ensureLspDocument();
+        const node = self.syntax_manager.getNodeAt(s.cursor_row, s.cursor_col) orelse return false;
+        const type_str = self.syntax_manager.getNodeType(node);
 
-                        self.hover_pending = true;
-                        try self.lsp_manager.requestHover(path, @intCast(s.cursor_row), @intCast(s.cursor_col));
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
+        // Different grammars name identifier-ish nodes differently
+        // (`identifier`, `type_identifier`, `field_identifier`,
+        // `scoped_identifier`, `property_identifier`, …). Accept any
+        // node whose type contains "identifier", plus the small set of
+        // non-`identifier`-named hover targets (builtin/primitive types).
+        const is_hoverable =
+            std.mem.indexOf(u8, type_str, "identifier") != null or
+            std.mem.eql(u8, type_str, "builtin_type") or
+            std.mem.eql(u8, type_str, "primitive_type") or
+            std.mem.eql(u8, type_str, "type") or
+            std.mem.endsWith(u8, type_str, "_name");
+
+        if (!is_hoverable) return false;
+
+        try self.ensureLspDocument();
+        self.hover_pending = true;
+        try self.lsp_manager.requestHover(path, @intCast(s.cursor_row), @intCast(s.cursor_col));
+        return true;
     }
 
     pub fn ensureLspDocument(self: *Core) !void {
@@ -4119,7 +4144,7 @@ pub const Core = struct {
         var msg = protocol.Message{ .command = .quit };
         const bytes = try msg.encode(self.allocator);
         defer self.allocator.free(bytes);
-        try self.ui_inbox.send(bytes);
+        try self.ui_bus.sendCritical(bytes);
     }
 
     fn restoreSession(self: *Core) void {

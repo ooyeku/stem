@@ -8,6 +8,8 @@ const Plugin = @import("plugin.zig").Plugin;
 const CommandRegistry = @import("../kernel/command.zig").CommandRegistry;
 const UIManager = @import("ui_manager.zig").UIManager;
 const crash_isolation = @import("crash_isolation.zig");
+const MessageBus = @import("../kernel/message_bus.zig").MessageBus;
+const telemetry = @import("../services/telemetry.zig");
 
 pub const PluginManager = struct {
     allocator: std.mem.Allocator,
@@ -16,8 +18,13 @@ pub const PluginManager = struct {
     plugins: std.StringHashMapUnmanaged(*Plugin),
     ui_manager: UIManager,
 
+    /// Vigil process group that mirrors `plugins` — used for broadcast
+    /// operations (graceful shutdown, group-wide health pings, telemetry
+    /// counts). Mutated alongside `plugins` so the two stay in sync.
+    plugin_group: ?vigil.ProcessGroup = null,
+
     core_inbox: ?*vigil.Inbox = null,
-    ui_inbox: *vigil.Inbox,
+    ui_bus: *MessageBus,
 
     command_registry: *CommandRegistry,
 
@@ -31,7 +38,7 @@ pub const PluginManager = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         environ_block: std.process.Environ.Block,
-        ui_inbox: *vigil.Inbox,
+        ui_bus: *MessageBus,
         command_registry: *CommandRegistry,
     ) PluginManager {
         // Install SIGSEGV/SIGBUS handlers as soon as we know we're going
@@ -44,7 +51,7 @@ pub const PluginManager = struct {
             .plugins = .empty,
             .ui_manager = UIManager.init(allocator),
             .core_inbox = null,
-            .ui_inbox = ui_inbox,
+            .ui_bus = ui_bus,
             .command_registry = command_registry,
             .allocated_contexts = .empty,
             .event_subscribers = .empty,
@@ -180,6 +187,11 @@ pub const PluginManager = struct {
     }
 
     pub fn deinit(self: *PluginManager) void {
+        if (self.plugin_group) |*group| {
+            group.deinit();
+            self.plugin_group = null;
+        }
+
         var it = self.plugins.valueIterator();
         while (it.next()) |plugin_ptr| {
             const plugin = plugin_ptr.*;
@@ -268,8 +280,30 @@ pub const PluginManager = struct {
         };
 
         if (plugin_interface.version != interface.PLUGIN_VERSION) {
-            log.err("Plugin version mismatch: expected {d}, got {d}", .{ interface.PLUGIN_VERSION, plugin_interface.version });
+            log.err(
+                "Plugin at {s} is ABI v{d}, this stem is v{d}. " ++
+                    "Rebuild it (zig build) and refresh ~/.stem/plugins/ — " ++
+                    "see src/plugins/interface.zig for the changelog.",
+                .{ plugin_path, plugin_interface.version, interface.PLUGIN_VERSION },
+            );
             return error.IncompatiblePlugin;
+        }
+
+        // ABI version is just an integer — it doesn't catch struct-layout
+        // skew. If the plugin and stem disagree on @sizeOf(PluginContext),
+        // every field access from the plugin lands on the wrong offset and
+        // init segfaults. Refuse to load instead of crashing later.
+        if (lib.lookup(*const fn () callconv(.c) usize, "stem_plugin_context_sizeof")) |size_fn| {
+            const plugin_size = size_fn();
+            const stem_size = @sizeOf(context.PluginContext);
+            if (plugin_size != stem_size) {
+                log.err(
+                    "Plugin at {s} sees PluginContext as {d} bytes, stem sees {d}. " ++
+                        "Struct-layout mismatch — rebuild the plugin against this stem.",
+                    .{ plugin_path, plugin_size, stem_size },
+                );
+                return error.IncompatiblePlugin;
+            }
         }
 
         const id_name = std.mem.span(plugin_interface.name);
@@ -310,11 +344,17 @@ pub const PluginManager = struct {
             plugin.id,
             inbox,
             self.core_inbox.?,
-            self.ui_inbox,
+            // Plugins keep a raw Inbox handle for now — the SDK ABI is
+            // a separate concern from stem's internal MessageBus layer.
+            self.ui_bus.inbox,
             self.allocator,
         );
         plugin.ctx = ctx;
         plugin.inbox = inbox;
+        // Per-plugin bus: gives us priority-aware sends + telemetry on
+        // every event/response delivered to this plugin. `bus` lives in
+        // the Plugin struct so it dies with the plugin.
+        plugin.bus = MessageBus.init(self.allocator, inbox, plugin.id);
 
         // Spawn the worker BEFORE inserting into the registry. If spawn fails
         // we don't want the map to retain a *Plugin whose backing struct will
@@ -334,7 +374,38 @@ pub const PluginManager = struct {
             return err;
         };
 
+        // Lazily create the process group on first plugin; mirror plugin
+        // membership in it. We use this for broadcast operations later.
+        if (self.plugin_group == null) {
+            self.plugin_group = vigil.ProcessGroup.init(self.allocator, "plugins") catch null;
+        }
+        if (self.plugin_group) |*group| {
+            group.add(plugin.id, inbox) catch |err| {
+                log.warn("could not add plugin '{s}' to process group: {}", .{ plugin.id, err });
+            };
+        }
+
         log.info("Loaded plugin: {s}", .{plugin.id});
+    }
+
+    /// Called from the (about-to-exit) worker thread after a crash.
+    /// Records the crash time and — if the policy allows it — sets
+    /// `restart_requested`. The manager's `tickRestarts` will see the
+    /// flag on its next tick and do the actual reload work.
+    fn markForRestart(plugin: *Plugin) void {
+        const now_ms = vigil.compat.milliTimestamp();
+        plugin.crash_history.record(now_ms);
+        const recent = plugin.crash_history.recentCount(now_ms, plugin.restart_policy.window_ms);
+        if (recent > plugin.restart_policy.max_restarts_in_window) {
+            log.warn(
+                "Plugin '{s}' exceeded restart budget ({d}/{d}ms); giving up",
+                .{ plugin.id, recent, plugin.restart_policy.window_ms },
+            );
+            return;
+        }
+        plugin.next_restart_after_ms = now_ms +
+            @as(i64, @intCast(recent)) * plugin.restart_policy.restart_backoff_ms;
+        plugin.restart_requested.store(true, .release);
     }
 
     fn pluginMain(plugin: *Plugin) void {
@@ -356,7 +427,9 @@ pub const PluginManager = struct {
             const res = crash_isolation.runIsolated(.{ opaque_ctx, init_fn, &rc }, InitCall.run);
             if (res == .crashed) {
                 plugin.state = .failed;
+                telemetry.recordPluginCrash(plugin.id);
                 log.err("Plugin {s} CRASHED during init (signal={d}); marked dead", .{ plugin.id, crash_isolation.lastCrashSignal() });
+                markForRestart(plugin);
                 return;
             }
             if (rc != 0) {
@@ -390,7 +463,9 @@ pub const PluginManager = struct {
                             const res = crash_isolation.runIsolated(.{ opaque_ctx, handler, &pm }, HandleCall.run);
                             if (res == .crashed) {
                                 plugin.state = .failed;
+                                telemetry.recordPluginCrash(plugin.id);
                                 log.err("Plugin {s} CRASHED during handleMessage (signal={d}); marked dead", .{ plugin.id, crash_isolation.lastCrashSignal() });
+                                markForRestart(plugin);
                                 break;
                             }
                         }
@@ -466,23 +541,33 @@ pub const PluginManager = struct {
                 log.info("PluginManager: Received register_command from {s}", .{msg.plugin_id});
                 const payload = msg.payload.command_register;
 
+                // Dupe each field into a local with its own errdefer
+                // before assembling the struct. Doing the dupes inline
+                // inside the struct literal would leak any earlier
+                // successful dupes if a later one OOMs — the errdefer
+                // below only fires after `ctx.*` is fully assigned and
+                // can't reach the orphaned slices.
+                const plugin_id_dupe = try self.allocator.dupe(u8, msg.plugin_id);
+                errdefer self.allocator.free(plugin_id_dupe);
+                const command_id_dupe = try self.allocator.dupe(u8, payload.id);
+                errdefer self.allocator.free(command_id_dupe);
+                const registry_id_dupe = try self.allocator.dupe(u8, payload.id);
+                errdefer self.allocator.free(registry_id_dupe);
+                const registry_title_dupe = try self.allocator.dupe(u8, payload.title);
+                errdefer self.allocator.free(registry_title_dupe);
+                const registry_description_dupe = try self.allocator.dupe(u8, payload.description);
+                errdefer self.allocator.free(registry_description_dupe);
+
                 const ctx = try self.allocator.create(PluginCommandContext);
+                errdefer self.allocator.destroy(ctx);
                 ctx.* = .{
                     .manager = self,
-                    .plugin_id = try self.allocator.dupe(u8, msg.plugin_id),
-                    .command_id = try self.allocator.dupe(u8, payload.id),
-                    .registry_id = try self.allocator.dupe(u8, payload.id),
-                    .registry_title = try self.allocator.dupe(u8, payload.title),
-                    .registry_description = try self.allocator.dupe(u8, payload.description),
+                    .plugin_id = plugin_id_dupe,
+                    .command_id = command_id_dupe,
+                    .registry_id = registry_id_dupe,
+                    .registry_title = registry_title_dupe,
+                    .registry_description = registry_description_dupe,
                 };
-                errdefer {
-                    self.allocator.free(ctx.plugin_id);
-                    self.allocator.free(ctx.command_id);
-                    self.allocator.free(ctx.registry_id);
-                    self.allocator.free(ctx.registry_title);
-                    self.allocator.free(ctx.registry_description);
-                    self.allocator.destroy(ctx);
-                }
 
                 self.command_registry.register(
                     ctx.registry_id,
@@ -558,16 +643,19 @@ pub const PluginManager = struct {
                 const value = self.plugin_configs.get(composite_key);
 
                 if (self.plugins.get(msg.plugin_id)) |plugin| {
-                    if (plugin.inbox) |inbox| {
+                    if (plugin.bus) |*bus| {
                         const response = protocol.PluginMessage{
                             .plugin_id = msg.plugin_id,
                             .message_type = .config_response,
                             .payload = .{ .config_value = .{ .key = key, .value = value } },
+                            .correlation_id = msg.correlation_id,
                         };
                         const encoded = response.encode(self.allocator) catch return;
                         defer self.allocator.free(encoded);
-                        // best-effort: plugin inbox may be closed if plugin already shut down
-                        inbox.send(encoded) catch {};
+                        // best-effort: plugin inbox may be closed if plugin already shut down.
+                        // Reply to a request → interactive class so the plugin
+                        // resumes promptly.
+                        bus.sendInteractive(encoded) catch {};
                     }
                 }
             },
@@ -649,13 +737,14 @@ pub const PluginManager = struct {
                     .plugin_id = msg.plugin_id,
                     .message_type = .get_plugin_list_response,
                     .payload = .{ .plugin_list_data = serialized.written() },
+                    .correlation_id = msg.correlation_id,
                 };
 
                 if (self.plugins.get(msg.plugin_id)) |p| {
-                    if (p.inbox) |ib| {
+                    if (p.bus) |*pbus| {
                         const encoded = try response.encode(self.allocator);
                         defer self.allocator.free(encoded);
-                        try ib.send(encoded);
+                        pbus.sendInteractive(encoded) catch {};
                     }
                 }
             },
@@ -697,12 +786,97 @@ pub const PluginManager = struct {
         }
     }
 
+    // -------------------------------------------------------------------
+    // Restart supervision
+    //
+    // When a plugin crashes (segfaults in init / handleMessage), the
+    // worker thread calls `markForRestart` which records the crash time
+    // and, if the policy allows it, sets `restart_requested = true`.
+    // The manager's `tickRestarts` (driven from core's tick handler)
+    // observes the flag and performs the actual reload — joining the
+    // dead thread, closing the old library, and calling `loadPlugin`
+    // again with the same path. This mirrors Erlang/OTP's "restart
+    // intensity" approach: cap N restarts per window, then give up.
+    // -------------------------------------------------------------------
+
+    /// Run any pending restarts. Called from the core tick handler.
+    /// Bounded work: one restart per call to avoid blocking the tick.
+    pub fn tickRestarts(self: *PluginManager) void {
+        const now_ms = vigil.compat.milliTimestamp();
+
+        var target_id_buf: [256]u8 = undefined;
+        var target_path_buf: [1024]u8 = undefined;
+        var target: ?struct { id: []const u8, path: []const u8 } = null;
+
+        var it = self.plugins.valueIterator();
+        while (it.next()) |plugin_ptr| {
+            const plugin = plugin_ptr.*;
+            if (!plugin.restart_requested.load(.acquire)) continue;
+            if (now_ms < plugin.next_restart_after_ms) continue;
+            if (plugin.id.len > target_id_buf.len or plugin.path.len > target_path_buf.len) continue;
+            @memcpy(target_id_buf[0..plugin.id.len], plugin.id);
+            @memcpy(target_path_buf[0..plugin.path.len], plugin.path);
+            target = .{
+                .id = target_id_buf[0..plugin.id.len],
+                .path = target_path_buf[0..plugin.path.len],
+            };
+            // Clear the flag *before* we start work — if the reload itself
+            // crashes during init, the new crash will re-set it.
+            plugin.restart_requested.store(false, .release);
+            break;
+        }
+
+        if (target) |t| {
+            self.restartOne(t.id, t.path) catch |err| {
+                log.err("Plugin '{s}' restart failed: {}", .{ t.id, err });
+            };
+        }
+    }
+
+    fn restartOne(self: *PluginManager, plugin_id: []const u8, plugin_path: []const u8) !void {
+        // The worker thread already exited (it returned after recording
+        // the crash). We unload the dead plugin and load fresh.
+        if (self.plugins.fetchRemove(plugin_id)) |entry| {
+            const dead = entry.value;
+            // Remove from the process group too so broadcasts skip it
+            // until the new instance reinstalls.
+            if (self.plugin_group) |*group| {
+                _ = group.remove(dead.id);
+            }
+            self.cleanupPluginResources(dead.id);
+            dead.deinit(self.allocator);
+            self.allocator.destroy(dead);
+        }
+
+        // Stash path before reloading — we need a stable copy since the
+        // borrowed slice points at the deinited plugin's storage.
+        const path_copy = try self.allocator.dupe(u8, plugin_path);
+        defer self.allocator.free(path_copy);
+
+        try self.loadPlugin(path_copy);
+        telemetry.recordSupervisorRestart();
+        log.info("Plugin '{s}' restarted after crash", .{plugin_id});
+    }
+
     pub fn broadcastEvent(self: *PluginManager, event: protocol.PluginEvent, data: []const u8) void {
+        // Also publish to the Vigil global pub/sub broker so anyone
+        // (plugin-dashboard, telemetry, future external consumers) can
+        // subscribe by topic pattern instead of going through the
+        // event_subscribers map. The legacy direct-send loop below is
+        // kept so existing plugins keep receiving events on their inbox
+        // — the broker is purely additive.
+        const topic = pluginEventTopic(event);
+        if (vigil.pubsub.getGlobal()) |broker| {
+            _ = broker.publish(topic, data) catch |err| {
+                log.warn("pubsub publish '{s}' failed: {}", .{ topic, err });
+            };
+        }
+
         if (self.event_subscribers.get(event)) |subscribers| {
             for (subscribers.items) |plugin_id| {
                 if (self.plugins.get(plugin_id)) |plugin| {
                     if (plugin.state == .running) {
-                        if (plugin.inbox) |inbox| {
+                        if (plugin.bus) |*bus| {
                             const notif = protocol.PluginMessage{
                                 .plugin_id = plugin_id,
                                 .message_type = .event_notification,
@@ -710,13 +884,29 @@ pub const PluginManager = struct {
                             };
                             const encoded = notif.encode(self.allocator) catch continue;
                             defer self.allocator.free(encoded);
-                            // best-effort: plugin inbox may be closed if plugin already shut down
-                            inbox.send(encoded) catch {};
+                            // best-effort: plugin inbox may be closed if plugin already shut down.
+                            // Events are coalescible — a flood of cursor-moved
+                            // doesn't need to all land in priority lane.
+                            bus.sendCoalescible(encoded) catch {};
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Stable topic names so external subscribers don't have to know
+    /// the `protocol.PluginEvent` enum integer.
+    fn pluginEventTopic(event: protocol.PluginEvent) []const u8 {
+        return switch (event) {
+            .buffer_changed => "buffer.changed",
+            .cursor_moved => "cursor.moved",
+            .mode_changed => "mode.changed",
+            .file_saved => "file.saved",
+            .file_opened => "file.opened",
+            .buffer_switched => "buffer.switched",
+            .custom_event => "custom",
+        };
     }
 };
 

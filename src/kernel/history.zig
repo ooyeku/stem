@@ -216,6 +216,12 @@ pub const HistoryManager = struct {
         const txn = self.redo_stack.pop() orelse return null;
 
         const undo_clone = txn.clone(self.allocator) catch return txn;
+        // Enforce max_stack_size here too — pushUndo does, but it also
+        // clears redo, which we must not do mid-redo.
+        while (self.undo_stack.items.len >= self.max_stack_size) {
+            var oldest = self.undo_stack.orderedRemove(0);
+            oldest.deinit(self.allocator);
+        }
         self.undo_stack.append(self.allocator, undo_clone) catch |err| {
             log.warn("Failed to save undo state during redo: {}", .{err});
         };

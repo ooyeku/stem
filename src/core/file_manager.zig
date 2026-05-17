@@ -18,12 +18,12 @@ pub const FileManager = struct {
     entries: std.ArrayListUnmanaged(DirEntry),
     selected_index: usize,
 
-    pub fn init(allocator: Allocator, io: std.Io) FileManager {
+    pub fn init(allocator: Allocator, io: std.Io) !FileManager {
         const cwd: []u8 = if (std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator)) |z| blk: {
             // Convert sentinel-terminated slice to plain []u8 so deinit's free matches the alloc.
             defer allocator.free(z);
-            break :blk allocator.dupe(u8, z) catch unreachable;
-        } else |_| allocator.dupe(u8, "/") catch unreachable;
+            break :blk try allocator.dupe(u8, z);
+        } else |_| try allocator.dupe(u8, "/");
 
         return .{
             .allocator = allocator,
@@ -52,8 +52,10 @@ pub const FileManager = struct {
         self.selected_index = 0;
 
         if (!std.mem.eql(u8, self.cwd, "/")) {
+            const dotdot = try self.allocator.dupe(u8, "..");
+            errdefer self.allocator.free(dotdot);
             try self.entries.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, ".."),
+                .name = dotdot,
                 .is_dir = true,
             });
         }
@@ -68,6 +70,7 @@ pub const FileManager = struct {
         while (try iter.next(self.io)) |entry| {
             if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
             const name = try self.allocator.dupe(u8, entry.name);
+            errdefer self.allocator.free(name);
             try self.entries.append(self.allocator, .{
                 .name = name,
                 .is_dir = entry.kind == .directory,
@@ -149,7 +152,7 @@ test "FileManager basic operations" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();
@@ -162,7 +165,7 @@ test "FileManager initialization" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try std.testing.expect(fm.cwd.len > 0);
@@ -176,7 +179,7 @@ test "FileManager moveUp and moveDown" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();
@@ -198,7 +201,7 @@ test "FileManager moveUp at start" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();
@@ -214,7 +217,7 @@ test "FileManager moveDown at end" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();
@@ -234,7 +237,7 @@ test "FileManager getSelectedEntry empty" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     const entry = fm.getSelectedEntry();
@@ -247,7 +250,7 @@ test "FileManager getSelectedEntry valid" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();
@@ -264,7 +267,7 @@ test "FileManager goParent" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     const original_cwd = try allocator.dupe(u8, fm.cwd);
@@ -284,7 +287,7 @@ test "FileManager setCwd" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.setCwd("/");
@@ -298,7 +301,7 @@ test "FileManager entries sorted" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();
@@ -319,7 +322,7 @@ test "FileManager enter directory" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();
@@ -345,7 +348,7 @@ test "FileManager enter file returns path" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();
@@ -374,7 +377,7 @@ test "FileManager enter on empty list" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     const result = try fm.enter();
@@ -387,7 +390,7 @@ test "Test written via Stem" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 }
 
@@ -397,7 +400,7 @@ test "FileManager rapid moveUp at top" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();
@@ -416,7 +419,7 @@ test "FileManager rapid moveDown at bottom" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();
@@ -440,7 +443,7 @@ test "FileManager goParent at root" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.setCwd("/");
@@ -458,7 +461,7 @@ test "FileManager getSelectedEntry bounds" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     const entry = fm.getSelectedEntry();
@@ -471,7 +474,7 @@ test "FileManager selected_index after refresh" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();
@@ -490,7 +493,7 @@ test "FileManager enter with parent directory entry" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.setCwd("/tmp");
@@ -514,7 +517,7 @@ test "FileManager directories sorted before files" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var fm = FileManager.init(allocator, io);
+    var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
     try fm.refresh();

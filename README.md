@@ -13,12 +13,24 @@ Stem aims to enable "flow state" editing while being more approachable than Vim/
 
 ### Install a prebuilt binary (macOS / Linux)
 
+Download `scripts/install.sh` from the repo, review it, then run it:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ooyeku/stem/main/scripts/install.sh | sh
+curl -fsSLO https://raw.githubusercontent.com/ooyeku/stem/main/scripts/install.sh
+less install.sh                  # review what it does
+sh install.sh                    # run it once you're satisfied
 ```
 
-This downloads the latest release archive for your platform and installs `stem`
-to `/usr/local/bin` (or `~/.local/bin` if you can't write to `/usr/local`).
+The installer fetches the latest release archive for your platform, verifies
+its SHA-256 against the published `.sha256`, and installs `stem` to
+`/usr/local/bin` (or `~/.local/bin` if you can't write to `/usr/local`).
+
+Pin a specific release with `STEM_VERSION` and the install prefix with
+`STEM_PREFIX`:
+
+```bash
+STEM_VERSION=v0.6.0 STEM_PREFIX=$HOME/.local sh install.sh
+```
 
 ### Or build from source
 

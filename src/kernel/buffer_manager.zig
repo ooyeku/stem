@@ -103,9 +103,12 @@ pub const BufferManager = struct {
         const content_slice = content[0..read_n];
 
         const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
+        errdefer self.allocator.free(name);
         const file_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(file_path);
 
         var state = EditorState.init(self.allocator, self.io, content_slice);
+        errdefer state.deinit();
         if (state.file_path) |old| self.allocator.free(old);
         state.file_path = try self.allocator.dupe(u8, path);
         state.modified = false;
@@ -116,9 +119,9 @@ pub const BufferManager = struct {
             .name = name,
             .file_path = file_path,
         };
-        self.next_id += 1;
 
         try self.buffers.append(self.allocator, buffer);
+        self.next_id += 1;
         self.active_index = self.buffers.items.len - 1;
 
         return &self.buffers.items[self.active_index];
@@ -135,21 +138,26 @@ pub const BufferManager = struct {
         }
 
         const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
+        errdefer self.allocator.free(name);
         var state = EditorState.init(self.allocator, self.io, "");
+        errdefer state.deinit();
         if (state.file_path) |old| self.allocator.free(old);
         state.file_path = try self.allocator.dupe(u8, path);
         state.modified = false;
+
+        const buf_file_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(buf_file_path);
 
         const buffer = Buffer{
             .id = self.next_id,
             .state = state,
             .name = name,
-            .file_path = try self.allocator.dupe(u8, path),
+            .file_path = buf_file_path,
             .not_loaded = true,
         };
-        self.next_id += 1;
 
         try self.buffers.append(self.allocator, buffer);
+        self.next_id += 1;
         self.active_index = self.buffers.items.len - 1;
 
         return &self.buffers.items[self.active_index];
@@ -225,8 +233,10 @@ pub const BufferManager = struct {
         }
 
         const buf_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(buf_name);
 
         var state = EditorState.init(self.allocator, self.io, content);
+        errdefer state.deinit();
         state.modified = false;
 
         const buffer = Buffer{
@@ -235,9 +245,9 @@ pub const BufferManager = struct {
             .name = buf_name,
             .file_path = null,
         };
-        self.next_id += 1;
 
         try self.buffers.append(self.allocator, buffer);
+        self.next_id += 1;
         self.active_index = self.buffers.items.len - 1;
     }
 

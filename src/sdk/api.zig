@@ -112,10 +112,11 @@ pub fn handleStandardMessages(ctx: *PluginContext, msg: *const PluginMessage) bo
             return true;
         },
         .state_response => {
-            if (state_callback) |cb| {
-                cb(ctx, msg.payload.state);
-                state_callback = null;
-            }
+            // Encode the EditorStateView so the typed trampoline can read
+            // it back. The tracker is type-erased: it only knows about
+            // `[]const u8` payloads. We give it the encoded view.
+            const stash = ResponseStash{ .state = msg.payload.state };
+            _ = ctx.requests.deliver(msg.correlation_id, std.mem.asBytes(&stash));
             return true;
         },
         .event_notification => {
@@ -128,31 +129,37 @@ pub fn handleStandardMessages(ctx: *PluginContext, msg: *const PluginMessage) bo
             return true;
         },
         .config_response => {
-            if (config_callback) |cb| {
-                const cfg = msg.payload.config_value;
-                cb(ctx, cfg.key, cfg.value);
-                config_callback = null;
-            }
+            const cfg = msg.payload.config_value;
+            const stash = ResponseStash{ .config = .{ .key = cfg.key, .value = cfg.value } };
+            _ = ctx.requests.deliver(msg.correlation_id, std.mem.asBytes(&stash));
             return true;
         },
         .buffer_content_response => {
-            if (buffer_content_callback) |cb| {
-                const resp = msg.payload.buffer_content_response;
-                cb(ctx, resp.id, resp.content);
-                buffer_content_callback = null;
-            }
+            const resp = msg.payload.buffer_content_response;
+            const stash = ResponseStash{ .buffer_content = .{ .id = resp.id, .content = resp.content } };
+            _ = ctx.requests.deliver(msg.correlation_id, std.mem.asBytes(&stash));
             return true;
         },
         .get_plugin_list_response => {
-            if (plugin_list_callback) |cb| {
-                cb(ctx, msg.payload.plugin_list_data);
-                plugin_list_callback = null;
-            }
+            const stash = ResponseStash{ .plugin_list = msg.payload.plugin_list_data };
+            _ = ctx.requests.deliver(msg.correlation_id, std.mem.asBytes(&stash));
             return true;
         },
         else => return false,
     }
 }
+
+/// Transport for typed replies through the type-erased `RequestTracker`.
+/// We stack-allocate one, take its bytes, and the trampoline casts back.
+/// All fields borrow from the message buffer that's still alive during
+/// `handleStandardMessages` — the trampolines must consume them before
+/// returning.
+const ResponseStash = union(enum) {
+    state: protocol.EditorStateView,
+    config: struct { key: []const u8, value: ?[]const u8 },
+    buffer_content: struct { id: u32, content: []const u8 },
+    plugin_list: []const u8,
+};
 
 pub fn deinitSdk(ctx: *PluginContext) void {
     if (registry_initialized) {
@@ -177,14 +184,68 @@ pub fn deinitSdk(ctx: *PluginContext) void {
     }
 }
 
-var state_callback: ?*const fn (*PluginContext, protocol.EditorStateView) void = null;
+// -----------------------------------------------------------------------------
+// Async request/reply via the per-context RequestTracker.
+//
+// Each `request*` function:
+//   1. Registers (ctx, typed_cb, trampoline) with the tracker, getting
+//      a unique u64 correlation ID.
+//   2. Builds the outgoing PluginMessage with that `correlation_id`.
+//   3. Sends it to core.
+//
+// When core's reply comes back, `handleStandardMessages` calls
+// `tracker.deliver(correlation_id, &stash)`. The trampoline then casts
+// the stash and calls the original typed callback.
+//
+// Multiple in-flight requests of the same kind now coexist; replies
+// no longer race for a global single-slot callback.
+// -----------------------------------------------------------------------------
 
-pub fn requestEditorState(ctx: *PluginContext, callback: *const fn (*PluginContext, protocol.EditorStateView) void) !void {
-    state_callback = callback;
+const StateCallback = *const fn (*PluginContext, protocol.EditorStateView) void;
+const ConfigCallback = *const fn (*PluginContext, []const u8, ?[]const u8) void;
+const BufferContentCallback = *const fn (*PluginContext, u32, []const u8) void;
+const PluginListCallback = *const fn (*PluginContext, []const u8) void;
+
+fn stateTrampoline(user_data: *anyopaque, typed_cb: *anyopaque, payload: []const u8) void {
+    const ctx: *PluginContext = @ptrCast(@alignCast(user_data));
+    const cb: StateCallback = @ptrCast(@alignCast(typed_cb));
+    const stash: *const ResponseStash = @ptrCast(@alignCast(payload.ptr));
+    cb(ctx, stash.state);
+}
+
+fn configTrampoline(user_data: *anyopaque, typed_cb: *anyopaque, payload: []const u8) void {
+    const ctx: *PluginContext = @ptrCast(@alignCast(user_data));
+    const cb: ConfigCallback = @ptrCast(@alignCast(typed_cb));
+    const stash: *const ResponseStash = @ptrCast(@alignCast(payload.ptr));
+    cb(ctx, stash.config.key, stash.config.value);
+}
+
+fn bufferContentTrampoline(user_data: *anyopaque, typed_cb: *anyopaque, payload: []const u8) void {
+    const ctx: *PluginContext = @ptrCast(@alignCast(user_data));
+    const cb: BufferContentCallback = @ptrCast(@alignCast(typed_cb));
+    const stash: *const ResponseStash = @ptrCast(@alignCast(payload.ptr));
+    cb(ctx, stash.buffer_content.id, stash.buffer_content.content);
+}
+
+fn pluginListTrampoline(user_data: *anyopaque, typed_cb: *anyopaque, payload: []const u8) void {
+    const ctx: *PluginContext = @ptrCast(@alignCast(user_data));
+    const cb: PluginListCallback = @ptrCast(@alignCast(typed_cb));
+    const stash: *const ResponseStash = @ptrCast(@alignCast(payload.ptr));
+    cb(ctx, stash.plugin_list);
+}
+
+pub fn requestEditorState(ctx: *PluginContext, callback: StateCallback) !void {
+    const id = try ctx.requests.register(
+        @ptrCast(ctx),
+        @ptrCast(@constCast(callback)),
+        stateTrampoline,
+        5_000, // 5 s timeout — core is local so this is generous
+    );
     const msg = protocol.PluginMessage{
         .plugin_id = ctx.plugin_id,
         .message_type = .get_state,
         .payload = .{ .state_request = {} },
+        .correlation_id = id,
     };
     try ctx.sendToCore(msg);
 }
@@ -274,14 +335,18 @@ pub fn setConfig(ctx: *PluginContext, key: []const u8, value: []const u8) !void 
     try ctx.sendToCore(msg);
 }
 
-var config_callback: ?*const fn (*PluginContext, []const u8, ?[]const u8) void = null;
-
-pub fn getConfig(ctx: *PluginContext, key: []const u8, callback: *const fn (*PluginContext, []const u8, ?[]const u8) void) !void {
-    config_callback = callback;
+pub fn getConfig(ctx: *PluginContext, key: []const u8, callback: ConfigCallback) !void {
+    const id = try ctx.requests.register(
+        @ptrCast(ctx),
+        @ptrCast(@constCast(callback)),
+        configTrampoline,
+        5_000,
+    );
     const msg = protocol.PluginMessage{
         .plugin_id = ctx.plugin_id,
         .message_type = .get_config,
         .payload = .{ .config_get = key },
+        .correlation_id = id,
     };
     try ctx.sendToCore(msg);
 }
@@ -316,14 +381,18 @@ pub fn openBuffer(ctx: *PluginContext, name: []const u8, content: []const u8) !v
     try ctx.sendToCore(msg);
 }
 
-var buffer_content_callback: ?*const fn (*PluginContext, u32, []const u8) void = null;
-
-pub fn getBufferContent(ctx: *PluginContext, callback: *const fn (*PluginContext, u32, []const u8) void) !void {
-    buffer_content_callback = callback;
+pub fn getBufferContent(ctx: *PluginContext, callback: BufferContentCallback) !void {
+    const id = try ctx.requests.register(
+        @ptrCast(ctx),
+        @ptrCast(@constCast(callback)),
+        bufferContentTrampoline,
+        5_000,
+    );
     const msg = protocol.PluginMessage{
         .plugin_id = ctx.plugin_id,
         .message_type = .get_buffer_content,
         .payload = .{ .buffer_content_request = {} },
+        .correlation_id = id,
     };
     try ctx.sendToCore(msg);
 }
@@ -337,14 +406,18 @@ pub fn switchBuffer(ctx: *PluginContext, buffer_id: u32) !void {
     try ctx.sendToCore(msg);
 }
 
-var plugin_list_callback: ?*const fn (*PluginContext, []const u8) void = null;
-
-pub fn requestPluginList(ctx: *PluginContext, callback: *const fn (*PluginContext, []const u8) void) !void {
-    plugin_list_callback = callback;
+pub fn requestPluginList(ctx: *PluginContext, callback: PluginListCallback) !void {
+    const id = try ctx.requests.register(
+        @ptrCast(ctx),
+        @ptrCast(@constCast(callback)),
+        pluginListTrampoline,
+        5_000,
+    );
     const msg = protocol.PluginMessage{
         .plugin_id = ctx.plugin_id,
         .message_type = .get_plugin_list,
         .payload = .{ .plugin_list_request = {} },
+        .correlation_id = id,
     };
     try ctx.sendToCore(msg);
 }

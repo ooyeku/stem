@@ -1,0 +1,69 @@
+# bash completion for stem
+#
+# Install by sourcing this file from your ~/.bashrc:
+#   source /path/to/stem/scripts/completions/bash/stem
+# or copy it to a directory on $BASH_COMPLETION_USER_DIR (commonly
+#   ~/.local/share/bash-completion/completions/stem).
+
+_stem() {
+    local cur prev words cword
+    _init_completion || return
+
+    local subcommands="find vfind scope config logs lsp help version"
+    local global_flags="-h --help -V --version"
+
+    # First positional: subcommand or file path.
+    if (( cword == 1 )); then
+        if [[ "$cur" == -* ]]; then
+            COMPREPLY=( $(compgen -W "$global_flags" -- "$cur") )
+        else
+            COMPREPLY=( $(compgen -W "$subcommands" -- "$cur") )
+            # Also offer file completion.
+            COMPREPLY+=( $(compgen -f -- "$cur") )
+        fi
+        return
+    fi
+
+    case "${words[1]}" in
+        find|vfind|--find|--vfind|-f)
+            case "$prev" in
+                -p|--path)       COMPREPLY=( $(compgen -d -- "$cur") ); return ;;
+                -e|--ext)        COMPREPLY=( $(compgen -W "zig py js ts tsx jsx go rs c cpp h hpp md json yaml yml" -- "$cur") ); return ;;
+                -x|--exclude)    return ;;
+            esac
+            COMPREPLY=( $(compgen -W "-p --path -e --ext -x --exclude -h --help" -- "$cur") )
+            ;;
+        scope|--scope)
+            case "$prev" in
+                -B|--before|-A|--after) return ;;
+            esac
+            if (( cword == 2 )); then
+                COMPREPLY=( $(compgen -f -- "$cur") )
+            else
+                COMPREPLY=( $(compgen -W "-B --before -A --after -h --help" -- "$cur") )
+            fi
+            ;;
+        config)
+            if (( cword == 2 )); then
+                COMPREPLY=( $(compgen -W "list get set unset" -- "$cur") )
+            fi
+            ;;
+        logs|log)
+            if (( cword == 2 )); then
+                COMPREPLY=( $(compgen -W "view clear" -- "$cur") )
+            fi
+            ;;
+        lsp)
+            if (( cword == 2 )); then
+                COMPREPLY=( $(compgen -W "install list status" -- "$cur") )
+            elif (( cword == 3 )) && [[ "${words[2]}" == "install" ]]; then
+                COMPREPLY=( $(compgen -W "python typescript javascript go rust cpp ruby csharp java all" -- "$cur") )
+            fi
+            ;;
+        *)
+            COMPREPLY=( $(compgen -f -- "$cur") )
+            ;;
+    esac
+}
+
+complete -F _stem stem

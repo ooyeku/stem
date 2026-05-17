@@ -1,3 +1,12 @@
+// Sibling test file for lsp_manager.zig.
+//
+// Convention: most modules in this codebase keep their tests inline as
+// `test "..."` blocks in the same file. This one is the exception — it
+// pulls in transport mocks (Transport.MemPipe) and TestIo helpers that
+// would bloat the production module, and exercises LSPManager through
+// its public API rather than internal helpers, so co-locating buys
+// nothing. New tests for LSPManager belong here.
+
 const std = @import("std");
 const LSPManager = @import("lsp_manager.zig").LSPManager;
 const LSPServer = @import("lsp/server.zig").LSPServer;

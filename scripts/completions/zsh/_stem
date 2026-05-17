@@ -1,0 +1,86 @@
+#compdef stem
+#
+# zsh completion for stem.
+#
+# Install: copy or symlink this file into a directory on $fpath, then
+# rerun `compinit`. A common location is /usr/local/share/zsh/site-functions
+# or ~/.zsh/completions (after adding it to fpath in your ~/.zshrc):
+#
+#   fpath=(~/.zsh/completions $fpath)
+#   autoload -Uz compinit && compinit
+
+_stem() {
+    local -a commands
+    commands=(
+        'find:Search file contents (grep-like)'
+        'vfind:Interactive search results'
+        'scope:Search within one file with context'
+        'config:Read or modify configuration'
+        'logs:Inspect or wipe editor logs'
+        'lsp:Install or list language servers'
+        'help:Show help'
+        'version:Print version'
+    )
+
+    _arguments -C \
+        '(-h --help)'{-h,--help}'[show help]' \
+        '(-V --version)'{-V,--version}'[print version]' \
+        '1: :->cmd_or_path' \
+        '*::arg:->args'
+
+    case $state in
+        cmd_or_path)
+            _describe -t commands 'subcommands' commands
+            _files
+            ;;
+        args)
+            case $words[1] in
+                find|vfind|--find|--vfind|-f)
+                    _arguments \
+                        '*'{-p,--path}'[restrict to path]:dir:_files -/' \
+                        '*'{-e,--ext}'[extension filter]:ext:(zig py js ts tsx jsx go rs c cpp h hpp md json yaml yml)' \
+                        '*'{-x,--exclude}'[exclude pattern]:pattern:' \
+                        '1:query:'
+                    ;;
+                scope|--scope)
+                    _arguments \
+                        '1:file:_files' \
+                        '2:query:' \
+                        {-B,--before}'[lines before]:n:' \
+                        {-A,--after}'[lines after]:n:'
+                    ;;
+                config)
+                    if (( CURRENT == 2 )); then
+                        _values 'config action' \
+                            'list[show all settings]' \
+                            'get[read a key]' \
+                            'set[write a key]' \
+                            'unset[reset a key]'
+                    fi
+                    ;;
+                logs|log)
+                    if (( CURRENT == 2 )); then
+                        _values 'logs action' \
+                            'view[print log files]' \
+                            'clear[delete log files]'
+                    fi
+                    ;;
+                lsp)
+                    if (( CURRENT == 2 )); then
+                        _values 'lsp action' \
+                            'install[install a language server]' \
+                            'list[show installed servers]'
+                    elif (( CURRENT == 3 )) && [[ $words[2] == install ]]; then
+                        _values 'language' \
+                            python typescript javascript go rust cpp ruby csharp java all
+                    fi
+                    ;;
+                *)
+                    _files
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_stem "$@"

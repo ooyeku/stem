@@ -3,8 +3,8 @@
 set.seed(42)
 
 # Simulate y = 2*x + 3 + noise
-n <- 50
-x <- runif(n, min = 0, max = 10)
+n <- 5000
+x <- runif(n, min = 0, max = 100)
 noise <- rnorm(n, mean = 0, sd = 1.5)
 y <- 2 * x + 3 + noise
 
