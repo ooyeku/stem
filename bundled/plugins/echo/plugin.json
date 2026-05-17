@@ -1,0 +1,17 @@
+{
+  "name": "echo",
+  "version": "0.1.0",
+  "description": "Reference out-of-process plugin: registers a single 'echo.hello' command that logs a friendly message",
+  "runtime": "exec",
+  "entry": "stem-echo",
+  "permissions": {
+    "events": []
+  },
+  "commands": [
+    {
+      "id": "echo.hello",
+      "title": "[Echo] Hello",
+      "description": "Log a greeting from the echo plugin"
+    }
+  ]
+}

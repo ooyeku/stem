@@ -79,6 +79,13 @@ fn lookup(handle: abi.PluginHandle) ?*Plugin {
     return state.plugins.get(handle.id);
 }
 
+/// Wire-protocol version for out-of-process plugins. Independent of
+/// the in-process `abi.ABI_VERSION` because the two transports can
+/// rev separately (e.g. adding a JSON-RPC method doesn't require the
+/// .dylib ABI to change). Bumped when the JSON-RPC envelope semantics
+/// change.
+pub const ABI_VERSION_FOR_PROC: u32 = 1;
+
 // ---------------------------------------------------------------------------
 // C-ABI exports — must match the `extern fn` declarations in `abi.zig`.
 // Don't rename these; the dynamic linker keys off the exact symbol name.

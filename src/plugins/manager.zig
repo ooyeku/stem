@@ -11,12 +11,21 @@ const crash_isolation = @import("crash_isolation.zig");
 const MessageBus = @import("../kernel/message_bus.zig").MessageBus;
 const telemetry = @import("../services/telemetry.zig");
 const host_abi = @import("host_abi.zig");
+const manifest_mod = @import("manifest.zig");
+const process_loader = @import("process_loader.zig");
+const ProcessPlugin = process_loader.ProcessPlugin;
+const jsonrpc = @import("jsonrpc.zig");
+const logger_service = @import("../services/logger.zig");
 
 pub const PluginManager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     environ_block: std.process.Environ.Block,
     plugins: std.StringHashMapUnmanaged(*Plugin),
+    /// Out-of-process plugins (Phase 1). Parallel to `plugins` (which
+    /// holds in-process .dylib plugins). Event broadcasts and command
+    /// routing iterate both maps.
+    process_plugins: std.StringHashMapUnmanaged(*ProcessPlugin) = .empty,
     ui_manager: UIManager,
 
     /// Vigil process group that mirrors `plugins` — used for broadcast
@@ -94,13 +103,66 @@ pub const PluginManager = struct {
 
         var it = dir.iterate();
         while (it.next(self.io) catch null) |entry| {
-            if (entry.kind != .file) continue;
-            if (!isSharedLib(entry.name)) continue;
             const full_path = try std.fs.path.join(self.allocator, &[_][]const u8{ plugin_dir, entry.name });
             defer self.allocator.free(full_path);
-            self.loadPlugin(full_path) catch |err| {
-                log.err("Failed to auto-load plugin {s}: {}", .{ entry.name, err });
-            };
+
+            switch (entry.kind) {
+                .file => {
+                    // Flat .dylib layout — Phase 0 compatibility.
+                    if (!isSharedLib(entry.name)) continue;
+                    self.loadPlugin(full_path) catch |err| {
+                        log.err("Failed to auto-load plugin {s}: {}", .{ entry.name, err });
+                    };
+                },
+                .directory => {
+                    // Plugin-directory layout — Phase 1. Looks for a
+                    // manifest at `<dir>/plugin.json`. Skips silently
+                    // if the manifest is missing (treat as a stray dir).
+                    self.tryLoadPluginDir(full_path) catch |err| {
+                        log.warn("Plugin dir {s} failed to load: {s}", .{ entry.name, @errorName(err) });
+                    };
+                },
+                else => continue,
+            }
+        }
+    }
+
+    /// Try to load a plugin from a directory containing a `plugin.json`
+    /// manifest. Routes to the appropriate loader based on the
+    /// manifest's `runtime` field.
+    pub fn tryLoadPluginDir(self: *PluginManager, plugin_dir: []const u8) !void {
+        const manifest_path = try std.fs.path.join(self.allocator, &.{ plugin_dir, "plugin.json" });
+        defer self.allocator.free(manifest_path);
+
+        const file = std.Io.Dir.openFileAbsolute(self.io, manifest_path, .{}) catch |err| {
+            if (err == error.FileNotFound) return; // not a plugin dir
+            return err;
+        };
+        defer file.close(self.io);
+
+        const size = try file.length(self.io);
+        if (size > 1 * 1024 * 1024) return error.ManifestTooLarge;
+
+        const bytes = try self.allocator.alloc(u8, @intCast(size));
+        defer self.allocator.free(bytes);
+        _ = try file.readPositionalAll(self.io, bytes, 0);
+
+        var m = try manifest_mod.parse(self.allocator, bytes);
+        defer m.deinit();
+
+        switch (m.runtime) {
+            .dylib => {
+                const entry_path = try std.fs.path.join(self.allocator, &.{ plugin_dir, m.entry });
+                defer self.allocator.free(entry_path);
+                try self.loadPlugin(entry_path);
+            },
+            .exec => {
+                try self.loadProcessPluginFromManifest(plugin_dir, &m);
+            },
+            .wasm => {
+                log.warn("Plugin '{s}' requests wasm runtime — Phase 2 not yet shipped", .{m.name});
+                return error.RuntimeNotSupported;
+            },
         }
     }
 
@@ -365,6 +427,207 @@ pub const PluginManager = struct {
         }
 
         log.info("Loaded plugin: {s}", .{plugin.id});
+    }
+
+    // -------------------------------------------------------------------
+    // Out-of-process plugins (Phase 1).
+    //
+    // A `ProcessPlugin` is a child process speaking JSON-RPC over
+    // stdio. The methods below define the host's RPC surface — what
+    // a plugin can call. Plugin-side handlers are simple symmetric
+    // functions that translate JSON-RPC calls to/from the same
+    // protocol.PluginMessage events the in-process .dylib plugins
+    // see, so commands + events flow through one registry regardless
+    // of which loader serves them.
+    // -------------------------------------------------------------------
+
+    pub fn loadProcessPluginFromManifest(
+        self: *PluginManager,
+        plugin_dir: []const u8,
+        m: *const manifest_mod.Manifest,
+    ) !void {
+        if (self.process_plugins.contains(m.name)) return error.DuplicatePluginId;
+
+        const entry_path = try std.fs.path.join(self.allocator, &.{ plugin_dir, m.entry });
+        errdefer self.allocator.free(entry_path);
+
+        const name_dup = try self.allocator.dupe(u8, m.name);
+        errdefer self.allocator.free(name_dup);
+
+        const pp = try self.allocator.create(ProcessPlugin);
+        errdefer self.allocator.destroy(pp);
+
+        pp.* = ProcessPlugin.init(self.allocator, self.io, name_dup, entry_path, .{
+            .user_data = @ptrCast(self),
+            .on_notification = handleProcessNotification,
+            .on_request = handleProcessRequest,
+            .on_exit = handleProcessExit,
+        });
+        errdefer pp.deinit();
+
+        try pp.start();
+
+        try self.process_plugins.put(self.allocator, name_dup, pp);
+
+        // Synchronous `initialize` handshake: tell the plugin which
+        // ABI version it's talking to, and its assigned id. Plugins
+        // use this to bind any local state before the first command.
+        const init_params = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"abi_version\":{d},\"plugin_id\":\"{s}\"}}",
+            .{ host_abi.ABI_VERSION_FOR_PROC, m.name },
+        );
+        defer self.allocator.free(init_params);
+        try pp.sendNotification("plugin/initialize", init_params);
+
+        log.info("Loaded process plugin: {s} ({s})", .{ m.name, entry_path });
+    }
+
+    /// JSON-RPC notification handler — runs on the ProcessPlugin's
+    /// reader thread. Routes to the existing in-process plumbing
+    /// where possible (so commands appear in the same palette etc.).
+    fn handleProcessNotification(
+        user_data: *anyopaque,
+        method: []const u8,
+        params: std.json.Value,
+    ) void {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+
+        if (std.mem.eql(u8, method, "plugin/log")) {
+            // params: { "level": int, "message": string }
+            if (params != .object) return;
+            const obj = params.object;
+            const message = if (obj.get("message")) |v| (if (v == .string) v.string else return) else return;
+            const level: u8 = if (obj.get("level")) |v| (if (v == .integer) @intCast(v.integer) else 1) else 1;
+            if (logger_service.getGlobal()) |g| {
+                const lvl: logger_service.LogLevel = switch (level) {
+                    0 => .debug,
+                    2 => .warn,
+                    3 => .err,
+                    else => .info,
+                };
+                g.log(lvl, "Plugin", "{s}", .{message});
+            }
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "plugin/registerCommand")) {
+            // params: { "plugin_id": string, "id": string, "title": string, "description": string }
+            self.registerProcessCommand(params) catch |err| {
+                log.warn("registerCommand failed: {s}", .{@errorName(err)});
+            };
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "plugin/subscribeEvent")) {
+            // params: { "plugin_id": string, "event": string }
+            self.subscribeProcessEvent(params) catch {};
+            return;
+        }
+
+        if (std.mem.eql(u8, method, "editor/showNotification")) {
+            // params: { "level": int, "message": string }
+            if (params != .object) return;
+            const obj = params.object;
+            const msg_v = obj.get("message") orelse return;
+            if (msg_v != .string) return;
+            const level: u8 = if (obj.get("level")) |v| (if (v == .integer) @intCast(v.integer) else 0) else 0;
+            const nl: protocol.NotificationLevel = switch (level) {
+                1 => .warning,
+                2 => .err,
+                else => .info,
+            };
+            const pm = protocol.PluginMessage{
+                .plugin_id = "process-plugin",
+                .message_type = .show_notification,
+                .payload = .{ .notification = .{ .level = nl, .message = msg_v.string } },
+            };
+            const outer = protocol.Message{ .plugin_message = pm };
+            const encoded = outer.encode(self.allocator) catch return;
+            defer self.allocator.free(encoded);
+            if (self.ui_bus.inbox.send(encoded)) |_| {} else |_| {}
+            return;
+        }
+
+        log.info("process plugin: unhandled notification '{s}'", .{method});
+    }
+
+    fn handleProcessRequest(
+        user_data: *anyopaque,
+        id: u64,
+        method: []const u8,
+        params: std.json.Value,
+    ) void {
+        _ = params;
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        _ = self;
+        log.info("process plugin: request '{s}' id={d} (not yet handled)", .{ method, id });
+        // Future: route editor/getState etc. here.
+    }
+
+    fn handleProcessExit(user_data: *anyopaque) void {
+        _ = user_data;
+        log.info("process plugin exited", .{});
+        // Future: trigger the same RestartPolicy as in-process plugins.
+    }
+
+    fn registerProcessCommand(self: *PluginManager, params: std.json.Value) !void {
+        if (params != .object) return error.InvalidParams;
+        const obj = params.object;
+        const plugin_id = obj.get("plugin_id") orelse return error.InvalidParams;
+        const id = obj.get("id") orelse return error.InvalidParams;
+        const title = obj.get("title") orelse return error.InvalidParams;
+        const description = if (obj.get("description")) |d| d else std.json.Value{ .string = "" };
+        if (plugin_id != .string or id != .string or title != .string or description != .string) return error.InvalidParams;
+
+        const ctx = try self.allocator.create(PluginCommandContext);
+        errdefer self.allocator.destroy(ctx);
+        const plugin_id_dup = try self.allocator.dupe(u8, plugin_id.string);
+        errdefer self.allocator.free(plugin_id_dup);
+        const id_dup = try self.allocator.dupe(u8, id.string);
+        errdefer self.allocator.free(id_dup);
+        const registry_id_dup = try self.allocator.dupe(u8, id.string);
+        errdefer self.allocator.free(registry_id_dup);
+        const title_dup = try self.allocator.dupe(u8, title.string);
+        errdefer self.allocator.free(title_dup);
+        const description_dup = try self.allocator.dupe(u8, description.string);
+        errdefer self.allocator.free(description_dup);
+        ctx.* = .{
+            .manager = self,
+            .plugin_id = plugin_id_dup,
+            .command_id = id_dup,
+            .registry_id = registry_id_dup,
+            .registry_title = title_dup,
+            .registry_description = description_dup,
+        };
+
+        try self.command_registry.register(
+            ctx.registry_id,
+            ctx.registry_title,
+            ctx.registry_description,
+            executeProcessPluginCommand,
+            ctx,
+        );
+        try self.allocated_contexts.append(self.allocator, ctx);
+        log.info("Process plugin '{s}' registered command: {s}", .{ plugin_id.string, id.string });
+    }
+
+    /// Dispatch a command back to its owning process plugin.
+    fn executeProcessPluginCommand(_: *anyopaque, context_ptr: ?*const anyopaque) anyerror!void {
+        const cmd_ctx: *const PluginCommandContext = @ptrCast(@alignCast(context_ptr.?));
+        const self = cmd_ctx.manager;
+        const pp = self.process_plugins.get(cmd_ctx.plugin_id) orelse return;
+        const params = try std.fmt.allocPrint(self.allocator, "{{\"id\":\"{s}\"}}", .{cmd_ctx.command_id});
+        defer self.allocator.free(params);
+        try pp.sendNotification("command/execute", params);
+    }
+
+    fn subscribeProcessEvent(self: *PluginManager, params: std.json.Value) !void {
+        _ = self;
+        _ = params;
+        // Future: extract `plugin_id` + `event`, add to event_subscribers
+        // map. broadcastEvent already iterates subscribers; we'll need a
+        // parallel path for the process_plugins map.
     }
 
     /// Called from the (about-to-exit) worker thread after a crash.

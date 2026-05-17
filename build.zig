@@ -388,6 +388,21 @@ pub fn build(b: *std.Build) void {
     md_plugin.root_module.addImport("stem", stem_plugin_module);
     b.installArtifact(md_plugin);
 
+    // Out-of-process reference plugin (Phase 1). Speaks JSON-RPC 2.0
+    // over stdio with LSP framing. No `stem` import — the plugin is
+    // language-agnostic by design, so we keep the reference example
+    // free of any host-side dependencies too.
+    const echo_plugin = b.addExecutable(.{
+        .name = "stem-echo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bundled/plugins/echo/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    echo_plugin.root_module.link_libc = true;
+    b.installArtifact(echo_plugin);
+
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
