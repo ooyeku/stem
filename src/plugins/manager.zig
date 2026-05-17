@@ -14,6 +14,8 @@ const host_abi = @import("host_abi.zig");
 const manifest_mod = @import("manifest.zig");
 const process_loader = @import("process_loader.zig");
 const ProcessPlugin = process_loader.ProcessPlugin;
+const wasm_loader = @import("wasm/loader.zig");
+const WasmPlugin = wasm_loader.WasmPlugin;
 const jsonrpc = @import("jsonrpc.zig");
 const logger_service = @import("../services/logger.zig");
 
@@ -26,6 +28,10 @@ pub const PluginManager = struct {
     /// holds in-process .dylib plugins). Event broadcasts and command
     /// routing iterate both maps.
     process_plugins: std.StringHashMapUnmanaged(*ProcessPlugin) = .empty,
+    /// WebAssembly plugins (Phase 2). Each entry owns a decoded
+    /// module + live wasm instance; commands route through
+    /// `executeWasmPluginCommand`.
+    wasm_plugins: std.StringHashMapUnmanaged(*WasmPlugin) = .empty,
     ui_manager: UIManager,
 
     /// Vigil process group that mirrors `plugins` — used for broadcast
@@ -160,8 +166,7 @@ pub const PluginManager = struct {
                 try self.loadProcessPluginFromManifest(plugin_dir, &m);
             },
             .wasm => {
-                log.warn("Plugin '{s}' requests wasm runtime — Phase 2 not yet shipped", .{m.name});
-                return error.RuntimeNotSupported;
+                try self.loadWasmPluginFromManifest(plugin_dir, &m);
             },
         }
     }
@@ -266,6 +271,17 @@ pub const PluginManager = struct {
             self.allocator.destroy(plugin);
         }
         self.plugins.deinit(self.allocator);
+
+        // Phase 2 wasm plugins — tear down instances + decoded modules.
+        var w_it = self.wasm_plugins.valueIterator();
+        while (w_it.next()) |wp_ptr| {
+            const wp = wp_ptr.*;
+            self.cleanupPluginResources(wp.plugin_id);
+            wp.deinit();
+            self.allocator.destroy(wp);
+        }
+        self.wasm_plugins.deinit(self.allocator);
+
         self.ui_manager.deinit();
 
         self.allocated_contexts.deinit(self.allocator);
@@ -628,6 +644,153 @@ pub const PluginManager = struct {
         // Future: extract `plugin_id` + `event`, add to event_subscribers
         // map. broadcastEvent already iterates subscribers; we'll need a
         // parallel path for the process_plugins map.
+    }
+
+    // -------------------------------------------------------------------
+    // WebAssembly plugins (Phase 2).
+    //
+    // Same command-registry plumbing as process plugins, but the host
+    // surface is a small handful of wasm imports (`stem_log`,
+    // `stem_register_command`, …) instead of JSON-RPC methods.
+    // -------------------------------------------------------------------
+
+    pub fn loadWasmPluginFromManifest(
+        self: *PluginManager,
+        plugin_dir: []const u8,
+        m: *const manifest_mod.Manifest,
+    ) !void {
+        if (self.wasm_plugins.contains(m.name)) return error.DuplicatePluginId;
+        if (self.plugins.contains(m.name)) return error.DuplicatePluginId;
+
+        const wasm_path = try std.fs.path.join(self.allocator, &.{ plugin_dir, m.entry });
+        defer self.allocator.free(wasm_path);
+
+        const wp = wasm_loader.load(
+            self.allocator,
+            self.io,
+            m.name,
+            wasm_path,
+            .{
+                .user_data = @ptrCast(self),
+                .on_log = onWasmLog,
+                .on_register_command = onWasmRegisterCommand,
+                .on_show_notification = onWasmShowNotification,
+            },
+        ) catch |err| {
+            log.err("Failed to load wasm plugin '{s}': {s}", .{ m.name, @errorName(err) });
+            return err;
+        };
+        errdefer {
+            wp.deinit();
+            self.allocator.destroy(wp);
+        }
+
+        try self.wasm_plugins.put(self.allocator, wp.plugin_id, wp);
+
+        // Run `activate` — plugin uses it to call back into
+        // `stem_register_command` and friends.
+        wp.activate() catch |err| {
+            log.warn("wasm plugin '{s}' activate failed: {s}", .{ m.name, @errorName(err) });
+        };
+
+        log.info("Loaded wasm plugin: {s} ({s})", .{ m.name, wasm_path });
+    }
+
+    fn onWasmLog(user_data: *anyopaque, plugin_id: []const u8, level: u8, message: []const u8) void {
+        _ = plugin_id;
+        _ = user_data;
+        if (logger_service.getGlobal()) |g| {
+            const lvl: logger_service.LogLevel = switch (level) {
+                0 => .debug,
+                2 => .warn,
+                3 => .err,
+                else => .info,
+            };
+            g.log(lvl, "Plugin", "{s}", .{message});
+        }
+    }
+
+    fn onWasmRegisterCommand(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        id: []const u8,
+        title: []const u8,
+        description: []const u8,
+    ) void {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.registerWasmCommand(plugin_id, id, title, description) catch |err| {
+            log.warn("wasm registerCommand failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    fn onWasmShowNotification(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        level: u8,
+        message: []const u8,
+    ) void {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        _ = plugin_id;
+        const nl: protocol.NotificationLevel = switch (level) {
+            1 => .warning,
+            2 => .err,
+            else => .info,
+        };
+        const pm = protocol.PluginMessage{
+            .plugin_id = "wasm-plugin",
+            .message_type = .show_notification,
+            .payload = .{ .notification = .{ .level = nl, .message = message } },
+        };
+        const outer = protocol.Message{ .plugin_message = pm };
+        const encoded = outer.encode(self.allocator) catch return;
+        defer self.allocator.free(encoded);
+        if (self.ui_bus.inbox.send(encoded)) |_| {} else |_| {}
+    }
+
+    fn registerWasmCommand(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        id: []const u8,
+        title: []const u8,
+        description: []const u8,
+    ) !void {
+        const ctx = try self.allocator.create(PluginCommandContext);
+        errdefer self.allocator.destroy(ctx);
+        const pid_dup = try self.allocator.dupe(u8, plugin_id);
+        errdefer self.allocator.free(pid_dup);
+        const id_dup = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(id_dup);
+        const registry_id_dup = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(registry_id_dup);
+        const title_dup = try self.allocator.dupe(u8, title);
+        errdefer self.allocator.free(title_dup);
+        const desc_dup = try self.allocator.dupe(u8, description);
+        errdefer self.allocator.free(desc_dup);
+        ctx.* = .{
+            .manager = self,
+            .plugin_id = pid_dup,
+            .command_id = id_dup,
+            .registry_id = registry_id_dup,
+            .registry_title = title_dup,
+            .registry_description = desc_dup,
+        };
+        try self.command_registry.register(
+            ctx.registry_id,
+            ctx.registry_title,
+            ctx.registry_description,
+            executeWasmPluginCommand,
+            ctx,
+        );
+        try self.allocated_contexts.append(self.allocator, ctx);
+        log.info("Wasm plugin '{s}' registered command: {s}", .{ plugin_id, id });
+    }
+
+    /// Dispatch a command back to its owning wasm plugin.
+    fn executeWasmPluginCommand(_: *anyopaque, context_ptr: ?*const anyopaque) anyerror!void {
+        const cmd_ctx: *const PluginCommandContext = @ptrCast(@alignCast(context_ptr.?));
+        const self = cmd_ctx.manager;
+        const wp = self.wasm_plugins.get(cmd_ctx.plugin_id) orelse return;
+        try wp.dispatchCommand(cmd_ctx.command_id);
     }
 
     /// Called from the (about-to-exit) worker thread after a crash.

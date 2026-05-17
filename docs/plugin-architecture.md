@@ -67,27 +67,39 @@ Pieces to build:
 
 Estimated effort: 5–7 days.
 
-### Phase 2: WebAssembly plugins
+### Phase 2: WebAssembly plugins (shipped)
 
-Goal: the primary plugin runtime is WASM. Sandboxed by default, single
-file distribution, any-language source, hot-reload trivial.
+WASM plugins run inside stem's own pure-Zig interpreter — no
+transitive C deps, no subprocess. Sandboxed by default, single-file
+distribution, any-language source.
 
-Pieces to build:
+Shipped pieces:
 
-1. **Pure-Zig WASM interpreter** (the route I'd recommend — keeps the
-   toolchain pure-Zig, no transitive C deps; the wasm subset stem
-   needs is small). Approx. 1500 lines.
-2. **WASI-style host imports** matching the phase 1 schema — same
-   capabilities, exposed as wasm imports instead of JSON-RPC methods.
-3. **WASM build pipeline** — `zig build -Dtarget=wasm32-freestanding`
-   for the bundled plugins. Single .wasm output per plugin.
-4. **Markdown-viewer + plugin-manager** migrations as canaries.
+1. **Pure-Zig WASM interpreter** — `src/plugins/wasm/interpreter.zig`.
+   Handles the wasm 1.0 core subset stem plugins need: module decode
+   (type/import/function/memory/global/export/start/code/data
+   sections), linear memory with grow, globals, block/loop/if/else
+   control flow, br/br_if/br_table, full i32 + i64 ALU, memory
+   loads/stores with sign extension, drop/select, host imports.
+   Unsupported opcodes (floats, SIMD, tables, refs) abort with
+   `error.UnsupportedOp` rather than silently miscompile.
+2. **Host imports** in `src/plugins/wasm/loader.zig`:
+   `env.stem_log`, `env.stem_register_command`,
+   `env.stem_show_notification`. Same surface area as Phase 1
+   JSON-RPC, but with `(ptr, len)` pointer pairs into wasm linear
+   memory instead of JSON envelopes.
+3. **Build pipeline** — `build.zig` adds a `wasm32-freestanding`
+   target for the canary plugin. The output `.wasm` is installed
+   alongside the dylibs and `stem-echo`.
+4. **Canary plugin** — `bundled/plugins/echo-wasm/`. Imports the host
+   surface, exports `activate` (which registers a command) and
+   `handle_command` (which logs a greeting when the command fires).
+   `tryLoadPluginDir` dispatches `runtime: "wasm"` manifests to the
+   wasm loader; cleanup mirrors the dylib + process paths.
 
-Alternative: embed [wazero](https://wazero.io/) via a small Go runner
-process (extra dep, extra binary size, but battle-tested).
-
-Estimated effort: 2–3 weeks for the interpreter route, 1 week for
-wazero subprocess route.
+End-to-end integration test (`zig build test`) loads the built
+`.wasm`, drives `activate` and `handle_command`, and asserts the host
+callbacks fired.
 
 ### Phase 3: polish + deprecate
 

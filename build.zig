@@ -403,6 +403,29 @@ pub fn build(b: *std.Build) void {
     echo_plugin.root_module.link_libc = true;
     b.installArtifact(echo_plugin);
 
+    // ===== Bundled WebAssembly plugin (Phase 2) =====
+    // The wasm canary is built for `wasm32-freestanding`. We attach
+    // it to the default install step so `zig build` produces a
+    // ready-to-load .wasm alongside the .dylibs and stem-echo. Wasm
+    // host imports (env.stem_*) are left unresolved at build-time —
+    // they're bound by the host's pure-Zig interpreter at instantiate
+    // time.
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const echo_wasm = b.addExecutable(.{
+        .name = "echo-wasm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bundled/plugins/echo-wasm/src/main.zig"),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    echo_wasm.entry = .disabled;
+    echo_wasm.rdynamic = true;
+    b.installArtifact(echo_wasm);
+
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);

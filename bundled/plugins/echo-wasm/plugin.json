@@ -1,0 +1,17 @@
+{
+  "name": "echo-wasm",
+  "version": "0.1.0",
+  "description": "Reference WebAssembly plugin: registers an 'echo-wasm.hello' command that logs a greeting from inside the wasm sandbox",
+  "runtime": "wasm",
+  "entry": "echo-wasm.wasm",
+  "permissions": {
+    "events": []
+  },
+  "commands": [
+    {
+      "id": "echo-wasm.hello",
+      "title": "[Echo-WASM] Hello",
+      "description": "Log a greeting from the wasm echo plugin"
+    }
+  ]
+}
