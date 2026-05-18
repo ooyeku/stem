@@ -544,7 +544,13 @@ pub const LSPServer = struct {
         // by the reader thread's defer when it dies, so a crashed server
         // wakes us promptly too.
         const init_deadline_ms = std.Io.Clock.real.now(self.io).toMilliseconds() + init_timeout_seconds * 1000;
-        const tick_ms: i64 = 100;
+        // The reader thread fires `init_event` the moment the
+        // initialize response arrives, so the common case wakes us
+        // immediately. The tick is a safety net for missed events or
+        // a crashed reader — keep it short so the worst-case latency
+        // between server-ready and us-noticing stays in the tens of
+        // milliseconds, not a tenth of a second.
+        const tick_ms: i64 = 25;
         while (!self.is_initialized.load(.acquire)) {
             if (self.external_shutdown) |flag| {
                 if (flag.load(.acquire)) {

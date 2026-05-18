@@ -752,6 +752,7 @@ pub const Core = struct {
         try R.register("lsp.definition", "LSP: Go to Definition", "Jump to symbol definition", Wrap(LspCommands.cmdLspGoToDefinition).run, null);
         try R.register("lsp.diagnostics", "LSP: Show Diagnostics", "List all errors/warnings for current file", Wrap(LspCommands.cmdLspShowDiagnostics).run, null);
         try R.register("lsp.restart", "LSP: Restart Server", "Force restart the embedded zls instance", Wrap(LspCommands.cmdLspRestartServer).run, null);
+        try R.register("lsp.prewarm", "LSP: Prewarm Workspace", "Scan the workspace and start servers for every detected language", Wrap(LspCommands.cmdLspPrewarm).run, null);
         try R.register("lsp.hover", "LSP: Hover", "Trigger hover information for symbol under cursor", Wrap(LspCommands.cmdLspHover).run, null);
         try R.register("lsp.references", "LSP: Find References", "Find all references to symbol under cursor", Wrap(LspCommands.cmdLspFindReferences).run, null);
 
@@ -839,6 +840,19 @@ pub const Core = struct {
         self.prespawnLSPs() catch |err| {
             std.log.warn("LSP prespawn failed: {}", .{err});
         };
+
+        // Scan the workspace and start LSPs for every language that
+        // appears in the project — not just languages of currently-open
+        // buffers. This covers the "user opens stem on a polyglot repo
+        // and the first hover on a new language is slow" case: by the
+        // time they switch buffers, the relevant server is initializing
+        // (or done) in the background.
+        if (std.Io.Dir.cwd().realPathFileAlloc(self.io, ".", self.allocator)) |cwd| {
+            defer self.allocator.free(cwd);
+            _ = self.lsp_manager.prewarmWorkspaceLanguages(cwd) catch |err| {
+                std.log.warn("LSP workspace prewarm failed: {}", .{err});
+            };
+        } else |_| {}
 
         // Eagerly send `didOpen` for the active buffer so the LSP is aware
         // of the document the user is about to edit. This queues through

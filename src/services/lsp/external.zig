@@ -1,6 +1,7 @@
 const std = @import("std");
 const Transport = @import("../../lsp/transport.zig");
 const platform = @import("../../kernel/platform.zig");
+const installer_mod = @import("installer.zig");
 
 const log = std.log.scoped(.LSPExternal);
 
@@ -8,6 +9,14 @@ const log = std.log.scoped(.LSPExternal);
 /// PID is captured as an integer (cheap, safe to copy across threads), so
 /// the watch doesn't reference the `Child` struct after `runExternalServer`
 /// returns. Owned by the watchdog thread, freed via `defer` there.
+/// True when `s` looks like a bare program name (no path separators)
+/// that needs OS PATH resolution to spawn.
+fn isBareName(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (c == '/' or c == '\\') return false;
+    return true;
+}
+
 const KillWatch = struct {
     pid: platform.Pid,
     /// Set by `pumpInput` when its read loop exits — usually because our
@@ -35,12 +44,60 @@ pub fn runExternalServer(
     defer threaded.deinit();
     const io = threaded.io();
 
-    var child = try std.process.spawn(io, .{
-        .argv = args,
+    // If `args[0]` is a bare program name (no path separator) and the
+    // child would inherit a bare PATH from a GUI-launched stem, the
+    // OS lookup will fail before we ever see stdout. Resolve the
+    // interpreter ourselves against the same toolchain dirs we
+    // search for LSP binaries (brew, opam, ghcup, cargo, etc.) and
+    // substitute an absolute path. If resolution fails, fall through
+    // — let the OS try its own PATH lookup with the bare name and
+    // surface its error.
+    var resolved_buf: [256][]const u8 = undefined;
+    var resolved_slice: []const []const u8 = args;
+    var resolved_owned: ?[]u8 = null;
+    defer if (resolved_owned) |s| allocator.free(s);
+
+    if (args.len > 0 and args.len <= resolved_buf.len and isBareName(args[0])) {
+        if (installer_mod.findOnSystem(allocator, io, args[0], environ_block)) |abs| {
+            log.info("resolved interpreter '{s}' -> '{s}'", .{ args[0], abs });
+            resolved_owned = abs;
+            resolved_buf[0] = abs;
+            for (args[1..], 1..) |a, i| resolved_buf[i] = a;
+            resolved_slice = resolved_buf[0..args.len];
+        } else {
+            // Bail loud-and-fast instead of letting `std.process.spawn`
+            // return `FileNotFound` and then having `is_initialized`
+            // wait its full 30 s timeout. The error message names the
+            // missing interpreter so the user knows exactly what to
+            // install — most commonly `node` for the npm-based servers
+            // (Pyright, typescript-language-server, vscode-css/html/
+            // json, intelephense, bash-language-server, perlnavigator)
+            // or `java` for jdtls.
+            log.err(
+                "interpreter '{s}' not found on PATH or in any known toolchain dir (brew, opam, ghcup, cargo, sdkman, asdf, …). Install it and restart stem. Hint: `brew install {s}` on macOS.",
+                .{ args[0], args[0] },
+            );
+            // Close output_pipe so the LSPServer reader thread sees
+            // EOF and wakes the init waiter — otherwise the start()
+            // path sits in its 30 s timeout for nothing.
+            output_pipe.close();
+            return error.InterpreterNotFound;
+        }
+    }
+
+    var child = std.process.spawn(io, .{
+        .argv = resolved_slice,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
-    });
+    }) catch |err| {
+        // Same logic as the interpreter-not-found path: surface
+        // failure to the reader so we don't burn the full init
+        // timeout when the spawn itself never succeeds.
+        log.err("spawn '{s}' failed: {} — closing pipes so init can bail fast", .{ resolved_slice[0], err });
+        output_pipe.close();
+        return err;
+    };
     // If anything after the spawn fails before we reach `child.wait` below,
     // we'd otherwise leak a child process (zombie) and its three pipes. Kill
     // and reap so the caller can give up cleanly. Note: this errdefer also

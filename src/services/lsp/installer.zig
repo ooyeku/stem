@@ -2,10 +2,36 @@ const std = @import("std");
 const builtin = @import("builtin");
 const log = std.log.scoped(.LSPInstaller);
 
+/// System-wide binary lookup, usable outside the `Installer` (for
+/// example by `external.runExternalServer` to resolve interpreters
+/// like `node` and `java` before spawning an LSP child). Searches
+/// `$PATH` first, then the same well-known toolchain bin directories
+/// the Installer probes. Returns null when nothing matches.
+///
+/// Caller owns the returned slice.
+pub fn findOnSystem(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    name: []const u8,
+    environ_block: std.process.Environ.Block,
+) ?[]u8 {
+    var inst: Installer = .{
+        .allocator = allocator,
+        .io = io,
+        .environ_block = environ_block,
+    };
+    return inst.findBinary(name, &[_][]const u8{});
+}
+
 pub const Installer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     environ_block: std.process.Environ.Block,
+    /// Optional user-facing progress sink. The CLI sets this to stderr
+    /// so `stem lsp install` prints download / extract milestones live
+    /// — without it, the same messages only land in `~/.stem/logs/*`
+    /// and the command looks frozen for the 10+ seconds curl is busy.
+    progress: ?*std.Io.Writer = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_block: std.process.Environ.Block) Installer {
         return .{
@@ -13,6 +39,18 @@ pub const Installer = struct {
             .io = io,
             .environ_block = environ_block,
         };
+    }
+
+    /// Emit a milestone message: always to the structured log; to the
+    /// user-facing progress writer too if one is attached. Errors on
+    /// the progress write are swallowed — a broken pipe to the CLI
+    /// shouldn't abort the install.
+    fn note(self: *Installer, comptime fmt: []const u8, args: anytype) void {
+        log.info(fmt, args);
+        if (self.progress) |w| {
+            w.print("    " ++ fmt ++ "\n", args) catch {};
+            w.flush() catch {};
+        }
     }
 
     pub fn ensurePyright(self: *Installer, auto_install: bool) ![]const u8 {
@@ -78,7 +116,7 @@ pub const Installer = struct {
     fn fetchNpmTarballUrl(self: *Installer, package: []const u8) ![]u8 {
         const metadata_url = try std.fmt.allocPrint(self.allocator, "https://registry.npmjs.org/{s}/latest", .{package});
         defer self.allocator.free(metadata_url);
-        log.info("Fetching metadata from {s}", .{metadata_url});
+        self.note("fetching npm metadata for {s}", .{package});
 
         const json_out = try self.runCommand(&.{ "curl", "-fsSL", metadata_url });
         defer self.allocator.free(json_out);
@@ -103,7 +141,6 @@ pub const Installer = struct {
     fn installNpmPackage(self: *Installer, package: []const u8, install_dir: []const u8) !void {
         const tarball_url = try self.fetchNpmTarballUrl(package);
         defer self.allocator.free(tarball_url);
-        log.info("Found tarball: {s}", .{tarball_url});
 
         try std.Io.Dir.cwd().createDirPath(self.io, install_dir);
 
@@ -114,9 +151,11 @@ pub const Installer = struct {
         const archive_path = try std.fs.path.join(self.allocator, &.{ tmp, archive_name });
         defer self.allocator.free(archive_path);
 
+        self.note("downloading tarball", .{});
         try self.runArgvVerbose(&.{ "curl", "-fsSL", "-o", archive_path, tarball_url });
         defer std.Io.Dir.cwd().deleteFile(self.io, archive_path) catch {};
 
+        self.note("extracting to {s}", .{install_dir});
         try self.runArgvVerbose(&.{ "tar", "-xzf", archive_path, "-C", install_dir });
     }
 
@@ -222,7 +261,7 @@ pub const Installer = struct {
         defer self.allocator.free(bin_dir);
         try std.Io.Dir.cwd().createDirPath(self.io, bin_dir);
 
-        log.info("Installing gopls via 'go install' with GOBIN={s}", .{bin_dir});
+        self.note("running 'go install golang.org/x/tools/gopls@latest' (this can take a minute)", .{});
 
         // Pass GOBIN via the child's environment block rather than via shell
         // string interpolation.
@@ -324,7 +363,7 @@ pub const Installer = struct {
         );
         defer self.allocator.free(download_url);
 
-        log.info("Downloading rust-analyzer from {s}", .{download_url});
+        self.note("downloading rust-analyzer ({s})", .{target_tuple});
 
         const tmp = try self.tempDir();
         defer self.allocator.free(tmp);
@@ -335,6 +374,7 @@ pub const Installer = struct {
 
         try self.runArgvVerbose(&.{ "curl", "-fsSL", "-o", archive_path, download_url });
         defer std.Io.Dir.cwd().deleteFile(self.io, archive_path) catch {};
+        self.note("extracting", .{});
 
         const final_path = try std.fs.path.join(self.allocator, &.{ install_dir, binary_name });
         defer self.allocator.free(final_path);
@@ -399,23 +439,165 @@ pub const Installer = struct {
         return error.NotInstalled;
     }
 
-    /// Resolve a binary name on the user's PATH. Returns an owned absolute
-    /// path string on hit, null on miss. Used by language servers that ship
-    /// with system toolchains (clangd, jdtls launcher script).
+    /// Resolve a binary name on the user's PATH. Returns an owned
+    /// absolute path string on hit, null on miss. Kept as a thin
+    /// wrapper over `findBinary` so the simple case stays readable.
     fn findOnPath(self: *Installer, name: []const u8) ?[]u8 {
+        return self.findBinary(name, &[_][]const u8{});
+    }
+
+    /// Search for `name` in PATH, then in well-known toolchain bin
+    /// directories that GUI-launched stem (or a fresh shell before
+    /// rc-files load) tends to miss. `extra_dirs` are tool-specific
+    /// fallbacks the caller already knows about. Caller owns the
+    /// returned slice.
+    ///
+    /// Order matters: PATH first (so user-overridden binaries win),
+    /// then `extra_dirs` (tool-specific knowledge), then a bundled
+    /// list of common locations (brew/cargo/ghcup/opam/coursier/
+    /// sdkman/asdf/etc.). The first hit wins.
+    fn findBinary(self: *Installer, name: []const u8, extra_dirs: []const []const u8) ?[]u8 {
         const env: std.process.Environ = .{ .block = self.environ_block };
-        const path = env.getPosix("PATH") orelse return null;
-        var it = std.mem.tokenizeScalar(u8, path, if (builtin.os.tag == .windows) ';' else ':');
-        while (it.next()) |dir| {
-            const candidate = std.fs.path.join(self.allocator, &.{ dir, name }) catch continue;
-            // Check that it's executable. `access` with .mode = .read_only
-            // would be enough to confirm existence; we trust PATH placement
-            // to mean executable.
-            std.Io.Dir.accessAbsolute(self.io, candidate, .{}) catch {
-                self.allocator.free(candidate);
-                continue;
-            };
-            return candidate;
+        const sep: u8 = if (builtin.os.tag == .windows) ';' else ':';
+
+        if (env.getPosix("PATH")) |path| {
+            var it = std.mem.tokenizeScalar(u8, path, sep);
+            while (it.next()) |dir| {
+                if (self.tryJoinFile(dir, name)) |p| return p;
+            }
+        }
+
+        for (extra_dirs) |dir| {
+            if (self.expandAndTry(dir, name)) |p| return p;
+        }
+
+        const home = env.getPosix("HOME") orelse env.getPosix("USERPROFILE") orelse "";
+        const common = commonBinDirs();
+        for (common) |dir| {
+            if (self.expandAndTry(dir, name)) |p| return p;
+            _ = home; // referenced via expandAndTry through getPosix
+        }
+
+        // Some toolchains expose binaries via glob-y dirs (`~/.opam/<switch>/bin`,
+        // `~/.sdkman/candidates/<tool>/current/bin`). Probe them too.
+        if (self.findInOpamSwitches(name)) |p| return p;
+        if (self.findInSdkmanCandidates(name)) |p| return p;
+        return null;
+    }
+
+    /// Catalogue of well-known per-toolchain bin directories. Each
+    /// entry may contain a leading `~/` which `expandAndTry` resolves
+    /// against `$HOME` (or `%USERPROFILE%` on Windows).
+    fn commonBinDirs() []const []const u8 {
+        const posix = &[_][]const u8{
+            // System / package-manager defaults.
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            // Per-user defaults written to by lots of installers.
+            "~/.local/bin",
+            "~/.local/share/coursier/bin",
+            "~/Library/Application Support/Coursier/bin",
+            // Language toolchain shims / bins.
+            "~/.cargo/bin",
+            "~/.ghcup/bin",
+            "~/.cabal/bin",
+            "~/.opam/default/bin",
+            "~/.pub-cache/bin",
+            "~/.gem/ruby/3.4.0/bin",
+            "~/.gem/ruby/3.3.0/bin",
+            "~/.gem/ruby/3.2.0/bin",
+            "~/.gem/ruby/3.1.0/bin",
+            "~/.asdf/shims",
+            "~/.volta/bin",
+            "~/.pyenv/shims",
+            "~/.rbenv/shims",
+            "~/.nodenv/shims",
+            // Common scoop / clang prefix on macOS.
+            "/opt/homebrew/opt/llvm/bin",
+            "/usr/local/opt/llvm/bin",
+        };
+        const windows = &[_][]const u8{
+            "~/scoop/shims",
+            "~/AppData/Local/Programs/Python/Python312/Scripts",
+            "~/AppData/Roaming/npm",
+            "C:/Program Files/LLVM/bin",
+            "C:/Program Files (x86)/LLVM/bin",
+        };
+        return if (builtin.os.tag == .windows) windows else posix;
+    }
+
+    fn tryJoinFile(self: *Installer, dir: []const u8, name: []const u8) ?[]u8 {
+        const candidate = std.fs.path.join(self.allocator, &.{ dir, name }) catch return null;
+        std.Io.Dir.accessAbsolute(self.io, candidate, .{}) catch {
+            self.allocator.free(candidate);
+            return null;
+        };
+        return candidate;
+    }
+
+    /// Resolve a `~/`-prefixed directory against `$HOME` (or
+    /// `%USERPROFILE%`), then probe for `<dir>/<name>`.
+    fn expandAndTry(self: *Installer, dir: []const u8, name: []const u8) ?[]u8 {
+        const env: std.process.Environ = .{ .block = self.environ_block };
+        const home_opt: ?[]const u8 = env.getPosix("HOME") orelse env.getPosix("USERPROFILE");
+
+        if (std.mem.startsWith(u8, dir, "~/")) {
+            const home = home_opt orelse return null;
+            const expanded = std.fs.path.join(self.allocator, &.{ home, dir[2..] }) catch return null;
+            defer self.allocator.free(expanded);
+            return self.tryJoinFile(expanded, name);
+        }
+        return self.tryJoinFile(dir, name);
+    }
+
+    /// Walk `~/.opam/*/bin` for `name`. Opam uses one bin dir per
+    /// switch (`~/.opam/default/bin`, `~/.opam/5.1.0/bin`, …) and
+    /// users rarely have `default` set without overriding it, so a
+    /// shallow scan is the only reliable way short of running
+    /// `opam env`.
+    fn findInOpamSwitches(self: *Installer, name: []const u8) ?[]u8 {
+        const env: std.process.Environ = .{ .block = self.environ_block };
+        const home = env.getPosix("HOME") orelse return null;
+        const opam_root = std.fs.path.join(self.allocator, &.{ home, ".opam" }) catch return null;
+        defer self.allocator.free(opam_root);
+
+        var dir = std.Io.Dir.openDirAbsolute(self.io, opam_root, .{ .iterate = true }) catch return null;
+        defer dir.close(self.io);
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            // Skip non-switch dirs (opam keeps state in `repo/`, `log/`, etc).
+            if (std.mem.eql(u8, entry.name, "repo") or
+                std.mem.eql(u8, entry.name, "log") or
+                std.mem.eql(u8, entry.name, "download-cache") or
+                std.mem.eql(u8, entry.name, "plugins") or
+                (entry.name.len > 0 and entry.name[0] == '.')) continue;
+            const bin_dir = std.fs.path.join(self.allocator, &.{ opam_root, entry.name, "bin" }) catch continue;
+            defer self.allocator.free(bin_dir);
+            if (self.tryJoinFile(bin_dir, name)) |p| return p;
+        }
+        return null;
+    }
+
+    /// Walk `~/.sdkman/candidates/*/current/bin/` for `name`. SDKMAN
+    /// is a common installer for JVM-ecosystem tools (Kotlin, Scala,
+    /// gradle, etc.) and creates `current/` symlinks per candidate.
+    fn findInSdkmanCandidates(self: *Installer, name: []const u8) ?[]u8 {
+        const env: std.process.Environ = .{ .block = self.environ_block };
+        const home = env.getPosix("HOME") orelse return null;
+        const root = std.fs.path.join(self.allocator, &.{ home, ".sdkman", "candidates" }) catch return null;
+        defer self.allocator.free(root);
+
+        var dir = std.Io.Dir.openDirAbsolute(self.io, root, .{ .iterate = true }) catch return null;
+        defer dir.close(self.io);
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            const bin_dir = std.fs.path.join(self.allocator, &.{ root, entry.name, "current", "bin" }) catch continue;
+            defer self.allocator.free(bin_dir);
+            if (self.tryJoinFile(bin_dir, name)) |p| return p;
         }
         return null;
     }
@@ -443,7 +625,7 @@ pub const Installer = struct {
 
         // Install via `gem install --user-install ruby-lsp`. User-install
         // avoids needing sudo and writes to ~/.gem.
-        log.info("Installing ruby-lsp via 'gem install --user-install ruby-lsp'", .{});
+        self.note("running 'gem install --user-install ruby-lsp'", .{});
         const res = std.process.run(self.allocator, self.io, .{
             .argv = &.{ "gem", "install", "--user-install", "--no-document", "ruby-lsp" },
         }) catch |err| {
@@ -555,8 +737,10 @@ pub const Installer = struct {
         const archive_path = try std.fs.path.join(self.allocator, &.{ tmp, asset });
         defer self.allocator.free(archive_path);
 
+        self.note("downloading OmniSharp ({s})", .{asset});
         try self.runArgvVerbose(&.{ "curl", "-fsSL", "-o", archive_path, download_url });
         defer std.Io.Dir.cwd().deleteFile(self.io, archive_path) catch {};
+        self.note("extracting", .{});
 
         try self.runArgvVerbose(&.{ "tar", "-xzf", archive_path, "-C", install_dir });
     }
@@ -584,7 +768,7 @@ pub const Installer = struct {
             return error.NotInstalled;
         }
 
-        log.info("Installing jdtls...", .{});
+        self.note("downloading jdtls (~100 MB)", .{});
         try self.installJdtls(install_dir);
 
         const found = try findJdtlsLauncher(self.allocator, self.io, install_dir);
@@ -629,6 +813,407 @@ pub const Installer = struct {
         try self.runArgvVerbose(&.{ "curl", "-fsSL", "-o", archive_path, download_url });
         defer std.Io.Dir.cwd().deleteFile(self.io, archive_path) catch {};
 
+        self.note("extracting", .{});
         try self.runArgvVerbose(&.{ "tar", "-xzf", archive_path, "-C", install_dir });
+    }
+
+    // ---------- bash-language-server ----------
+    //
+    // Distributed as an npm package; we mirror the Pyright pattern.
+
+    pub fn ensureBashLanguageServer(self: *Installer, auto_install: bool) ![]const u8 {
+        log.info("ensureBashLanguageServer called (auto_install={})", .{auto_install});
+        const install_dir = try self.getInstallDir("bash-language-server");
+        defer self.allocator.free(install_dir);
+
+        const entry_point = try std.fs.path.join(self.allocator, &.{ install_dir, "package", "out", "cli.js" });
+        errdefer self.allocator.free(entry_point);
+
+        const file = std.Io.Dir.openFileAbsolute(self.io, entry_point, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (!auto_install) {
+                    log.info("bash-language-server not installed (run `stem lsp install bash`)", .{});
+                    return error.NotInstalled;
+                }
+                self.note("installing bash-language-server via npm tarball", .{});
+                try self.installNpmPackage("bash-language-server", install_dir);
+                std.Io.Dir.accessAbsolute(self.io, entry_point, .{}) catch |e| {
+                    log.err("bash-language-server install verification failed: {}", .{e});
+                    return error.InstallFailed;
+                };
+                return entry_point;
+            },
+            else => return err,
+        };
+        file.close(self.io);
+        log.info("bash-language-server already installed at {s}", .{entry_point});
+        return entry_point;
+    }
+
+    // ---------- lua-language-server ----------
+    //
+    // lua-language-server (sumneko) ships as a platform-specific tarball on
+    // GitHub releases — single self-contained binary per platform, no system
+    // Lua needed at runtime. We download into ~/.stem/lsp/lua-language-server
+    // and return the path to the launcher binary.
+
+    pub fn ensureLuaLanguageServer(self: *Installer, auto_install: bool) ![]const u8 {
+        log.info("ensureLuaLanguageServer called (auto_install={})", .{auto_install});
+        const install_dir = try self.getInstallDir("lua-language-server");
+        defer self.allocator.free(install_dir);
+
+        const binary_name = if (builtin.os.tag == .windows) "lua-language-server.exe" else "lua-language-server";
+        const entry_point = try std.fs.path.join(self.allocator, &.{ install_dir, "bin", binary_name });
+        errdefer self.allocator.free(entry_point);
+
+        const file = std.Io.Dir.openFileAbsolute(self.io, entry_point, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                // PATH fallback before downloading — users with `brew install
+                // lua-language-server` already have it and we'd rather use
+                // theirs (gets security updates via brew).
+                if (self.findOnPath(binary_name)) |p| {
+                    self.allocator.free(entry_point);
+                    log.info("lua-language-server found on PATH at {s}", .{p});
+                    return p;
+                }
+                if (!auto_install) {
+                    log.info("lua-language-server not installed (run `stem lsp install lua`)", .{});
+                    return error.NotInstalled;
+                }
+                self.note("downloading lua-language-server from GitHub releases", .{});
+                try self.installLuaLanguageServer(install_dir);
+                std.Io.Dir.accessAbsolute(self.io, entry_point, .{}) catch |e| {
+                    log.err("lua-language-server install verification failed: {}", .{e});
+                    return error.InstallFailed;
+                };
+                return entry_point;
+            },
+            else => return err,
+        };
+        file.close(self.io);
+        log.info("lua-language-server already installed at {s}", .{entry_point});
+        return entry_point;
+    }
+
+    fn installLuaLanguageServer(self: *Installer, install_dir: []const u8) !void {
+        try std.Io.Dir.cwd().createDirPath(self.io, install_dir);
+
+        // sumneko publishes a per-platform tarball. Version is pinned to a
+        // recent stable — bumping it is a one-line change.
+        const version = "3.13.6";
+        const arch = builtin.cpu.arch;
+        const os = builtin.os.tag;
+        const asset_suffix = switch (os) {
+            .macos => switch (arch) {
+                .aarch64 => "darwin-arm64.tar.gz",
+                .x86_64 => "darwin-x64.tar.gz",
+                else => return error.UnsupportedArch,
+            },
+            .linux => switch (arch) {
+                .aarch64 => "linux-arm64.tar.gz",
+                .x86_64 => "linux-x64.tar.gz",
+                else => return error.UnsupportedArch,
+            },
+            .windows => switch (arch) {
+                .x86_64 => "win32-x64.zip",
+                else => return error.UnsupportedArch,
+            },
+            else => return error.UnsupportedOS,
+        };
+        const download_url = try std.fmt.allocPrint(
+            self.allocator,
+            "https://github.com/LuaLS/lua-language-server/releases/download/{s}/lua-language-server-{s}-{s}",
+            .{ version, version, asset_suffix },
+        );
+        defer self.allocator.free(download_url);
+
+        const tmp = try self.tempDir();
+        defer self.allocator.free(tmp);
+        const archive_name = try std.fmt.allocPrint(self.allocator, "lua-ls.{s}", .{asset_suffix});
+        defer self.allocator.free(archive_name);
+        const archive_path = try std.fs.path.join(self.allocator, &.{ tmp, archive_name });
+        defer self.allocator.free(archive_path);
+
+        self.note("downloading lua-language-server {s} ({s})", .{ version, asset_suffix });
+        try self.runArgvVerbose(&.{ "curl", "-fsSL", "-o", archive_path, download_url });
+        defer std.Io.Dir.cwd().deleteFile(self.io, archive_path) catch {};
+
+        self.note("extracting", .{});
+        if (std.mem.endsWith(u8, asset_suffix, ".zip")) {
+            try self.runArgvVerbose(&.{ "unzip", "-q", archive_path, "-d", install_dir });
+        } else {
+            try self.runArgvVerbose(&.{ "tar", "-xzf", archive_path, "-C", install_dir });
+        }
+    }
+
+    // ---------- sourcekit-lsp (Swift) ----------
+    //
+    // sourcekit-lsp ships with the Swift toolchain (Xcode on macOS, swiftly
+    // / swift.org tarballs on Linux). No reasonable way to vendor it
+    // independently of Swift itself — just look on PATH and tell the user
+    // where to get the toolchain.
+
+    pub fn ensureSourcekitLsp(self: *Installer, auto_install: bool) ![]const u8 {
+        _ = auto_install;
+        const name = if (builtin.os.tag == .windows) "sourcekit-lsp.exe" else "sourcekit-lsp";
+        if (self.findOnPath(name)) |p| {
+            log.info("sourcekit-lsp found on PATH at {s}", .{p});
+            return p;
+        }
+        log.info("sourcekit-lsp not on PATH. Install the Swift toolchain:", .{});
+        switch (builtin.os.tag) {
+            .macos => log.info("  Install Xcode from the App Store, or just the Command Line Tools: xcode-select --install", .{}),
+            .linux => log.info("  Install Swift from https://www.swift.org/install/linux/ (the tarball includes sourcekit-lsp)", .{}),
+            else => log.info("  Install Swift from https://www.swift.org/install/", .{}),
+        }
+        return error.NotInstalled;
+    }
+
+    // ---------- R languageserver ----------
+    //
+    // The canonical R LSP is the `languageserver` CRAN package, invoked as
+    // `R --slave -e "languageserver::run()"`. It needs R installed plus that
+    // one package. We can't install R itself, but we can offer to install
+    // the package if R is present.
+
+    pub fn ensureRLanguageServer(self: *Installer, auto_install: bool) ![]const u8 {
+        const r_bin = if (builtin.os.tag == .windows) "R.exe" else "R";
+        const r_path = self.findOnPath(r_bin) orelse {
+            log.info("R not on PATH. Install R first:", .{});
+            switch (builtin.os.tag) {
+                .macos => log.info("  brew install r       (or https://cran.r-project.org/bin/macosx/)", .{}),
+                .linux => log.info("  apt install r-base   (or your distro's package manager)", .{}),
+                else => log.info("  https://cran.r-project.org/", .{}),
+            }
+            return error.NotInstalled;
+        };
+
+        // Detect whether `languageserver` is installed in any of the user's
+        // R library paths. `Rscript -e 'cat(requireNamespace(...))'` writes
+        // TRUE/FALSE to stdout.
+        const probe = std.process.run(self.allocator, self.io, .{
+            .argv = &.{ r_path, "--slave", "-e", "cat(requireNamespace('languageserver', quietly=TRUE))" },
+        }) catch |err| {
+            log.err("Failed to probe R for languageserver: {}", .{err});
+            self.allocator.free(r_path);
+            return error.NotInstalled;
+        };
+        defer {
+            self.allocator.free(probe.stdout);
+            self.allocator.free(probe.stderr);
+        }
+
+        const has_pkg = std.mem.indexOf(u8, probe.stdout, "TRUE") != null;
+        if (has_pkg) return r_path;
+
+        if (!auto_install) {
+            log.info("R 'languageserver' package not installed. Run `stem lsp install r` or in R:", .{});
+            log.info("  install.packages('languageserver')", .{});
+            self.allocator.free(r_path);
+            return error.NotInstalled;
+        }
+
+        self.note("installing R 'languageserver' package (this can take a few minutes)", .{});
+        const install_res = std.process.run(self.allocator, self.io, .{
+            .argv = &.{ r_path, "--slave", "-e", "install.packages('languageserver', repos='https://cloud.r-project.org')" },
+        }) catch |err| {
+            log.err("Failed to run R install: {}", .{err});
+            self.allocator.free(r_path);
+            return error.InstallFailed;
+        };
+        defer {
+            self.allocator.free(install_res.stdout);
+            self.allocator.free(install_res.stderr);
+        }
+        if (install_res.term.exited != 0) {
+            log.err("R languageserver install failed (exit={d}): {s}", .{ install_res.term.exited, install_res.stderr });
+            self.allocator.free(r_path);
+            return error.InstallFailed;
+        }
+        return r_path;
+    }
+
+    // ---------- vscode-langservers-extracted (CSS / HTML / JSON) ----------
+    //
+    // One npm package ships three lightweight servers: CSS, HTML, and
+    // JSON. We install once into ~/.stem/lsp/vscode-langservers-extracted
+    // and return the right binary path per language. The binaries are
+    // node scripts; spawn via `node <path> --stdio`.
+
+    fn vsLangServerInstall(self: *Installer, auto_install: bool) ![]const u8 {
+        const install_dir = try self.getInstallDir("vscode-langservers-extracted");
+        errdefer self.allocator.free(install_dir);
+
+        const marker = try std.fs.path.join(self.allocator, &.{ install_dir, "package", "package.json" });
+        defer self.allocator.free(marker);
+
+        const file = std.Io.Dir.openFileAbsolute(self.io, marker, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (!auto_install) return error.NotInstalled;
+                self.note("installing vscode-langservers-extracted via npm tarball", .{});
+                try self.installNpmPackage("vscode-langservers-extracted", install_dir);
+                std.Io.Dir.accessAbsolute(self.io, marker, .{}) catch |e| {
+                    log.err("vscode-langservers-extracted install verification failed: {}", .{e});
+                    self.allocator.free(install_dir);
+                    return error.InstallFailed;
+                };
+                return install_dir;
+            },
+            else => return err,
+        };
+        file.close(self.io);
+        return install_dir;
+    }
+
+    fn vsLangServerBin(self: *Installer, auto_install: bool, binary_rel: []const u8) ![]const u8 {
+        const install_dir = try self.vsLangServerInstall(auto_install);
+        defer self.allocator.free(install_dir);
+        return std.fs.path.join(self.allocator, &.{ install_dir, "package", binary_rel });
+    }
+
+    pub fn ensureCssLanguageServer(self: *Installer, auto_install: bool) ![]const u8 {
+        return self.vsLangServerBin(auto_install, "bin/vscode-css-language-server");
+    }
+
+    pub fn ensureHtmlLanguageServer(self: *Installer, auto_install: bool) ![]const u8 {
+        return self.vsLangServerBin(auto_install, "bin/vscode-html-language-server");
+    }
+
+    pub fn ensureJsonLanguageServer(self: *Installer, auto_install: bool) ![]const u8 {
+        return self.vsLangServerBin(auto_install, "bin/vscode-json-language-server");
+    }
+
+    // ---------- intelephense (PHP) ----------
+
+    pub fn ensureIntelephense(self: *Installer, auto_install: bool) ![]const u8 {
+        const install_dir = try self.getInstallDir("intelephense");
+        defer self.allocator.free(install_dir);
+
+        const entry_point = try std.fs.path.join(self.allocator, &.{ install_dir, "package", "lib", "intelephense.js" });
+        errdefer self.allocator.free(entry_point);
+
+        const file = std.Io.Dir.openFileAbsolute(self.io, entry_point, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (!auto_install) return error.NotInstalled;
+                self.note("installing intelephense via npm tarball", .{});
+                try self.installNpmPackage("intelephense", install_dir);
+                std.Io.Dir.accessAbsolute(self.io, entry_point, .{}) catch |e| {
+                    log.err("intelephense install verification failed: {}", .{e});
+                    return error.InstallFailed;
+                };
+                return entry_point;
+            },
+            else => return err,
+        };
+        file.close(self.io);
+        return entry_point;
+    }
+
+    // ---------- perlnavigator (Perl) ----------
+
+    pub fn ensurePerlNavigator(self: *Installer, auto_install: bool) ![]const u8 {
+        const install_dir = try self.getInstallDir("perlnavigator");
+        defer self.allocator.free(install_dir);
+
+        // `perlnavigator-server` package ships its bin script as a
+        // shell wrapper around `node`. We invoke the JS directly to
+        // skip an extra exec.
+        const entry_point = try std.fs.path.join(self.allocator, &.{ install_dir, "package", "out", "server.js" });
+        errdefer self.allocator.free(entry_point);
+
+        const file = std.Io.Dir.openFileAbsolute(self.io, entry_point, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (!auto_install) return error.NotInstalled;
+                self.note("installing perlnavigator-server via npm tarball", .{});
+                try self.installNpmPackage("perlnavigator-server", install_dir);
+                std.Io.Dir.accessAbsolute(self.io, entry_point, .{}) catch |e| {
+                    log.err("perlnavigator install verification failed: {}", .{e});
+                    return error.InstallFailed;
+                };
+                return entry_point;
+            },
+            else => return err,
+        };
+        file.close(self.io);
+        return entry_point;
+    }
+
+    // ---------- PATH-only servers ----------
+    //
+    // The following all rely on external toolchains: Dart (dart SDK),
+    // Elixir (mix / asdf), Erlang (rebar3), Haskell (ghcup), Kotlin
+    // (sdkman / brew), OCaml (opam), Scala (coursier). We don't try
+    // to install those toolchains ourselves — just look for the LSP
+    // binary on PATH and give the user a one-line hint if it's
+    // missing.
+
+    fn ensureOnPath(
+        self: *Installer,
+        binary: []const u8,
+        install_hint: []const u8,
+    ) ![]const u8 {
+        if (self.findOnPath(binary)) |p| return p;
+        log.info("{s} not on PATH. {s}", .{ binary, install_hint });
+        return error.NotInstalled;
+    }
+
+    pub fn ensureDartLanguageServer(self: *Installer, auto_install: bool) ![]const u8 {
+        _ = auto_install;
+        return self.ensureOnPath(
+            if (builtin.os.tag == .windows) "dart.exe" else "dart",
+            "Install the Dart SDK from https://dart.dev/get-dart or `brew install dart`.",
+        );
+    }
+
+    pub fn ensureElixirLs(self: *Installer, auto_install: bool) ![]const u8 {
+        _ = auto_install;
+        return self.ensureOnPath(
+            "elixir-ls",
+            "Install elixir-ls from https://github.com/elixir-lsp/elixir-ls/releases or `brew install elixir-ls`.",
+        );
+    }
+
+    pub fn ensureErlangLs(self: *Installer, auto_install: bool) ![]const u8 {
+        _ = auto_install;
+        return self.ensureOnPath(
+            "erlang_ls",
+            "Install erlang_ls from https://github.com/erlang-ls/erlang_ls (requires Erlang/OTP + rebar3).",
+        );
+    }
+
+    pub fn ensureHaskellLanguageServer(self: *Installer, auto_install: bool) ![]const u8 {
+        _ = auto_install;
+        // The launcher script picks the right server binary for the
+        // GHC the project uses; the bare `haskell-language-server`
+        // binary is a pinned version. Prefer the launcher.
+        if (self.findOnPath("haskell-language-server-wrapper")) |p| return p;
+        return self.ensureOnPath(
+            "haskell-language-server",
+            "Install via `ghcup install hls` (https://www.haskell.org/ghcup/).",
+        );
+    }
+
+    pub fn ensureKotlinLanguageServer(self: *Installer, auto_install: bool) ![]const u8 {
+        _ = auto_install;
+        return self.ensureOnPath(
+            "kotlin-language-server",
+            "Install kotlin-language-server from https://github.com/fwcd/kotlin-language-server/releases or `brew install kotlin-language-server`.",
+        );
+    }
+
+    pub fn ensureOcamlLsp(self: *Installer, auto_install: bool) ![]const u8 {
+        _ = auto_install;
+        return self.ensureOnPath(
+            "ocamllsp",
+            "Install via `opam install ocaml-lsp-server` (https://opam.ocaml.org/).",
+        );
+    }
+
+    pub fn ensureMetals(self: *Installer, auto_install: bool) ![]const u8 {
+        _ = auto_install;
+        return self.ensureOnPath(
+            "metals",
+            "Install via `coursier install metals` (https://scalameta.org/metals/).",
+        );
     }
 };

@@ -641,6 +641,57 @@ fn runLogs(ctx: Context) !void {
 // `lsp`
 // ---------------------------------------------------------------------------
 
+/// One entry of the LSP server registry — shared by `lsp install`,
+/// `lsp list`, and the help text so they never drift apart. `keys`
+/// holds every alias the user can type on the CLI (`python`, `py`,
+/// `cpp`, `c++`, …). `path_only` servers (clangd, sourcekit-lsp) skip
+/// auto-install and report `not on PATH` instead.
+const LspEntry = struct {
+    /// Short, lowercase alias used in error messages and `lsp list`.
+    display: []const u8,
+    /// Aliases accepted on the `stem lsp install <name>` CLI.
+    keys: []const []const u8,
+    ensure: *const fn (*Installer, bool) anyerror![]const u8,
+    path_only: bool = false,
+    /// One-line note shown to the user before this server tries to
+    /// install (e.g. external runtime requirement).
+    hint: []const u8 = "",
+};
+
+const lsp_entries = [_]LspEntry{
+    .{ .display = "pyright (python)", .keys = &.{ "python", "py" }, .ensure = Installer.ensurePyright, .hint = "needs node on PATH" },
+    .{ .display = "typescript-language-server", .keys = &.{ "typescript", "ts", "javascript", "js" }, .ensure = Installer.ensureTypeScriptLS, .hint = "needs node on PATH" },
+    .{ .display = "gopls (go)", .keys = &.{"go"}, .ensure = Installer.ensureGopls, .hint = "needs go on PATH" },
+    .{ .display = "rust-analyzer", .keys = &.{ "rust", "rs" }, .ensure = Installer.ensureRustAnalyzer },
+    .{ .display = "clangd (c/c++)", .keys = &.{ "cpp", "c", "c++" }, .ensure = Installer.ensureClangd, .path_only = true, .hint = "ships with LLVM/Xcode — install via your OS package manager" },
+    .{ .display = "ruby-lsp", .keys = &.{"ruby"}, .ensure = Installer.ensureRubyLsp, .hint = "needs ruby + gem on PATH" },
+    .{ .display = "omnisharp (c#)", .keys = &.{ "csharp", "c#" }, .ensure = Installer.ensureOmniSharp },
+    .{ .display = "jdtls (java)", .keys = &.{"java"}, .ensure = Installer.ensureJdtls, .hint = "needs java on PATH at runtime" },
+    .{ .display = "bash-language-server", .keys = &.{ "bash", "sh" }, .ensure = Installer.ensureBashLanguageServer, .hint = "needs node on PATH" },
+    .{ .display = "lua-language-server", .keys = &.{"lua"}, .ensure = Installer.ensureLuaLanguageServer },
+    .{ .display = "sourcekit-lsp (swift)", .keys = &.{"swift"}, .ensure = Installer.ensureSourcekitLsp, .path_only = true, .hint = "ships with the Swift toolchain (Xcode CLT on macOS)" },
+    .{ .display = "languageserver (r)", .keys = &.{"r"}, .ensure = Installer.ensureRLanguageServer, .hint = "needs R on PATH; installs the R 'languageserver' package" },
+    .{ .display = "vscode-css-language-server", .keys = &.{"css"}, .ensure = Installer.ensureCssLanguageServer, .hint = "needs node on PATH; shares install with html + json" },
+    .{ .display = "vscode-html-language-server", .keys = &.{"html"}, .ensure = Installer.ensureHtmlLanguageServer, .hint = "needs node on PATH; shares install with css + json" },
+    .{ .display = "vscode-json-language-server", .keys = &.{"json"}, .ensure = Installer.ensureJsonLanguageServer, .hint = "needs node on PATH; shares install with css + html" },
+    .{ .display = "intelephense (php)", .keys = &.{"php"}, .ensure = Installer.ensureIntelephense, .hint = "needs node on PATH" },
+    .{ .display = "perlnavigator (perl)", .keys = &.{"perl"}, .ensure = Installer.ensurePerlNavigator, .hint = "needs node on PATH" },
+    .{ .display = "dart language-server", .keys = &.{"dart"}, .ensure = Installer.ensureDartLanguageServer, .path_only = true, .hint = "ships with the Dart SDK (https://dart.dev/get-dart)" },
+    .{ .display = "elixir-ls", .keys = &.{"elixir"}, .ensure = Installer.ensureElixirLs, .path_only = true, .hint = "install via brew or https://github.com/elixir-lsp/elixir-ls/releases" },
+    .{ .display = "erlang_ls", .keys = &.{"erlang"}, .ensure = Installer.ensureErlangLs, .path_only = true, .hint = "install via rebar3 from https://github.com/erlang-ls/erlang_ls" },
+    .{ .display = "haskell-language-server", .keys = &.{"haskell"}, .ensure = Installer.ensureHaskellLanguageServer, .path_only = true, .hint = "install via `ghcup install hls`" },
+    .{ .display = "kotlin-language-server", .keys = &.{"kotlin"}, .ensure = Installer.ensureKotlinLanguageServer, .path_only = true, .hint = "install via brew or https://github.com/fwcd/kotlin-language-server" },
+    .{ .display = "ocamllsp", .keys = &.{"ocaml"}, .ensure = Installer.ensureOcamlLsp, .path_only = true, .hint = "install via `opam install ocaml-lsp-server`" },
+    .{ .display = "metals (scala)", .keys = &.{"scala"}, .ensure = Installer.ensureMetals, .path_only = true, .hint = "install via `coursier install metals`" },
+};
+
+fn matchLspKey(entry: LspEntry, want: []const u8) bool {
+    for (entry.keys) |k| {
+        if (std.mem.eql(u8, k, want)) return true;
+    }
+    return false;
+}
+
 fn runLsp(ctx: Context) !void {
     if (ctx.args.len < 3) {
         try printVerbHelp(ctx.io, .lsp);
@@ -652,13 +703,7 @@ fn runLsp(ctx: Context) !void {
             errPrint(ctx.io, "usage: stem lsp install <language|all>\n", .{});
             return;
         }
-        var mgr = LSPManager.init(ctx.allocator, ctx.io, ctx.environ_block);
-        defer mgr.deinit();
-        mgr.installLanguageServer(ctx.args[3]) catch |err| {
-            errPrint(ctx.io, "lsp install failed: {s}\n", .{@errorName(err)});
-            return;
-        };
-        errPrint(ctx.io, "done\n", .{});
+        try runLspInstall(ctx, ctx.args[3]);
         return;
     }
     if (std.mem.eql(u8, sub, "list") or std.mem.eql(u8, sub, "status")) {
@@ -669,27 +714,70 @@ fn runLsp(ctx: Context) !void {
     try printVerbHelp(ctx.io, .lsp);
 }
 
+fn runLspInstall(ctx: Context, want: []const u8) !void {
+    // Build the work list — either every server, or just those whose
+    // keys match the user's argument.
+    var todo: std.ArrayListUnmanaged(LspEntry) = .empty;
+    defer todo.deinit(ctx.allocator);
+    if (std.mem.eql(u8, want, "all")) {
+        try todo.appendSlice(ctx.allocator, &lsp_entries);
+    } else {
+        for (lsp_entries) |e| {
+            if (matchLspKey(e, want)) try todo.append(ctx.allocator, e);
+        }
+        if (todo.items.len == 0) {
+            errPrint(ctx.io, "unknown language: '{s}'. Try:\n", .{want});
+            for (lsp_entries) |e| errPrint(ctx.io, "  {s}\n", .{e.keys[0]});
+            errPrint(ctx.io, "  all\n", .{});
+            return;
+        }
+    }
+
+    // Stderr is unbuffered in this binary — each `errPrint` lands
+    // immediately, which is what we want for the live progress feel.
+    // Wrap stderr in a Writer so the Installer can stream its own
+    // milestones inline with our per-server headers.
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writerStreaming(ctx.io, &stderr_buf);
+    const w = &stderr_writer.interface;
+
+    var installer = Installer.init(ctx.allocator, ctx.io, ctx.environ_block);
+    installer.progress = w;
+
+    var ok: usize = 0;
+    var failed: usize = 0;
+    for (todo.items) |entry| {
+        errPrint(ctx.io, "\n→ {s}\n", .{entry.display});
+        if (entry.hint.len > 0) errPrint(ctx.io, "    ({s})\n", .{entry.hint});
+
+        const result = entry.ensure(&installer, !entry.path_only);
+        if (result) |path| {
+            defer ctx.allocator.free(path);
+            // Flush any inline progress so the ✓ line lands after,
+            // not interleaved with, the last installer note.
+            w.flush() catch {};
+            errPrint(ctx.io, "  \xe2\x9c\x93 {s}\n", .{path});
+            ok += 1;
+        } else |err| {
+            w.flush() catch {};
+            errPrint(ctx.io, "  \xe2\x9c\x97 failed: {s}\n", .{@errorName(err)});
+            failed += 1;
+        }
+    }
+
+    errPrint(ctx.io, "\n{d} installed, {d} failed.\n", .{ ok, failed });
+}
+
 fn listLspStatus(ctx: Context) !void {
     var installer = Installer.init(ctx.allocator, ctx.io, ctx.environ_block);
-    const Item = struct { name: []const u8, ensure: *const fn (*Installer, bool) anyerror![]const u8 };
-    const items = [_]Item{
-        .{ .name = "pyright (python)", .ensure = Installer.ensurePyright },
-        .{ .name = "typescript-language-server", .ensure = Installer.ensureTypeScriptLS },
-        .{ .name = "gopls (go)", .ensure = Installer.ensureGopls },
-        .{ .name = "rust-analyzer", .ensure = Installer.ensureRustAnalyzer },
-        .{ .name = "clangd (c/c++)", .ensure = Installer.ensureClangd },
-        .{ .name = "ruby-lsp", .ensure = Installer.ensureRubyLsp },
-        .{ .name = "omnisharp (c#)", .ensure = Installer.ensureOmniSharp },
-        .{ .name = "jdtls (java)", .ensure = Installer.ensureJdtls },
-    };
     try outPrint(ctx.io, "Language servers:\n", .{});
-    for (items) |it| {
-        const path = it.ensure(&installer, false) catch {
-            try outPrint(ctx.io, "  {s:<32} not installed\n", .{it.name});
+    for (lsp_entries) |entry| {
+        const path = entry.ensure(&installer, false) catch {
+            try outPrint(ctx.io, "  {s:<32} not installed\n", .{entry.display});
             continue;
         };
         defer ctx.allocator.free(path);
-        try outPrint(ctx.io, "  {s:<32} {s}\n", .{ it.name, path });
+        try outPrint(ctx.io, "  {s:<32} {s}\n", .{ entry.display, path });
     }
     try outPrint(ctx.io, "\nInstall with: stem lsp install <name|all>\n", .{});
 }

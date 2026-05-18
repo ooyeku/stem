@@ -355,83 +355,6 @@ pub const LSPManager = struct {
         }
     }
 
-    /// Install one or more language servers in the background. Pass `all=true`
-    /// to install every supported server. Otherwise pass a specific language
-    /// name ("python", "typescript", "javascript", "go", "rust").
-    ///
-    /// This is opt-in — startup no longer auto-installs LSP servers. Callers
-    /// invoke this from the `stem lsp install` CLI subcommand.
-    pub fn installLanguageServer(self: *LSPManager, name: []const u8) !void {
-        var installer = Installer.init(self.allocator, self.io, self.environ_block);
-        self.install_lock.lockUncancelable(self.io);
-        defer self.install_lock.unlock(self.io);
-
-        const want_all = std.mem.eql(u8, name, "all");
-        const want_py = want_all or std.mem.eql(u8, name, "python");
-        const want_ts = want_all or std.mem.eql(u8, name, "typescript") or std.mem.eql(u8, name, "javascript");
-        const want_go = want_all or std.mem.eql(u8, name, "go");
-        const want_rs = want_all or std.mem.eql(u8, name, "rust");
-        const want_cpp = want_all or std.mem.eql(u8, name, "cpp") or std.mem.eql(u8, name, "c") or std.mem.eql(u8, name, "c++");
-        const want_ruby = want_all or std.mem.eql(u8, name, "ruby");
-        const want_cs = want_all or std.mem.eql(u8, name, "csharp") or std.mem.eql(u8, name, "c#");
-        const want_java = want_all or std.mem.eql(u8, name, "java");
-
-        if (!(want_py or want_ts or want_go or want_rs or want_cpp or want_ruby or want_cs or want_java)) {
-            log.warn("Unknown language server: {s}. Supported: python, typescript, go, rust, cpp, ruby, csharp, java, all.", .{name});
-            return error.UnknownLanguage;
-        }
-
-        if (want_py) {
-            if (installer.ensurePyright(true)) |path| {
-                log.info("Pyright installed at {s}", .{path});
-                self.allocator.free(path);
-            } else |err| log.warn("Pyright install failed: {}", .{err});
-        }
-        if (want_ts) {
-            if (installer.ensureTypeScriptLS(true)) |path| {
-                log.info("TypeScript LS installed at {s}", .{path});
-                self.allocator.free(path);
-            } else |err| log.warn("TypeScript LS install failed: {}", .{err});
-        }
-        if (want_go) {
-            if (installer.ensureGopls(true)) |path| {
-                log.info("gopls installed at {s}", .{path});
-                self.allocator.free(path);
-            } else |err| log.warn("gopls install failed: {} (Go must be installed)", .{err});
-        }
-        if (want_rs) {
-            if (installer.ensureRustAnalyzer(true)) |path| {
-                log.info("rust-analyzer installed at {s}", .{path});
-                self.allocator.free(path);
-            } else |err| log.warn("rust-analyzer install failed: {}", .{err});
-        }
-        if (want_cpp) {
-            // clangd is detected on PATH only; we don't auto-install LLVM.
-            if (installer.ensureClangd(false)) |path| {
-                log.info("clangd available at {s}", .{path});
-                self.allocator.free(path);
-            } else |err| log.warn("clangd not on PATH: {} (install LLVM via your package manager)", .{err});
-        }
-        if (want_ruby) {
-            if (installer.ensureRubyLsp(true)) |path| {
-                log.info("ruby-lsp installed at {s}", .{path});
-                self.allocator.free(path);
-            } else |err| log.warn("ruby-lsp install failed: {} (Ruby + gem must be installed)", .{err});
-        }
-        if (want_cs) {
-            if (installer.ensureOmniSharp(true)) |path| {
-                log.info("OmniSharp installed at {s}", .{path});
-                self.allocator.free(path);
-            } else |err| log.warn("OmniSharp install failed: {}", .{err});
-        }
-        if (want_java) {
-            if (installer.ensureJdtls(true)) |path| {
-                log.info("jdtls installed at {s}", .{path});
-                self.allocator.free(path);
-            } else |err| log.warn("jdtls install failed: {} (java must be installed)", .{err});
-        }
-    }
-
     pub fn deinit(self: *LSPManager) void {
         // Signal global shutdown FIRST. This causes any LSP server start
         // currently waiting on init to bail out immediately, which in turn
@@ -543,6 +466,22 @@ pub const LSPManager = struct {
             .{ .lang = "java", .exts = &.{".java"} },
             .{ .lang = "ruby", .exts = &.{ ".rb", ".rake" } },
             .{ .lang = "csharp", .exts = &.{".cs"} },
+            .{ .lang = "bash", .exts = &.{ ".sh", ".bash", ".zsh" } },
+            .{ .lang = "lua", .exts = &.{".lua"} },
+            .{ .lang = "swift", .exts = &.{".swift"} },
+            .{ .lang = "r", .exts = &.{ ".r", ".R", ".rmd", ".Rmd" } },
+            .{ .lang = "css", .exts = &.{ ".css", ".scss", ".less" } },
+            .{ .lang = "html", .exts = &.{ ".html", ".htm" } },
+            .{ .lang = "json", .exts = &.{".json"} },
+            .{ .lang = "php", .exts = &.{ ".php", ".phtml" } },
+            .{ .lang = "perl", .exts = &.{ ".pl", ".pm", ".t" } },
+            .{ .lang = "dart", .exts = &.{".dart"} },
+            .{ .lang = "elixir", .exts = &.{ ".ex", ".exs" } },
+            .{ .lang = "erlang", .exts = &.{ ".erl", ".hrl" } },
+            .{ .lang = "haskell", .exts = &.{".hs"} },
+            .{ .lang = "kotlin", .exts = &.{ ".kt", ".kts" } },
+            .{ .lang = "ocaml", .exts = &.{ ".ml", ".mli" } },
+            .{ .lang = "scala", .exts = &.{ ".scala", ".sc" } },
         };
         for (exts) |row| {
             if (!std.mem.eql(u8, row.lang, lang)) continue;
@@ -812,6 +751,90 @@ pub const LSPManager = struct {
                 return err;
             };
             log.info("[LSP MANAGER] jdtls (Java) server started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "bash")) {
+            self.startBashLanguageServer(root_path) catch |err| {
+                log.err("Failed to start bash-language-server: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] bash-language-server started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "lua")) {
+            self.startLuaLanguageServer(root_path) catch |err| {
+                log.err("Failed to start lua-language-server: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] lua-language-server started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "swift")) {
+            self.startSourcekitLsp(root_path) catch |err| {
+                log.err("Failed to start sourcekit-lsp: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] sourcekit-lsp started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "r")) {
+            self.startRLanguageServer(root_path) catch |err| {
+                log.err("Failed to start R languageserver: {}", .{err});
+                return err;
+            };
+            log.info("[LSP MANAGER] R languageserver started successfully", .{});
+        } else if (std.mem.eql(u8, lang, "css")) {
+            self.startCssLanguageServer(root_path) catch |err| {
+                log.err("Failed to start vscode-css-language-server: {}", .{err});
+                return err;
+            };
+        } else if (std.mem.eql(u8, lang, "html")) {
+            self.startHtmlLanguageServer(root_path) catch |err| {
+                log.err("Failed to start vscode-html-language-server: {}", .{err});
+                return err;
+            };
+        } else if (std.mem.eql(u8, lang, "json")) {
+            self.startJsonLanguageServer(root_path) catch |err| {
+                log.err("Failed to start vscode-json-language-server: {}", .{err});
+                return err;
+            };
+        } else if (std.mem.eql(u8, lang, "php")) {
+            self.startIntelephense(root_path) catch |err| {
+                log.err("Failed to start intelephense: {}", .{err});
+                return err;
+            };
+        } else if (std.mem.eql(u8, lang, "perl")) {
+            self.startPerlNavigator(root_path) catch |err| {
+                log.err("Failed to start perlnavigator: {}", .{err});
+                return err;
+            };
+        } else if (std.mem.eql(u8, lang, "dart")) {
+            self.startDartLanguageServer(root_path) catch |err| {
+                log.err("Failed to start dart language-server: {}", .{err});
+                return err;
+            };
+        } else if (std.mem.eql(u8, lang, "elixir")) {
+            self.startElixirLs(root_path) catch |err| {
+                log.err("Failed to start elixir-ls: {}", .{err});
+                return err;
+            };
+        } else if (std.mem.eql(u8, lang, "erlang")) {
+            self.startErlangLs(root_path) catch |err| {
+                log.err("Failed to start erlang_ls: {}", .{err});
+                return err;
+            };
+        } else if (std.mem.eql(u8, lang, "haskell")) {
+            self.startHaskellLanguageServer(root_path) catch |err| {
+                log.err("Failed to start haskell-language-server: {}", .{err});
+                return err;
+            };
+        } else if (std.mem.eql(u8, lang, "kotlin")) {
+            self.startKotlinLanguageServer(root_path) catch |err| {
+                log.err("Failed to start kotlin-language-server: {}", .{err});
+                return err;
+            };
+        } else if (std.mem.eql(u8, lang, "ocaml")) {
+            self.startOcamlLsp(root_path) catch |err| {
+                log.err("Failed to start ocamllsp: {}", .{err});
+                return err;
+            };
+        } else if (std.mem.eql(u8, lang, "scala")) {
+            self.startMetals(root_path) catch |err| {
+                log.err("Failed to start metals: {}", .{err});
+                return err;
+            };
         } else {
             log.info("[LSP MANAGER] Unknown language '{s}', no LSP server available", .{lang});
         }
@@ -1150,6 +1173,347 @@ pub const LSPManager = struct {
         };
     }
 
+    fn startBashLanguageServer(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startBashLanguageServer called with root_path={s}", .{root_path orelse "null"});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const script_path = installer.ensureBashLanguageServer(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "bash");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runBashLanguageServerThread, .{ script_path, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("bash", server);
+    }
+
+    fn runBashLanguageServerThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, script_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(script_path);
+        const args = [_][]const u8{ "node", script_path, "start" };
+        log.info("Starting bash-language-server: node {s} start", .{script_path});
+        external.runExternalServer(allocator, input, output, "node", &args, environ_block) catch |err| {
+            log.info("bash-language-server failed: {} (is node on PATH?)", .{err});
+        };
+    }
+
+    fn startLuaLanguageServer(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startLuaLanguageServer called with root_path={s}", .{root_path orelse "null"});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const binary_path = installer.ensureLuaLanguageServer(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "lua");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runLuaLanguageServerThread, .{ binary_path, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("lua", server);
+    }
+
+    fn runLuaLanguageServerThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, binary_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(binary_path);
+        const args = [_][]const u8{binary_path};
+        log.info("Starting lua-language-server: {s}", .{binary_path});
+        external.runExternalServer(allocator, input, output, binary_path, &args, environ_block) catch |err| {
+            log.info("lua-language-server failed: {}", .{err});
+        };
+    }
+
+    fn startSourcekitLsp(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startSourcekitLsp called with root_path={s}", .{root_path orelse "null"});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const binary_path = installer.ensureSourcekitLsp(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "swift");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runSourcekitLspThread, .{ binary_path, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("swift", server);
+    }
+
+    fn runSourcekitLspThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, binary_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(binary_path);
+        const args = [_][]const u8{binary_path};
+        log.info("Starting sourcekit-lsp: {s}", .{binary_path});
+        external.runExternalServer(allocator, input, output, binary_path, &args, environ_block) catch |err| {
+            log.info("sourcekit-lsp failed: {}", .{err});
+        };
+    }
+
+    fn startRLanguageServer(self: *LSPManager, root_path: ?[]const u8) !void {
+        log.info("LSPManager: startRLanguageServer called with root_path={s}", .{root_path orelse "null"});
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+
+        self.install_lock.lockUncancelable(self.io);
+        const r_path = installer.ensureRLanguageServer(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+
+        var server = try LSPServer.init(self.allocator, self.io, "r");
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+
+        try server.start(runRLanguageServerThread, .{ r_path, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put("r", server);
+    }
+
+    fn runRLanguageServerThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, r_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(r_path);
+        // The canonical incantation per the languageserver README:
+        // `R --slave -e "languageserver::run()"`.
+        const args = [_][]const u8{ r_path, "--slave", "-e", "languageserver::run()" };
+        log.info("Starting R languageserver: {s} --slave -e \"languageserver::run()\"", .{r_path});
+        external.runExternalServer(allocator, input, output, r_path, &args, environ_block) catch |err| {
+            log.info("R languageserver failed: {}", .{err});
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Generic helpers for the remaining language servers.
+    //
+    // The pattern is identical for every server:
+    //   1. resolve the binary via the installer (auto-install or PATH)
+    //   2. construct an LSPServer with the editor's diagnostic hooks
+    //   3. spawn the runner thread with the right argv shape
+    //
+    // We keep one `startGeneric*` per shape (script-via-node, bare
+    // binary, binary-with-flag) to avoid 12 near-identical copies.
+
+    fn startGenericServer(
+        self: *LSPManager,
+        comptime lang_key: []const u8,
+        binary_path_owned: []const u8,
+        comptime runner: anytype,
+        extra: anytype,
+    ) !void {
+        var server = try LSPServer.init(self.allocator, self.io, lang_key);
+        errdefer server.deinit();
+        server.external_shutdown = &self.global_shutdown;
+        server.on_tokens_ready = self.on_tokens_ready;
+        server.token_cache_dir = self.computeTokenCacheDir() catch null;
+        server.on_diagnostics = self.on_diagnostics;
+        if (extra.root_path) |p| {
+            if (server.current_root_path) |old| self.allocator.free(old);
+            server.current_root_path = try self.allocator.dupe(u8, p);
+        }
+        try server.start(runner, .{ binary_path_owned, self.environ_block });
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        try self.servers.put(lang_key, server);
+    }
+
+    // CSS / HTML / JSON — all run via `node <script> --stdio`.
+    fn runNodeStdioThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, script_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(script_path);
+        const args = [_][]const u8{ "node", script_path, "--stdio" };
+        log.info("Starting node {s} --stdio", .{script_path});
+        external.runExternalServer(allocator, input, output, "node", &args, environ_block) catch |err| {
+            log.info("node-stdio LSP failed: {} (is node on PATH?)", .{err});
+        };
+    }
+
+    fn startCssLanguageServer(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        self.install_lock.lockUncancelable(self.io);
+        const p = installer.ensureCssLanguageServer(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+        try self.startGenericServer("css", p, runNodeStdioThread, .{ .root_path = root_path });
+    }
+
+    fn startHtmlLanguageServer(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        self.install_lock.lockUncancelable(self.io);
+        const p = installer.ensureHtmlLanguageServer(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+        try self.startGenericServer("html", p, runNodeStdioThread, .{ .root_path = root_path });
+    }
+
+    fn startJsonLanguageServer(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        self.install_lock.lockUncancelable(self.io);
+        const p = installer.ensureJsonLanguageServer(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+        try self.startGenericServer("json", p, runNodeStdioThread, .{ .root_path = root_path });
+    }
+
+    // intelephense (PHP) — node script with `--stdio`.
+    fn startIntelephense(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        self.install_lock.lockUncancelable(self.io);
+        const p = installer.ensureIntelephense(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+        try self.startGenericServer("php", p, runNodeStdioThread, .{ .root_path = root_path });
+    }
+
+    // perlnavigator — node script invoked without flags (it speaks
+    // LSP on stdio by default).
+    fn runPerlNavigatorThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, script_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(script_path);
+        const args = [_][]const u8{ "node", script_path, "--stdio" };
+        log.info("Starting perlnavigator: node {s} --stdio", .{script_path});
+        external.runExternalServer(allocator, input, output, "node", &args, environ_block) catch |err| {
+            log.info("perlnavigator failed: {} (is node on PATH?)", .{err});
+        };
+    }
+
+    fn startPerlNavigator(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        self.install_lock.lockUncancelable(self.io);
+        const p = installer.ensurePerlNavigator(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+        try self.startGenericServer("perl", p, runPerlNavigatorThread, .{ .root_path = root_path });
+    }
+
+    // Dart SDK ships its language server; invoked as `dart language-server`.
+    fn runDartLanguageServerThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, dart_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(dart_path);
+        const args = [_][]const u8{ dart_path, "language-server", "--protocol=lsp" };
+        log.info("Starting dart language-server: {s}", .{dart_path});
+        external.runExternalServer(allocator, input, output, dart_path, &args, environ_block) catch |err| {
+            log.info("dart language-server failed: {}", .{err});
+        };
+    }
+
+    fn startDartLanguageServer(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        self.install_lock.lockUncancelable(self.io);
+        const p = installer.ensureDartLanguageServer(false) catch |err| {
+            self.install_lock.unlock(self.io);
+            return err;
+        };
+        self.install_lock.unlock(self.io);
+        try self.startGenericServer("dart", p, runDartLanguageServerThread, .{ .root_path = root_path });
+    }
+
+    // The following all speak LSP on stdio when invoked with no
+    // arguments — one shared runner with a bare argv suffices.
+    fn runBareBinaryThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, binary_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(binary_path);
+        const args = [_][]const u8{binary_path};
+        log.info("Starting LSP binary: {s}", .{binary_path});
+        external.runExternalServer(allocator, input, output, binary_path, &args, environ_block) catch |err| {
+            log.info("LSP binary {s} failed: {}", .{ binary_path, err });
+        };
+    }
+
+    fn startElixirLs(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        const p = installer.ensureElixirLs(false) catch |err| return err;
+        try self.startGenericServer("elixir", p, runBareBinaryThread, .{ .root_path = root_path });
+    }
+
+    fn startErlangLs(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        const p = installer.ensureErlangLs(false) catch |err| return err;
+        try self.startGenericServer("erlang", p, runBareBinaryThread, .{ .root_path = root_path });
+    }
+
+    fn startHaskellLanguageServer(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        const p = installer.ensureHaskellLanguageServer(false) catch |err| return err;
+        // `haskell-language-server-wrapper --lsp` is the documented
+        // launch incantation; the bare wrapper without `--lsp` prints
+        // a config check and exits.
+        try self.startGenericServer("haskell", p, runHaskellLsThread, .{ .root_path = root_path });
+    }
+
+    fn runHaskellLsThread(allocator: std.mem.Allocator, input: *Transport.MemPipe, output: *Transport.MemPipe, binary_path: []const u8, environ_block: std.process.Environ.Block) void {
+        defer allocator.free(binary_path);
+        const args = [_][]const u8{ binary_path, "--lsp" };
+        log.info("Starting haskell-language-server: {s} --lsp", .{binary_path});
+        external.runExternalServer(allocator, input, output, binary_path, &args, environ_block) catch |err| {
+            log.info("haskell-language-server failed: {}", .{err});
+        };
+    }
+
+    fn startKotlinLanguageServer(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        const p = installer.ensureKotlinLanguageServer(false) catch |err| return err;
+        try self.startGenericServer("kotlin", p, runBareBinaryThread, .{ .root_path = root_path });
+    }
+
+    fn startOcamlLsp(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        const p = installer.ensureOcamlLsp(false) catch |err| return err;
+        try self.startGenericServer("ocaml", p, runBareBinaryThread, .{ .root_path = root_path });
+    }
+
+    fn startMetals(self: *LSPManager, root_path: ?[]const u8) !void {
+        var installer = Installer.init(self.allocator, self.io, self.environ_block);
+        const p = installer.ensureMetals(false) catch |err| return err;
+        try self.startGenericServer("scala", p, runBareBinaryThread, .{ .root_path = root_path });
+    }
+
     fn getServer(self: *LSPManager, lang: []const u8) ?*LSPServer {
         return self.servers.get(lang);
     }
@@ -1176,6 +1540,25 @@ pub const LSPManager = struct {
         if (std.mem.endsWith(u8, path, ".java")) return "java";
         if (std.mem.endsWith(u8, path, ".rb") or std.mem.endsWith(u8, path, ".rake")) return "ruby";
         if (std.mem.endsWith(u8, path, ".cs")) return "csharp";
+        if (std.mem.endsWith(u8, path, ".sh") or std.mem.endsWith(u8, path, ".bash") or std.mem.endsWith(u8, path, ".zsh")) return "bash";
+        if (std.mem.endsWith(u8, path, ".lua")) return "lua";
+        if (std.mem.endsWith(u8, path, ".swift")) return "swift";
+        if (std.mem.endsWith(u8, path, ".r") or std.mem.endsWith(u8, path, ".R") or
+            std.mem.endsWith(u8, path, ".rmd") or std.mem.endsWith(u8, path, ".Rmd")) return "r";
+        if (std.mem.endsWith(u8, path, ".css") or std.mem.endsWith(u8, path, ".scss") or
+            std.mem.endsWith(u8, path, ".less")) return "css";
+        if (std.mem.endsWith(u8, path, ".html") or std.mem.endsWith(u8, path, ".htm")) return "html";
+        if (std.mem.endsWith(u8, path, ".json")) return "json";
+        if (std.mem.endsWith(u8, path, ".php") or std.mem.endsWith(u8, path, ".phtml")) return "php";
+        if (std.mem.endsWith(u8, path, ".pl") or std.mem.endsWith(u8, path, ".pm") or
+            std.mem.endsWith(u8, path, ".t")) return "perl";
+        if (std.mem.endsWith(u8, path, ".dart")) return "dart";
+        if (std.mem.endsWith(u8, path, ".ex") or std.mem.endsWith(u8, path, ".exs")) return "elixir";
+        if (std.mem.endsWith(u8, path, ".erl") or std.mem.endsWith(u8, path, ".hrl")) return "erlang";
+        if (std.mem.endsWith(u8, path, ".hs")) return "haskell";
+        if (std.mem.endsWith(u8, path, ".kt") or std.mem.endsWith(u8, path, ".kts")) return "kotlin";
+        if (std.mem.endsWith(u8, path, ".ml") or std.mem.endsWith(u8, path, ".mli")) return "ocaml";
+        if (std.mem.endsWith(u8, path, ".scala") or std.mem.endsWith(u8, path, ".sc")) return "scala";
         return null;
     }
 
@@ -1704,6 +2087,157 @@ pub const LSPManager = struct {
 
     fn pathToUri(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
         return @import("../lsp/client.zig").pathToUri(allocator, io, path);
+    }
+
+    /// Walk the workspace shallowly and return every language we can
+    /// detect — by project marker (`Cargo.toml` → rust, `go.mod` → go,
+    /// etc.) or by file extension within the first two directory
+    /// levels. The result feeds `prewarmWorkspaceLanguages` so we
+    /// start an LSP server for each language present in the project
+    /// *before* the user opens a file of that type. First hover is
+    /// then warm instead of paying a cold init delay.
+    ///
+    /// The walk is bounded (depth 2, ~5k entries) so it stays under
+    /// ~100ms even on big monorepos. Common dirs that contain
+    /// generated / vendored code are skipped.
+    ///
+    /// Caller owns the returned slice (and each entry — they're
+    /// borrowed from a static table, so don't free the inner
+    /// strings; just `free` the outer slice).
+    pub fn detectWorkspaceLanguages(self: *LSPManager, root: []const u8) ![]const []const u8 {
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(self.allocator);
+
+        // Project markers — strong signal that a project of this
+        // language lives at the workspace root, even if there are no
+        // source files directly at top level.
+        const Marker = struct { file: []const u8, lang: []const u8 };
+        const markers = [_]Marker{
+            .{ .file = "Cargo.toml", .lang = "rust" },
+            .{ .file = "go.mod", .lang = "go" },
+            .{ .file = "build.zig", .lang = "zig" },
+            .{ .file = "package.json", .lang = "typescript" }, // ts server covers js too
+            .{ .file = "tsconfig.json", .lang = "typescript" },
+            .{ .file = "pyproject.toml", .lang = "python" },
+            .{ .file = "requirements.txt", .lang = "python" },
+            .{ .file = "setup.py", .lang = "python" },
+            .{ .file = "Gemfile", .lang = "ruby" },
+            .{ .file = "pom.xml", .lang = "java" },
+            .{ .file = "build.gradle", .lang = "java" },
+            .{ .file = "build.gradle.kts", .lang = "java" },
+            .{ .file = "Package.swift", .lang = "swift" },
+            .{ .file = "CMakeLists.txt", .lang = "cpp" },
+            .{ .file = "Makefile", .lang = "cpp" },
+            .{ .file = "DESCRIPTION", .lang = "r" },
+            .{ .file = "pubspec.yaml", .lang = "dart" },
+            .{ .file = "mix.exs", .lang = "elixir" },
+            .{ .file = "rebar.config", .lang = "erlang" },
+            .{ .file = "stack.yaml", .lang = "haskell" },
+            .{ .file = "cabal.project", .lang = "haskell" },
+            .{ .file = "dune-project", .lang = "ocaml" },
+            .{ .file = "composer.json", .lang = "php" },
+            .{ .file = "build.sbt", .lang = "scala" },
+            .{ .file = "cpanfile", .lang = "perl" },
+        };
+        for (markers) |m| {
+            const p = try std.fs.path.join(self.allocator, &.{ root, m.file });
+            defer self.allocator.free(p);
+            std.Io.Dir.accessAbsolute(self.io, p, .{}) catch continue;
+            _ = try seen.getOrPut(self.allocator, m.lang);
+        }
+
+        // Extension fan-out — walk root + one level deep, looking at
+        // each file's extension. Catches projects without a canonical
+        // marker (loose `.lua` scripts, a directory of `.sh` files,
+        // etc).
+        try self.scanDirForLanguages(root, 0, 2, &seen);
+
+        // Materialise the set.
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var it = seen.keyIterator();
+        while (it.next()) |k| try out.append(self.allocator, k.*);
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    /// Recursive helper for `detectWorkspaceLanguages`. Bounded so
+    /// monorepos don't pay a multi-second scan on startup.
+    fn scanDirForLanguages(
+        self: *LSPManager,
+        dir_path: []const u8,
+        depth: u32,
+        max_depth: u32,
+        seen: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        if (depth > max_depth) return;
+        var dir = std.Io.Dir.openDirAbsolute(self.io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+
+        var entry_count: u32 = 0;
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            entry_count += 1;
+            if (entry_count > 5000) break; // safety cap
+            // Skip noisy / generated dirs. Saves time AND avoids
+            // detecting wrong languages (e.g. `.ts` files in
+            // `node_modules` shouldn't make every Python project
+            // think it's also a TypeScript project).
+            if (entry.kind == .directory) {
+                if (shouldSkipDir(entry.name)) continue;
+                if (depth + 1 > max_depth) continue;
+                const sub = std.fs.path.join(self.allocator, &.{ dir_path, entry.name }) catch continue;
+                defer self.allocator.free(sub);
+                self.scanDirForLanguages(sub, depth + 1, max_depth, seen) catch {};
+                continue;
+            }
+            if (entry.kind != .file) continue;
+            const lang = getLangFromPath(entry.name) orelse continue;
+            _ = seen.getOrPut(self.allocator, lang) catch {};
+        }
+    }
+
+    fn shouldSkipDir(name: []const u8) bool {
+        const skip = [_][]const u8{
+            ".git",        ".hg",          ".svn",
+            "node_modules", "vendor",      "target",
+            "build",        "dist",        "out",
+            ".zig-cache",   "zig-cache",   "zig-out",
+            ".cache",       ".idea",       ".vscode",
+            "__pycache__",  ".venv",       "venv",
+            ".tox",         ".mypy_cache", ".pytest_cache",
+            ".next",        ".nuxt",       ".gradle",
+            "DerivedData",
+        };
+        for (skip) |s| {
+            if (std.mem.eql(u8, s, name)) return true;
+        }
+        // Skip dot-files / dot-dirs by default — they're usually
+        // tooling state, not source.
+        return name.len > 0 and name[0] == '.';
+    }
+
+    /// One-shot prewarm: discover languages in `root`, kick off a
+    /// non-blocking `startServer` for each. Servers spin up in
+    /// parallel on the supervisor's worker pool; the call returns
+    /// once the starts are queued, not when they finish.
+    pub fn prewarmWorkspaceLanguages(self: *LSPManager, root: []const u8) !usize {
+        const langs = try self.detectWorkspaceLanguages(root);
+        defer self.allocator.free(langs);
+        var queued: usize = 0;
+        for (langs) |lang| {
+            // Don't restart a server we already have running.
+            self.manager_mutex.lockUncancelable(self.io);
+            const already = self.servers.get(lang) != null;
+            self.manager_mutex.unlock(self.io);
+            if (already) continue;
+            self.startServer(lang, root) catch |err| {
+                log.warn("[LSP PREWARM] enqueue failed for {s}: {}", .{ lang, err });
+                continue;
+            };
+            queued += 1;
+            log.info("[LSP PREWARM] queued start for {s} at {s}", .{ lang, root });
+        }
+        return queued;
     }
 
     pub fn findProjectRoot(self: *LSPManager, file_path: []const u8, lang: []const u8) ![]const u8 {

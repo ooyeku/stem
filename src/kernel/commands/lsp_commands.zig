@@ -91,6 +91,23 @@ pub const LspCommands = struct {
         }
     }
 
+    /// Scan the workspace and start an LSP server for every language
+    /// we find — same logic that runs at startup, exposed as a
+    /// command so the user can rewarm after a `cd`-style workflow or
+    /// after pulling new code that introduces a new language.
+    pub fn cmdLspPrewarm(core: anytype) anyerror!void {
+        const cwd = std.Io.Dir.cwd().realPathFileAlloc(core.io, ".", core.allocator) catch |err| {
+            log.warn("LSP prewarm: cannot resolve cwd: {}", .{err});
+            return;
+        };
+        defer core.allocator.free(cwd);
+        const queued = core.lsp_manager.prewarmWorkspaceLanguages(cwd) catch |err| {
+            log.warn("LSP prewarm failed: {}", .{err});
+            return;
+        };
+        log.info("[LSP PREWARM] queued {d} new server(s) for {s}", .{ queued, cwd });
+    }
+
     pub fn cmdLspHover(core: anytype) anyerror!void {
         try core.ensureLspDocument();
 
