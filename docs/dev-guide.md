@@ -126,10 +126,8 @@ modules and out-of-process exec plugins.
 | **Plugin CLI** | `stem plugin list/info/install/remove/test` | `src/tools/plugin_cli.zig` |
 
 **Bundled Plugins:**
-- `echo` - Reference exec JSON-RPC plugin
-- `echo-wasm` - Reference wasm plugin
+- `echo` - Reference wasm plugin (palette command pops a notification)
 - `git` - Wasm git status/diff integration
-- `markdown_viewer` - Wasm markdown commands; live panel rebuild pending
 - `plugin_manager` - Wasm plugin dashboard/operator commands
 
 ---

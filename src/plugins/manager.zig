@@ -5,18 +5,16 @@
 //! permissions, and populates the command palette eagerly from each
 //! manifest before the plugin starts.
 //!
-//! The legacy in-process `.dylib` runtime, its `PluginInterface`
-//! extern struct, the SIGSEGV crash-isolation shim, and the
-//! Plugin-Manager UI surface (status items / panels) were removed in
-//! the Phase 4 cleanup. The two surviving runtimes are:
+//! Two runtimes:
 //!
-//!   * **exec** — `bundled/plugins/<name>/{plugin.json, stem-<name>}`.
-//!     A child process speaking JSON-RPC 2.0 over stdio with LSP
-//!     framing. See `process_loader.zig`.
 //!   * **wasm** — `bundled/plugins/<name>/{plugin.json, <name>.wasm}`.
 //!     A WebAssembly module loaded by the pure-Zig interpreter and
 //!     bound to a small set of `env.stem_*` host imports. See
 //!     `wasm/{interpreter,loader}.zig`.
+//!   * **exec** — `~/.stem/plugins/<name>/{plugin.json, <entry>}`.
+//!     A child process speaking JSON-RPC 2.0 over stdio with LSP
+//!     framing. See `process_loader.zig`. Nothing bundled uses this
+//!     path today; it's available for third-party plugins.
 
 const std = @import("std");
 const log = std.log.scoped(.PluginManager);
@@ -75,6 +73,14 @@ pub const PluginManager = struct {
     /// command id to execute. The core input handler consults this
     /// after its own leader chord chain when `leader_pending` is set.
     plugin_keybindings: std.StringHashMapUnmanaged([]u8) = .empty,
+
+    /// Editor-side hooks set by Core after construction. Lets the
+    /// plugin manager pull data that lives on Core (active buffer
+    /// content, file path) without taking a circular import on the
+    /// `Core` type. Wasm `stem_get_buffer_*` host imports route
+    /// through these.
+    host_hooks: HostHooks = .{},
+
     /// Monotonic counter for assigning new widget ids on each
     /// status-item / panel registration. Stable across the lifetime
     /// of the plugin manager.
@@ -623,6 +629,16 @@ pub const PluginManager = struct {
     // Manifest-driven palette + permissions.
     // -------------------------------------------------------------------
 
+    pub const HostHooks = struct {
+        user_data: ?*anyopaque = null,
+        get_buffer_content: ?*const fn (user_data: *anyopaque, out_buf: []u8) i32 = null,
+        get_buffer_path: ?*const fn (user_data: *anyopaque, out_buf: []u8) i32 = null,
+    };
+
+    pub fn setHostHooks(self: *PluginManager, hooks: HostHooks) void {
+        self.host_hooks = hooks;
+    }
+
     pub const PluginRuntimeKind = enum { exec, wasm };
 
     /// One subscriber entry on the event bus.
@@ -1076,6 +1092,10 @@ pub const PluginManager = struct {
                 .on_clear_status_item = onWasmClearStatusItem,
                 .on_set_panel = onWasmSetPanel,
                 .on_clear_panel = onWasmClearPanel,
+                .on_get_buffer_content = onWasmGetBufferContent,
+                .on_get_buffer_path = onWasmGetBufferPath,
+                .on_load_plugin = onWasmLoadPlugin,
+                .on_unload_plugin = onWasmUnloadPlugin,
             },
         ) catch |err| {
             log.err("Failed to load wasm plugin '{s}': {s}", .{ m.name, @errorName(err) });
@@ -1369,6 +1389,60 @@ pub const PluginManager = struct {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
         self.removePanel(plugin_id, id);
         self.requestUiRefresh();
+    }
+
+    fn onWasmGetBufferContent(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        out_buf: []u8,
+    ) i32 {
+        _ = plugin_id;
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        const hooks = self.host_hooks;
+        const fn_ptr = hooks.get_buffer_content orelse return -2;
+        const ud = hooks.user_data orelse return -2;
+        return fn_ptr(ud, out_buf);
+    }
+
+    fn onWasmGetBufferPath(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        out_buf: []u8,
+    ) i32 {
+        _ = plugin_id;
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        const hooks = self.host_hooks;
+        const fn_ptr = hooks.get_buffer_path orelse return -2;
+        const ud = hooks.user_data orelse return -2;
+        return fn_ptr(ud, out_buf);
+    }
+
+    fn onWasmLoadPlugin(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        name: []const u8,
+    ) i32 {
+        _ = plugin_id;
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.loadPluginByName(name) catch |err| {
+            log.warn("stem_load_plugin('{s}') failed: {s}", .{ name, @errorName(err) });
+            return -1;
+        };
+        return 0;
+    }
+
+    fn onWasmUnloadPlugin(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        name: []const u8,
+    ) i32 {
+        _ = plugin_id;
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.unloadPlugin(name) catch |err| {
+            log.warn("stem_unload_plugin('{s}') failed: {s}", .{ name, @errorName(err) });
+            return -1;
+        };
+        return 0;
     }
 
     /// After a widget mutation, prod core to re-render. We do this by

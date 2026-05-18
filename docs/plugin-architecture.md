@@ -9,11 +9,8 @@ palette integration.
 | `wasm`  | `<name>.wasm`      | pure-Zig interpreter in stem's process | wasm sandbox     | `spawn` enforced |
 | `exec`  | executable binary  | child process, stdin/stdout            | OS process       | event subscription checked |
 
-The legacy in-process `.dylib` runtime — with its `PluginInterface`
-extern struct, host-exported `_stem_*` symbols, SIGSEGV crash-isolation
-shim, and request/reply SDK — was removed in the Phase 4 cleanup.
 `PluginManager` in [src/plugins/manager.zig](../src/plugins/manager.zig)
-now only orchestrates wasm and exec plugins.
+orchestrates both runtimes.
 
 ## Manifest
 
@@ -116,11 +113,9 @@ The `stem plugin` CLI subcommand lives in
 
 | Name | Runtime | What it does |
 | --- | --- | --- |
-| `echo` | exec | reference JSON-RPC plugin (`echo.hello` logs a greeting) |
-| `echo-wasm` | wasm | reference wasm plugin (`echo-wasm.hello` logs a greeting) |
-| `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` via `stem_spawn_capture` |
-| `markdown_viewer` | wasm | `markdown.preview/edit/toggle_panel` (preview rebuild pending wasm event ABI) |
-| `plugin_manager` | wasm | dashboard via `stem plugin list` shell-out + load/unload hints |
+| `echo` | wasm | reference wasm plugin (`echo.hello` pops a notification) |
+| `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` via `stem_spawn_capture`; live `Git: <branch>` status indicator via event subscriptions |
+| `plugin_manager` | wasm | dashboard via `stem plugin list` shell-out + `reload_all` via `stem_load/unload_plugin` |
 
 `install.sh` copies each directory to both `<prefix>/lib/stem/plugins/<name>/`
 and `~/.stem/plugins/<name>/`, codesigns the installed `stem` binary
@@ -148,9 +143,6 @@ per-user dir.
 
 ## Follow-ups
 
-- Wasm event dispatch (`buffer_switched`, `cursor_moved`, …) so
-  markdown-viewer's live preview can come back.
-- Wasm panel / status-item host imports.
 - Process plugin event subscription delivery (the permission check
   lands today but the broadcast → process-plugin route is a stub).
 - Spawn checksum verification + `stem plugin install <url>` for

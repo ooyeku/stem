@@ -929,8 +929,7 @@ Embedded query files in `src/syntax/queries/`:
 
 ## Plugin System
 
-Stem has a manifest-driven plugin system that keeps extensions outside
-the old in-process dylib boundary. Plugins live in
+Stem has a manifest-driven plugin system. Plugins live in
 `~/.stem/plugins/<name>/`, declare their commands and permissions in
 `plugin.json`, and run through either the `wasm` or `exec` runtime.
 
@@ -952,7 +951,7 @@ graph TB
     end
 
     subgraph "Exec Plugin Process"
-        EP[stem-echo]
+        EP[third-party.bin]
         STDIO[JSON-RPC over stdio]
     end
 
@@ -1010,11 +1009,9 @@ Stem comes with several plugins pre-installed:
 
 | Plugin | Runtime | Commands |
 |--------|---------|----------|
-| `echo` | exec | `echo.hello` |
-| `echo-wasm` | wasm | `echo-wasm.hello` |
+| `echo` | wasm | `echo.hello` |
 | `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` |
-| `markdown_viewer` | wasm | `markdown.preview`, `markdown.edit`, `markdown.toggle_panel` |
-| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin.load`, `plugin.unload` |
+| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` |
 
 Current plugin UI extension gaps: event delivery into plugins, visible
 notifications, panel/status-item host imports, and filesystem

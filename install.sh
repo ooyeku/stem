@@ -125,8 +125,8 @@ install_plugin_dir() {
 USER_PLUGIN_DIR="$HOME/.stem/plugins"
 mkdir -p "$USER_PLUGIN_DIR"
 
-# Wasm bundled plugins: git, markdown-viewer, plugin-manager, echo-wasm.
-WASM_PLUGINS="git-wasm markdown-viewer-wasm plugin-manager-wasm echo-wasm"
+# Wasm bundled plugins: echo, git, plugin-manager.
+WASM_PLUGINS="echo git-wasm plugin-manager-wasm"
 
 echo "Installing bundled wasm plugins to $PLUGIN_DIR/"
 for name in $WASM_PLUGINS; do
@@ -134,18 +134,11 @@ for name in $WASM_PLUGINS; do
     echo "  $PLUGIN_DIR/$name/"
 done
 
-# Echo exec reference plugin (Phase 1, kept as the canonical
-# language-agnostic out-of-process example).
-echo "Installing exec reference plugin to $PLUGIN_DIR/"
-install_plugin_dir "bundled/plugins/echo" "stem-echo" "$PLUGIN_DIR"
-echo "  $PLUGIN_DIR/echo/"
-
 echo ""
 echo "Refreshing per-user plugin dir: $USER_PLUGIN_DIR"
 for name in $WASM_PLUGINS; do
     install_plugin_dir "bundled/plugins/$name" "$name.wasm" "$USER_PLUGIN_DIR"
 done
-install_plugin_dir "bundled/plugins/echo" "stem-echo" "$USER_PLUGIN_DIR"
 
 # Sweep dylib plugins from older releases out of the per-user dir.
 # stem no longer has a dylib loader at all; any leftover .dylib would
@@ -162,7 +155,7 @@ fi
 echo ""
 echo "Installed:"
 echo "  $BIN_DIR/stem"
-echo "  $PLUGIN_DIR/{$(echo "$WASM_PLUGINS" | tr ' ' ','),echo}/"
+echo "  $PLUGIN_DIR/{$(echo "$WASM_PLUGINS" | tr ' ' ',')}/"
 echo "  $USER_PLUGIN_DIR/  (refreshed)"
 
 if ! printf '%s' "$PATH" | tr ':' '\n' | grep -Fxq "$BIN_DIR"; then

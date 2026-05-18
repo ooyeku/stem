@@ -1,4 +1,4 @@
-//! WebAssembly plugin loader (Phase 2).
+//! WebAssembly plugin loader.
 //!
 //! Manages the lifecycle of a wasm plugin:
 //!   1. Read the `.wasm` file pointed at by the manifest's `entry`.
@@ -11,11 +11,11 @@
 //!      `handle_command(id_ptr, id_len)` function.
 //!   7. On shutdown, call `deactivate` if exported.
 //!
-//! The wasm plugin's import schema is intentionally a narrow mirror of
-//! the JSON-RPC method names from Phase 1, but with pointer+length
-//! arguments instead of JSON envelopes. Each host import marshals
-//! linear-memory bytes into Zig slices, then routes to the same
-//! subsystems (command registry, logger, etc.) the process plugins use.
+//! The wasm plugin's import schema mirrors the JSON-RPC method names
+//! exec plugins use, but with pointer+length arguments instead of JSON
+//! envelopes. Each host import marshals linear-memory bytes into Zig
+//! slices, then routes to the same subsystems (command registry,
+//! logger, etc.) the exec plugins use.
 
 const std = @import("std");
 const vigil = @import("vigil");
@@ -72,6 +72,19 @@ pub const Callbacks = struct {
     on_set_panel: *const fn (user_data: *anyopaque, plugin_id: []const u8, id: []const u8, title: []const u8, content: []const u8, position: u8, width_percent: u8) void,
     /// Plugin called `stem_clear_panel(id)`.
     on_clear_panel: *const fn (user_data: *anyopaque, plugin_id: []const u8, id: []const u8) void,
+    /// Plugin called `stem_get_buffer_content(out_buf)`. Host copies
+    /// the active buffer's text into `out_buf` (truncating as
+    /// needed) and returns the byte count, or negative on error.
+    on_get_buffer_content: *const fn (user_data: *anyopaque, plugin_id: []const u8, out_buf: []u8) i32,
+    /// Plugin called `stem_get_buffer_path(out_buf)`. Host writes the
+    /// active buffer's file path (or its virtual name) and returns
+    /// the byte count.
+    on_get_buffer_path: *const fn (user_data: *anyopaque, plugin_id: []const u8, out_buf: []u8) i32,
+    /// Plugin called `stem_load_plugin(name)`. Routes to
+    /// `PluginManager.loadPluginByName`.
+    on_load_plugin: *const fn (user_data: *anyopaque, plugin_id: []const u8, name: []const u8) i32,
+    /// Plugin called `stem_unload_plugin(name)`.
+    on_unload_plugin: *const fn (user_data: *anyopaque, plugin_id: []const u8, name: []const u8) i32,
 };
 
 pub const State = enum { loaded, activated, deactivated, failed };
@@ -292,6 +305,10 @@ pub fn load(
         .{ .module_name = "env", .field_name = "stem_clear_status_item", .func = hostStemClearStatusItem },
         .{ .module_name = "env", .field_name = "stem_set_panel", .func = hostStemSetPanel },
         .{ .module_name = "env", .field_name = "stem_clear_panel", .func = hostStemClearPanel },
+        .{ .module_name = "env", .field_name = "stem_get_buffer_content", .func = hostStemGetBufferContent },
+        .{ .module_name = "env", .field_name = "stem_get_buffer_path", .func = hostStemGetBufferPath },
+        .{ .module_name = "env", .field_name = "stem_load_plugin", .func = hostStemLoadPlugin },
+        .{ .module_name = "env", .field_name = "stem_unload_plugin", .func = hostStemUnloadPlugin },
     };
 
     wp.instance = try interp.instantiate(allocator, &wp.module, &host_imports, @ptrCast(wp));
@@ -486,6 +503,54 @@ fn hostStemClearPanel(instance: *interp.Instance, args: []const u64, _: *u64) in
     wp.callbacks.on_clear_panel(wp.callbacks.user_data, wp.plugin_id, id);
 }
 
+/// env.stem_get_buffer_content(out_ptr, out_max) -> i32
+fn hostStemGetBufferContent(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 2) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const out_buf = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const n = wp.callbacks.on_get_buffer_content(wp.callbacks.user_data, wp.plugin_id, out_buf);
+    result.* = @as(u64, @bitCast(@as(i64, n)));
+}
+
+/// env.stem_get_buffer_path(out_ptr, out_max) -> i32
+fn hostStemGetBufferPath(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 2) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const out_buf = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const n = wp.callbacks.on_get_buffer_path(wp.callbacks.user_data, wp.plugin_id, out_buf);
+    result.* = @as(u64, @bitCast(@as(i64, n)));
+}
+
+/// env.stem_load_plugin(name_ptr, name_len) -> i32
+fn hostStemLoadPlugin(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 2) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const name = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const rc = wp.callbacks.on_load_plugin(wp.callbacks.user_data, wp.plugin_id, name);
+    result.* = @as(u64, @bitCast(@as(i64, rc)));
+}
+
+/// env.stem_unload_plugin(name_ptr, name_len) -> i32
+fn hostStemUnloadPlugin(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 2) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const name = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const rc = wp.callbacks.on_unload_plugin(wp.callbacks.user_data, wp.plugin_id, name);
+    result.* = @as(u64, @bitCast(@as(i64, rc)));
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -523,6 +588,18 @@ const TestState = struct {
     fn onClearSI(_: *anyopaque, _: []const u8, _: []const u8) void {}
     fn onSetPanel(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: u8, _: u8) void {}
     fn onClearPanel(_: *anyopaque, _: []const u8, _: []const u8) void {}
+    fn onGetBufContent(_: *anyopaque, _: []const u8, _: []u8) i32 {
+        return -1;
+    }
+    fn onGetBufPath(_: *anyopaque, _: []const u8, _: []u8) i32 {
+        return -1;
+    }
+    fn onLoadPlugin(_: *anyopaque, _: []const u8, _: []const u8) i32 {
+        return -1;
+    }
+    fn onUnloadPlugin(_: *anyopaque, _: []const u8, _: []const u8) i32 {
+        return -1;
+    }
     fn deinit(self: *TestState) void {
         for (self.logs.items) |s| self.allocator.free(s);
         for (self.commands.items) |s| self.allocator.free(s);
@@ -570,6 +647,10 @@ test "load + activate + dispatchCommand against the built echo-wasm.wasm" {
         .on_clear_status_item = TestState.onClearSI,
         .on_set_panel = TestState.onSetPanel,
         .on_clear_panel = TestState.onClearPanel,
+        .on_get_buffer_content = TestState.onGetBufContent,
+        .on_get_buffer_path = TestState.onGetBufPath,
+        .on_load_plugin = TestState.onLoadPlugin,
+        .on_unload_plugin = TestState.onUnloadPlugin,
     };
 
     const wp = try load(a, io, "echo-wasm", abs_path, cbs);

@@ -154,8 +154,8 @@ export fn handle_command(id_ptr: [*]const u8, id_len: i32) void {
 }
 ```
 
-The bundled `echo-wasm`, `git`, `markdown_viewer`, and
-`plugin_manager` plugins are the current references.
+The bundled `echo`, `git`, and `plugin_manager` plugins are the
+current references.
 
 ## Exec Plugins
 
@@ -207,11 +207,9 @@ host imports.
 
 | Name | Runtime | Commands |
 | --- | --- | --- |
-| `echo` | exec | `echo.hello` |
-| `echo-wasm` | wasm | `echo-wasm.hello` |
+| `echo` | wasm | `echo.hello` |
 | `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` |
-| `markdown_viewer` | wasm | `markdown.preview`, `markdown.edit`, `markdown.toggle_panel` |
-| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin.load`, `plugin.unload` |
+| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` |
 
 ## Current Limitations
 

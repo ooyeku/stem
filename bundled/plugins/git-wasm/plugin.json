@@ -1,11 +1,12 @@
 {
   "name": "git",
-  "version": "0.4.0",
-  "description": "Git integration. Runs git subcommands via the wasm spawn host import and surfaces their output in a virtual buffer.",
+  "version": "0.5.0",
+  "description": "Git integration. Runs git subcommands and tracks the active branch in the status bar.",
   "runtime": "wasm",
   "entry": "git-wasm.wasm",
   "permissions": {
-    "spawn": ["git"]
+    "spawn": ["git"],
+    "events": ["buffer.switched", "buffer.changed", "file.saved"]
   },
   "commands": [
     {"id": "git.status", "title": "[Git] Status", "description": "Show repository status (git status --porcelain)"},

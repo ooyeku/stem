@@ -1,9 +1,8 @@
 //! Plugin manifest parser.
 //!
 //! Manifest file format: `plugin.json` (sibling of the plugin binary,
-//! inside the plugin's directory). Switched from the TOML draft for
-//! Phase 1 because `std.json` makes this a ~50-line parser instead of
-//! a TOML implementation. A future TOML reader can be additive: try
+//! inside the plugin's directory). JSON keeps the parser to ~50 lines
+//! via `std.json`; a future TOML reader can be additive — try
 //! `plugin.toml` first, fall back to `plugin.json`.
 //!
 //! Example:
@@ -27,8 +26,8 @@
 //! ```
 //!
 //! Plugin manager reads this BEFORE loading the binary so commands +
-//! keybinds populate the palette at startup, and so the permissions
-//! checker (Phase 3) can deny capability requests not declared here.
+//! keybinds populate the palette at startup, and so the permission
+//! checker can deny capability requests not declared here.
 
 const std = @import("std");
 

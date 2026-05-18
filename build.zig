@@ -317,32 +317,12 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addIncludePath(ts_dep.path("lib/src"));
     b.installArtifact(exe);
 
-    // ===== Bundled Plugins =====
-    // All bundled plugins now target the wasm runtime (Phase 4
-    // migration). Dylib loading still works for third-party plugins
-    // installed under ~/.stem/plugins/, but no bundled .dylib ships
-    // with stem itself — the legacy plugin SDK module is left in
-    // tree as a reference for external plugin authors.
-
-    // Out-of-process reference plugin (Phase 1). Speaks JSON-RPC 2.0
-    // over stdio with LSP framing. No `stem` import — the plugin is
-    // language-agnostic by design, so we keep the reference example
-    // free of any host-side dependencies too.
-    const echo_plugin = b.addExecutable(.{
-        .name = "stem-echo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bundled/plugins/echo/src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    echo_plugin.root_module.link_libc = true;
-    b.installArtifact(echo_plugin);
-
     // ===== Bundled WebAssembly plugins =====
-    // Built for `wasm32-freestanding`. Host imports (env.stem_*) are
-    // left unresolved at build time — they're bound by the host's
-    // pure-Zig interpreter at instantiate time.
+    // All bundled plugins target the wasm runtime. The host still
+    // supports exec (out-of-process JSON-RPC) plugins, but nothing
+    // bundled uses that path. Built for `wasm32-freestanding`; host
+    // imports (env.stem_*) are left unresolved at build time and bound
+    // by the host's pure-Zig interpreter at instantiate time.
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
@@ -350,9 +330,8 @@ pub fn build(b: *std.Build) void {
 
     const WasmPlugin = struct { name: []const u8, source: []const u8 };
     const wasm_plugins = [_]WasmPlugin{
-        .{ .name = "echo-wasm", .source = "bundled/plugins/echo-wasm/src/main.zig" },
+        .{ .name = "echo", .source = "bundled/plugins/echo/src/main.zig" },
         .{ .name = "git-wasm", .source = "bundled/plugins/git-wasm/src/main.zig" },
-        .{ .name = "markdown-viewer-wasm", .source = "bundled/plugins/markdown-viewer-wasm/src/main.zig" },
         .{ .name = "plugin-manager-wasm", .source = "bundled/plugins/plugin-manager-wasm/src/main.zig" },
     };
     inline for (wasm_plugins) |wp| {

@@ -52,18 +52,9 @@
                 cp "$out/bin/$artifact" "$dest/"
               fi
             }
-            install_plugin_dir echo-wasm           echo-wasm.wasm
+            install_plugin_dir echo                echo.wasm
             install_plugin_dir git-wasm            git-wasm.wasm
-            install_plugin_dir markdown-viewer-wasm markdown-viewer-wasm.wasm
             install_plugin_dir plugin-manager-wasm plugin-manager-wasm.wasm
-            # Exec reference plugin (echo).
-            if [ -d bundled/plugins/echo ]; then
-              mkdir -p $out/lib/stem/plugins/echo
-              cp bundled/plugins/echo/plugin.json $out/lib/stem/plugins/echo/
-              if [ -f $out/bin/stem-echo ]; then
-                cp $out/bin/stem-echo $out/lib/stem/plugins/echo/
-              fi
-            fi
           '';
 
           meta = with pkgs.lib; {

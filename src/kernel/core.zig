@@ -761,7 +761,7 @@ pub const Core = struct {
         try R.register("mode.select", "Mode: Select", "Switch to select mode", Wrap(SystemCommands.cmdModeSelect).run, null);
 
         try R.register("help.show", "Help: Show", "Show editor help", Wrap(SystemCommands.cmdShowHelp).run, null);
-        try R.register("plugin.show", "[Plugin Manager] List Plugins", "Show loaded plugins", Wrap(SystemCommands.cmdShowPlugins).run, null);
+        try R.register("plugin.show", "Plugins: List Loaded", "Show plugins currently loaded in the running stem instance", Wrap(SystemCommands.cmdShowPlugins).run, null);
         try R.register("stats.show", "Stats: Message Bus", "Live view of stem's Vigil-backed message bus stats", Wrap(SystemCommands.cmdShowStats).run, null);
         try R.register("job.list", "Jobs: List Active", "Show all active background jobs (Space+j)", Wrap(SystemCommands.cmdJobList).run, null);
         try R.register("view.logs", "View: Logs", "Open log viewer", Wrap(SystemCommands.cmdViewLogs).run, null);
@@ -791,6 +791,13 @@ pub const Core = struct {
         self.core_inbox = inbox;
         self.core_bus = bus;
         self.plugin_manager.core_inbox = inbox;
+        // Editor hooks so wasm plugins can synchronously read the
+        // active buffer's content/path via `stem_get_buffer_*`.
+        self.plugin_manager.setHostHooks(.{
+            .user_data = @ptrCast(self),
+            .get_buffer_content = coreGetBufferContent,
+            .get_buffer_path = coreGetBufferPath,
+        });
         try self.registerCommands();
 
         self.plugin_manager.loadUserPlugins() catch |err| {
@@ -966,12 +973,12 @@ pub const Core = struct {
                                 std.Io.Clock.real.now(self.io).toMilliseconds() + 4_000;
                             self.sendUpdate() catch {};
                         }
-                        // Other PluginMessage variants (state/buffer
-                        // requests, command registers, status items,
-                        // panels, event subs) were the dylib SDK's
-                        // wire surface; the wasm + exec runtimes use
-                        // their own callback/JSON-RPC paths and never
-                        // emit those tags.
+                        // Other PluginMessage variants are unused —
+                        // wasm plugins call host imports directly and
+                        // exec plugins use JSON-RPC, so command
+                        // registration, status items, panels and
+                        // event subs all route through those paths
+                        // and never reach this dispatch.
                     },
                     .tick => {
                         // Drain any paths discovered by background directory
@@ -1630,7 +1637,7 @@ pub const Core = struct {
             return true;
         }
         if (self.leader_pending) {
-            // Plugin keybindings (Phase 4): manifests can declare a
+            // Plugin keybindings: manifests can declare a
             // chord like `"keybinding": "Space g s"`. We accumulate
             // ASCII keystrokes into `plugin_chord_buf` (after the
             // leader) and consult the manager. Exact match runs the
@@ -3457,6 +3464,30 @@ pub const Core = struct {
         self.lsp_manager.documentSaved(path) catch |err| {
             log.warn("LSP save notification failed for '{s}': {}", .{ path, err });
         };
+    }
+
+    /// Wasm host-hook implementations. These run on whichever thread
+    /// invoked the wasm function — currently always core's main
+    /// thread, so direct access to `buffer_manager` is safe. If we
+    /// ever dispatch wasm work off-thread the manager will need to
+    /// route these through `core_inbox` instead.
+    fn coreGetBufferContent(user_data: *anyopaque, out_buf: []u8) i32 {
+        const self: *Core = @ptrCast(@alignCast(user_data));
+        const active = self.buffer_manager.getActive();
+        const content = active.state.buffer.toString(self.allocator) catch return -1;
+        defer self.allocator.free(content);
+        const n = @min(content.len, out_buf.len);
+        @memcpy(out_buf[0..n], content[0..n]);
+        return @intCast(n);
+    }
+
+    fn coreGetBufferPath(user_data: *anyopaque, out_buf: []u8) i32 {
+        const self: *Core = @ptrCast(@alignCast(user_data));
+        const active = self.buffer_manager.getActive();
+        const path = active.file_path orelse active.name;
+        const n = @min(path.len, out_buf.len);
+        @memcpy(out_buf[0..n], path[0..n]);
+        return @intCast(n);
     }
 
     /// Hand a `PluginMessage` reply back to whichever process plugin

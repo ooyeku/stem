@@ -104,37 +104,70 @@ fn runList(ctx: Context) !void {
     };
     defer dir.close(ctx.io);
 
-    try ctx.out.print("Plugins in {s}:\n\n", .{root});
-
-    var it = dir.iterate();
-    var count: usize = 0;
-    while (it.next(ctx.io) catch null) |entry| {
-        switch (entry.kind) {
-            .directory => {
-                const plugin_dir = try std.fs.path.join(ctx.allocator, &.{ root, entry.name });
-                defer ctx.allocator.free(plugin_dir);
-                if (readManifest(ctx.allocator, ctx.io, plugin_dir)) |m_const| {
-                    var m = m_const;
-                    defer m.deinit();
-                    try ctx.out.print("  {s:<24} {s}  ({s})\n", .{ m.name, m.version, @tagName(m.runtime) });
-                    if (m.description.len > 0) {
-                        try ctx.out.print("    {s}\n", .{m.description});
-                    }
-                    count += 1;
-                } else |_| {
-                    // Stray directory without manifest — skip silently.
-                }
-            },
-            else => {
-                // Files at the top of `~/.stem/plugins/` are stale
-                // artifacts from older releases (e.g. leftover .dylib
-                // files); `install.sh` sweeps them. Plugins live as
-                // directories now.
-            },
-        }
+    // Two-pass: collect manifests first so the header line knows the
+    // total count, and we can render the listing inside a fixed-width
+    // visual frame.
+    var manifests: std.ArrayListUnmanaged(manifest_mod.Manifest) = .empty;
+    defer {
+        for (manifests.items) |*m| m.deinit();
+        manifests.deinit(ctx.allocator);
     }
-    if (count == 0) {
-        try ctx.out.print("  (none installed)\n", .{});
+    var it = dir.iterate();
+    while (it.next(ctx.io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const plugin_dir = try std.fs.path.join(ctx.allocator, &.{ root, entry.name });
+        defer ctx.allocator.free(plugin_dir);
+        if (readManifest(ctx.allocator, ctx.io, plugin_dir)) |m| {
+            try manifests.append(ctx.allocator, m);
+        } else |_| {}
+    }
+    std.mem.sort(manifest_mod.Manifest, manifests.items, {}, struct {
+        fn lt(_: void, a: manifest_mod.Manifest, b: manifest_mod.Manifest) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lt);
+
+    const rule = "─────────────────────────────────────────────────────────────────────";
+    try ctx.out.print("Stem plugins — {d} installed\n", .{manifests.items.len});
+    try ctx.out.print("{s}\n\n", .{rule});
+
+    if (manifests.items.len == 0) {
+        try ctx.out.print("  (none installed)\n\n", .{});
+    }
+
+    for (manifests.items) |*m| {
+        const runtime_tag = @tagName(m.runtime);
+        try ctx.out.print("  {s:<22} v{s:<8} [{s}]\n", .{ m.name, m.version, runtime_tag });
+        if (m.description.len > 0) {
+            try printWrapped(ctx.out, m.description, "    ", 72);
+        }
+        try ctx.out.print("\n", .{});
+    }
+
+    try ctx.out.print("Plugins directory: {s}\n", .{root});
+}
+
+/// Word-wrap `text` to `max_cols` columns, prefixing each line with
+/// `indent`. Falls back to a single overlong line if a word doesn't
+/// fit — better to be ugly than to silently lose characters.
+fn printWrapped(out: *std.Io.Writer, text: []const u8, indent: []const u8, max_cols: usize) !void {
+    var rem = std.mem.trim(u8, text, " \t\r\n");
+    while (rem.len > 0) {
+        // Each line gets the indent first.
+        const budget: usize = if (max_cols > indent.len) max_cols - indent.len else 16;
+        if (rem.len <= budget) {
+            try out.print("{s}{s}\n", .{ indent, rem });
+            return;
+        }
+        // Look for the last whitespace at or before `budget`.
+        var break_at: usize = budget;
+        while (break_at > 0 and rem[break_at] != ' ' and rem[break_at] != '\t') : (break_at -= 1) {}
+        if (break_at == 0) break_at = budget; // no space — hard-break
+        try out.print("{s}{s}\n", .{ indent, rem[0..break_at] });
+        // Skip the breaking whitespace.
+        var next: usize = break_at;
+        while (next < rem.len and (rem[next] == ' ' or rem[next] == '\t')) : (next += 1) {}
+        rem = rem[next..];
     }
 }
 
@@ -349,6 +382,18 @@ const TestHarness = struct {
     fn onClearSI(_: *anyopaque, _: []const u8, _: []const u8) void {}
     fn onSetPanel(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: u8, _: u8) void {}
     fn onClearPanel(_: *anyopaque, _: []const u8, _: []const u8) void {}
+    fn onGetBufContent(_: *anyopaque, _: []const u8, _: []u8) i32 {
+        return -1;
+    }
+    fn onGetBufPath(_: *anyopaque, _: []const u8, _: []u8) i32 {
+        return -1;
+    }
+    fn onLoadPlugin(_: *anyopaque, _: []const u8, _: []const u8) i32 {
+        return -1;
+    }
+    fn onUnloadPlugin(_: *anyopaque, _: []const u8, _: []const u8) i32 {
+        return -1;
+    }
 
     fn deinit(self: *TestHarness) void {
         for (self.commands.items) |s| self.allocator.free(s);
@@ -416,6 +461,10 @@ fn runTest(ctx: Context) !void {
                     .on_clear_status_item = TestHarness.onClearSI,
                     .on_set_panel = TestHarness.onSetPanel,
                     .on_clear_panel = TestHarness.onClearPanel,
+                    .on_get_buffer_content = TestHarness.onGetBufContent,
+                    .on_get_buffer_path = TestHarness.onGetBufPath,
+                    .on_load_plugin = TestHarness.onLoadPlugin,
+                    .on_unload_plugin = TestHarness.onUnloadPlugin,
                 },
             ) catch |err| {
                 try ctx.err.print("FAIL: wasm load: {s}\n", .{@errorName(err)});

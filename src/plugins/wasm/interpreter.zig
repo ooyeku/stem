@@ -1,4 +1,4 @@
-//! Pure-Zig WebAssembly interpreter (Phase 2).
+//! Pure-Zig WebAssembly interpreter.
 //!
 //! Scope: enough of the wasm 1.0 core spec to run stem plugins.
 //! Plugins are compiled `zig build -Dtarget=wasm32-freestanding`,
@@ -1054,8 +1054,79 @@ fn step(
             try push(inst, vs, @as(u64, v));
         },
 
+        // Sign-extension ops (post-MVP, but Zig emits them freely).
+        0xC0 => { // i32.extend8_s
+            const v: i8 = @bitCast(@as(u8, @truncate(try pop(vs))));
+            try push(inst, vs, @as(u64, @as(u32, @bitCast(@as(i32, v)))));
+        },
+        0xC1 => { // i32.extend16_s
+            const v: i16 = @bitCast(@as(u16, @truncate(try pop(vs))));
+            try push(inst, vs, @as(u64, @as(u32, @bitCast(@as(i32, v)))));
+        },
+        0xC2 => { // i64.extend8_s
+            const v: i8 = @bitCast(@as(u8, @truncate(try pop(vs))));
+            try push(inst, vs, @as(u64, @bitCast(@as(i64, v))));
+        },
+        0xC3 => { // i64.extend16_s
+            const v: i16 = @bitCast(@as(u16, @truncate(try pop(vs))));
+            try push(inst, vs, @as(u64, @bitCast(@as(i64, v))));
+        },
+        0xC4 => { // i64.extend32_s
+            const v: i32 = @bitCast(@as(u32, @truncate(try pop(vs))));
+            try push(inst, vs, @as(u64, @bitCast(@as(i64, v))));
+        },
+
+        // 0xfc-prefixed family: bulk memory + saturating truncations.
+        // The next byte is the sub-opcode; we only implement the
+        // subops Zig actually emits for our plugins (`memory.copy`
+        // and `memory.fill`).
+        0xFC => try stepFC(inst, vs, frame),
+
         else => {
             log.warn("unsupported opcode 0x{x:0>2} at pc={d}", .{ opcode, frame.pc - 1 });
+            return error.UnsupportedOp;
+        },
+    }
+}
+
+fn stepFC(inst: *Instance, vs: *std.ArrayListUnmanaged(u64), frame: *Frame) !void {
+    const sub = try readU32Body(frame);
+    switch (sub) {
+        // memory.copy: immediates are two memory indices (both 0 in
+        // the MVP). Pops n, src, dst (i32 each), then copies n bytes
+        // from `memory[src..]` to `memory[dst..]`. Handles overlap by
+        // direction-sensitive copy.
+        0x0A => {
+            _ = try readByteBody(frame); // dst memory index
+            _ = try readByteBody(frame); // src memory index
+            const n: u32 = @truncate(try pop(vs));
+            const src: u32 = @truncate(try pop(vs));
+            const dst: u32 = @truncate(try pop(vs));
+            if (n == 0) return;
+            const end_src = @as(u64, src) + n;
+            const end_dst = @as(u64, dst) + n;
+            if (end_src > inst.memory.len or end_dst > inst.memory.len) return error.Trap;
+            // Forward-or-backward to handle overlap correctly.
+            if (dst <= src) {
+                std.mem.copyForwards(u8, inst.memory[dst .. dst + n], inst.memory[src .. src + n]);
+            } else {
+                std.mem.copyBackwards(u8, inst.memory[dst .. dst + n], inst.memory[src .. src + n]);
+            }
+        },
+        // memory.fill: immediate is one memory index. Pops n, value,
+        // dst — fills `memory[dst..dst+n]` with `value & 0xff`.
+        0x0B => {
+            _ = try readByteBody(frame); // memory index
+            const n: u32 = @truncate(try pop(vs));
+            const value: u8 = @truncate(try pop(vs));
+            const dst: u32 = @truncate(try pop(vs));
+            if (n == 0) return;
+            const end_dst = @as(u64, dst) + n;
+            if (end_dst > inst.memory.len) return error.Trap;
+            @memset(inst.memory[dst .. dst + n], value);
+        },
+        else => {
+            log.warn("unsupported 0xfc subop 0x{x:0>2} at pc={d}", .{ sub, frame.pc - 1 });
             return error.UnsupportedOp;
         },
     }
@@ -1235,6 +1306,8 @@ fn scanToEnd(frame: *Frame, _: usize, _: *std.ArrayListUnmanaged(Label)) !void {
                 _ = try readU32Body(frame);
                 _ = try readU32Body(frame);
             },
+            // 0xfc family: sub-opcode + variable immediates.
+            0xFC => try skipFCImmediates(frame),
             else => {},
         }
     }
@@ -1280,10 +1353,33 @@ fn skipToElseOrEnd(frame: *Frame, labels: *std.ArrayListUnmanaged(Label)) !void 
                 _ = try readU32Body(frame);
                 _ = try readU32Body(frame);
             },
+            0xFC => try skipFCImmediates(frame),
             else => {},
         }
     }
     return error.InvalidModule;
+}
+
+/// Skip past the immediates of a 0xfc-prefixed instruction when
+/// fast-forwarding through unreachable code (br, if/else, etc).
+/// Only the subops we actually decode in `stepFC` need a precise
+/// arity here.
+fn skipFCImmediates(frame: *Frame) !void {
+    const sub = try readU32Body(frame);
+    switch (sub) {
+        0x00...0x07 => {}, // saturating truncations: no immediates
+        0x08 => { // memory.init: data_idx (u32), mem_idx (byte)
+            _ = try readU32Body(frame);
+            _ = try readByteBody(frame);
+        },
+        0x09 => _ = try readU32Body(frame), // data.drop: data_idx
+        0x0A => { // memory.copy: two memory indices
+            _ = try readByteBody(frame);
+            _ = try readByteBody(frame);
+        },
+        0x0B => _ = try readByteBody(frame), // memory.fill: mem_idx
+        else => return error.UnsupportedOp,
+    }
 }
 
 fn skipToEnd(frame: *Frame, labels: *std.ArrayListUnmanaged(Label)) !void {
@@ -1321,6 +1417,7 @@ fn skipToEnd(frame: *Frame, labels: *std.ArrayListUnmanaged(Label)) !void {
                 _ = try readU32Body(frame);
                 _ = try readU32Body(frame);
             },
+            0xFC => try skipFCImmediates(frame),
             else => {},
         }
     }

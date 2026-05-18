@@ -1,12 +1,11 @@
 //! Correlation-ID-based async request/reply for stem.
 //!
 //! Vigil's built-in `request_reply` is synchronous — the caller blocks
-//! on a reply mailbox. The stem plugin SDK is built around async
-//! callbacks (`requestEditorState(ctx, cb)` returns immediately; `cb`
-//! fires when the response arrives). The previous design used global
-//! single-slot callbacks (`state_callback`, `config_callback`, …),
-//! which silently broke under concurrent requests: a second call
-//! overwrote the first's callback and the first reply was dropped on
+//! on a reply mailbox. Exec plugins talk to the host through async
+//! JSON-RPC, so requests with replies need correlation IDs that
+//! survive arbitrary interleaving. A single-slot callback design would
+//! silently break under concurrent requests: a second call would
+//! overwrite the first's callback and the first reply would drop on
 //! the floor.
 //!
 //! This module gives stem a per-context `RequestTracker`:

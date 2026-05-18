@@ -293,10 +293,8 @@ either as sandboxed wasm modules or as child-process exec plugins.
 
 | Plugin | Runtime | Description |
 |--------|---------|-------------|
-| `echo` | exec | Reference JSON-RPC plugin |
-| `echo-wasm` | wasm | Reference WebAssembly plugin |
+| `echo` | wasm | Reference plugin (palette command pops a notification) |
 | `git` | wasm | Git status and diff integration |
-| `markdown_viewer` | wasm | Markdown commands; live panel rebuild is pending |
 | `plugin_manager` | wasm | Plugin dashboard and operator commands |
 
 See the [Plugin Development Guide](docs/plugin-design.md) to build your

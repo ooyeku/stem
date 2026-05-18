@@ -1,9 +1,9 @@
 {
   "name": "echo",
-  "version": "0.1.0",
-  "description": "Reference out-of-process plugin: registers a single 'echo.hello' command that logs a friendly message",
-  "runtime": "exec",
-  "entry": "stem-echo",
+  "version": "0.2.0",
+  "description": "Reference plugin: registers an 'echo.hello' command that pops a notification from inside the wasm sandbox.",
+  "runtime": "wasm",
+  "entry": "echo.wasm",
   "permissions": {
     "events": []
   },
@@ -11,7 +11,7 @@
     {
       "id": "echo.hello",
       "title": "[Echo] Hello",
-      "description": "Log a greeting from the echo plugin"
+      "description": "Pop a greeting notification from the echo plugin"
     }
   ]
 }
