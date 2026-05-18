@@ -101,21 +101,47 @@ End-to-end integration test (`zig build test`) loads the built
 `.wasm`, drives `activate` and `handle_command`, and asserts the host
 callbacks fired.
 
-### Phase 3: polish + deprecate
+### Phase 3: polish + deprecate (shipped)
 
-1. **Manifest-driven palette/keybinds** — read `plugin.toml` at
-   startup so commands appear in the palette without loading the
-   binary.
-2. **Permissions enforcement** — `stem_*` accessors check declared
-   capabilities; a plugin without `spawn:git` can't call
-   `stem_spawn_process` (new host accessor in phase 1).
-3. **`stem plugin test`** — hermetic editor instance with mocked host
-   imports, exercises a plugin's commands, asserts on responses.
-4. **`stem plugin install <name|url>`** — fetch, verify checksum,
-   register.
-5. **Deprecate .dylib loader** in one release, remove in the next.
+Shipped pieces:
 
-Estimated effort: 1–2 weeks.
+1. **Manifest-driven palette** — `loadProcessPluginFromManifest` and
+   `loadWasmPluginFromManifest` walk `m.commands` and register each
+   one in the command palette BEFORE the plugin starts. Commands stay
+   visible even if `activate` traps later, and runtime self-registers
+   for the same id are deduped silently.
+2. **Permissions enforcement** — manifest `permissions` are duped into
+   `PluginManager.plugin_permissions` at load time. The first
+   enforcement point is `plugin/subscribeEvent`: process plugins that
+   try to subscribe to an event not listed in their manifest (or not
+   covered by a trailing `*` glob) get a soft denial with an audit log
+   line. The same `permissionAllows()` helper is the hook for future
+   spawn / filesystem checks.
+3. **`stem plugin` CLI** — `src/tools/plugin_cli.zig`:
+   - `stem plugin list` — every installed plugin with version + runtime.
+   - `stem plugin info <name>` — pretty-prints the manifest.
+   - `stem plugin install <path>` — copies a plugin dir into
+     `~/.stem/plugins`. Refuses to overwrite (use `remove` first).
+   - `stem plugin remove <name>` — deletes the install dir.
+   - `stem plugin test <path>` — hermetic smoke test. For wasm,
+     decodes the module, runs `activate` against mocked host imports
+     (capturing `stem_register_command` and `stem_log` calls), and
+     reports which manifest-declared commands weren't re-registered.
+     For exec/dylib it verifies the entry artifact exists and the
+     symbol/binary is loadable.
+4. **Deprecation warning** — flat `.dylib` loads via `loadPlugin()`
+   now log a one-shot warning pointing operators at the manifest-dir
+   layout. Loading still works (no behavioral change), but the
+   warning surfaces in `stem logs` so it's visible in audits.
+
+Open follow-ups (intentionally deferred):
+
+- `stem plugin install <url>` — needs an HTTP client + checksum check.
+- Process plugin event-subscription wiring (`broadcastEvent` -> the
+  process plugin map) — once that lands, subscribed events will
+  actually deliver, gated by the permission check above.
+- `stem plugin test` for exec plugins — spawn the child with mocked
+  stdio rather than just checking that the binary exists.
 
 ### Phase 4: registry / marketplace
 

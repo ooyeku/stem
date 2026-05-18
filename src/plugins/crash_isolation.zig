@@ -72,9 +72,12 @@ fn crashHandler(sig: std.c.SIG) callconv(.c) void {
         current_checkpoint = null;
         siglongjmp(env, 1);
     }
-    // No checkpoint on this thread — let the default handler run. We
-    // re-raise to the default so the OS produces its normal crash report
-    // / core dump instead of silently exiting.
+    // No checkpoint on this thread — restore the default disposition
+    // and re-raise so the OS produces a real crash report instead of
+    // looping in the handler. NOTE: stem currently doesn't install
+    // this handler at all (see manager.zig). Kept here for future
+    // out-of-process / wasm-sandbox boundaries that may want it
+    // back, scoped to specific call sites with a checkpoint.
     var dfl: std.posix.Sigaction = .{
         .handler = .{ .handler = @ptrFromInt(0) },
         .mask = std.posix.sigemptyset(),

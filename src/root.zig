@@ -59,6 +59,7 @@ test {
     _ = @import("plugins/process_loader.zig");
     _ = @import("plugins/wasm/interpreter.zig");
     _ = @import("plugins/wasm/loader.zig");
+    _ = @import("tools/plugin_cli.zig");
     _ = @import("lsp/transport.zig");
     _ = @import("ui/width.zig");
 

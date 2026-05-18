@@ -1,0 +1,15 @@
+{
+  "name": "plugin_manager",
+  "version": "0.3.0",
+  "description": "Plugin operator surface. Shows installed plugins in a virtual buffer; load/unload via the `stem plugin` CLI.",
+  "runtime": "wasm",
+  "entry": "plugin-manager-wasm.wasm",
+  "permissions": {
+    "spawn": ["stem"]
+  },
+  "commands": [
+    {"id": "plugin-manager.stats", "title": "[Plugin Manager] Show Stats", "description": "Display the installed plugin list"},
+    {"id": "plugin.load", "title": "[Plugin] Load", "description": "Reminder: install plugins via `stem plugin install <path>`"},
+    {"id": "plugin.unload", "title": "[Plugin] Unload", "description": "Reminder: remove plugins via `stem plugin remove <name>`"}
+  ]
+}

@@ -19,6 +19,7 @@ const builtin = @import("builtin");
 const search_tool = @import("tools/search.zig");
 const vfind_tool = @import("tools/vfind.zig");
 const scope_tool = @import("tools/scope.zig");
+const plugin_cli = @import("tools/plugin_cli.zig");
 const StorageManager = @import("config/storage.zig").StorageManager;
 const LSPManager = @import("services/lsp_manager.zig").LSPManager;
 const Installer = @import("services/lsp/installer.zig").Installer;
@@ -81,6 +82,7 @@ const Verb = enum {
     config,
     logs,
     lsp,
+    plugin,
     help,
     version,
 };
@@ -91,6 +93,7 @@ fn resolveVerb(arg: [:0]const u8) ?Verb {
         .{ "vfind", Verb.vfind },     .{ "--vfind", Verb.vfind }, .{ "scope", Verb.scope },
         .{ "--scope", Verb.scope },   .{ "config", Verb.config }, .{ "logs", Verb.logs },
         .{ "log", Verb.logs },        .{ "lsp", Verb.lsp },       .{ "help", Verb.help },
+        .{ "plugin", Verb.plugin },   .{ "plugins", Verb.plugin },
         .{ "version", Verb.version },
     };
     inline for (table) |entry| {
@@ -115,6 +118,7 @@ fn dispatchVerb(ctx: Context, verb: Verb) !Action {
         .config => try runConfig(ctx),
         .logs => try runLogs(ctx),
         .lsp => try runLsp(ctx),
+        .plugin => try runPlugin(ctx),
     }
     return .handled;
 }
@@ -691,6 +695,41 @@ fn listLspStatus(ctx: Context) !void {
 }
 
 // ---------------------------------------------------------------------------
+// `plugin`
+// ---------------------------------------------------------------------------
+
+fn runPlugin(ctx: Context) !void {
+    if (ctx.args.len < 3) {
+        try printVerbHelp(ctx.io, .plugin);
+        return;
+    }
+    const sub = ctx.args[2];
+
+    // Buffered stdout + stderr so subcommand output stays grouped and
+    // doesn't interleave with random log lines.
+    const out_file = std.Io.File.stdout();
+    const err_file = std.Io.File.stderr();
+    var out_buf: [8192]u8 = undefined;
+    var err_buf: [4096]u8 = undefined;
+    var out_writer = out_file.writerStreaming(ctx.io, &out_buf);
+    var err_writer = err_file.writerStreaming(ctx.io, &err_buf);
+    defer out_writer.interface.flush() catch {};
+    defer err_writer.interface.flush() catch {};
+
+    plugin_cli.run(.{
+        .allocator = ctx.allocator,
+        .io = ctx.io,
+        .environ_block = ctx.environ_block,
+        .sub = sub,
+        .sub_args = if (ctx.args.len > 3) ctx.args[3..] else &.{},
+        .out = &out_writer.interface,
+        .err = &err_writer.interface,
+    }) catch |err| {
+        errPrint(ctx.io, "stem plugin {s}: {s}\n", .{ sub, @errorName(err) });
+    };
+}
+
+// ---------------------------------------------------------------------------
 // Help / version
 // ---------------------------------------------------------------------------
 
@@ -784,6 +823,23 @@ const verb_specs = [_]VerbSpec{
         \\                        python, typescript, go, rust, cpp,
         \\                        ruby, csharp, java, all
         \\  list                  Show installed-server status
+        ,
+    },
+    .{
+        .verb = .plugin,
+        .name = "plugin <action>",
+        .summary = "Manage installed plugins",
+        .detail =
+        \\Usage: stem plugin <list|info|install|remove|test> [args]
+        \\
+        \\  list                  List installed plugins
+        \\  info <name>           Show a plugin's manifest
+        \\  install <path>        Copy a plugin directory into ~/.stem/plugins
+        \\  remove <name>         Delete an installed plugin
+        \\  test <path>           Hermetic smoke test (manifest + entry artifact;
+        \\                        for wasm plugins, runs `activate` against
+        \\                        mocked host imports and reports registered
+        \\                        commands).
         ,
     },
     .{

@@ -34,6 +34,14 @@ pub const Callbacks = struct {
     on_register_command: *const fn (user_data: *anyopaque, plugin_id: []const u8, id: []const u8, title: []const u8, description: []const u8) void,
     /// Plugin called `stem_show_notification(level, msg)`.
     on_show_notification: *const fn (user_data: *anyopaque, plugin_id: []const u8, level: u8, message: []const u8) void,
+    /// Plugin called `stem_open_buffer(name, content)`. Host should
+    /// surface the content in a new virtual buffer.
+    on_open_buffer: *const fn (user_data: *anyopaque, plugin_id: []const u8, name: []const u8, content: []const u8) void,
+    /// Plugin called `stem_spawn_capture(cmd, out_buf)`. Host parses
+    /// the command line, enforces manifest spawn permissions, runs
+    /// the process synchronously, and writes captured stdout into
+    /// `out_buf`. Returns the byte count, or 0 on denial / error.
+    on_spawn_capture: *const fn (user_data: *anyopaque, plugin_id: []const u8, cmd: []const u8, out_buf: []u8) u32,
 };
 
 pub const State = enum { loaded, activated, deactivated, failed };
@@ -174,6 +182,8 @@ pub fn load(
         .{ .module_name = "env", .field_name = "stem_log", .func = hostStemLog },
         .{ .module_name = "env", .field_name = "stem_register_command", .func = hostStemRegisterCommand },
         .{ .module_name = "env", .field_name = "stem_show_notification", .func = hostStemShowNotification },
+        .{ .module_name = "env", .field_name = "stem_open_buffer", .func = hostStemOpenBuffer },
+        .{ .module_name = "env", .field_name = "stem_spawn_capture", .func = hostStemSpawnCapture },
     };
 
     wp.instance = try interp.instantiate(allocator, &wp.module, &host_imports, @ptrCast(wp));
@@ -220,6 +230,44 @@ fn hostStemShowNotification(instance: *interp.Instance, args: []const u64, _: *u
     wp.callbacks.on_show_notification(wp.callbacks.user_data, wp.plugin_id, level, msg);
 }
 
+/// env.stem_open_buffer(name_ptr, name_len, content_ptr, content_len) -> ()
+fn hostStemOpenBuffer(instance: *interp.Instance, args: []const u64, _: *u64) interp.Error!void {
+    if (args.len < 4) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const name = instance.slice(@truncate(args[0]), @truncate(args[1])) catch return;
+    const content = instance.slice(@truncate(args[2]), @truncate(args[3])) catch return;
+    wp.callbacks.on_open_buffer(wp.callbacks.user_data, wp.plugin_id, name, content);
+}
+
+/// env.stem_spawn_capture(cmd_ptr, cmd_len, out_ptr, out_max) -> i32
+///
+/// Synchronously runs the (whitespace-tokenized) command line and
+/// copies up to `out_max` stdout bytes into the wasm linear memory at
+/// `out_ptr`. Returns the byte count, or 0 if the spawn was denied
+/// (manifest permissions) or failed. Plugins typically size the
+/// scratch buffer at a few KiB; we don't allocate inside wasm.
+fn hostStemSpawnCapture(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 4) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const cmd = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = 0;
+        return;
+    };
+    const out_off: u32 = @truncate(args[2]);
+    const out_max: u32 = @truncate(args[3]);
+    const out_buf = instance.slice(out_off, out_max) catch {
+        result.* = 0;
+        return;
+    };
+    const written = wp.callbacks.on_spawn_capture(
+        wp.callbacks.user_data,
+        wp.plugin_id,
+        cmd,
+        out_buf,
+    );
+    result.* = @as(u64, written);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -240,6 +288,10 @@ const TestState = struct {
         self.commands.append(self.allocator, dup) catch self.allocator.free(dup);
     }
     fn onNote(_: *anyopaque, _: []const u8, _: u8, _: []const u8) void {}
+    fn onOpenBuf(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) void {}
+    fn onSpawn(_: *anyopaque, _: []const u8, _: []const u8, _: []u8) u32 {
+        return 0;
+    }
     fn deinit(self: *TestState) void {
         for (self.logs.items) |s| self.allocator.free(s);
         for (self.commands.items) |s| self.allocator.free(s);
@@ -278,6 +330,8 @@ test "load + activate + dispatchCommand against the built echo-wasm.wasm" {
         .on_log = TestState.onLog,
         .on_register_command = TestState.onReg,
         .on_show_notification = TestState.onNote,
+        .on_open_buffer = TestState.onOpenBuf,
+        .on_spawn_capture = TestState.onSpawn,
     };
 
     const wp = try load(a, io, "echo-wasm", abs_path, cbs);

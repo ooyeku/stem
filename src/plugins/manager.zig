@@ -50,6 +50,12 @@ pub const PluginManager = struct {
 
     plugin_configs: std.StringHashMapUnmanaged([]const u8),
 
+    /// Phase 3: per-plugin permission grants, lifted from the manifest
+    /// at load time. Host accessors consult this table before granting
+    /// capability requests (event subscription, spawn, filesystem).
+    /// Lookups are keyed by plugin id.
+    plugin_permissions: std.StringHashMapUnmanaged(StoredPermissions) = .empty,
+
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -57,12 +63,22 @@ pub const PluginManager = struct {
         ui_bus: *MessageBus,
         command_registry: *CommandRegistry,
     ) PluginManager {
-        // Install SIGSEGV/SIGBUS handlers as soon as we know we're going
-        // to be loading plugins. Idempotent across managers/threads.
-        _ = crash_isolation.install();
-        // Initialize the host-side plugin handle registry. Required
-        // before any plugin is loaded so accessors can look up handles.
+        // Defer signal-handler installation. Installing a SIGSEGV
+        // handler before the dynamic linker has finished lazy-binding
+        // a freshly dlopen'd plugin causes the kernel to surface
+        // dyld's binding traps as user-visible signals, which made
+        // every plugin's `activate` look like a crash. We now run
+        // activate under default disposition and install the handler
+        // only after the first activate completes — guarding the
+        // long-running `handle_message` path where real plugin bugs
+        // are more likely to land.
         host_abi.init(allocator);
+        // Pin the `_stem_*` C-ABI exports against LTO stripping by
+        // calling the runtime keep-alive function. The compiler can't
+        // prove the call has no effect (it stores into a static
+        // pointer), so it preserves the function and its referenced
+        // exports.
+        host_abi.keep_exports_alive();
         return .{
             .allocator = allocator,
             .io = io,
@@ -301,6 +317,13 @@ pub const PluginManager = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.plugin_configs.deinit(self.allocator);
+
+        var perm_it = self.plugin_permissions.iterator();
+        while (perm_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.plugin_permissions.deinit(self.allocator);
     }
 
     fn cleanupPluginResources(self: *PluginManager, plugin_id: []const u8) void {
@@ -350,6 +373,15 @@ pub const PluginManager = struct {
     }
 
     pub fn loadPlugin(self: *PluginManager, plugin_path: []const u8) !void {
+        // Phase 3: dylib plugins (flat layout, no manifest) are
+        // deprecated in favor of `runtime: "wasm"` or `runtime: "exec"`
+        // plugin directories. We still load them so existing installs
+        // keep working, but log a one-shot warning so operators see
+        // the deprecation notice in `stem logs`.
+        log.warn(
+            "loading legacy .dylib plugin '{s}' — package this as a directory with plugin.json + wasm/exec entry (see docs/plugin-architecture.md)",
+            .{plugin_path},
+        );
         var lib = std.DynLib.open(plugin_path) catch |err| {
             log.err("Failed to load plugin at {s}: {}", .{ plugin_path, err });
             return err;
@@ -481,6 +513,19 @@ pub const PluginManager = struct {
         });
         errdefer pp.deinit();
 
+        // Phase 3: register manifest-declared commands in the palette
+        // BEFORE the plugin starts. They're discoverable even if the
+        // plugin fails to come up, and the dispatcher path no-ops
+        // gracefully when the plugin map doesn't yet have an entry.
+        for (m.commands) |cmd| {
+            self.registerManifestCommand(m.name, .exec, cmd) catch |err| {
+                log.warn("manifest commands for '{s}': {s}", .{ m.name, @errorName(err) });
+            };
+        }
+        // Phase 3: stash permissions so host accessors can check them
+        // before granting capability requests at runtime.
+        try self.installPluginPermissions(m.name, m.permissions);
+
         try pp.start();
 
         try self.process_plugins.put(self.allocator, name_dup, pp);
@@ -596,6 +641,14 @@ pub const PluginManager = struct {
         const description = if (obj.get("description")) |d| d else std.json.Value{ .string = "" };
         if (plugin_id != .string or id != .string or title != .string or description != .string) return error.InvalidParams;
 
+        // Phase 3: manifest already populates the palette eagerly.
+        // A runtime self-register for the same id is a no-op so we
+        // don't double-register or leak duplicate contexts.
+        if (self.command_registry.commands.contains(id.string)) {
+            log.debug("command '{s}' already registered (from manifest) — skipping runtime re-register", .{id.string});
+            return;
+        }
+
         const ctx = try self.allocator.create(PluginCommandContext);
         errdefer self.allocator.destroy(ctx);
         const plugin_id_dup = try self.allocator.dupe(u8, plugin_id.string);
@@ -639,11 +692,176 @@ pub const PluginManager = struct {
     }
 
     fn subscribeProcessEvent(self: *PluginManager, params: std.json.Value) !void {
-        _ = self;
-        _ = params;
-        // Future: extract `plugin_id` + `event`, add to event_subscribers
-        // map. broadcastEvent already iterates subscribers; we'll need a
-        // parallel path for the process_plugins map.
+        if (params != .object) return error.InvalidParams;
+        const obj = params.object;
+        const plugin_id_v = obj.get("plugin_id") orelse return error.InvalidParams;
+        const event_v = obj.get("event") orelse return error.InvalidParams;
+        if (plugin_id_v != .string or event_v != .string) return error.InvalidParams;
+        // Phase 3: enforce declared event permissions. Plugins that
+        // didn't list the event (or a matching glob) in their manifest
+        // get a soft denial — the subscription is dropped and we log
+        // the attempt for audit. We don't kill the plugin: silent
+        // capability degrade is friendlier than a crash.
+        if (!self.permissionAllows(plugin_id_v.string, .event, event_v.string)) {
+            log.warn(
+                "plugin '{s}' attempted to subscribe to '{s}' but lacks the declared permission",
+                .{ plugin_id_v.string, event_v.string },
+            );
+            return;
+        }
+        log.info("plugin '{s}' subscribed to event '{s}'", .{ plugin_id_v.string, event_v.string });
+        // TODO(phase 3+): wire the subscription into broadcastEvent so
+        // matching events are forwarded to the process plugin.
+    }
+
+    // -------------------------------------------------------------------
+    // Manifest-driven palette + permissions (Phase 3).
+    //
+    // Two responsibilities:
+    //   1. Eagerly register commands declared in `plugin.json` so the
+    //      palette is populated independent of plugin load success.
+    //   2. Stash declared permissions per plugin id so host accessors
+    //      can deny capability requests not listed in the manifest.
+    // -------------------------------------------------------------------
+
+    pub const PluginRuntimeKind = enum { exec, wasm };
+
+    /// Heap-owned mirror of `manifest_mod.Permissions`. The original
+    /// is freed with its manifest's arena, so we copy what we need.
+    const StoredPermissions = struct {
+        spawn_allowlist: [][]const u8 = &.{},
+        filesystem: [][]const u8 = &.{},
+        events: [][]const u8 = &.{},
+
+        fn deinit(self: *StoredPermissions, allocator: std.mem.Allocator) void {
+            for (self.spawn_allowlist) |s| allocator.free(s);
+            for (self.filesystem) |s| allocator.free(s);
+            for (self.events) |s| allocator.free(s);
+            allocator.free(self.spawn_allowlist);
+            allocator.free(self.filesystem);
+            allocator.free(self.events);
+        }
+    };
+
+    fn installPluginPermissions(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        perms: manifest_mod.Permissions,
+    ) !void {
+        // Replace any existing entry (e.g. plugin restarted in-place).
+        if (self.plugin_permissions.fetchRemove(plugin_id)) |kv| {
+            self.allocator.free(kv.key);
+            var p = kv.value;
+            p.deinit(self.allocator);
+        }
+        const key = try self.allocator.dupe(u8, plugin_id);
+        errdefer self.allocator.free(key);
+        var stored: StoredPermissions = .{};
+        stored.spawn_allowlist = try dupStringList(self.allocator, perms.spawn_allowlist);
+        errdefer freeStringList(self.allocator, stored.spawn_allowlist);
+        stored.filesystem = try dupStringList(self.allocator, perms.filesystem);
+        errdefer freeStringList(self.allocator, stored.filesystem);
+        stored.events = try dupStringList(self.allocator, perms.events);
+        errdefer freeStringList(self.allocator, stored.events);
+        try self.plugin_permissions.put(self.allocator, key, stored);
+    }
+
+    fn dupStringList(allocator: std.mem.Allocator, xs: []const []const u8) ![][]const u8 {
+        const out = try allocator.alloc([]const u8, xs.len);
+        var i: usize = 0;
+        errdefer {
+            for (out[0..i]) |s| allocator.free(s);
+            allocator.free(out);
+        }
+        while (i < xs.len) : (i += 1) out[i] = try allocator.dupe(u8, xs[i]);
+        return out;
+    }
+
+    fn freeStringList(allocator: std.mem.Allocator, xs: [][]const u8) void {
+        for (xs) |s| allocator.free(s);
+        allocator.free(xs);
+    }
+
+    pub const CapabilityKind = enum { event, spawn, filesystem };
+
+    /// Returns `true` if `plugin_id` declared a permission that allows
+    /// `item` for `kind`. Plugins with no permissions entry get a
+    /// strict deny (= empty allowlist).
+    pub fn permissionAllows(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        kind: CapabilityKind,
+        item: []const u8,
+    ) bool {
+        const stored = self.plugin_permissions.get(plugin_id) orelse return false;
+        const list: []const []const u8 = switch (kind) {
+            .event => stored.events,
+            .spawn => stored.spawn_allowlist,
+            .filesystem => stored.filesystem,
+        };
+        for (list) |entry| {
+            if (matchesPermissionEntry(entry, item)) return true;
+        }
+        return false;
+    }
+
+    /// Permission entries support a trailing `*` glob (e.g. `buffer.*`).
+    /// Everything else is exact-match.
+    fn matchesPermissionEntry(entry: []const u8, item: []const u8) bool {
+        if (entry.len > 0 and entry[entry.len - 1] == '*') {
+            const prefix = entry[0 .. entry.len - 1];
+            return std.mem.startsWith(u8, item, prefix);
+        }
+        return std.mem.eql(u8, entry, item);
+    }
+
+    /// Register one manifest-declared command in the palette. The
+    /// dispatcher routes by runtime kind. Idempotent — a duplicate id
+    /// is logged and skipped, since the registry doesn't tolerate
+    /// double-inserts.
+    fn registerManifestCommand(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        kind: PluginRuntimeKind,
+        decl: manifest_mod.CommandDecl,
+    ) !void {
+        if (self.command_registry.commands.contains(decl.id)) {
+            log.debug("command '{s}' already registered — manifest entry skipped", .{decl.id});
+            return;
+        }
+        const ctx = try self.allocator.create(PluginCommandContext);
+        errdefer self.allocator.destroy(ctx);
+        const pid_dup = try self.allocator.dupe(u8, plugin_id);
+        errdefer self.allocator.free(pid_dup);
+        const id_dup = try self.allocator.dupe(u8, decl.id);
+        errdefer self.allocator.free(id_dup);
+        const registry_id_dup = try self.allocator.dupe(u8, decl.id);
+        errdefer self.allocator.free(registry_id_dup);
+        const title_dup = try self.allocator.dupe(u8, decl.title);
+        errdefer self.allocator.free(title_dup);
+        const desc_dup = try self.allocator.dupe(u8, decl.description);
+        errdefer self.allocator.free(desc_dup);
+        ctx.* = .{
+            .manager = self,
+            .plugin_id = pid_dup,
+            .command_id = id_dup,
+            .registry_id = registry_id_dup,
+            .registry_title = title_dup,
+            .registry_description = desc_dup,
+        };
+        const DispatcherFn = *const fn (*anyopaque, ?*const anyopaque) anyerror!void;
+        const dispatcher: DispatcherFn = switch (kind) {
+            .exec => &executeProcessPluginCommand,
+            .wasm => &executeWasmPluginCommand,
+        };
+        try self.command_registry.register(
+            ctx.registry_id,
+            ctx.registry_title,
+            ctx.registry_description,
+            dispatcher,
+            ctx,
+        );
+        try self.allocated_contexts.append(self.allocator, ctx);
     }
 
     // -------------------------------------------------------------------
@@ -665,6 +883,16 @@ pub const PluginManager = struct {
         const wasm_path = try std.fs.path.join(self.allocator, &.{ plugin_dir, m.entry });
         defer self.allocator.free(wasm_path);
 
+        // Phase 3: manifest-driven registration. Eagerly publish each
+        // declared command before activate runs, so the palette stays
+        // populated even if activate later traps.
+        for (m.commands) |cmd| {
+            self.registerManifestCommand(m.name, .wasm, cmd) catch |err| {
+                log.warn("manifest commands for '{s}': {s}", .{ m.name, @errorName(err) });
+            };
+        }
+        try self.installPluginPermissions(m.name, m.permissions);
+
         const wp = wasm_loader.load(
             self.allocator,
             self.io,
@@ -675,6 +903,8 @@ pub const PluginManager = struct {
                 .on_log = onWasmLog,
                 .on_register_command = onWasmRegisterCommand,
                 .on_show_notification = onWasmShowNotification,
+                .on_open_buffer = onWasmOpenBuffer,
+                .on_spawn_capture = onWasmSpawnCapture,
             },
         ) catch |err| {
             log.err("Failed to load wasm plugin '{s}': {s}", .{ m.name, @errorName(err) });
@@ -747,6 +977,83 @@ pub const PluginManager = struct {
         if (self.ui_bus.inbox.send(encoded)) |_| {} else |_| {}
     }
 
+    /// Route a wasm plugin's `stem_open_buffer` call into core's
+    /// inbox as a regular `open_buffer` PluginMessage — identical to
+    /// what a dylib plugin would emit via `stem_send_to_core`.
+    fn onWasmOpenBuffer(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        name: []const u8,
+        content: []const u8,
+    ) void {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        const core_inbox = self.core_inbox orelse return;
+        const pm = protocol.PluginMessage{
+            .plugin_id = plugin_id,
+            .message_type = .open_buffer,
+            .payload = .{ .buffer_open = .{ .name = name, .content = content } },
+        };
+        const outer = protocol.Message{ .plugin_message = pm };
+        const encoded = outer.encode(self.allocator) catch return;
+        defer self.allocator.free(encoded);
+        core_inbox.send(encoded) catch |err| {
+            log.warn("wasm open_buffer send failed for '{s}': {s}", .{ plugin_id, @errorName(err) });
+        };
+    }
+
+    /// Handle a wasm plugin's `stem_spawn_capture` request. Tokenizes
+    /// the command line, checks manifest spawn permissions, runs the
+    /// child synchronously, and writes stdout into the wasm-supplied
+    /// linear-memory slice. Returns the byte count, or 0 on denial /
+    /// any error (so wasm plugins can treat 0 as a uniform failure
+    /// signal).
+    fn onWasmSpawnCapture(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        cmd: []const u8,
+        out_buf: []u8,
+    ) u32 {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+
+        // Tokenize the command line. We accept a single whitespace-
+        // separated string for simplicity — good enough for the
+        // common `git status --porcelain` shape; quoted arguments
+        // aren't supported yet.
+        var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer argv.deinit(self.allocator);
+        var it = std.mem.tokenizeAny(u8, cmd, " \t\r\n");
+        while (it.next()) |tok| {
+            argv.append(self.allocator, tok) catch return 0;
+        }
+        if (argv.items.len == 0) return 0;
+        const program = argv.items[0];
+
+        // Enforce manifest-declared spawn permissions. A plugin that
+        // didn't declare `permissions.spawn` for this program gets a
+        // soft denial — we log it and return 0 so the plugin can
+        // surface a clean error to the user.
+        if (!self.permissionAllows(plugin_id, .spawn, program)) {
+            log.warn(
+                "wasm plugin '{s}' attempted unauthorized spawn: {s}",
+                .{ plugin_id, program },
+            );
+            return 0;
+        }
+
+        const result = std.process.run(self.allocator, self.io, .{
+            .argv = argv.items,
+        }) catch |err| {
+            log.warn("wasm spawn for '{s}' failed: {s}", .{ plugin_id, @errorName(err) });
+            return 0;
+        };
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        const n = @min(result.stdout.len, out_buf.len);
+        @memcpy(out_buf[0..n], result.stdout[0..n]);
+        return @intCast(n);
+    }
+
     fn registerWasmCommand(
         self: *PluginManager,
         plugin_id: []const u8,
@@ -754,6 +1061,13 @@ pub const PluginManager = struct {
         title: []const u8,
         description: []const u8,
     ) !void {
+        // Phase 3: manifest-driven palette population is the primary
+        // path. If the wasm plugin's `activate` re-registers a command
+        // already declared in the manifest, treat it as a no-op.
+        if (self.command_registry.commands.contains(id)) {
+            log.debug("wasm command '{s}' already registered (from manifest) — skipping", .{id});
+            return;
+        }
         const ctx = try self.allocator.create(PluginCommandContext);
         errdefer self.allocator.destroy(ctx);
         const pid_dup = try self.allocator.dupe(u8, plugin_id);
@@ -817,33 +1131,32 @@ pub const PluginManager = struct {
         plugin.state = .running;
         const handle = plugin.handle;
 
-        // Install the SIGSEGV/SIGBUS handler on first use. Idempotent
-        // across threads.
-        _ = crash_isolation.install();
-
-        // v3: plugin's `activate` takes a PluginHandle (extern u64) and
-        // returns i32. No Zig structs cross the boundary.
+        // v3: plugin's `activate` takes a PluginHandle (extern u64)
+        // and returns i32. No Zig structs cross the boundary.
+        //
+        // Run activate WITHOUT crash_isolation. Installing the
+        // SIGSEGV handler before macOS finishes lazy-binding the
+        // plugin's `_stem_*` host imports causes dyld's internal
+        // bind traps to surface as user-visible SIGSEGV — every
+        // plugin would otherwise be falsely marked "crashed". The
+        // tradeoff: a real bug inside `activate` will bring stem
+        // down. That's an acceptable risk for a one-shot setup
+        // step; the long-running `handle_message` hot path below
+        // still gets crash isolation once the handler is installed.
         if (plugin.interface.activate) |activate_fn| {
-            const ActivateCall = struct {
-                fn run(h: interface.PluginHandle, fn_ptr: *const fn (interface.PluginHandle) callconv(.c) i32, rc_out: *i32) void {
-                    rc_out.* = fn_ptr(h);
-                }
-            };
-            var rc: i32 = 0;
-            const res = crash_isolation.runIsolated(.{ handle, activate_fn, &rc }, ActivateCall.run);
-            if (res == .crashed) {
-                plugin.state = .failed;
-                telemetry.recordPluginCrash(plugin.id);
-                log.err("Plugin {s} CRASHED during activate (signal={d}); marked dead", .{ plugin.id, crash_isolation.lastCrashSignal() });
-                markForRestart(plugin);
-                return;
-            }
+            const rc = activate_fn(handle);
             if (rc != 0) {
                 plugin.state = .failed;
                 log.err("Plugin {s} activate returned {d}", .{ plugin.id, rc });
                 return;
             }
         }
+
+        // After at least one plugin has successfully bound its imports
+        // and finished `activate`, install the crash-isolation handler
+        // for the duration of the message loop. Idempotent across
+        // threads via `crash_isolation.install`.
+        _ = crash_isolation.install();
 
         const inbox = plugin.inbox.?;
 
@@ -889,7 +1202,10 @@ pub const PluginManager = struct {
                 if (res == .crashed) {
                     plugin.state = .failed;
                     telemetry.recordPluginCrash(plugin.id);
-                    log.err("Plugin {s} CRASHED during handle_message (signal={d}); marked dead", .{ plugin.id, crash_isolation.lastCrashSignal() });
+                    log.err(
+                        "Plugin {s} CRASHED during handle_message (signal={d}); marked dead",
+                        .{ plugin.id, crash_isolation.lastCrashSignal() },
+                    );
                     markForRestart(plugin);
                     break;
                 }
@@ -902,8 +1218,6 @@ pub const PluginManager = struct {
                     fn_ptr(h);
                 }
             };
-            // Best-effort: if deactivate crashes we can't do anything useful;
-            // the plugin is already on its way out.
             _ = crash_isolation.runIsolated(.{ handle, deactivate_fn }, DeactivateCall.run);
         }
 

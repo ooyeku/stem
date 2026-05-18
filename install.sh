@@ -69,15 +69,103 @@ $SUDO mkdir -p "$BIN_DIR" "$PLUGIN_DIR"
 $SUDO cp zig-out/bin/stem "$BIN_DIR/stem"
 $SUDO chmod +x "$BIN_DIR/stem"
 
-for lib in zig-out/lib/libgit.* zig-out/lib/libmarkdown_viewer.* zig-out/lib/libplugin_manager.*; do
-    [ -f "$lib" ] || continue
-    $SUDO cp "$lib" "$PLUGIN_DIR/"
+# On macOS the kernel sometimes SIGKILLs a freshly-`cp`'d binary
+# whose embedded adhoc signature got invalidated by the copy. Re-
+# signing in place repairs the signature against the new on-disk
+# location. Harmless no-op on other platforms (codesign absent).
+if command -v codesign >/dev/null 2>&1; then
+    $SUDO codesign --force -s - "$BIN_DIR/stem" >/dev/null 2>&1 || true
+fi
+
+# ===== Bundled plugin install =====
+# Bundled plugins now ship as directories (plugin.json + entry
+# artifact). Each one goes to <PLUGIN_DIR>/<name>/ alongside its
+# manifest. Legacy flat .dylib copies are no longer produced or
+# installed; the seed-on-first-launch pathway in stem still handles
+# third-party .dylib plugins dropped directly into ~/.stem/plugins/.
+
+install_plugin_dir() {
+    # $1 = source directory under bundled/plugins/
+    # $2 = artifact filename under zig-out/bin/ (or zig-out/lib/)
+    # $3 = "$DEST" for system, "$USER" for per-user
+    local src_dir="$1"
+    local artifact="$2"
+    local target_root="$3"
+
+    local name
+    name="$(basename "$src_dir")"
+    local dest_dir="$target_root/$name"
+
+    if [ ! -d "$src_dir" ]; then
+        echo "  (skip $name: source dir missing)" >&2
+        return
+    fi
+
+    if [ "$target_root" = "$PLUGIN_DIR" ]; then
+        $SUDO rm -rf "$dest_dir"
+        $SUDO mkdir -p "$dest_dir"
+        $SUDO cp "$src_dir/plugin.json" "$dest_dir/"
+        if [ -f "zig-out/bin/$artifact" ]; then
+            $SUDO cp "zig-out/bin/$artifact" "$dest_dir/"
+        elif [ -f "zig-out/lib/$artifact" ]; then
+            $SUDO cp "zig-out/lib/$artifact" "$dest_dir/"
+        fi
+    else
+        rm -rf "$dest_dir"
+        mkdir -p "$dest_dir"
+        cp "$src_dir/plugin.json" "$dest_dir/"
+        if [ -f "zig-out/bin/$artifact" ]; then
+            cp "zig-out/bin/$artifact" "$dest_dir/"
+        elif [ -f "zig-out/lib/$artifact" ]; then
+            cp "zig-out/lib/$artifact" "$dest_dir/"
+        fi
+    fi
+}
+
+USER_PLUGIN_DIR="$HOME/.stem/plugins"
+mkdir -p "$USER_PLUGIN_DIR"
+
+# Wasm bundled plugins: git, markdown-viewer, plugin-manager, echo-wasm.
+WASM_PLUGINS="git-wasm markdown-viewer-wasm plugin-manager-wasm echo-wasm"
+
+echo "Installing bundled wasm plugins to $PLUGIN_DIR/"
+for name in $WASM_PLUGINS; do
+    install_plugin_dir "bundled/plugins/$name" "$name.wasm" "$PLUGIN_DIR"
+    echo "  $PLUGIN_DIR/$name/"
+done
+
+# Echo exec reference plugin (Phase 1, kept as the canonical
+# language-agnostic out-of-process example).
+echo "Installing exec reference plugin to $PLUGIN_DIR/"
+install_plugin_dir "bundled/plugins/echo" "stem-echo" "$PLUGIN_DIR"
+echo "  $PLUGIN_DIR/echo/"
+
+echo ""
+echo "Refreshing per-user plugin dir: $USER_PLUGIN_DIR"
+for name in $WASM_PLUGINS; do
+    install_plugin_dir "bundled/plugins/$name" "$name.wasm" "$USER_PLUGIN_DIR"
+done
+install_plugin_dir "bundled/plugins/echo" "stem-echo" "$USER_PLUGIN_DIR"
+
+# Phase 4 cleanup: previous releases installed flat .dylib plugins
+# (libgit.dylib, libmarkdown_viewer.dylib, libplugin_manager.dylib)
+# at the per-user plugin dir's root. They've been replaced by their
+# wasm equivalents under their own subdirectories, so the legacy
+# files would now be redundant — and a real liability, since stem's
+# loader would happily dlopen any leftover dylib with the same
+# plugin name, racing the wasm replacement. Sweep them up here.
+for stale in libgit.dylib libmarkdown_viewer.dylib libplugin_manager.dylib; do
+    if [ -f "$USER_PLUGIN_DIR/$stale" ]; then
+        rm -f "$USER_PLUGIN_DIR/$stale"
+        echo "  removed legacy $USER_PLUGIN_DIR/$stale"
+    fi
 done
 
 echo ""
 echo "Installed:"
 echo "  $BIN_DIR/stem"
-echo "  $PLUGIN_DIR/*"
+echo "  $PLUGIN_DIR/{$(echo "$WASM_PLUGINS" | tr ' ' ','),echo}/"
+echo "  $USER_PLUGIN_DIR/  (refreshed)"
 
 if ! printf '%s' "$PATH" | tr ':' '\n' | grep -Fxq "$BIN_DIR"; then
     echo ""

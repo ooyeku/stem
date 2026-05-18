@@ -280,6 +280,12 @@ pub fn build(b: *std.Build) void {
     // `-export_dynamic` on macOS / `-rdynamic` on Linux, forcing the
     // symbols into the export trie so dlopen'd plugins can bind to them.
     exe.rdynamic = true;
+    // Release-mode default is to strip symbols, which nukes the
+    // dynamic export trie along with debug info — leaving every
+    // `_stem_*` host accessor unresolvable from plugin dylibs. We
+    // disable stripping unconditionally so `rdynamic` actually
+    // works under ReleaseFast / ReleaseSafe.
+    exe.root_module.strip = false;
     const vaxis_dep = b.dependency("vaxis", .{
         .target = target,
         .optimize = optimize,
@@ -326,67 +332,11 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     // ===== Bundled Plugins =====
-    // Plugins are built as dynamic libraries and installed to zig-out/lib/.
-    // They are copied into ~/.stem/plugins/ either:
-    //   - at runtime, on first launch, if that directory is empty, or
-    //   - by `./install.sh`, when installing stem system-wide.
-    // We deliberately do NOT touch $HOME from a build step.
-    const plugin_manager = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "plugin_manager",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bundled/plugins/plugin-manager/src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    plugin_manager.root_module.link_libc = true;
-    // Plugin v3 ABI: plugins reference host-exported `stem_*` C symbols
-    // (defined in src/plugins/host_abi.zig) that get resolved at
-    // dlopen-time against the running stem binary. macOS needs
-    // `-undefined dynamic_lookup` to tell the linker to leave those
-    // symbols unresolved at build time.
-    if (target.result.os.tag == .macos or target.result.os.tag == .ios) {
-        plugin_manager.linker_allow_shlib_undefined = true;
-    } else {
-        plugin_manager.linker_allow_shlib_undefined = true;
-    }
-    b.installArtifact(plugin_manager);
-    // Create stem SDK module for plugins
-    const stem_plugin_module = b.createModule(.{
-        .root_source_file = b.path("src/stem_plugin.zig"),
-    });
-    stem_plugin_module.addImport("vigil", vigil_dep.module("vigil"));
-    stem_plugin_module.addImport("vaxis", vaxis_dep.module("vaxis"));
-    plugin_manager.root_module.addImport("stem", stem_plugin_module);
-    // Build git plugin as a dynamic library
-    const git_plugin = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "git",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bundled/plugins/git/src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    git_plugin.root_module.link_libc = true;
-    git_plugin.linker_allow_shlib_undefined = true;
-    git_plugin.root_module.addImport("stem", stem_plugin_module);
-    b.installArtifact(git_plugin);
-    // Build markdown-viewer plugin as a dynamic library
-    const md_plugin = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "markdown_viewer",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bundled/plugins/markdown-viewer/src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    md_plugin.root_module.link_libc = true;
-    md_plugin.linker_allow_shlib_undefined = true;
-    md_plugin.root_module.addImport("stem", stem_plugin_module);
-    b.installArtifact(md_plugin);
+    // All bundled plugins now target the wasm runtime (Phase 4
+    // migration). Dylib loading still works for third-party plugins
+    // installed under ~/.stem/plugins/, but no bundled .dylib ships
+    // with stem itself — the legacy plugin SDK module is left in
+    // tree as a reference for external plugin authors.
 
     // Out-of-process reference plugin (Phase 1). Speaks JSON-RPC 2.0
     // over stdio with LSP framing. No `stem` import — the plugin is
@@ -403,28 +353,35 @@ pub fn build(b: *std.Build) void {
     echo_plugin.root_module.link_libc = true;
     b.installArtifact(echo_plugin);
 
-    // ===== Bundled WebAssembly plugin (Phase 2) =====
-    // The wasm canary is built for `wasm32-freestanding`. We attach
-    // it to the default install step so `zig build` produces a
-    // ready-to-load .wasm alongside the .dylibs and stem-echo. Wasm
-    // host imports (env.stem_*) are left unresolved at build-time —
-    // they're bound by the host's pure-Zig interpreter at instantiate
-    // time.
+    // ===== Bundled WebAssembly plugins =====
+    // Built for `wasm32-freestanding`. Host imports (env.stem_*) are
+    // left unresolved at build time — they're bound by the host's
+    // pure-Zig interpreter at instantiate time.
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
     });
-    const echo_wasm = b.addExecutable(.{
-        .name = "echo-wasm",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bundled/plugins/echo-wasm/src/main.zig"),
-            .target = wasm_target,
-            .optimize = .ReleaseSmall,
-        }),
-    });
-    echo_wasm.entry = .disabled;
-    echo_wasm.rdynamic = true;
-    b.installArtifact(echo_wasm);
+
+    const WasmPlugin = struct { name: []const u8, source: []const u8 };
+    const wasm_plugins = [_]WasmPlugin{
+        .{ .name = "echo-wasm", .source = "bundled/plugins/echo-wasm/src/main.zig" },
+        .{ .name = "git-wasm", .source = "bundled/plugins/git-wasm/src/main.zig" },
+        .{ .name = "markdown-viewer-wasm", .source = "bundled/plugins/markdown-viewer-wasm/src/main.zig" },
+        .{ .name = "plugin-manager-wasm", .source = "bundled/plugins/plugin-manager-wasm/src/main.zig" },
+    };
+    inline for (wasm_plugins) |wp| {
+        const exe_wasm = b.addExecutable(.{
+            .name = wp.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(wp.source),
+                .target = wasm_target,
+                .optimize = .ReleaseSmall,
+            }),
+        });
+        exe_wasm.entry = .disabled;
+        exe_wasm.rdynamic = true;
+        b.installArtifact(exe_wasm);
+    }
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);

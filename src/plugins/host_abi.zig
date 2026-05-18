@@ -148,17 +148,38 @@ export fn stem_plugin_id(handle: abi.PluginHandle) callconv(.c) [*:0]const u8 {
 // ---------------------------------------------------------------------------
 // Symbol pinning — force the linker to keep these exports even when
 // nothing inside the stem binary calls them. The plugin .dylibs reach
-// them through `dlopen` symbol resolution against the running process,
-// and `--export-dynamic` would do this on Linux; on macOS the exports
-// are kept by default. The `&` references below are a no-op that just
-// prevents over-eager dead-code elimination.
+// them through `dlopen` symbol resolution against the running process.
+//
+// Under Debug, `comptime { _ = &fn; }` was enough. ReleaseFast LTO is
+// aggressive enough to strip those address-takes when nothing else
+// uses them — every `_stem_*` symbol vanished from the export trie
+// and plugin dylibs hard-faulted during lazy binding.
+//
+// `keep_exports_alive` is a never-called runtime function whose
+// body holds genuine call expressions and address-stores into a
+// volatile pointer. The compiler can't prove the calls are dead
+// (the volatile sink might be observed) and so leaves the function
+// — plus everything it references — in the final binary.
 // ---------------------------------------------------------------------------
 
-comptime {
-    _ = &stem_send_to_core;
-    _ = &stem_send_to_ui;
-    _ = &stem_log;
-    _ = &stem_plugin_id;
+/// Side-effectful sink that LTO can't prove dead. Inline asm
+/// constrains the compiler from optimizing away the address loads.
+pub fn keep_exports_alive() void {
+    @setRuntimeSafety(false);
+    forceUse(@ptrCast(&stem_send_to_core));
+    forceUse(@ptrCast(&stem_send_to_ui));
+    forceUse(@ptrCast(&stem_log));
+    forceUse(@ptrCast(&stem_plugin_id));
+}
+
+fn forceUse(p: *const anyopaque) void {
+    // Pass `p` through inline asm with no clobbers. The compiler
+    // sees `p` as live across the asm boundary, so it can't be
+    // eliminated. No instruction is actually emitted.
+    asm volatile (""
+        :
+        : [p] "r" (p),
+        : .{});
 }
 
 // ---------------------------------------------------------------------------

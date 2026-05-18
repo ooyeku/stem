@@ -1,0 +1,15 @@
+{
+  "name": "git",
+  "version": "0.4.0",
+  "description": "Git integration. Runs git subcommands via the wasm spawn host import and surfaces their output in a virtual buffer.",
+  "runtime": "wasm",
+  "entry": "git-wasm.wasm",
+  "permissions": {
+    "spawn": ["git"]
+  },
+  "commands": [
+    {"id": "git.status", "title": "[Git] Status", "description": "Show repository status (git status --porcelain)"},
+    {"id": "git.diff", "title": "[Git] Diff", "description": "Show unstaged changes (git diff)"},
+    {"id": "git.diff_staged", "title": "[Git] Diff Staged", "description": "Show staged changes (git diff --staged)"}
+  ]
+}
