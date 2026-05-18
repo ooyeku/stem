@@ -797,6 +797,7 @@ pub const Core = struct {
             .user_data = @ptrCast(self),
             .get_buffer_content = coreGetBufferContent,
             .get_buffer_path = coreGetBufferPath,
+            .request_render = coreRequestRender,
         });
         try self.registerCommands();
 
@@ -1219,6 +1220,14 @@ pub const Core = struct {
                                 }
                                 self.requestRender();
                             }
+                        }
+
+                        // Drain any plugins that crashed since the
+                        // last tick. Cleanup runs on the main loop so
+                        // the dying plugin's reader thread is fully
+                        // unwound by the time we destroy its state.
+                        if (self.plugin_manager.drainPendingExits() > 0) {
+                            self.requestRender();
                         }
 
                         if (self.needs_render) {
@@ -3488,6 +3497,17 @@ pub const Core = struct {
         const n = @min(path.len, out_buf.len);
         @memcpy(out_buf[0..n], path[0..n]);
         return @intCast(n);
+    }
+
+    /// HostHooks.request_render trampoline. May be called from a
+    /// plugin reader thread — `needs_render` is a plain bool so the
+    /// worst case is a tearing read by the main loop on tick, which
+    /// resolves on the next iteration. Good enough; a full atomic
+    /// would just push the same single-flip behaviour through a
+    /// fence.
+    fn coreRequestRender(user_data: *anyopaque) void {
+        const self: *Core = @ptrCast(@alignCast(user_data));
+        self.requestRender();
     }
 
     /// Hand a `PluginMessage` reply back to whichever process plugin

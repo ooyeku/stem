@@ -40,10 +40,33 @@ pub const PluginManager = struct {
     io: std.Io,
     environ_block: std.process.Environ.Block,
 
+    /// Guards every mutable field on the manager. Process plugin reader
+    /// threads call into the manager off the main loop (notifications,
+    /// request forwarding, exit reporting), so map mutations and
+    /// permission lookups must be serialised. Core's main thread takes
+    /// the same lock when it mutates plugin state on tick / load /
+    /// unload, which gives both sides a single ordering.
+    state_mu: vigil.compat.Mutex = .{},
+
+    /// Plugins whose reader thread observed EOF/error. Populated from
+    /// the reader thread (off-loop); drained by core on tick via
+    /// `drainPendingExits`. The strings are owned copies — freed after
+    /// the unload completes. This is what keeps `on_exit` from
+    /// destroying the very plugin still unwinding its callback stack.
+    pending_exits: std.ArrayListUnmanaged([]u8) = .empty,
+
     /// Out-of-process plugins.
     process_plugins: std.StringHashMapUnmanaged(*ProcessPlugin) = .empty,
     /// WebAssembly plugins.
     wasm_plugins: std.StringHashMapUnmanaged(*WasmPlugin) = .empty,
+
+    /// `correlation_id → plugin name` for in-flight process plugin
+    /// requests. Lets `replyToProcessPlugin` route a reply back to the
+    /// exact plugin that asked, rather than broadcasting to every
+    /// running exec plugin. Populated when a process plugin's reader
+    /// thread forwards a request to core's inbox; drained when the
+    /// reply (or error) is dispatched back.
+    pending_requests: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
 
     core_inbox: ?*vigil.Inbox = null,
     ui_bus: *MessageBus,
@@ -161,27 +184,102 @@ pub const PluginManager = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.plugin_permissions.deinit(self.allocator);
+
+        for (self.pending_exits.items) |name| self.allocator.free(name);
+        self.pending_exits.deinit(self.allocator);
+
+        var pr_it = self.pending_requests.iterator();
+        while (pr_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        self.pending_requests.deinit(self.allocator);
     }
 
     pub fn loadUserPlugins(self: *PluginManager) !void {
+        // Walk every configured plugin root in priority order. The
+        // first occurrence of a plugin name wins, so `~/.stem/plugins`
+        // (per-user) shadows the system path, which shadows anything
+        // injected via `STEM_PLUGIN_PATH`. That keeps `stem plugin
+        // install <path>` (which lands in `~/.stem/plugins`) doing
+        // what its UX implies: overriding the bundled copy.
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer {
+            var it = seen.keyIterator();
+            while (it.next()) |k| self.allocator.free(k.*);
+            seen.deinit(self.allocator);
+        }
+
+        var roots = try self.collectPluginRoots();
+        defer {
+            for (roots.items) |p| self.allocator.free(p);
+            roots.deinit(self.allocator);
+        }
+
+        for (roots.items) |root| {
+            try self.loadFromRoot(root, &seen);
+        }
+    }
+
+    /// Ordered list of directories to scan for plugins. Each entry is
+    /// an owned absolute path; caller frees.
+    fn collectPluginRoots(self: *PluginManager) !std.ArrayListUnmanaged([]u8) {
         const env: std.process.Environ = .{ .block = self.environ_block };
+        var out: std.ArrayListUnmanaged([]u8) = .empty;
+        errdefer {
+            for (out.items) |p| self.allocator.free(p);
+            out.deinit(self.allocator);
+        }
 
-        const home = blk: {
-            if (env.getPosix("HOME")) |h| break :blk try self.allocator.dupe(u8, h);
-            if (@import("builtin").os.tag == .windows) {
-                if (env.getPosix("USERPROFILE")) |up| break :blk try self.allocator.dupe(u8, up);
-            }
-            log.warn("Could not determine HOME for loading plugins", .{});
-            return;
+        // 1. Per-user dir under HOME (or USERPROFILE on Windows).
+        const home_opt: ?[]const u8 = env.getPosix("HOME") orelse env.getPosix("USERPROFILE");
+        if (home_opt) |home| {
+            const user_dir = try std.fs.path.join(self.allocator, &.{ home, ".stem", "plugins" });
+            try out.append(self.allocator, user_dir);
+        } else {
+            log.warn("Could not determine HOME — skipping ~/.stem/plugins", .{});
+        }
+
+        // 2. Common system install dirs. `install.sh` writes to
+        // `~/.local/lib/stem/plugins` (no /usr/local access) or
+        // `/usr/local/lib/stem/plugins`; the Nix derivation lands in
+        // `<store>/lib/stem/plugins`. We can't ask the binary where
+        // it lives in Zig 0.16, so we just probe the well-known paths
+        // and silently skip anything that doesn't exist.
+        if (home_opt) |home| {
+            const local_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "lib", "stem", "plugins" });
+            try out.append(self.allocator, local_dir);
+        }
+        const system_dirs = [_][]const u8{
+            "/usr/local/lib/stem/plugins",
+            "/usr/lib/stem/plugins",
+            "/opt/stem/plugins",
         };
-        defer self.allocator.free(home);
+        for (system_dirs) |sd| {
+            const dup = try self.allocator.dupe(u8, sd);
+            try out.append(self.allocator, dup);
+        }
 
-        const plugin_dir = try std.fs.path.join(self.allocator, &[_][]const u8{ home, ".stem", "plugins" });
-        defer self.allocator.free(plugin_dir);
+        // 3. Anything on `STEM_PLUGIN_PATH`. Split on `:` on POSIX,
+        // `;` on Windows. Empty segments are ignored.
+        const sep: u8 = if (@import("builtin").os.tag == .windows) ';' else ':';
+        if (env.getPosix("STEM_PLUGIN_PATH")) |raw| {
+            var it = std.mem.tokenizeScalar(u8, raw, sep);
+            while (it.next()) |seg| {
+                if (seg.len == 0) continue;
+                const dup = try self.allocator.dupe(u8, seg);
+                try out.append(self.allocator, dup);
+            }
+        }
 
-        var dir = std.Io.Dir.openDirAbsolute(self.io, plugin_dir, .{ .iterate = true }) catch |err| {
+        return out;
+    }
+
+    fn loadFromRoot(
+        self: *PluginManager,
+        root: []const u8,
+        seen: *std.StringHashMapUnmanaged(void),
+    ) !void {
+        var dir = std.Io.Dir.openDirAbsolute(self.io, root, .{ .iterate = true }) catch |err| {
             if (err == error.FileNotFound) return;
-            log.warn("Failed to open plugin dir {s}: {}", .{ plugin_dir, err });
+            log.warn("Failed to open plugin dir {s}: {}", .{ root, err });
             return;
         };
         defer dir.close(self.io);
@@ -189,10 +287,19 @@ pub const PluginManager = struct {
         var it = dir.iterate();
         while (it.next(self.io) catch null) |entry| {
             if (entry.kind != .directory) continue;
-            const full_path = try std.fs.path.join(self.allocator, &[_][]const u8{ plugin_dir, entry.name });
+            if (seen.contains(entry.name)) {
+                log.debug("plugin '{s}' already loaded from a higher-priority root; skipping {s}", .{ entry.name, root });
+                continue;
+            }
+            const full_path = try std.fs.path.join(self.allocator, &.{ root, entry.name });
             defer self.allocator.free(full_path);
             self.tryLoadPluginDir(full_path) catch |err| {
                 log.warn("Plugin dir {s} failed to load: {s}", .{ entry.name, @errorName(err) });
+                continue;
+            };
+            const dup = try self.allocator.dupe(u8, entry.name);
+            seen.put(self.allocator, dup, {}) catch {
+                self.allocator.free(dup);
             };
         }
     }
@@ -328,13 +435,20 @@ pub const PluginManager = struct {
     }
 
     /// JSON-RPC notification handler — runs on the ProcessPlugin's
-    /// reader thread.
+    /// reader thread. Mutations to manager state (command registry,
+    /// event subscribers, status items, panels) all happen inside this
+    /// call, so we serialise the whole dispatch under `state_mu`. The
+    /// lock is short-lived: every branch is O(1) or O(N small) work.
     fn handleProcessNotification(
         user_data: *anyopaque,
+        plugin_id: []const u8,
         method: []const u8,
         params: std.json.Value,
     ) void {
+        _ = plugin_id;
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
 
         if (std.mem.eql(u8, method, "plugin/log")) {
             // params: { "level": int, "message": string }
@@ -381,29 +495,34 @@ pub const PluginManager = struct {
 
     fn handleProcessRequest(
         user_data: *anyopaque,
+        plugin_id: []const u8,
         id: u64,
         method: []const u8,
         _: std.json.Value,
     ) void {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
-        // We can't safely read core's state from the ProcessPlugin's
-        // reader thread, so forward the request onto core's inbox as
-        // a PluginMessage carrying the JSON-RPC id in `correlation_id`.
-        // Core handles it on its own thread and calls
-        // `replyToProcessPlugin` once it has the answer.
+        // Forward the request onto core's inbox as a PluginMessage
+        // carrying the JSON-RPC id in `correlation_id`; core handles
+        // it on its own thread and calls `replyToProcessPlugin` once
+        // it has the answer. Record `(id → plugin_id)` here so the
+        // reply lands on the exact plugin that asked.
         const core_inbox = self.core_inbox orelse {
-            self.replyProcessPluginError(method, id, -32603, "core inbox unavailable");
+            self.replyProcessPluginByName(plugin_id, id, null, -32603, "core inbox unavailable");
             return;
         };
         const which: protocol.PluginMessage.PluginMessageType = blk: {
             if (std.mem.eql(u8, method, "editor/getState")) break :blk .get_state;
             if (std.mem.eql(u8, method, "editor/getBufferContent")) break :blk .get_buffer_content;
             if (std.mem.eql(u8, method, "editor/getPluginList")) break :blk .get_plugin_list;
-            self.replyProcessPluginError(method, id, -32601, "Method not found");
+            self.replyProcessPluginByName(plugin_id, id, null, -32601, "Method not found");
             return;
         };
+        if (!self.recordPendingRequest(id, plugin_id)) {
+            self.replyProcessPluginByName(plugin_id, id, null, -32603, "request tracking failed");
+            return;
+        }
         const pm = protocol.PluginMessage{
-            .plugin_id = method, // we don't know which plugin made the request — method serves as a label
+            .plugin_id = plugin_id,
             .message_type = which,
             .payload = switch (which) {
                 .get_state => .{ .state_request = {} },
@@ -415,84 +534,146 @@ pub const PluginManager = struct {
         };
         const outer = protocol.Message{ .plugin_message = pm };
         const encoded = outer.encode(self.allocator) catch {
-            self.replyProcessPluginError(method, id, -32603, "encode failed");
+            _ = self.takePendingRequest(id);
+            self.replyProcessPluginByName(plugin_id, id, null, -32603, "encode failed");
             return;
         };
         defer self.allocator.free(encoded);
         core_inbox.send(encoded) catch {
-            self.replyProcessPluginError(method, id, -32603, "core inbox closed");
+            _ = self.takePendingRequest(id);
+            self.replyProcessPluginByName(plugin_id, id, null, -32603, "core inbox closed");
         };
     }
 
+    /// Record an in-flight `(correlation_id → plugin_id)` mapping
+    /// under the state lock. Returns `false` if allocation fails so
+    /// the caller can surface an error reply immediately rather than
+    /// silently drop the reply when it arrives.
+    fn recordPendingRequest(self: *PluginManager, id: u64, plugin_id: []const u8) bool {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+        const copy = self.allocator.dupe(u8, plugin_id) catch return false;
+        self.pending_requests.put(self.allocator, id, copy) catch {
+            self.allocator.free(copy);
+            return false;
+        };
+        return true;
+    }
+
+    fn takePendingRequest(self: *PluginManager, id: u64) ?[]u8 {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+        if (self.pending_requests.fetchRemove(id)) |kv| return kv.value;
+        return null;
+    }
+
     /// Dispatch a JSON-RPC reply built by core back to the originating
-    /// process plugin. `plugin_id` is the plugin name the request came
-    /// from — but since `handleProcessRequest` runs without knowing
-    /// which exec plugin spawned it, we broadcast to every running
-    /// process plugin whose pending-request id matches. This works
-    /// today because there's a single process plugin (echo); when
-    /// multiple exec plugins coexist the request handler needs to
-    /// carry the plugin id explicitly. TODO once we have >1 exec
-    /// plugin in flight.
+    /// process plugin. Looks up the plugin by name (saved when the
+    /// request was forwarded); if the plugin has since been unloaded
+    /// or crashed the reply is silently dropped — better than waking
+    /// every other plugin with a stale correlation id.
     pub fn replyToProcessPlugin(
         self: *PluginManager,
         correlation_id: u64,
         result_json: []const u8,
     ) void {
-        var it = self.process_plugins.valueIterator();
-        while (it.next()) |pp_ptr| {
-            pp_ptr.*.sendReply(correlation_id, result_json) catch |err| {
-                log.warn("reply to process plugin '{s}' id={d} failed: {s}", .{ pp_ptr.*.name, correlation_id, @errorName(err) });
-            };
-        }
+        const plugin_name_opt = self.takePendingRequest(correlation_id);
+        const plugin_name = plugin_name_opt orelse {
+            log.warn("dropping reply for unknown correlation_id={d}", .{correlation_id});
+            return;
+        };
+        defer self.allocator.free(plugin_name);
+
+        self.state_mu.lock();
+        const pp_opt = self.process_plugins.get(plugin_name);
+        self.state_mu.unlock();
+        const pp = pp_opt orelse {
+            log.warn("dropping reply id={d}: plugin '{s}' is gone", .{ correlation_id, plugin_name });
+            return;
+        };
+        pp.sendReply(correlation_id, result_json) catch |err| {
+            log.warn("reply to '{s}' id={d} failed: {s}", .{ plugin_name, correlation_id, @errorName(err) });
+        };
     }
 
-    fn replyProcessPluginError(
+    /// Send a JSON-RPC error to a specific process plugin. If the
+    /// correlation id was already recorded (`takePendingRequest`
+    /// returned a name) the caller passes it as `recorded_name`;
+    /// otherwise we fall back to the `plugin_id` argument the request
+    /// handler observed.
+    fn replyProcessPluginByName(
         self: *PluginManager,
-        method: []const u8,
+        plugin_id: []const u8,
         correlation_id: u64,
+        recorded_name: ?[]u8,
         code: i32,
         message: []const u8,
     ) void {
-        _ = method;
-        var it = self.process_plugins.valueIterator();
-        while (it.next()) |pp_ptr| {
-            pp_ptr.*.sendError(correlation_id, code, message) catch {};
+        defer if (recorded_name) |n| self.allocator.free(n);
+
+        self.state_mu.lock();
+        const pp_opt = self.process_plugins.get(plugin_id);
+        self.state_mu.unlock();
+        if (pp_opt) |pp| {
+            pp.sendError(correlation_id, code, message) catch {};
         }
-        log.warn("process plugin request id={d} error {d}: {s}", .{ correlation_id, code, message });
+        log.warn("process plugin '{s}' request id={d} error {d}: {s}", .{ plugin_id, correlation_id, code, message });
     }
 
-    fn handleProcessExit(user_data: *anyopaque) void {
-        // Called from the ProcessPlugin's reader thread when the
-        // child closes stdout. Mark the plugin failed and tear down
-        // its registered commands / widgets / subscriptions so the
-        // palette doesn't show dead entries. We don't auto-restart
-        // here — that's a policy decision the operator drives via
-        // `:plugin.reload`, `stem plugin install`, or the
-        // load/unload PluginMessage variants.
+    fn handleProcessExit(user_data: *anyopaque, plugin_id: []const u8) void {
+        // Runs on the ProcessPlugin's reader thread when the child
+        // closes stdout. We MUST NOT call `unloadPlugin` here —
+        // doing so would destroy the very `ProcessPlugin` whose
+        // reader thread is still unwinding through this callback,
+        // and the manager's maps may be in use on the main loop.
+        // Instead, hand the name to `pending_exits` for the main
+        // loop to drain on its next tick via `drainPendingExits`.
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
-        log.warn("process plugin exited; pruning resources", .{});
 
-        // Find the process plugin whose state has flipped to
-        // .failed / .stopped (the reader thread sets it in its exit
-        // path before invoking on_exit).
-        var stale: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer stale.deinit(self.allocator);
-        var it = self.process_plugins.iterator();
-        while (it.next()) |entry| {
-            const pp = entry.value_ptr.*;
-            pp.state_mu.lock();
-            const dead = pp.state == .failed or pp.state == .stopped;
-            pp.state_mu.unlock();
-            if (dead) {
-                stale.append(self.allocator, entry.key_ptr.*) catch break;
-            }
+        self.state_mu.lock();
+        const copy = self.allocator.dupe(u8, plugin_id) catch {
+            self.state_mu.unlock();
+            return;
+        };
+        self.pending_exits.append(self.allocator, copy) catch {
+            self.allocator.free(copy);
+            self.state_mu.unlock();
+            return;
+        };
+        self.state_mu.unlock();
+
+        // Wake core so it drains promptly. The render flag is set in
+        // `drainPendingExits` once the work actually runs.
+        if (self.core_inbox) |inbox| {
+            const tick_bytes = (protocol.Message{ .tick = {} }).encode(self.allocator) catch return;
+            defer self.allocator.free(tick_bytes);
+            inbox.send(tick_bytes) catch {};
         }
-        for (stale.items) |name| {
+    }
+
+    /// Drain any process plugins flagged by their reader thread.
+    /// Called by core on tick, on the main loop, so it's safe to
+    /// destroy the plugin and tear down its commands/widgets here.
+    /// Returns the number of plugins actually unloaded — non-zero
+    /// means the UI should re-render to drop stale palette entries.
+    pub fn drainPendingExits(self: *PluginManager) usize {
+        // Move the pending list out under the lock, then process
+        // outside it so the unload path (which also takes the lock
+        // via the public API) doesn't deadlock against itself.
+        self.state_mu.lock();
+        const names = self.pending_exits.toOwnedSlice(self.allocator) catch &[_][]u8{};
+        self.state_mu.unlock();
+        defer self.allocator.free(names);
+
+        for (names) |name| {
             telemetry.recordPluginCrash(name);
             self.unloadPlugin(name) catch |err| {
                 log.warn("unload of failed process plugin '{s}' failed: {s}", .{ name, @errorName(err) });
             };
+            log.warn("process plugin '{s}' exited; resources pruned", .{name});
+            self.allocator.free(name);
         }
+        return names.len;
     }
 
     fn registerProcessCommand(self: *PluginManager, params: std.json.Value) !void {
@@ -633,6 +814,12 @@ pub const PluginManager = struct {
         user_data: ?*anyopaque = null,
         get_buffer_content: ?*const fn (user_data: *anyopaque, out_buf: []u8) i32 = null,
         get_buffer_path: ?*const fn (user_data: *anyopaque, out_buf: []u8) i32 = null,
+        /// Tell the editor that something a plugin owns needs to be
+        /// redrawn (status item / panel / palette refresh). Without
+        /// this, the synthetic tick we send wakes the loop but
+        /// `Core.tick` will not actually call `sendUpdate()` because
+        /// `needs_render` is still false.
+        request_render: ?*const fn (user_data: *anyopaque) void = null,
     };
 
     pub fn setHostHooks(self: *PluginManager, hooks: HostHooks) void {
@@ -881,6 +1068,7 @@ pub const PluginManager = struct {
         spawn_allowlist: [][]const u8 = &.{},
         filesystem: [][]const u8 = &.{},
         events: [][]const u8 = &.{},
+        manage_plugins: bool = false,
 
         fn deinit(self: *StoredPermissions, allocator: std.mem.Allocator) void {
             for (self.spawn_allowlist) |s| allocator.free(s);
@@ -911,7 +1099,17 @@ pub const PluginManager = struct {
         errdefer freeStringList(self.allocator, stored.filesystem);
         stored.events = try dupStringList(self.allocator, perms.events);
         errdefer freeStringList(self.allocator, stored.events);
+        stored.manage_plugins = perms.manage_plugins;
         try self.plugin_permissions.put(self.allocator, key, stored);
+    }
+
+    /// True iff the plugin was granted the `manage_plugins` capability
+    /// in its manifest. Wasm load/unload host imports gate on this.
+    fn canManagePlugins(self: *PluginManager, plugin_id: []const u8) bool {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+        const stored = self.plugin_permissions.get(plugin_id) orelse return false;
+        return stored.manage_plugins;
     }
 
     fn dupStringList(allocator: std.mem.Allocator, xs: []const []const u8) ![][]const u8 {
@@ -1237,45 +1435,149 @@ pub const PluginManager = struct {
             return -1;
         }
 
-        const run_options = std.process.RunOptions{
-            .argv = argv.items,
-            .cwd = if (opts.cwd) |c| .{ .path = c } else .inherit,
-        };
-        const result = std.process.run(self.allocator, self.io, run_options) catch |err| {
+        const spawn_result = self.spawnCapture(argv.items, opts.cwd, opts.timeout_ms) catch |err| {
             log.warn("wasm spawn for '{s}' failed: {s}", .{ plugin_id, @errorName(err) });
             return -3;
         };
-        defer self.allocator.free(result.stdout);
-        defer self.allocator.free(result.stderr);
+        defer self.allocator.free(spawn_result.stdout);
+        defer self.allocator.free(spawn_result.stderr);
 
-        // Honor the optional timeout. std.process.run is synchronous,
-        // so we can only check the wall clock AFTER. A future
-        // improvement is to use a non-blocking spawn + poll; today we
-        // surface a clear timeout signal post-hoc.
-        _ = opts.timeout_ms; // TODO: pre-spawn timeout enforcement.
+        if (spawn_result.timed_out) {
+            log.warn(
+                "wasm spawn for '{s}' (cmd='{s}') exceeded {d}ms — killed",
+                .{ plugin_id, opts.cmd, opts.timeout_ms },
+            );
+            return -4;
+        }
 
         // Write stdout, optionally followed by stderr (NUL-separated).
         var written: usize = 0;
-        const n = @min(result.stdout.len, out_buf.len);
-        @memcpy(out_buf[0..n], result.stdout[0..n]);
+        const n = @min(spawn_result.stdout.len, out_buf.len);
+        @memcpy(out_buf[0..n], spawn_result.stdout[0..n]);
         written += n;
         if (opts.include_stderr and written < out_buf.len) {
             // Separator.
             out_buf[written] = 0;
             written += 1;
             const remaining = out_buf.len - written;
-            const m = @min(result.stderr.len, remaining);
-            @memcpy(out_buf[written..][0..m], result.stderr[0..m]);
+            const m = @min(spawn_result.stderr.len, remaining);
+            @memcpy(out_buf[written..][0..m], spawn_result.stderr[0..m]);
             written += m;
         }
 
         // Surface non-zero exit codes so plugins can distinguish "ran
         // but failed" from "stdout was empty". We still return the
         // bytes written; the negative code is purely informational.
-        return switch (result.term) {
+        return switch (spawn_result.term) {
             .exited => |code| if (code == 0) @intCast(written) else -5,
             else => -5,
         };
+    }
+
+    const SpawnCaptureResult = struct {
+        stdout: []u8,
+        stderr: []u8,
+        term: std.process.Child.Term,
+        timed_out: bool,
+    };
+
+    /// Run a child with stdout/stderr piped, enforcing `timeout_ms`
+    /// if non-zero. A watchdog thread kills the process if it doesn't
+    /// exit in time. We drain stdout then stderr; a misbehaving child
+    /// that writes >1 MiB to stderr while we're reading stdout will
+    /// eventually block — but only after the kill window, which puts
+    /// it on the watchdog's path.
+    fn spawnCapture(
+        self: *PluginManager,
+        argv: []const []const u8,
+        cwd: ?[]const u8,
+        timeout_ms: u32,
+    ) !SpawnCaptureResult {
+        const child_cwd: std.process.Child.Cwd = if (cwd) |c| .{ .path = c } else .inherit;
+        var child = try std.process.spawn(self.io, .{
+            .argv = argv,
+            .cwd = child_cwd,
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        });
+
+        const Watchdog = struct {
+            io: std.Io,
+            child_ptr: *std.process.Child,
+            timeout_ms: u32,
+            done: std.atomic.Value(bool) = .{ .raw = false },
+            fired: std.atomic.Value(bool) = .{ .raw = false },
+
+            fn run(ctx: *@This()) void {
+                const step_ms: u32 = 25;
+                var elapsed: u32 = 0;
+                while (elapsed < ctx.timeout_ms) {
+                    if (ctx.done.load(.acquire)) return;
+                    vigil.compat.sleep(step_ms * std.time.ns_per_ms);
+                    elapsed += step_ms;
+                }
+                if (ctx.done.load(.acquire)) return;
+                ctx.fired.store(true, .release);
+                ctx.child_ptr.kill(ctx.io);
+            }
+        };
+
+        var wd: Watchdog = .{
+            .io = self.io,
+            .child_ptr = &child,
+            .timeout_ms = timeout_ms,
+        };
+        var wd_thread: ?std.Thread = null;
+        if (timeout_ms > 0) {
+            wd_thread = std.Thread.spawn(.{}, Watchdog.run, .{&wd}) catch null;
+        }
+
+        // Capped to avoid runaway children exhausting RAM via a
+        // stuck spawn; mirrors the previous behaviour of
+        // `std.process.run` (which had its own internal cap).
+        const max_capture: usize = 1024 * 1024;
+        const stdout_bytes = readAllCapped(self.io, child.stdout, self.allocator, max_capture) catch try self.allocator.alloc(u8, 0);
+        const stderr_bytes = readAllCapped(self.io, child.stderr, self.allocator, max_capture) catch try self.allocator.alloc(u8, 0);
+
+        const term = child.wait(self.io) catch std.process.Child.Term{ .unknown = 0 };
+
+        // Signal the watchdog that the child is done, then join. If
+        // the watchdog never fired the loop will pick up `done=true`
+        // and return promptly.
+        wd.done.store(true, .release);
+        if (wd_thread) |t| t.join();
+
+        return .{
+            .stdout = stdout_bytes,
+            .stderr = stderr_bytes,
+            .term = term,
+            .timed_out = wd.fired.load(.acquire),
+        };
+    }
+
+    fn readAllCapped(
+        io: std.Io,
+        file_opt: ?std.Io.File,
+        allocator: std.mem.Allocator,
+        cap: usize,
+    ) ![]u8 {
+        const file = file_opt orelse return try allocator.alloc(u8, 0);
+        var buf: [4096]u8 = undefined;
+        var reader = file.readerStreaming(io, &buf);
+        const r = &reader.interface;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const remaining = if (out.items.len >= cap) 0 else cap - out.items.len;
+            if (remaining == 0) break;
+            const slice_len = @min(chunk.len, remaining);
+            const n = r.readSliceShort(chunk[0..slice_len]) catch break;
+            if (n == 0) break;
+            try out.appendSlice(allocator, chunk[0..n]);
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     fn onWasmSubscribeEvent(
@@ -1422,11 +1724,17 @@ pub const PluginManager = struct {
         plugin_id: []const u8,
         name: []const u8,
     ) i32 {
-        _ = plugin_id;
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        if (!self.canManagePlugins(plugin_id)) {
+            log.warn(
+                "wasm plugin '{s}' attempted stem_load_plugin('{s}') without `manage_plugins` permission",
+                .{ plugin_id, name },
+            );
+            return -1;
+        }
         self.loadPluginByName(name) catch |err| {
             log.warn("stem_load_plugin('{s}') failed: {s}", .{ name, @errorName(err) });
-            return -1;
+            return -2;
         };
         return 0;
     }
@@ -1436,24 +1744,45 @@ pub const PluginManager = struct {
         plugin_id: []const u8,
         name: []const u8,
     ) i32 {
-        _ = plugin_id;
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        if (!self.canManagePlugins(plugin_id)) {
+            log.warn(
+                "wasm plugin '{s}' attempted stem_unload_plugin('{s}') without `manage_plugins` permission",
+                .{ plugin_id, name },
+            );
+            return -1;
+        }
+        // Forbid self-unload outright: the host would destroy the
+        // very WasmPlugin whose instance is still on the call stack
+        // (we're inside one of its host imports), so the wasm-side
+        // return-from-call would jump back into freed memory. Plugins
+        // that want to "reload self" should call load on a sibling
+        // (like plugin_manager.reload_all does).
+        if (std.mem.eql(u8, name, plugin_id)) {
+            log.warn(
+                "wasm plugin '{s}' attempted to unload itself — denied",
+                .{plugin_id},
+            );
+            return -3;
+        }
         self.unloadPlugin(name) catch |err| {
             log.warn("stem_unload_plugin('{s}') failed: {s}", .{ name, @errorName(err) });
-            return -1;
+            return -2;
         };
         return 0;
     }
 
-    /// After a widget mutation, prod core to re-render. We do this by
-    /// sending an empty `open_buffer` request? No — instead we just
-    /// inject a synthetic tick so the snapshot includes the new
-    /// widget state. Core's existing tick handler already calls
-    /// `sendUpdate()` indirectly via the [STATS] refresh path.
+    /// After a widget mutation, mark the editor dirty AND wake its
+    /// event loop. The dirty flag is what makes `Core.tick` actually
+    /// run `sendUpdate()` — without it the synthetic tick would wake
+    /// the loop only to fall through (`needs_render` is false). The
+    /// `request_render` hook runs synchronously on whichever thread
+    /// called us, so it must just flip a flag (no locks, no I/O).
     fn requestUiRefresh(self: *PluginManager) void {
+        if (self.host_hooks.request_render) |fn_ptr| {
+            if (self.host_hooks.user_data) |ud| fn_ptr(ud);
+        }
         const core_inbox = self.core_inbox orelse return;
-        // A `tick` outer message is the cheapest way to wake core's
-        // render path without inventing a new variant.
         const tick_bytes = (protocol.Message{ .tick = {} }).encode(self.allocator) catch return;
         defer self.allocator.free(tick_bytes);
         core_inbox.send(tick_bytes) catch {};

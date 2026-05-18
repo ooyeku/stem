@@ -618,17 +618,17 @@ test "decode: integrate through loader path" {
     try std.testing.expect(m.types.len == 0);
 }
 
-// End-to-end: when the build has produced `zig-out/bin/echo-wasm.wasm`,
+// End-to-end: when the build has produced `zig-out/bin/echo.wasm`,
 // load it, run `activate`, and confirm the host callbacks fired.
 // Skipped silently when the artifact isn't present.
-test "load + activate + dispatchCommand against the built echo-wasm.wasm" {
+test "load + activate + dispatchCommand against the built echo.wasm" {
     const a = std.testing.allocator;
     var threaded = std.Io.Threaded.init(a, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
     // Tests run from the repo root. realPathFileAlloc returns an absolute path.
-    const abs_path = std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/echo-wasm.wasm", a) catch return error.SkipZigTest;
+    const abs_path = std.Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/echo.wasm", a) catch return error.SkipZigTest;
     defer a.free(abs_path);
 
     var ts: TestState = .{ .allocator = a };
@@ -653,15 +653,15 @@ test "load + activate + dispatchCommand against the built echo-wasm.wasm" {
         .on_unload_plugin = TestState.onUnloadPlugin,
     };
 
-    const wp = try load(a, io, "echo-wasm", abs_path, cbs);
+    const wp = try load(a, io, "echo", abs_path, cbs);
     defer {
         wp.deinit();
         a.destroy(wp);
     }
     try wp.activate();
     try std.testing.expect(ts.commands.items.len == 1);
-    try std.testing.expectEqualStrings("echo-wasm.hello", ts.commands.items[0]);
-    try wp.dispatchCommand("echo-wasm.hello");
+    try std.testing.expectEqualStrings("echo.hello", ts.commands.items[0]);
+    try wp.dispatchCommand("echo.hello");
     // After both calls we should have at least one log (the "ready" log
     // from activate) plus one from handle_command.
     try std.testing.expect(ts.logs.items.len >= 2);

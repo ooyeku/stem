@@ -92,13 +92,19 @@ pub const ProcessPlugin = struct {
     pub const Callbacks = struct {
         user_data: *anyopaque,
         /// Plugin sent a notification — host should route to the right
-        /// subsystem (event bus, log, command registry).
-        on_notification: *const fn (user_data: *anyopaque, method: []const u8, params_json: std.json.Value) void,
+        /// subsystem (event bus, log, command registry). `plugin_id`
+        /// is the plugin's manifest name, borrowed from the
+        /// ProcessPlugin; valid for the duration of the call.
+        on_notification: *const fn (user_data: *anyopaque, plugin_id: []const u8, method: []const u8, params_json: std.json.Value) void,
         /// Plugin sent a request — host should compute a reply and
-        /// call `send_reply`.
-        on_request: *const fn (user_data: *anyopaque, id: u64, method: []const u8, params_json: std.json.Value) void,
-        /// Reader saw EOF / parser error. Plugin has crashed.
-        on_exit: *const fn (user_data: *anyopaque) void,
+        /// call `send_reply` on the same plugin. `plugin_id` lets the
+        /// host record the originating plugin so the reply lands on
+        /// the right outbox rather than getting broadcast.
+        on_request: *const fn (user_data: *anyopaque, plugin_id: []const u8, id: u64, method: []const u8, params_json: std.json.Value) void,
+        /// Reader saw EOF / parser error. `plugin_id` identifies the
+        /// crashed plugin so the host can prune its resources without
+        /// scanning every map for stale state.
+        on_exit: *const fn (user_data: *anyopaque, plugin_id: []const u8) void,
     };
 
     pub fn init(
@@ -150,25 +156,36 @@ pub const ProcessPlugin = struct {
     }
 
     pub fn stop(self: *ProcessPlugin) void {
+        // A plugin can crash (state=.failed) while its threads are
+        // still winding down — the reader sets .failed then calls
+        // `on_exit`, which queues the unload, which lands here. So
+        // skipping the body when state is already `.failed` would
+        // leak both threads. The right shortcut is: nothing to do
+        // only when there's literally no work pending — already
+        // joined and no child.
         self.state_mu.lock();
-        if (self.state == .stopped or self.state == .failed) {
+        const child_open = self.child != null;
+        const has_threads = self.reader_thread != null or self.writer_thread != null;
+        if (!child_open and !has_threads and (self.state == .stopped or self.state == .failed)) {
             self.state_mu.unlock();
             return;
         }
-        self.state = .stopping;
+        if (self.state == .running or self.state == .starting) {
+            self.state = .stopping;
+        }
         self.state_mu.unlock();
 
-        // Tell the plugin we're done.
-        const shutdown = jsonrpc.buildNotification(self.allocator, "plugin/shutdown", "{}") catch null;
-        if (shutdown) |s| self.enqueueRaw(s);
-
-        // Yield briefly so the writer thread has a chance to flush
-        // the shutdown notification before we yank stdin out from
-        // under it. The 50 ms we used to wait here was overkill —
-        // 5 ms is plenty for a single small frame and keeps the
-        // editor's exit feel snappy. Plugins that miss the
-        // notification still see EOF on stdin and exit cleanly.
-        vigil.compat.sleep(5 * std.time.ns_per_ms);
+        if (child_open) {
+            // Tell the plugin we're done. Skip the shutdown handshake
+            // if the child has already exited (`.failed` path) — the
+            // outbox would just leak the message.
+            const shutdown = jsonrpc.buildNotification(self.allocator, "plugin/shutdown", "{}") catch null;
+            if (shutdown) |s| self.enqueueRaw(s);
+            // Yield briefly so the writer thread can flush the
+            // shutdown frame before we yank stdin. 5 ms is plenty for
+            // a single small frame.
+            vigil.compat.sleep(5 * std.time.ns_per_ms);
+        }
 
         self.stop_flag.store(true, .release);
 
@@ -182,6 +199,10 @@ pub const ProcessPlugin = struct {
             self.child = null;
         }
 
+        // Always join — even on .failed — so the thread handles
+        // aren't leaked. The reader thread invokes `on_exit` *before*
+        // returning, but by the time we call `join()` it must have
+        // observed the EOF path and is on its way out.
         if (self.writer_thread) |t| {
             t.join();
             self.writer_thread = null;
@@ -192,7 +213,8 @@ pub const ProcessPlugin = struct {
         }
 
         self.state_mu.lock();
-        self.state = .stopped;
+        // Preserve `.failed` for postmortems; only flip a clean exit.
+        if (self.state == .stopping) self.state = .stopped;
         self.state_mu.unlock();
     }
 
@@ -317,18 +339,18 @@ pub const ProcessPlugin = struct {
                 const id = @as(u64, @intCast(id_value.integer));
                 const method = env.method.?;
                 const params = env.params orelse std.json.Value{ .null = {} };
-                self.callbacks.on_request(self.callbacks.user_data, id, method, params);
+                self.callbacks.on_request(self.callbacks.user_data, self.name, id, method, params);
             } else if (env.isNotification()) {
                 const method = env.method.?;
                 const params = env.params orelse std.json.Value{ .null = {} };
-                self.callbacks.on_notification(self.callbacks.user_data, method, params);
+                self.callbacks.on_notification(self.callbacks.user_data, self.name, method, params);
             }
         }
 
         self.state_mu.lock();
         if (self.state == .running) self.state = .failed;
         self.state_mu.unlock();
-        self.callbacks.on_exit(self.callbacks.user_data);
+        self.callbacks.on_exit(self.callbacks.user_data, self.name);
     }
 };
 
@@ -341,13 +363,13 @@ const TestState = struct {
     allocator: std.mem.Allocator,
     exited: bool = false,
 
-    fn onNotification(user_data: *anyopaque, method: []const u8, _: std.json.Value) void {
+    fn onNotification(user_data: *anyopaque, _: []const u8, method: []const u8, _: std.json.Value) void {
         const self: *TestState = @ptrCast(@alignCast(user_data));
         const copy = self.allocator.dupe(u8, method) catch return;
         self.notifications_seen.append(self.allocator, copy) catch self.allocator.free(copy);
     }
-    fn onRequest(_: *anyopaque, _: u64, _: []const u8, _: std.json.Value) void {}
-    fn onExit(user_data: *anyopaque) void {
+    fn onRequest(_: *anyopaque, _: []const u8, _: u64, _: []const u8, _: std.json.Value) void {}
+    fn onExit(user_data: *anyopaque, _: []const u8) void {
         const self: *TestState = @ptrCast(@alignCast(user_data));
         self.exited = true;
     }

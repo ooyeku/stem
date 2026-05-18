@@ -48,6 +48,12 @@ pub const Permissions = struct {
     spawn_allowlist: []const []const u8 = &.{},
     filesystem: []const []const u8 = &.{},
     events: []const []const u8 = &.{},
+    /// Allow the plugin to call `stem_load_plugin` / `stem_unload_plugin`
+    /// (or the eventual JSON-RPC equivalents). Default deny — a typo
+    /// in another plugin's wasm shouldn't be able to tear down the
+    /// rest of the editor. The bundled `plugin_manager` is the only
+    /// plugin that needs this today.
+    manage_plugins: bool = false,
 };
 
 pub const CommandDecl = struct {
@@ -112,6 +118,7 @@ pub fn parse(allocator: std.mem.Allocator, json_bytes: []const u8) !Manifest {
             .spawn_allowlist = try takeStringArray(aa, p, "spawn"),
             .filesystem = try takeStringArray(aa, p, "filesystem"),
             .events = try takeStringArray(aa, p, "events"),
+            .manage_plugins = takeBool(p, "manage_plugins") catch return error.InvalidManifest,
         };
     }
 
@@ -147,6 +154,12 @@ fn takeString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
     const v = obj.get(key) orelse return error.InvalidManifest;
     if (v != .string) return error.InvalidManifest;
     return v.string;
+}
+
+fn takeBool(obj: std.json.ObjectMap, key: []const u8) !bool {
+    const v = obj.get(key) orelse return false;
+    if (v != .bool) return error.InvalidManifest;
+    return v.bool;
 }
 
 fn takeStringArray(
@@ -227,6 +240,32 @@ test "parse: rejects missing required field" {
     const a = std.testing.allocator;
     const result = parse(a,
         \\{"version":"0","runtime":"exec","entry":"foo"}
+    );
+    try std.testing.expectError(error.InvalidManifest, result);
+}
+
+test "parse: manage_plugins defaults to false and parses true" {
+    const a = std.testing.allocator;
+    {
+        var m = try parse(a,
+            \\{"name":"x","version":"0","runtime":"wasm","entry":"x.wasm"}
+        );
+        defer m.deinit();
+        try std.testing.expect(!m.permissions.manage_plugins);
+    }
+    {
+        var m = try parse(a,
+            \\{"name":"x","version":"0","runtime":"wasm","entry":"x.wasm","permissions":{"manage_plugins":true}}
+        );
+        defer m.deinit();
+        try std.testing.expect(m.permissions.manage_plugins);
+    }
+}
+
+test "parse: manage_plugins must be a bool" {
+    const a = std.testing.allocator;
+    const result = parse(a,
+        \\{"name":"x","version":"0","runtime":"wasm","entry":"x.wasm","permissions":{"manage_plugins":"yes"}}
     );
     try std.testing.expectError(error.InvalidManifest, result);
 }
