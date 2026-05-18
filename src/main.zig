@@ -353,9 +353,47 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         if (last_arena_pool) |pool| pool.release(arena);
                     }
 
-                    const snapshot_ptr: *protocol.RenderSnapshot = @ptrFromInt(update.snapshot_ptr);
-                    const arena_ptr: *std.heap.ArenaAllocator = @ptrFromInt(update.arena_ptr);
-                    const pool_ptr: *@import("kernel/arena_pool.zig").ArenaPool = @ptrFromInt(update.pool_ptr);
+                    var latest = update;
+                    // Drain any newer render_updates queued behind
+                    // this one. Non-render messages on the way are
+                    // processed inline (`continue` round-trips them
+                    // through this switch). For each superseded
+                    // render we release its arena so the producer's
+                    // pool stays balanced.
+                    while (main_inbox.mailbox.receive()) |peek_msg| {
+                        if (peek_msg.payload) |peek_payload| {
+                            const peek_decoded = protocol.Message.decode(peek_payload) catch {
+                                peek_msg.deinit();
+                                continue;
+                            };
+                            if (peek_decoded == .render_update) {
+                                const prev_arena: *std.heap.ArenaAllocator = @ptrFromInt(latest.arena_ptr);
+                                const prev_pool: *@import("kernel/arena_pool.zig").ArenaPool = @ptrFromInt(latest.pool_ptr);
+                                prev_pool.release(prev_arena);
+                                latest = peek_decoded.render_update;
+                                peek_msg.deinit();
+                                continue;
+                            }
+                            // Non-render message in the lookahead.
+                            // The outer-loop scheduling expects to
+                            // see these in order, so we deliberately
+                            // stop draining and re-handle them on
+                            // the next iteration. To avoid losing
+                            // the message we already consumed, we
+                            // re-send it to ourselves through the
+                            // bus — preserves order with anything
+                            // still queued.
+                            const re_bytes = peek_payload;
+                            main_bus.sendInteractive(re_bytes) catch {};
+                            peek_msg.deinit();
+                            break;
+                        }
+                        peek_msg.deinit();
+                    } else |_| {}
+
+                    const snapshot_ptr: *protocol.RenderSnapshot = @ptrFromInt(latest.snapshot_ptr);
+                    const arena_ptr: *std.heap.ArenaAllocator = @ptrFromInt(latest.arena_ptr);
+                    const pool_ptr: *@import("kernel/arena_pool.zig").ArenaPool = @ptrFromInt(latest.pool_ptr);
 
                     last_snapshot = snapshot_ptr;
                     last_arena = arena_ptr;

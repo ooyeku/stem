@@ -99,6 +99,9 @@ pub const Core = struct {
     terminal_cwd: ?[]const u8 = null,
     terminal_old_cwd: ?[]const u8 = null,
     leader_pending: bool,
+    /// In-flight plugin-keybind chord. Reset when a chord matches,
+    /// no longer prefixes any binding, or the leader gate closes.
+    plugin_chord_buf: std.ArrayListUnmanaged(u8) = .empty,
     /// One of `[` or `]` pressed, awaiting target key (e.g. `d` for
     /// diagnostic). null = no bracket-prefix pending.
     bracket_pending: ?u8 = null,
@@ -187,6 +190,10 @@ pub const Core = struct {
     /// stack frame that built them (e.g. "Skipped N unsupported files"
     /// after a directory open). Fixed-size; messages truncate if longer.
     skip_status_buf: [128]u8 = undefined,
+    /// Separate buffer for plugin-emitted notifications so they don't
+    /// race the `skip_status_buf` writers. Sized larger because plugin
+    /// messages can include identifiers / file paths.
+    plugin_notification_buf: [512]u8 = undefined,
 
     /// Wall-clock ms of last autosave sweep. Set by `maybeAutosave`.
     last_autosave_ms: i64 = 0,
@@ -317,6 +324,7 @@ pub const Core = struct {
 
         self.leader_number_input.deinit(self.allocator);
         self.buffer_picker_number_input.deinit(self.allocator);
+        self.plugin_chord_buf.deinit(self.allocator);
 
         self.history_manager.deinit();
         self.jump_list.deinit();
@@ -881,6 +889,82 @@ pub const Core = struct {
                             self.command_registry.execute(cmd_id, self) catch |err| {
                                 log.err("Failed to execute core command '{s}' from plugin: {}", .{ cmd_id, err });
                             };
+                        } else if (pm.message_type == .get_state) {
+                            const active_buf = self.buffer_manager.getActive();
+                            const state_view = protocol.EditorStateView{
+                                .buffer_id = active_buf.id,
+                                .buffer_name = active_buf.name,
+                                .file_path = active_buf.file_path,
+                                .cursor_row = active_buf.state.cursor_row,
+                                .cursor_col = active_buf.state.cursor_col,
+                                .mode = self.mode,
+                                .file_modified = active_buf.state.modified,
+                                .total_lines = active_buf.state.buffer.lineCount(),
+                                .selection_start_row = null,
+                                .selection_start_col = null,
+                                .selection_end_row = null,
+                                .selection_end_col = null,
+                            };
+                            const reply = protocol.PluginMessage{
+                                .plugin_id = pm.plugin_id,
+                                .message_type = .state_response,
+                                .payload = .{ .state = state_view },
+                                .correlation_id = pm.correlation_id,
+                            };
+                            // Manager-owned JSON encoder will frame and
+                            // dispatch via the right process plugin.
+                            self.replyPluginRequest(reply) catch {};
+                        } else if (pm.message_type == .get_buffer_content) {
+                            const active_buf = self.buffer_manager.getActive();
+                            const content = active_buf.state.buffer.toString(self.allocator) catch "";
+                            defer self.allocator.free(content);
+                            const reply = protocol.PluginMessage{
+                                .plugin_id = pm.plugin_id,
+                                .message_type = .buffer_content_response,
+                                .payload = .{ .buffer_content_response = .{ .id = active_buf.id, .content = content } },
+                                .correlation_id = pm.correlation_id,
+                            };
+                            self.replyPluginRequest(reply) catch {};
+                        } else if (pm.message_type == .get_plugin_list) {
+                            const reply = protocol.PluginMessage{
+                                .plugin_id = pm.plugin_id,
+                                .message_type = .get_plugin_list_response,
+                                .payload = .{ .plugin_list_data = "" }, // free-form; manager populates the JSON
+                                .correlation_id = pm.correlation_id,
+                            };
+                            self.replyPluginRequest(reply) catch {};
+                        } else if (pm.message_type == .load_plugin) {
+                            const target = pm.payload.plugin_load;
+                            self.plugin_manager.loadPluginByName(target) catch |err| {
+                                log.warn("plugin '{s}' load failed: {s}", .{ target, @errorName(err) });
+                            };
+                            self.sendUpdate() catch {};
+                        } else if (pm.message_type == .unload_plugin) {
+                            const target = pm.payload.plugin_unload;
+                            self.plugin_manager.unloadPlugin(target) catch |err| {
+                                log.warn("plugin '{s}' unload failed: {s}", .{ target, @errorName(err) });
+                            };
+                            self.sendUpdate() catch {};
+                        } else if (pm.message_type == .show_notification) {
+                            // Plugin notification — fold into the
+                            // status bar with a 4-second TTL. Prefix
+                            // with `[plugin] ` so the source is
+                            // visible.
+                            const notif = pm.payload.notification;
+                            const tag: []const u8 = switch (notif.level) {
+                                .warning => "WARN",
+                                .err => "ERR",
+                                else => "INFO",
+                            };
+                            const written = std.fmt.bufPrint(
+                                &self.plugin_notification_buf,
+                                "[{s}] {s}: {s}",
+                                .{ tag, pm.plugin_id, notif.message },
+                            ) catch self.plugin_notification_buf[0..0];
+                            self.status_message = written;
+                            self.status_message_expires =
+                                std.Io.Clock.real.now(self.io).toMilliseconds() + 4_000;
+                            self.sendUpdate() catch {};
                         }
                         // Other PluginMessage variants (state/buffer
                         // requests, command registers, status items,
@@ -1546,6 +1630,41 @@ pub const Core = struct {
             return true;
         }
         if (self.leader_pending) {
+            // Plugin keybindings (Phase 4): manifests can declare a
+            // chord like `"keybinding": "Space g s"`. We accumulate
+            // ASCII keystrokes into `plugin_chord_buf` (after the
+            // leader) and consult the manager. Exact match runs the
+            // command; prefix match keeps the leader open; otherwise
+            // we fall through to the built-in chord switch.
+            if (key.codepoint > 0 and key.codepoint < 0x80) {
+                const ch: u8 = @intCast(key.codepoint);
+                self.plugin_chord_buf.append(self.allocator, ch) catch {};
+                // Build "Space <buf>" with spaces between chars.
+                var seq: std.ArrayListUnmanaged(u8) = .empty;
+                defer seq.deinit(self.allocator);
+                seq.appendSlice(self.allocator, "Space") catch {};
+                for (self.plugin_chord_buf.items) |c| {
+                    seq.append(self.allocator, ' ') catch {};
+                    seq.append(self.allocator, c) catch {};
+                }
+                if (self.plugin_manager.lookupKeybind(seq.items)) |cmd_id| {
+                    self.syncPaneToState();
+                    self.command_registry.execute(cmd_id, self) catch |err| {
+                        log.warn("plugin keybind '{s}' exec failed: {s}", .{ cmd_id, @errorName(err) });
+                    };
+                    self.plugin_chord_buf.clearRetainingCapacity();
+                    self.leader_pending = false;
+                    return true;
+                }
+                if (self.plugin_manager.isKeybindPrefix(seq.items)) {
+                    // Prefix match — keep leader open for the next char.
+                    return true;
+                }
+                // No plugin match — drop the chord buffer and fall
+                // through to the built-in leader switch below.
+                self.plugin_chord_buf.clearRetainingCapacity();
+            }
+
             if (key.codepoint >= '0' and key.codepoint <= '9') {
                 try self.leader_number_input.append(self.allocator, @intCast(key.codepoint));
 
@@ -3340,6 +3459,90 @@ pub const Core = struct {
         };
     }
 
+    /// Hand a `PluginMessage` reply back to whichever process plugin
+    /// originated the request. Encodes the payload as a JSON result
+    /// and routes via `PluginManager.replyToProcessPlugin`.
+    fn replyPluginRequest(self: *Core, reply: protocol.PluginMessage) !void {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+        const jsonrpc = @import("../plugins/jsonrpc.zig");
+        switch (reply.payload) {
+            .state => |s| {
+                try w.writeByte('{');
+                try jsonrpc.writeJsonStringKey(w, "buffer_id");
+                try w.print("{d}", .{s.buffer_id});
+                try w.writeAll(",");
+                try jsonrpc.writeJsonStringKey(w, "buffer_name");
+                try jsonrpc.writeJsonString(w, s.buffer_name);
+                try w.writeAll(",");
+                try jsonrpc.writeJsonStringKey(w, "file_path");
+                if (s.file_path) |fp| try jsonrpc.writeJsonString(w, fp) else try w.writeAll("null");
+                try w.writeAll(",");
+                try jsonrpc.writeJsonStringKey(w, "cursor_row");
+                try w.print("{d}", .{s.cursor_row});
+                try w.writeAll(",");
+                try jsonrpc.writeJsonStringKey(w, "cursor_col");
+                try w.print("{d}", .{s.cursor_col});
+                try w.writeAll(",");
+                try jsonrpc.writeJsonStringKey(w, "mode");
+                try jsonrpc.writeJsonString(w, @tagName(s.mode));
+                try w.writeAll(",");
+                try jsonrpc.writeJsonStringKey(w, "file_modified");
+                try w.writeAll(if (s.file_modified) "true" else "false");
+                try w.writeAll(",");
+                try jsonrpc.writeJsonStringKey(w, "total_lines");
+                try w.print("{d}", .{s.total_lines});
+                try w.writeByte('}');
+            },
+            .buffer_content_response => |r| {
+                try w.writeByte('{');
+                try jsonrpc.writeJsonStringKey(w, "id");
+                try w.print("{d}", .{r.id});
+                try w.writeAll(",");
+                try jsonrpc.writeJsonStringKey(w, "content");
+                try jsonrpc.writeJsonString(w, r.content);
+                try w.writeByte('}');
+            },
+            else => {
+                if (reply.message_type == .get_plugin_list_response) {
+                    // Walk the manager's runtime maps and render a
+                    // minimal JSON array of `{name, runtime}`.
+                    try w.writeByte('[');
+                    var first = true;
+                    var w_it = self.plugin_manager.wasm_plugins.valueIterator();
+                    while (w_it.next()) |wp_ptr| {
+                        if (!first) try w.writeByte(',');
+                        first = false;
+                        try w.writeByte('{');
+                        try jsonrpc.writeJsonStringKey(w, "name");
+                        try jsonrpc.writeJsonString(w, wp_ptr.*.plugin_id);
+                        try w.writeAll(",");
+                        try jsonrpc.writeJsonStringKey(w, "runtime");
+                        try jsonrpc.writeJsonString(w, "wasm");
+                        try w.writeByte('}');
+                    }
+                    var p_it = self.plugin_manager.process_plugins.valueIterator();
+                    while (p_it.next()) |pp_ptr| {
+                        if (!first) try w.writeByte(',');
+                        first = false;
+                        try w.writeByte('{');
+                        try jsonrpc.writeJsonStringKey(w, "name");
+                        try jsonrpc.writeJsonString(w, pp_ptr.*.name);
+                        try w.writeAll(",");
+                        try jsonrpc.writeJsonStringKey(w, "runtime");
+                        try jsonrpc.writeJsonString(w, "exec");
+                        try w.writeByte('}');
+                    }
+                    try w.writeByte(']');
+                } else {
+                    try w.writeAll("null");
+                }
+            },
+        }
+        self.plugin_manager.replyToProcessPlugin(reply.correlation_id, aw.written());
+    }
+
     pub fn sendUpdate(self: *Core) !void {
         const now = std.Io.Clock.real.now(self.io).toMilliseconds();
         self.last_render_time = now;
@@ -3753,8 +3956,8 @@ pub const Core = struct {
             .panes = pane_snapshots,
             .focused_pane_id = focused_pane_id,
             .plugin_count = self.plugin_manager.wasm_plugins.count() + self.plugin_manager.process_plugins.count(),
-            .plugin_status_items = &.{},
-            .plugin_panels = &.{},
+            .plugin_status_items = try self.plugin_manager.snapshotStatusItems(alloc),
+            .plugin_panels = try self.plugin_manager.snapshotPanels(alloc),
             .lsp_status = try self.lsp_manager.getActiveServerStatus(alloc),
             .logs = logs_slice,
             .editor_config = .{

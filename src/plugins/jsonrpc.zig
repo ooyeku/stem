@@ -156,18 +156,28 @@ pub fn parseEnvelope(parsed_value: std.json.Value) !Envelope {
     return env;
 }
 
-/// Build a request body. Caller owns the returned slice.
+/// Build a request body. Caller owns the returned slice. `method` is
+/// emitted verbatim — callers are responsible for using a method name
+/// composed of safe characters (letters, digits, `/`, `.`, `_`,
+/// `-`); arbitrary user-supplied input belongs in `params_json`,
+/// which the caller assembled via the safe writers below.
 pub fn buildRequest(
     allocator: std.mem.Allocator,
     id: u64,
     method: []const u8,
     params_json: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}",
-        .{ id, method, params_json },
-    );
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try w.print("{d}", .{id});
+    try w.writeAll(",\"method\":");
+    try writeJsonString(w, method);
+    try w.writeAll(",\"params\":");
+    try w.writeAll(params_json);
+    try w.writeAll("}");
+    return aw.toOwnedSlice();
 }
 
 pub fn buildNotification(
@@ -175,11 +185,15 @@ pub fn buildNotification(
     method: []const u8,
     params_json: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{s}}}",
-        .{ method, params_json },
-    );
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll("{\"jsonrpc\":\"2.0\",\"method\":");
+    try writeJsonString(w, method);
+    try w.writeAll(",\"params\":");
+    try w.writeAll(params_json);
+    try w.writeAll("}");
+    return aw.toOwnedSlice();
 }
 
 pub fn buildReply(
@@ -187,11 +201,13 @@ pub fn buildReply(
     id: u64,
     result_json: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}",
-        .{ id, result_json },
-    );
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":", .{id});
+    try w.writeAll(result_json);
+    try w.writeAll("}");
+    return aw.toOwnedSlice();
 }
 
 pub fn buildError(
@@ -200,11 +216,50 @@ pub fn buildError(
     code: i32,
     message: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":{d},\"message\":\"{s}\"}}}}",
-        .{ id, code, message },
-    );
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":{d},\"message\":", .{ id, code });
+    try writeJsonString(w, message);
+    try w.writeAll("}}");
+    return aw.toOwnedSlice();
+}
+
+// ---------------------------------------------------------------------------
+// Safe JSON string encoding.
+//
+// `allocPrint("...\"{s}\"...")` was fine when the only strings we
+// shipped were trusted internal identifiers, but plugins now route
+// arbitrary user-controlled text (file contents, error messages,
+// event payloads). These helpers escape per RFC 8259 section 7 so a
+// stray `"` or `\n` doesn't corrupt the envelope.
+// ---------------------------------------------------------------------------
+
+/// Write `s` to `w` wrapped in JSON-string delimiters with proper
+/// escaping. Suitable for writing values, not bare keys (use
+/// `writeJsonStringKey` for keys to get the trailing `:`).
+pub fn writeJsonString(w: anytype, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            0x08 => try w.writeAll("\\b"),
+            0x0c => try w.writeAll("\\f"),
+            0...0x07, 0x0b, 0x0e...0x1f => try w.print("\\u{x:0>4}", .{c}),
+            else => try w.writeByte(c),
+        }
+    }
+    try w.writeByte('"');
+}
+
+/// Write a JSON object key (escaped string followed by `:`).
+pub fn writeJsonStringKey(w: anytype, key: []const u8) !void {
+    try writeJsonString(w, key);
+    try w.writeByte(':');
 }
 
 // ---------------------------------------------------------------------------

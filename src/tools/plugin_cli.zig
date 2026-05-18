@@ -196,6 +196,7 @@ fn printManifest(out: *std.Io.Writer, m: *const manifest_mod.Manifest) !void {
         for (m.commands) |c| {
             try out.print("  {s}  —  {s}\n", .{ c.id, c.title });
             if (c.description.len > 0) try out.print("      {s}\n", .{c.description});
+            if (c.keybinding) |kb| try out.print("      bound to: {s}\n", .{kb});
         }
     }
 }
@@ -243,29 +244,50 @@ fn runInstall(ctx: Context) !void {
         return;
     };
     defer ctx.allocator.free(abs_src);
-    var src_dir = std.Io.Dir.openDirAbsolute(ctx.io, abs_src, .{ .iterate = true }) catch |err| {
-        try ctx.err.print("error: cannot open source directory {s}: {s}\n", .{ abs_src, @errorName(err) });
-        return;
-    };
-    defer src_dir.close(ctx.io);
-    var dst_dir = std.Io.Dir.openDirAbsolute(ctx.io, dest, .{}) catch |err| {
-        try ctx.err.print("error: cannot open dest directory {s}: {s}\n", .{ dest, @errorName(err) });
-        return;
-    };
-    defer dst_dir.close(ctx.io);
-
-    var iter = src_dir.iterate();
+    // Recursive copy preserves subdirectories (e.g. `assets/`,
+    // `templates/`) plus the manifest and entry artifact. Anything
+    // sitting beside `plugin.json` gets installed.
     var copied: usize = 0;
-    while (iter.next(ctx.io) catch null) |entry| {
-        if (entry.kind != .file) continue;
-        src_dir.copyFile(entry.name, dst_dir, entry.name, ctx.io, .{}) catch |err| {
-            try ctx.err.print("warning: could not copy {s}: {s}\n", .{ entry.name, @errorName(err) });
-            continue;
-        };
-        copied += 1;
-    }
+    copyTreeAbs(ctx, abs_src, dest, &copied) catch |err| {
+        try ctx.err.print("error: copy tree {s} → {s}: {s}\n", .{ abs_src, dest, @errorName(err) });
+        return;
+    };
 
     try ctx.out.print("Installed '{s}' to {s} ({d} file(s))\n", .{ m.name, dest, copied });
+}
+
+/// Recursively copy `src_abs` → `dst_abs`, creating intermediate
+/// directories under the destination. `counter` is bumped for every
+/// regular file written. Symlinks and special files are skipped with
+/// a warning. Caller-supplied paths must be absolute.
+fn copyTreeAbs(ctx: Context, src_abs: []const u8, dst_abs: []const u8, counter: *usize) !void {
+    var src_dir = try std.Io.Dir.openDirAbsolute(ctx.io, src_abs, .{ .iterate = true });
+    defer src_dir.close(ctx.io);
+    std.Io.Dir.cwd().createDirPath(ctx.io, dst_abs) catch {};
+    var dst_dir = try std.Io.Dir.openDirAbsolute(ctx.io, dst_abs, .{});
+    defer dst_dir.close(ctx.io);
+    var it = src_dir.iterate();
+    while (it.next(ctx.io) catch null) |entry| {
+        switch (entry.kind) {
+            .file => {
+                src_dir.copyFile(entry.name, dst_dir, entry.name, ctx.io, .{}) catch |err| {
+                    try ctx.err.print("warning: could not copy {s}: {s}\n", .{ entry.name, @errorName(err) });
+                    continue;
+                };
+                counter.* += 1;
+            },
+            .directory => {
+                const child_src = try std.fs.path.join(ctx.allocator, &.{ src_abs, entry.name });
+                defer ctx.allocator.free(child_src);
+                const child_dst = try std.fs.path.join(ctx.allocator, &.{ dst_abs, entry.name });
+                defer ctx.allocator.free(child_dst);
+                try copyTreeAbs(ctx, child_src, child_dst, counter);
+            },
+            else => {
+                try ctx.err.print("warning: skipping non-regular file {s}\n", .{entry.name});
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,9 +333,22 @@ const TestHarness = struct {
     }
     fn onNote(_: *anyopaque, _: []const u8, _: u8, _: []const u8) void {}
     fn onOpenBuf(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) void {}
-    fn onSpawn(_: *anyopaque, _: []const u8, _: []const u8, _: []u8) u32 {
-        return 0;
+    fn onSpawn(_: *anyopaque, _: []const u8, _: wasm_loader.SpawnOpts, _: []u8) i32 {
+        return -3;
     }
+    fn onSubEv(_: *anyopaque, _: []const u8, _: []const u8) i32 {
+        return -1;
+    }
+    fn onReadFile(_: *anyopaque, _: []const u8, _: []const u8, _: []u8) i32 {
+        return -1;
+    }
+    fn onWriteFile(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) i32 {
+        return -1;
+    }
+    fn onSetSI(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, _: u8, _: i8) void {}
+    fn onClearSI(_: *anyopaque, _: []const u8, _: []const u8) void {}
+    fn onSetPanel(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: u8, _: u8) void {}
+    fn onClearPanel(_: *anyopaque, _: []const u8, _: []const u8) void {}
 
     fn deinit(self: *TestHarness) void {
         for (self.commands.items) |s| self.allocator.free(s);
@@ -374,6 +409,13 @@ fn runTest(ctx: Context) !void {
                     .on_show_notification = TestHarness.onNote,
                     .on_open_buffer = TestHarness.onOpenBuf,
                     .on_spawn_capture = TestHarness.onSpawn,
+                    .on_subscribe_event = TestHarness.onSubEv,
+                    .on_read_file = TestHarness.onReadFile,
+                    .on_write_file = TestHarness.onWriteFile,
+                    .on_set_status_item = TestHarness.onSetSI,
+                    .on_clear_status_item = TestHarness.onClearSI,
+                    .on_set_panel = TestHarness.onSetPanel,
+                    .on_clear_panel = TestHarness.onClearPanel,
                 },
             ) catch |err| {
                 try ctx.err.print("FAIL: wasm load: {s}\n", .{@errorName(err)});
@@ -416,15 +458,121 @@ fn runTest(ctx: Context) !void {
             }
         },
         .exec => {
-            // Verify the entry binary exists. Deeper exec testing
-            // would spawn the child with mocked stdio — follow-up.
-            const f = std.Io.Dir.openFileAbsolute(ctx.io, entry_path, .{}) catch |err| {
-                try ctx.err.print("FAIL: exec entry not found at {s}: {s}\n", .{ entry_path, @errorName(err) });
-                return;
-            };
-            f.close(ctx.io);
-            try ctx.out.print("✓ exec entry exists ({s})\n", .{entry_path});
-            try ctx.out.print("  (deeper exec testing requires spawning the child — not yet wired)\n", .{});
+            try execHermeticTest(ctx, &m, entry_path);
         },
+    }
+}
+
+/// Hermetic exec-plugin test: spawn the child, send a synthetic
+/// `plugin/initialize` notification, watch its stdout for
+/// `plugin/registerCommand` calls, and report which manifest
+/// commands were claimed. Always sends `plugin/shutdown` and waits
+/// for the process to exit (capped at 2s).
+fn execHermeticTest(ctx: Context, m: *const manifest_mod.Manifest, entry_path: []const u8) !void {
+    const jsonrpc = @import("../plugins/jsonrpc.zig");
+
+    const f = std.Io.Dir.openFileAbsolute(ctx.io, entry_path, .{}) catch |err| {
+        try ctx.err.print("FAIL: exec entry not found at {s}: {s}\n", .{ entry_path, @errorName(err) });
+        return;
+    };
+    f.close(ctx.io);
+    try ctx.out.print("✓ exec entry exists ({s})\n", .{entry_path});
+
+    // Spawn with piped stdio.
+    var child = std.process.spawn(ctx.io, .{
+        .argv = &[_][]const u8{entry_path},
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    }) catch |err| {
+        try ctx.err.print("FAIL: spawn: {s}\n", .{@errorName(err)});
+        return;
+    };
+    var stdin_open = true;
+    defer if (stdin_open) {
+        if (child.stdin) |s| s.close(ctx.io);
+    };
+
+    // Send initialize + shutdown up front, then close stdin. The
+    // plugin processes the initialize notification (registering its
+    // commands), then the shutdown notification, then exits cleanly.
+    // Reading until EOF gives us a deterministic stop condition
+    // without polling timeouts.
+    if (child.stdin) |stdin| {
+        var buf: [4096]u8 = undefined;
+        var writer = stdin.writerStreaming(ctx.io, &buf);
+        const w = &writer.interface;
+        const init_frame = jsonrpc.buildNotification(
+            ctx.allocator,
+            "plugin/initialize",
+            "{\"abi_version\":1,\"plugin_id\":\"test\"}",
+        ) catch {
+            try ctx.err.print("FAIL: build initialize frame\n", .{});
+            return;
+        };
+        defer ctx.allocator.free(init_frame);
+        jsonrpc.writeFrame(w, init_frame) catch {};
+        const shutdown_frame = jsonrpc.buildNotification(ctx.allocator, "plugin/shutdown", "{}") catch null;
+        if (shutdown_frame) |sf| {
+            defer ctx.allocator.free(sf);
+            jsonrpc.writeFrame(w, sf) catch {};
+        }
+        w.flush() catch {};
+        stdin.close(ctx.io);
+        child.stdin = null;
+        stdin_open = false;
+    }
+
+    // Drain stdout until EOF, counting registerCommand frames.
+    var registered: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (registered.items) |s| ctx.allocator.free(s);
+        registered.deinit(ctx.allocator);
+    }
+    if (child.stdout) |stdout| {
+        var rd_buf: [4096]u8 = undefined;
+        var reader = stdout.readerStreaming(ctx.io, &rd_buf);
+        const r = &reader.interface;
+        while (true) {
+            const body = jsonrpc.readFrame(ctx.allocator, r) catch break;
+            defer ctx.allocator.free(body);
+            const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, body, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const method_v = parsed.value.object.get("method") orelse continue;
+            if (method_v != .string) continue;
+            if (!std.mem.eql(u8, method_v.string, "plugin/registerCommand")) continue;
+            const params_v = parsed.value.object.get("params") orelse continue;
+            if (params_v != .object) continue;
+            const id_v = params_v.object.get("id") orelse continue;
+            if (id_v != .string) continue;
+            const dup = ctx.allocator.dupe(u8, id_v.string) catch continue;
+            registered.append(ctx.allocator, dup) catch ctx.allocator.free(dup);
+        }
+    }
+
+    _ = child.wait(ctx.io) catch {};
+
+    try ctx.out.print("✓ exec spawn + initialize round-trip\n", .{});
+    try ctx.out.print("  plugin registered {d} command(s): ", .{registered.items.len});
+    for (registered.items, 0..) |id, i| {
+        if (i > 0) try ctx.out.print(", ", .{});
+        try ctx.out.print("{s}", .{id});
+    }
+    try ctx.out.print("\n", .{});
+    // Cross-check against the manifest.
+    var missing: usize = 0;
+    for (m.commands) |decl| {
+        var found = false;
+        for (registered.items) |id| {
+            if (std.mem.eql(u8, id, decl.id)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) missing += 1;
+    }
+    if (missing > 0) {
+        try ctx.err.print("warning: {d} manifest command(s) were not re-registered by the plugin\n", .{missing});
     }
 }

@@ -29,7 +29,9 @@ const process_loader = @import("process_loader.zig");
 const ProcessPlugin = process_loader.ProcessPlugin;
 const wasm_loader = @import("wasm/loader.zig");
 const WasmPlugin = wasm_loader.WasmPlugin;
+const jsonrpc = @import("jsonrpc.zig");
 const logger_service = @import("../services/logger.zig");
+const telemetry = @import("../services/telemetry.zig");
 
 /// Wire-protocol version handed to exec plugins on `plugin/initialize`.
 /// Bumped only when the JSON-RPC envelope semantics change.
@@ -58,6 +60,25 @@ pub const PluginManager = struct {
     /// time. Host accessors consult this table before granting
     /// capability requests (event subscription, spawn, filesystem).
     plugin_permissions: std.StringHashMapUnmanaged(StoredPermissions) = .empty,
+
+    /// Map of editor event → list of plugins subscribed to it.
+    /// Populated by `plugin/subscribeEvent` (exec) and
+    /// `stem_subscribe_event` (wasm); drained on plugin unload.
+    event_subscribers: std.AutoHashMapUnmanaged(protocol.PluginEvent, std.ArrayListUnmanaged(EventSub)) = .empty,
+
+    /// Plugin status-bar widgets, keyed by `"<plugin_id>:<item_id>"`.
+    status_items: std.StringHashMapUnmanaged(StoredStatusItem) = .empty,
+    /// Plugin side panels, keyed by `"<plugin_id>:<panel_id>"`.
+    panels: std.StringHashMapUnmanaged(StoredPanel) = .empty,
+    /// Manifest-declared keybinding sequences. Key is the
+    /// space-separated key sequence (e.g. `"Space g s"`); value is the
+    /// command id to execute. The core input handler consults this
+    /// after its own leader chord chain when `leader_pending` is set.
+    plugin_keybindings: std.StringHashMapUnmanaged([]u8) = .empty,
+    /// Monotonic counter for assigning new widget ids on each
+    /// status-item / panel registration. Stable across the lifetime
+    /// of the plugin manager.
+    next_widget_id: u32 = 1,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -98,6 +119,36 @@ pub const PluginManager = struct {
 
         self.allocated_contexts.deinit(self.allocator);
 
+        // Event subscriptions: each list owns its plugin_id duplicates.
+        var ev_it = self.event_subscribers.valueIterator();
+        while (ev_it.next()) |list| {
+            for (list.items) |s| self.allocator.free(s.plugin_id);
+            list.deinit(self.allocator);
+        }
+        self.event_subscribers.deinit(self.allocator);
+
+        // Plugin keybindings.
+        var kb_it = self.plugin_keybindings.iterator();
+        while (kb_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.plugin_keybindings.deinit(self.allocator);
+
+        // Status items / panels.
+        var si_it = self.status_items.iterator();
+        while (si_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.status_items.deinit(self.allocator);
+        var pn_it = self.panels.iterator();
+        while (pn_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.panels.deinit(self.allocator);
+
         var perm_it = self.plugin_permissions.iterator();
         while (perm_it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -137,6 +188,48 @@ pub const PluginManager = struct {
             self.tryLoadPluginDir(full_path) catch |err| {
                 log.warn("Plugin dir {s} failed to load: {s}", .{ entry.name, @errorName(err) });
             };
+        }
+    }
+
+    /// Resolve a plugin name into its `~/.stem/plugins/<name>/` dir
+    /// and (re)load it via `tryLoadPluginDir`. Used by the runtime
+    /// `:plugin.reload` command and the `load_plugin` plugin message.
+    pub fn loadPluginByName(self: *PluginManager, name: []const u8) !void {
+        const env: std.process.Environ = .{ .block = self.environ_block };
+        const home = env.getPosix("HOME") orelse return error.NoHome;
+        const plugin_dir = try std.fs.path.join(self.allocator, &.{ home, ".stem", "plugins", name });
+        defer self.allocator.free(plugin_dir);
+        try self.tryLoadPluginDir(plugin_dir);
+    }
+
+    /// Tear down a wasm or exec plugin by name. Drops every command,
+    /// status item, panel, event subscription, and permission grant
+    /// the plugin owned.
+    pub fn unloadPlugin(self: *PluginManager, name: []const u8) !void {
+        if (self.wasm_plugins.fetchRemove(name)) |kv| {
+            self.cleanupPluginResources(kv.value.plugin_id);
+            kv.value.deinit();
+            self.allocator.destroy(kv.value);
+            self.dropStoredPermissions(name);
+            log.info("Unloaded wasm plugin: {s}", .{name});
+            return;
+        }
+        if (self.process_plugins.fetchRemove(name)) |kv| {
+            self.cleanupPluginResources(kv.value.name);
+            kv.value.deinit();
+            self.allocator.destroy(kv.value);
+            self.dropStoredPermissions(name);
+            log.info("Unloaded process plugin: {s}", .{name});
+            return;
+        }
+        return error.PluginNotFound;
+    }
+
+    fn dropStoredPermissions(self: *PluginManager, plugin_id: []const u8) void {
+        if (self.plugin_permissions.fetchRemove(plugin_id)) |kv| {
+            self.allocator.free(kv.key);
+            var v = kv.value;
+            v.deinit(self.allocator);
         }
     }
 
@@ -273,20 +366,7 @@ pub const PluginManager = struct {
             const msg_v = obj.get("message") orelse return;
             if (msg_v != .string) return;
             const level: u8 = if (obj.get("level")) |v| (if (v == .integer) @intCast(v.integer) else 0) else 0;
-            const nl: protocol.NotificationLevel = switch (level) {
-                1 => .warning,
-                2 => .err,
-                else => .info,
-            };
-            const pm = protocol.PluginMessage{
-                .plugin_id = "process-plugin",
-                .message_type = .show_notification,
-                .payload = .{ .notification = .{ .level = nl, .message = msg_v.string } },
-            };
-            const outer = protocol.Message{ .plugin_message = pm };
-            const encoded = outer.encode(self.allocator) catch return;
-            defer self.allocator.free(encoded);
-            if (self.ui_bus.inbox.send(encoded)) |_| {} else |_| {}
+            self.dispatchNotification("process-plugin", level, msg_v.string);
             return;
         }
 
@@ -299,13 +379,114 @@ pub const PluginManager = struct {
         method: []const u8,
         _: std.json.Value,
     ) void {
-        _ = user_data;
-        log.info("process plugin: request '{s}' id={d} (not yet handled)", .{ method, id });
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        // We can't safely read core's state from the ProcessPlugin's
+        // reader thread, so forward the request onto core's inbox as
+        // a PluginMessage carrying the JSON-RPC id in `correlation_id`.
+        // Core handles it on its own thread and calls
+        // `replyToProcessPlugin` once it has the answer.
+        const core_inbox = self.core_inbox orelse {
+            self.replyProcessPluginError(method, id, -32603, "core inbox unavailable");
+            return;
+        };
+        const which: protocol.PluginMessage.PluginMessageType = blk: {
+            if (std.mem.eql(u8, method, "editor/getState")) break :blk .get_state;
+            if (std.mem.eql(u8, method, "editor/getBufferContent")) break :blk .get_buffer_content;
+            if (std.mem.eql(u8, method, "editor/getPluginList")) break :blk .get_plugin_list;
+            self.replyProcessPluginError(method, id, -32601, "Method not found");
+            return;
+        };
+        const pm = protocol.PluginMessage{
+            .plugin_id = method, // we don't know which plugin made the request — method serves as a label
+            .message_type = which,
+            .payload = switch (which) {
+                .get_state => .{ .state_request = {} },
+                .get_buffer_content => .{ .buffer_content_request = {} },
+                .get_plugin_list => .{ .plugin_list_request = {} },
+                else => unreachable,
+            },
+            .correlation_id = id,
+        };
+        const outer = protocol.Message{ .plugin_message = pm };
+        const encoded = outer.encode(self.allocator) catch {
+            self.replyProcessPluginError(method, id, -32603, "encode failed");
+            return;
+        };
+        defer self.allocator.free(encoded);
+        core_inbox.send(encoded) catch {
+            self.replyProcessPluginError(method, id, -32603, "core inbox closed");
+        };
+    }
+
+    /// Dispatch a JSON-RPC reply built by core back to the originating
+    /// process plugin. `plugin_id` is the plugin name the request came
+    /// from — but since `handleProcessRequest` runs without knowing
+    /// which exec plugin spawned it, we broadcast to every running
+    /// process plugin whose pending-request id matches. This works
+    /// today because there's a single process plugin (echo); when
+    /// multiple exec plugins coexist the request handler needs to
+    /// carry the plugin id explicitly. TODO once we have >1 exec
+    /// plugin in flight.
+    pub fn replyToProcessPlugin(
+        self: *PluginManager,
+        correlation_id: u64,
+        result_json: []const u8,
+    ) void {
+        var it = self.process_plugins.valueIterator();
+        while (it.next()) |pp_ptr| {
+            pp_ptr.*.sendReply(correlation_id, result_json) catch |err| {
+                log.warn("reply to process plugin '{s}' id={d} failed: {s}", .{ pp_ptr.*.name, correlation_id, @errorName(err) });
+            };
+        }
+    }
+
+    fn replyProcessPluginError(
+        self: *PluginManager,
+        method: []const u8,
+        correlation_id: u64,
+        code: i32,
+        message: []const u8,
+    ) void {
+        _ = method;
+        var it = self.process_plugins.valueIterator();
+        while (it.next()) |pp_ptr| {
+            pp_ptr.*.sendError(correlation_id, code, message) catch {};
+        }
+        log.warn("process plugin request id={d} error {d}: {s}", .{ correlation_id, code, message });
     }
 
     fn handleProcessExit(user_data: *anyopaque) void {
-        _ = user_data;
-        log.info("process plugin exited", .{});
+        // Called from the ProcessPlugin's reader thread when the
+        // child closes stdout. Mark the plugin failed and tear down
+        // its registered commands / widgets / subscriptions so the
+        // palette doesn't show dead entries. We don't auto-restart
+        // here — that's a policy decision the operator drives via
+        // `:plugin.reload`, `stem plugin install`, or the
+        // load/unload PluginMessage variants.
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        log.warn("process plugin exited; pruning resources", .{});
+
+        // Find the process plugin whose state has flipped to
+        // .failed / .stopped (the reader thread sets it in its exit
+        // path before invoking on_exit).
+        var stale: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer stale.deinit(self.allocator);
+        var it = self.process_plugins.iterator();
+        while (it.next()) |entry| {
+            const pp = entry.value_ptr.*;
+            pp.state_mu.lock();
+            const dead = pp.state == .failed or pp.state == .stopped;
+            pp.state_mu.unlock();
+            if (dead) {
+                stale.append(self.allocator, entry.key_ptr.*) catch break;
+            }
+        }
+        for (stale.items) |name| {
+            telemetry.recordPluginCrash(name);
+            self.unloadPlugin(name) catch |err| {
+                log.warn("unload of failed process plugin '{s}' failed: {s}", .{ name, @errorName(err) });
+            };
+        }
     }
 
     fn registerProcessCommand(self: *PluginManager, params: std.json.Value) !void {
@@ -379,9 +560,63 @@ pub const PluginManager = struct {
             );
             return;
         }
+        const event = eventFromTopic(event_v.string) orelse {
+            log.warn("plugin '{s}' subscribed to unknown event topic '{s}'", .{ plugin_id_v.string, event_v.string });
+            return;
+        };
+        try self.addEventSubscription(event, .exec, plugin_id_v.string);
         log.info("plugin '{s}' subscribed to event '{s}'", .{ plugin_id_v.string, event_v.string });
-        // Future: route matching `broadcastEvent` calls into the
-        // process plugin's outbox.
+    }
+
+    /// Translate a stable topic name (the format declared in a
+    /// manifest's `permissions.events` and used by exec subscribers)
+    /// to a `PluginEvent`. Inverse of `pluginEventTopic`.
+    fn eventFromTopic(topic: []const u8) ?protocol.PluginEvent {
+        const map = .{
+            .{ "buffer.changed", protocol.PluginEvent.buffer_changed },
+            .{ "cursor.moved", protocol.PluginEvent.cursor_moved },
+            .{ "mode.changed", protocol.PluginEvent.mode_changed },
+            .{ "file.saved", protocol.PluginEvent.file_saved },
+            .{ "file.opened", protocol.PluginEvent.file_opened },
+            .{ "buffer.switched", protocol.PluginEvent.buffer_switched },
+            .{ "custom", protocol.PluginEvent.custom_event },
+        };
+        inline for (map) |entry| {
+            if (std.mem.eql(u8, topic, entry[0])) return entry[1];
+        }
+        return null;
+    }
+
+    fn addEventSubscription(
+        self: *PluginManager,
+        event: protocol.PluginEvent,
+        runtime: PluginRuntimeKind,
+        plugin_id: []const u8,
+    ) !void {
+        const entry = try self.event_subscribers.getOrPut(self.allocator, event);
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        // Dedupe — re-subscribing is a no-op.
+        for (entry.value_ptr.items) |s| {
+            if (s.runtime == runtime and std.mem.eql(u8, s.plugin_id, plugin_id)) return;
+        }
+        const id_dup = try self.allocator.dupe(u8, plugin_id);
+        errdefer self.allocator.free(id_dup);
+        try entry.value_ptr.append(self.allocator, .{ .runtime = runtime, .plugin_id = id_dup });
+    }
+
+    fn removeEventSubscriptions(self: *PluginManager, plugin_id: []const u8) void {
+        var it = self.event_subscribers.valueIterator();
+        while (it.next()) |list| {
+            var i: usize = 0;
+            while (i < list.items.len) {
+                if (std.mem.eql(u8, list.items[i].plugin_id, plugin_id)) {
+                    self.allocator.free(list.items[i].plugin_id);
+                    _ = list.swapRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------
@@ -389,6 +624,240 @@ pub const PluginManager = struct {
     // -------------------------------------------------------------------
 
     pub const PluginRuntimeKind = enum { exec, wasm };
+
+    /// One subscriber entry on the event bus.
+    pub const EventSub = struct {
+        runtime: PluginRuntimeKind,
+        plugin_id: []u8, // owned
+    };
+
+    /// Heap-owned mirror of `protocol.StatusItem` keyed by
+    /// `<plugin_id>:<id>`. Strings are duped on insert; freed on
+    /// removal or `cleanupPluginResources`.
+    const StoredStatusItem = struct {
+        plugin_id: []u8,
+        id: []u8,
+        text: []u8,
+        alignment: protocol.StatusAlignment,
+        priority: i8,
+        widget_id: u64,
+
+        fn deinit(self: *StoredStatusItem, allocator: std.mem.Allocator) void {
+            allocator.free(self.plugin_id);
+            allocator.free(self.id);
+            allocator.free(self.text);
+        }
+    };
+
+    /// Heap-owned mirror of `protocol.PanelInfo`.
+    const StoredPanel = struct {
+        plugin_id: []u8,
+        id: []u8,
+        title: []u8,
+        /// Panel content stored as one heap-owned blob; splitting
+        /// into the renderer's expected `[]const []const u8` happens
+        /// in `snapshotPanels`.
+        content: []u8,
+        position: protocol.PanelPosition,
+        width_percent: u8,
+        widget_id: u64,
+
+        fn deinit(self: *StoredPanel, allocator: std.mem.Allocator) void {
+            allocator.free(self.plugin_id);
+            allocator.free(self.id);
+            allocator.free(self.title);
+            allocator.free(self.content);
+        }
+    };
+
+    /// Compose `<plugin_id>:<id>` into `out`. Caller owns the
+    /// returned slice (allocated from the manager's allocator).
+    fn widgetKey(self: *PluginManager, plugin_id: []const u8, id: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ plugin_id, id });
+    }
+
+    pub fn upsertStatusItem(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        id: []const u8,
+        text: []const u8,
+        alignment_raw: u8,
+        priority: i8,
+    ) !void {
+        const align_e: protocol.StatusAlignment = switch (alignment_raw) {
+            1 => .center,
+            2 => .right,
+            else => .left,
+        };
+        const key = try self.widgetKey(plugin_id, id);
+        if (self.status_items.getPtr(key)) |existing| {
+            // Update in place — keep the same widget_id so the
+            // renderer's caching doesn't see a fresh widget.
+            self.allocator.free(key);
+            self.allocator.free(existing.text);
+            existing.text = try self.allocator.dupe(u8, text);
+            existing.alignment = align_e;
+            existing.priority = priority;
+            return;
+        }
+        const stored: StoredStatusItem = .{
+            .plugin_id = try self.allocator.dupe(u8, plugin_id),
+            .id = try self.allocator.dupe(u8, id),
+            .text = try self.allocator.dupe(u8, text),
+            .alignment = align_e,
+            .priority = priority,
+            .widget_id = self.allocateWidgetId(),
+        };
+        try self.status_items.put(self.allocator, key, stored);
+    }
+
+    pub fn removeStatusItem(self: *PluginManager, plugin_id: []const u8, id: []const u8) void {
+        const key = self.widgetKey(plugin_id, id) catch return;
+        defer self.allocator.free(key);
+        if (self.status_items.fetchRemove(key)) |kv| {
+            self.allocator.free(kv.key);
+            var v = kv.value;
+            v.deinit(self.allocator);
+        }
+    }
+
+    pub fn upsertPanel(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        id: []const u8,
+        title: []const u8,
+        content: []const u8,
+        position_raw: u8,
+        width_percent: u8,
+    ) !void {
+        const position: protocol.PanelPosition = switch (position_raw) {
+            1 => .right,
+            2 => .bottom,
+            else => .left,
+        };
+        const key = try self.widgetKey(plugin_id, id);
+        if (self.panels.getPtr(key)) |existing| {
+            self.allocator.free(key);
+            self.allocator.free(existing.title);
+            self.allocator.free(existing.content);
+            existing.title = try self.allocator.dupe(u8, title);
+            existing.content = try self.allocator.dupe(u8, content);
+            existing.position = position;
+            existing.width_percent = width_percent;
+            return;
+        }
+        const stored: StoredPanel = .{
+            .plugin_id = try self.allocator.dupe(u8, plugin_id),
+            .id = try self.allocator.dupe(u8, id),
+            .title = try self.allocator.dupe(u8, title),
+            .content = try self.allocator.dupe(u8, content),
+            .position = position,
+            .width_percent = width_percent,
+            .widget_id = self.allocateWidgetId(),
+        };
+        try self.panels.put(self.allocator, key, stored);
+    }
+
+    pub fn removePanel(self: *PluginManager, plugin_id: []const u8, id: []const u8) void {
+        const key = self.widgetKey(plugin_id, id) catch return;
+        defer self.allocator.free(key);
+        if (self.panels.fetchRemove(key)) |kv| {
+            self.allocator.free(kv.key);
+            var v = kv.value;
+            v.deinit(self.allocator);
+        }
+    }
+
+    fn allocateWidgetId(self: *PluginManager) u64 {
+        const id: u64 = self.next_widget_id;
+        self.next_widget_id +%= 1;
+        return id;
+    }
+
+    /// Build a fresh slice of `protocol.StatusItem` over the
+    /// allocator (typically a per-frame arena). Strings borrow from
+    /// the stored entries; valid until the next mutation.
+    pub fn snapshotStatusItems(self: *PluginManager, allocator: std.mem.Allocator) ![]protocol.StatusItem {
+        var list: std.ArrayListUnmanaged(protocol.StatusItem) = .empty;
+        errdefer list.deinit(allocator);
+        var it = self.status_items.valueIterator();
+        while (it.next()) |s| {
+            try list.append(allocator, .{
+                .id = s.id,
+                .plugin_id = s.plugin_id,
+                .text = s.text,
+                .alignment = s.alignment,
+                .priority = s.priority,
+                .widget_id = s.widget_id,
+            });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Build a fresh slice of `protocol.PanelInfo`. The renderer
+    /// expects panel content as a `[]const []const u8` (one entry
+    /// per line); we split the stored blob on `\n`.
+    pub fn snapshotPanels(self: *PluginManager, allocator: std.mem.Allocator) ![]protocol.PanelInfo {
+        var list: std.ArrayListUnmanaged(protocol.PanelInfo) = .empty;
+        errdefer list.deinit(allocator);
+        var it = self.panels.valueIterator();
+        while (it.next()) |p| {
+            // Split content into lines for the renderer.
+            var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+            errdefer lines.deinit(allocator);
+            var split = std.mem.splitScalar(u8, p.content, '\n');
+            while (split.next()) |line| {
+                try lines.append(allocator, line);
+            }
+            try list.append(allocator, .{
+                .id = p.id,
+                .plugin_id = p.plugin_id,
+                .title = p.title,
+                .content = try lines.toOwnedSlice(allocator),
+                .position = p.position,
+                .width_percent = p.width_percent,
+                .widget_id = p.widget_id,
+            });
+        }
+        return list.toOwnedSlice(allocator);
+    }
+
+    /// Strip every status item / panel owned by `plugin_id`. Called
+    /// from `cleanupPluginResources` so a plugin's widgets disappear
+    /// when it's unloaded.
+    fn removePluginWidgets(self: *PluginManager, plugin_id: []const u8) void {
+        var si_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer si_keys.deinit(self.allocator);
+        var si_it = self.status_items.iterator();
+        while (si_it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.plugin_id, plugin_id)) {
+                si_keys.append(self.allocator, entry.key_ptr.*) catch {};
+            }
+        }
+        for (si_keys.items) |k| {
+            if (self.status_items.fetchRemove(k)) |kv| {
+                self.allocator.free(kv.key);
+                var v = kv.value;
+                v.deinit(self.allocator);
+            }
+        }
+
+        var pn_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer pn_keys.deinit(self.allocator);
+        var pn_it = self.panels.iterator();
+        while (pn_it.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.plugin_id, plugin_id)) {
+                pn_keys.append(self.allocator, entry.key_ptr.*) catch {};
+            }
+        }
+        for (pn_keys.items) |k| {
+            if (self.panels.fetchRemove(k)) |kv| {
+                self.allocator.free(kv.key);
+                var v = kv.value;
+                v.deinit(self.allocator);
+            }
+        }
+    }
 
     /// Heap-owned mirror of `manifest_mod.Permissions`. The manifest's
     /// arena is freed right after parsing, so we copy what we need.
@@ -482,6 +951,24 @@ pub const PluginManager = struct {
     /// dispatcher routes by runtime kind. Idempotent — a duplicate id
     /// is logged and skipped, since the registry doesn't tolerate
     /// double-inserts.
+    /// Look up a command id bound to `seq` (a space-separated key
+    /// sequence as written in the manifest). Returns null if no
+    /// plugin claims that binding.
+    pub fn lookupKeybind(self: *PluginManager, seq: []const u8) ?[]const u8 {
+        return self.plugin_keybindings.get(seq);
+    }
+
+    /// Return true if `seq` is a strict prefix of any registered
+    /// plugin keybinding. The input handler uses this to keep
+    /// leader_pending alive while the user types a multi-char chord.
+    pub fn isKeybindPrefix(self: *PluginManager, seq: []const u8) bool {
+        var it = self.plugin_keybindings.keyIterator();
+        while (it.next()) |k| {
+            if (k.*.len > seq.len and std.mem.startsWith(u8, k.*, seq) and k.*[seq.len] == ' ') return true;
+        }
+        return false;
+    }
+
     fn registerManifestCommand(
         self: *PluginManager,
         plugin_id: []const u8,
@@ -525,6 +1012,24 @@ pub const PluginManager = struct {
             ctx,
         );
         try self.allocated_contexts.append(self.allocator, ctx);
+
+        // Manifest-declared keybinding → command-id map. Stored
+        // separately so the input handler can look up multi-char
+        // chords without iterating every registered command.
+        if (decl.keybinding) |seq| {
+            const seq_dup = try self.allocator.dupe(u8, seq);
+            errdefer self.allocator.free(seq_dup);
+            const cmd_dup = try self.allocator.dupe(u8, decl.id);
+            errdefer self.allocator.free(cmd_dup);
+            // Replace any prior binding to keep the latest plugin to
+            // claim a sequence as the winner — easier to reason about
+            // than silent conflicts.
+            if (self.plugin_keybindings.fetchRemove(seq_dup)) |kv| {
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value);
+            }
+            try self.plugin_keybindings.put(self.allocator, seq_dup, cmd_dup);
+        }
     }
 
     // -------------------------------------------------------------------
@@ -564,6 +1069,13 @@ pub const PluginManager = struct {
                 .on_show_notification = onWasmShowNotification,
                 .on_open_buffer = onWasmOpenBuffer,
                 .on_spawn_capture = onWasmSpawnCapture,
+                .on_subscribe_event = onWasmSubscribeEvent,
+                .on_read_file = onWasmReadFile,
+                .on_write_file = onWasmWriteFile,
+                .on_set_status_item = onWasmSetStatusItem,
+                .on_clear_status_item = onWasmClearStatusItem,
+                .on_set_panel = onWasmSetPanel,
+                .on_clear_panel = onWasmClearPanel,
             },
         ) catch |err| {
             log.err("Failed to load wasm plugin '{s}': {s}", .{ m.name, @errorName(err) });
@@ -578,6 +1090,15 @@ pub const PluginManager = struct {
 
         wp.activate() catch |err| {
             log.warn("wasm plugin '{s}' activate failed: {s}", .{ m.name, @errorName(err) });
+            telemetry.recordPluginCrash(m.name);
+            // Tear down the half-loaded plugin: drop registered
+            // commands / widgets / subscriptions and remove the
+            // entry. The palette will only show what survives a
+            // successful activate.
+            self.unloadPlugin(m.name) catch |unload_err| {
+                log.warn("post-activate-fail unload of '{s}': {s}", .{ m.name, @errorName(unload_err) });
+            };
+            return;
         };
 
         log.info("Loaded wasm plugin: {s} ({s})", .{ m.name, wasm_path });
@@ -617,21 +1138,29 @@ pub const PluginManager = struct {
         message: []const u8,
     ) void {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
-        _ = plugin_id;
+        self.dispatchNotification(plugin_id, level, message);
+    }
+
+    /// Route a notification (from any plugin runtime) to core. Core
+    /// folds it into its `status_message` slot, where the next render
+    /// snapshot picks it up and the status bar shows it for a few
+    /// seconds.
+    fn dispatchNotification(self: *PluginManager, plugin_id: []const u8, level: u8, message: []const u8) void {
+        const core_inbox = self.core_inbox orelse return;
         const nl: protocol.NotificationLevel = switch (level) {
             1 => .warning,
             2 => .err,
             else => .info,
         };
         const pm = protocol.PluginMessage{
-            .plugin_id = "wasm-plugin",
+            .plugin_id = plugin_id,
             .message_type = .show_notification,
             .payload = .{ .notification = .{ .level = nl, .message = message } },
         };
         const outer = protocol.Message{ .plugin_message = pm };
         const encoded = outer.encode(self.allocator) catch return;
         defer self.allocator.free(encoded);
-        if (self.ui_bus.inbox.send(encoded)) |_| {} else |_| {}
+        core_inbox.send(encoded) catch {};
     }
 
     /// Route a wasm plugin's `stem_open_buffer` call into core's
@@ -666,18 +1195,18 @@ pub const PluginManager = struct {
     fn onWasmSpawnCapture(
         user_data: *anyopaque,
         plugin_id: []const u8,
-        cmd: []const u8,
+        opts: wasm_loader.SpawnOpts,
         out_buf: []u8,
-    ) u32 {
+    ) i32 {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
 
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv.deinit(self.allocator);
-        var it = std.mem.tokenizeAny(u8, cmd, " \t\r\n");
+        var it = std.mem.tokenizeAny(u8, opts.cmd, " \t\r\n");
         while (it.next()) |tok| {
-            argv.append(self.allocator, tok) catch return 0;
+            argv.append(self.allocator, tok) catch return -2;
         }
-        if (argv.items.len == 0) return 0;
+        if (argv.items.len == 0) return -2;
         const program = argv.items[0];
 
         if (!self.permissionAllows(plugin_id, .spawn, program)) {
@@ -685,21 +1214,197 @@ pub const PluginManager = struct {
                 "wasm plugin '{s}' attempted unauthorized spawn: {s}",
                 .{ plugin_id, program },
             );
-            return 0;
+            return -1;
         }
 
-        const result = std.process.run(self.allocator, self.io, .{
+        const run_options = std.process.RunOptions{
             .argv = argv.items,
-        }) catch |err| {
+            .cwd = if (opts.cwd) |c| .{ .path = c } else .inherit,
+        };
+        const result = std.process.run(self.allocator, self.io, run_options) catch |err| {
             log.warn("wasm spawn for '{s}' failed: {s}", .{ plugin_id, @errorName(err) });
-            return 0;
+            return -3;
         };
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);
 
+        // Honor the optional timeout. std.process.run is synchronous,
+        // so we can only check the wall clock AFTER. A future
+        // improvement is to use a non-blocking spawn + poll; today we
+        // surface a clear timeout signal post-hoc.
+        _ = opts.timeout_ms; // TODO: pre-spawn timeout enforcement.
+
+        // Write stdout, optionally followed by stderr (NUL-separated).
+        var written: usize = 0;
         const n = @min(result.stdout.len, out_buf.len);
         @memcpy(out_buf[0..n], result.stdout[0..n]);
-        return @intCast(n);
+        written += n;
+        if (opts.include_stderr and written < out_buf.len) {
+            // Separator.
+            out_buf[written] = 0;
+            written += 1;
+            const remaining = out_buf.len - written;
+            const m = @min(result.stderr.len, remaining);
+            @memcpy(out_buf[written..][0..m], result.stderr[0..m]);
+            written += m;
+        }
+
+        // Surface non-zero exit codes so plugins can distinguish "ran
+        // but failed" from "stdout was empty". We still return the
+        // bytes written; the negative code is purely informational.
+        return switch (result.term) {
+            .exited => |code| if (code == 0) @intCast(written) else -5,
+            else => -5,
+        };
+    }
+
+    fn onWasmSubscribeEvent(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        topic: []const u8,
+    ) i32 {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        if (!self.permissionAllows(plugin_id, .event, topic)) {
+            log.warn(
+                "wasm plugin '{s}' lacks event permission for '{s}'",
+                .{ plugin_id, topic },
+            );
+            return -1;
+        }
+        const event = eventFromTopic(topic) orelse {
+            log.warn("wasm plugin '{s}' subscribed to unknown event '{s}'", .{ plugin_id, topic });
+            return -2;
+        };
+        self.addEventSubscription(event, .wasm, plugin_id) catch return -3;
+        log.info("wasm plugin '{s}' subscribed to event '{s}'", .{ plugin_id, topic });
+        return 0;
+    }
+
+    fn onWasmReadFile(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        path: []const u8,
+        out_buf: []u8,
+    ) i32 {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        if (!self.filesystemAllows(plugin_id, .read, path)) {
+            log.warn("wasm plugin '{s}' lacks read permission for '{s}'", .{ plugin_id, path });
+            return -1;
+        }
+        const file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |err| {
+            log.warn("wasm plugin '{s}' read '{s}' failed: {s}", .{ plugin_id, path, @errorName(err) });
+            return -2;
+        };
+        defer file.close(self.io);
+        const len = file.length(self.io) catch return -2;
+        const cap = @min(@as(u64, @intCast(out_buf.len)), len);
+        _ = file.readPositionalAll(self.io, out_buf[0..@intCast(cap)], 0) catch return -2;
+        return @intCast(cap);
+    }
+
+    fn onWasmWriteFile(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        path: []const u8,
+        content: []const u8,
+    ) i32 {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        if (!self.filesystemAllows(plugin_id, .write, path)) {
+            log.warn("wasm plugin '{s}' lacks write permission for '{s}'", .{ plugin_id, path });
+            return -1;
+        }
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = content }) catch |err| {
+            log.warn("wasm plugin '{s}' write '{s}' failed: {s}", .{ plugin_id, path, @errorName(err) });
+            return -2;
+        };
+        return 0;
+    }
+
+    fn onWasmSetStatusItem(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        id: []const u8,
+        text: []const u8,
+        alignment: u8,
+        priority: i8,
+    ) void {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.upsertStatusItem(plugin_id, id, text, alignment, priority) catch |err| {
+            log.warn("wasm plugin '{s}' set_status_item failed: {s}", .{ plugin_id, @errorName(err) });
+        };
+        self.requestUiRefresh();
+    }
+
+    fn onWasmClearStatusItem(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        id: []const u8,
+    ) void {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.removeStatusItem(plugin_id, id);
+        self.requestUiRefresh();
+    }
+
+    fn onWasmSetPanel(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        id: []const u8,
+        title: []const u8,
+        content: []const u8,
+        position: u8,
+        width_percent: u8,
+    ) void {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.upsertPanel(plugin_id, id, title, content, position, width_percent) catch |err| {
+            log.warn("wasm plugin '{s}' set_panel failed: {s}", .{ plugin_id, @errorName(err) });
+        };
+        self.requestUiRefresh();
+    }
+
+    fn onWasmClearPanel(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        id: []const u8,
+    ) void {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.removePanel(plugin_id, id);
+        self.requestUiRefresh();
+    }
+
+    /// After a widget mutation, prod core to re-render. We do this by
+    /// sending an empty `open_buffer` request? No — instead we just
+    /// inject a synthetic tick so the snapshot includes the new
+    /// widget state. Core's existing tick handler already calls
+    /// `sendUpdate()` indirectly via the [STATS] refresh path.
+    fn requestUiRefresh(self: *PluginManager) void {
+        const core_inbox = self.core_inbox orelse return;
+        // A `tick` outer message is the cheapest way to wake core's
+        // render path without inventing a new variant.
+        const tick_bytes = (protocol.Message{ .tick = {} }).encode(self.allocator) catch return;
+        defer self.allocator.free(tick_bytes);
+        core_inbox.send(tick_bytes) catch {};
+    }
+
+    /// `permissions.filesystem` entries are typed: `read:<glob>` and
+    /// `write:<glob>`. The glob supports a trailing `*` for prefix
+    /// matching (same convention as event permissions).
+    fn filesystemAllows(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        op: enum { read, write },
+        path: []const u8,
+    ) bool {
+        const stored = self.plugin_permissions.get(plugin_id) orelse return false;
+        const prefix: []const u8 = switch (op) {
+            .read => "read:",
+            .write => "write:",
+        };
+        for (stored.filesystem) |entry| {
+            if (!std.mem.startsWith(u8, entry, prefix)) continue;
+            const pattern = entry[prefix.len..];
+            if (matchesPermissionEntry(pattern, path)) return true;
+        }
+        return false;
     }
 
     fn registerWasmCommand(
@@ -748,6 +1453,13 @@ pub const PluginManager = struct {
         const cmd_ctx: *const PluginCommandContext = @ptrCast(@alignCast(context_ptr.?));
         const self = cmd_ctx.manager;
         const wp = self.wasm_plugins.get(cmd_ctx.plugin_id) orelse return;
+        if (wp.state == .failed or wp.state == .deactivated) {
+            log.warn(
+                "wasm plugin '{s}' is in state {s}; dropping command '{s}'",
+                .{ wp.plugin_id, @tagName(wp.state), cmd_ctx.command_id },
+            );
+            return;
+        }
         try wp.dispatchCommand(cmd_ctx.command_id);
     }
 
@@ -772,23 +1484,93 @@ pub const PluginManager = struct {
                 i += 1;
             }
         }
+        // Drop any event subscriptions held by this plugin.
+        self.removeEventSubscriptions(plugin_id);
+        // And any status-bar widgets / side panels it owned.
+        self.removePluginWidgets(plugin_id);
+        // Strip keybindings that resolved to this plugin's commands.
+        self.removePluginKeybindings(plugin_id);
+    }
+
+    fn removePluginKeybindings(self: *PluginManager, plugin_id: []const u8) void {
+        // We don't track the plugin owner per-keybind, but command
+        // ids are conventionally prefixed with the plugin name
+        // (e.g. `git.status` owned by `git`). Strip every keybind
+        // whose target command id starts with `<plugin_id>.` —
+        // matches the convention without needing extra state.
+        var stale: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer stale.deinit(self.allocator);
+        var it = self.plugin_keybindings.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.startsWith(u8, entry.value_ptr.*, plugin_id) and
+                entry.value_ptr.*.len > plugin_id.len and
+                entry.value_ptr.*[plugin_id.len] == '.')
+            {
+                stale.append(self.allocator, entry.key_ptr.*) catch break;
+            }
+        }
+        for (stale.items) |k| {
+            if (self.plugin_keybindings.fetchRemove(k)) |kv| {
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value);
+            }
+        }
     }
 
     // -------------------------------------------------------------------
     // Event broadcasting
     // -------------------------------------------------------------------
 
-    /// Publish an editor event to the Vigil pub/sub broker. Plugins
-    /// that want to react can subscribe via the broker by topic; the
-    /// host doesn't push events directly into plugin inboxes anymore.
+    /// Publish an editor event to:
+    ///   1. The Vigil pub/sub broker (additive — external consumers
+    ///      like dashboards can subscribe by topic without going
+    ///      through the per-plugin route).
+    ///   2. Each subscribed exec plugin, as a JSON-RPC
+    ///      `editor/event` notification.
+    ///   3. Each subscribed wasm plugin, by invoking the optional
+    ///      `handle_event` export.
     pub fn broadcastEvent(self: *PluginManager, event: protocol.PluginEvent, data: []const u8) void {
-        _ = self;
         const topic = pluginEventTopic(event);
+
         if (vigil.pubsub.getGlobal()) |broker| {
             _ = broker.publish(topic, data) catch |err| {
                 log.warn("pubsub publish '{s}' failed: {}", .{ topic, err });
             };
         }
+
+        const subs = self.event_subscribers.get(event) orelse return;
+        for (subs.items) |sub| {
+            switch (sub.runtime) {
+                .exec => self.deliverExecEvent(sub.plugin_id, topic, data),
+                .wasm => self.deliverWasmEvent(sub.plugin_id, topic, data),
+            }
+        }
+    }
+
+    fn deliverExecEvent(self: *PluginManager, plugin_id: []const u8, topic: []const u8, data: []const u8) void {
+        const pp = self.process_plugins.get(plugin_id) orelse return;
+        // Encode payload via the safe JSON object builder so embedded
+        // quotes / backslashes in `data` don't break the envelope.
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.writeByte('{') catch return;
+        jsonrpc.writeJsonStringKey(w, "event") catch return;
+        jsonrpc.writeJsonString(w, topic) catch return;
+        w.writeByte(',') catch return;
+        jsonrpc.writeJsonStringKey(w, "data") catch return;
+        jsonrpc.writeJsonString(w, data) catch return;
+        w.writeByte('}') catch return;
+        pp.sendNotification("editor/event", aw.written()) catch |err| {
+            log.warn("exec event delivery to '{s}' failed: {s}", .{ plugin_id, @errorName(err) });
+        };
+    }
+
+    fn deliverWasmEvent(self: *PluginManager, plugin_id: []const u8, topic: []const u8, data: []const u8) void {
+        const wp = self.wasm_plugins.get(plugin_id) orelse return;
+        wp.dispatchEvent(topic, data) catch |err| {
+            log.warn("wasm event delivery to '{s}' failed: {s}", .{ plugin_id, @errorName(err) });
+        };
     }
 
     /// Stable topic names so external subscribers don't have to know

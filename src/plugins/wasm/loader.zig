@@ -40,11 +40,55 @@ pub const Callbacks = struct {
     /// Plugin called `stem_spawn_capture(cmd, out_buf)`. Host parses
     /// the command line, enforces manifest spawn permissions, runs
     /// the process synchronously, and writes captured stdout into
-    /// `out_buf`. Returns the byte count, or 0 on denial / error.
-    on_spawn_capture: *const fn (user_data: *anyopaque, plugin_id: []const u8, cmd: []const u8, out_buf: []u8) u32,
+    /// `out_buf`. Returns the byte count, or negative on denial /
+    /// error.
+    ///   -1: spawn permission denied
+    ///   -2: argv empty / malformed
+    ///   -3: child failed to spawn (e.g. ENOENT)
+    ///   -4: timed out
+    ///   -5: child exited with non-zero status (stdout still written)
+    on_spawn_capture: *const fn (user_data: *anyopaque, plugin_id: []const u8, opts: SpawnOpts, out_buf: []u8) i32,
+    /// Plugin called `stem_subscribe_event(topic)`. Host checks the
+    /// manifest's `permissions.events` allowlist and on success
+    /// records the plugin in its `event_subscribers` map; subsequent
+    /// `broadcastEvent` calls dispatch to the plugin's `handle_event`
+    /// export. Returns 0 on success, non-zero on denial.
+    on_subscribe_event: *const fn (user_data: *anyopaque, plugin_id: []const u8, topic: []const u8) i32,
+    /// Plugin called `stem_read_file(path, out_buf)`. Permission
+    /// gated on `permissions.filesystem` entries (prefix `read:`).
+    /// Returns bytes written, or negative on denial / failure.
+    on_read_file: *const fn (user_data: *anyopaque, plugin_id: []const u8, path: []const u8, out_buf: []u8) i32,
+    /// Plugin called `stem_write_file(path, content)`. Permission
+    /// gated on `permissions.filesystem` entries (prefix `write:`).
+    /// Returns 0 on success, negative on denial / failure.
+    on_write_file: *const fn (user_data: *anyopaque, plugin_id: []const u8, path: []const u8, content: []const u8) i32,
+    /// Plugin called `stem_set_status_item(id, text, alignment, priority)`.
+    /// Adds or updates a status-bar widget owned by the plugin.
+    on_set_status_item: *const fn (user_data: *anyopaque, plugin_id: []const u8, id: []const u8, text: []const u8, alignment: u8, priority: i8) void,
+    /// Plugin called `stem_clear_status_item(id)`.
+    on_clear_status_item: *const fn (user_data: *anyopaque, plugin_id: []const u8, id: []const u8) void,
+    /// Plugin called `stem_set_panel(id, title, content, position, width_percent)`.
+    /// `content` is the raw panel body (NL-separated lines accepted).
+    on_set_panel: *const fn (user_data: *anyopaque, plugin_id: []const u8, id: []const u8, title: []const u8, content: []const u8, position: u8, width_percent: u8) void,
+    /// Plugin called `stem_clear_panel(id)`.
+    on_clear_panel: *const fn (user_data: *anyopaque, plugin_id: []const u8, id: []const u8) void,
 };
 
 pub const State = enum { loaded, activated, deactivated, failed };
+
+/// Options for `stem_spawn_capture` — a forward-compatible shape so we
+/// can extend the wasm host import without churning every call site.
+pub const SpawnOpts = struct {
+    /// Single command line; tokenized on whitespace.
+    cmd: []const u8,
+    /// Working directory; null inherits the editor's cwd.
+    cwd: ?[]const u8 = null,
+    /// Hard wall-clock cap in milliseconds. 0 = no limit.
+    timeout_ms: u32 = 0,
+    /// If true, write captured stderr after stdout (separated by a
+    /// single NUL byte) into `out_buf` so plugins can show both.
+    include_stderr: bool = false,
+};
 
 pub const WasmPlugin = struct {
     allocator: std.mem.Allocator,
@@ -105,27 +149,18 @@ pub const WasmPlugin = struct {
         self.state = .activated;
     }
 
-    /// Invoke the plugin's `handle_command(id_ptr: i32, id_len: i32)`
-    /// export. We allocate a small scratch region of linear memory
-    /// and copy the command id into it.
+    /// Invoke the plugin's `handle_command(id_ptr, id_len)` export.
+    /// Copies the command id into the plugin's `__stem_scratch`
+    /// region.
     pub fn dispatchCommand(self: *WasmPlugin, command_id: []const u8) !void {
         const idx = self.module.findExport("handle_command", .func) orelse return error.MissingExport;
         self.invoke_mu.lock();
         defer self.invoke_mu.unlock();
 
-        // Reserve a small scratch buffer near the top of linear memory.
-        // We use a simple "bump" — a global named `__stem_scratch` that
-        // the plugin maintains, if present; otherwise we put the bytes
-        // at address 16 (well clear of typical wasm data segments).
-        var scratch_ptr: u32 = 16;
-        if (self.module.findExport("__stem_scratch", .global)) |g_idx| {
-            scratch_ptr = @truncate(self.instance.globals[g_idx]);
-        }
-        if (scratch_ptr + command_id.len > self.instance.memory.len) {
-            log.warn("plugin '{s}' memory too small to dispatch command", .{self.plugin_id});
-            return error.OutOfBounds;
-        }
-        @memcpy(self.instance.memory[scratch_ptr .. scratch_ptr + command_id.len], command_id);
+        const scratch = try self.scratchSlice();
+        if (command_id.len > scratch.len) return error.ScratchTooSmall;
+        @memcpy(scratch[0..command_id.len], command_id);
+        const scratch_ptr = self.scratchPtr() catch unreachable;
 
         var results: [4]u64 = undefined;
         _ = interp.invoke(
@@ -137,6 +172,71 @@ pub const WasmPlugin = struct {
             log.err("plugin '{s}' handle_command trapped: {s}", .{ self.plugin_id, @errorName(err) });
             return err;
         };
+    }
+
+    /// Invoke the plugin's optional `handle_event(topic_ptr, topic_len,
+    /// data_ptr, data_len)` export. Silently no-ops if the plugin
+    /// doesn't export the function (most plugins ignore events).
+    pub fn dispatchEvent(self: *WasmPlugin, topic: []const u8, data: []const u8) !void {
+        const idx = self.module.findExport("handle_event", .func) orelse return;
+        self.invoke_mu.lock();
+        defer self.invoke_mu.unlock();
+
+        const scratch = try self.scratchSlice();
+        const total = topic.len + data.len;
+        if (total > scratch.len) return error.ScratchTooSmall;
+        @memcpy(scratch[0..topic.len], topic);
+        @memcpy(scratch[topic.len..total], data);
+        const scratch_ptr = self.scratchPtr() catch unreachable;
+        const topic_ptr = scratch_ptr;
+        const data_ptr = scratch_ptr + @as(u32, @intCast(topic.len));
+
+        var results: [4]u64 = undefined;
+        _ = interp.invoke(
+            &self.instance,
+            idx,
+            &.{
+                @as(u64, topic_ptr),
+                @as(u64, @intCast(topic.len)),
+                @as(u64, data_ptr),
+                @as(u64, @intCast(data.len)),
+            },
+            results[0..0],
+        ) catch |err| {
+            log.err("plugin '{s}' handle_event trapped: {s}", .{ self.plugin_id, @errorName(err) });
+            return err;
+        };
+    }
+
+    /// Resolve the plugin's host-dispatch scratch region. Plugins
+    /// MUST export a `__stem_scratch_addr() -> i32` function that
+    /// returns the address of a dedicated buffer in linear memory.
+    /// They MAY also export `__stem_scratch_size() -> i32` returning
+    /// the buffer's length; if absent we default to 4 KiB. Linker-
+    /// assigned global addresses can't be propagated as `const`
+    /// values at Zig comptime, so we use a function call instead.
+    fn scratchPtr(self: *WasmPlugin) !u32 {
+        const idx = self.module.findExport("__stem_scratch_addr", .func) orelse {
+            log.warn("plugin '{s}' missing __stem_scratch_addr export", .{self.plugin_id});
+            return error.MissingScratch;
+        };
+        var results: [1]u64 = undefined;
+        _ = try interp.invoke(&self.instance, idx, &.{}, &results);
+        return @truncate(results[0]);
+    }
+
+    fn scratchSize(self: *WasmPlugin) u32 {
+        const idx = self.module.findExport("__stem_scratch_size", .func) orelse return 4 * 1024;
+        var results: [1]u64 = undefined;
+        _ = interp.invoke(&self.instance, idx, &.{}, &results) catch return 4 * 1024;
+        return @truncate(results[0]);
+    }
+
+    fn scratchSlice(self: *WasmPlugin) ![]u8 {
+        const ptr = try self.scratchPtr();
+        const len = self.scratchSize();
+        if (@as(u64, ptr) + len > self.instance.memory.len) return error.OutOfBounds;
+        return self.instance.memory[ptr .. ptr + len];
     }
 };
 
@@ -184,6 +284,14 @@ pub fn load(
         .{ .module_name = "env", .field_name = "stem_show_notification", .func = hostStemShowNotification },
         .{ .module_name = "env", .field_name = "stem_open_buffer", .func = hostStemOpenBuffer },
         .{ .module_name = "env", .field_name = "stem_spawn_capture", .func = hostStemSpawnCapture },
+        .{ .module_name = "env", .field_name = "stem_spawn_capture2", .func = hostStemSpawnCapture2 },
+        .{ .module_name = "env", .field_name = "stem_subscribe_event", .func = hostStemSubscribeEvent },
+        .{ .module_name = "env", .field_name = "stem_read_file", .func = hostStemReadFile },
+        .{ .module_name = "env", .field_name = "stem_write_file", .func = hostStemWriteFile },
+        .{ .module_name = "env", .field_name = "stem_set_status_item", .func = hostStemSetStatusItem },
+        .{ .module_name = "env", .field_name = "stem_clear_status_item", .func = hostStemClearStatusItem },
+        .{ .module_name = "env", .field_name = "stem_set_panel", .func = hostStemSetPanel },
+        .{ .module_name = "env", .field_name = "stem_clear_panel", .func = hostStemClearPanel },
     };
 
     wp.instance = try interp.instantiate(allocator, &wp.module, &host_imports, @ptrCast(wp));
@@ -241,31 +349,141 @@ fn hostStemOpenBuffer(instance: *interp.Instance, args: []const u64, _: *u64) in
 
 /// env.stem_spawn_capture(cmd_ptr, cmd_len, out_ptr, out_max) -> i32
 ///
-/// Synchronously runs the (whitespace-tokenized) command line and
-/// copies up to `out_max` stdout bytes into the wasm linear memory at
-/// `out_ptr`. Returns the byte count, or 0 if the spawn was denied
-/// (manifest permissions) or failed. Plugins typically size the
-/// scratch buffer at a few KiB; we don't allocate inside wasm.
+/// Default shape: run `cmd` with no timeout / cwd override and
+/// capture only stdout. Returns bytes written, or negative on error
+/// (see SpawnOpts doc on Callbacks).
 fn hostStemSpawnCapture(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
     if (args.len < 4) return error.UnknownImport;
     const wp = pluginFromInstance(instance);
     const cmd = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
-        result.* = 0;
+        result.* = @as(u64, @bitCast(@as(i64, -3)));
         return;
     };
-    const out_off: u32 = @truncate(args[2]);
-    const out_max: u32 = @truncate(args[3]);
-    const out_buf = instance.slice(out_off, out_max) catch {
-        result.* = 0;
+    const out_buf = instance.slice(@truncate(args[2]), @truncate(args[3])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -3)));
         return;
     };
-    const written = wp.callbacks.on_spawn_capture(
+    const rc = wp.callbacks.on_spawn_capture(
         wp.callbacks.user_data,
         wp.plugin_id,
-        cmd,
+        .{ .cmd = cmd },
         out_buf,
     );
-    result.* = @as(u64, written);
+    result.* = @as(u64, @bitCast(@as(i64, rc)));
+}
+
+/// env.stem_spawn_capture2(cmd, cwd, timeout_ms, include_stderr, out_ptr, out_max) -> i32
+///
+/// Richer entry point: per-call cwd override, wall-clock timeout in
+/// milliseconds (0 = none), and an `include_stderr` flag that
+/// appends captured stderr after stdout (separated by a single NUL
+/// byte). All other args mirror `stem_spawn_capture`.
+fn hostStemSpawnCapture2(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 8) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const cmd = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -3)));
+        return;
+    };
+    const cwd_ptr: u32 = @truncate(args[2]);
+    const cwd_len: u32 = @truncate(args[3]);
+    const cwd: ?[]const u8 = if (cwd_len == 0) null else (instance.slice(cwd_ptr, cwd_len) catch null);
+    const timeout_ms: u32 = @truncate(args[4]);
+    const include_stderr = args[5] != 0;
+    const out_buf = instance.slice(@truncate(args[6]), @truncate(args[7])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -3)));
+        return;
+    };
+    const rc = wp.callbacks.on_spawn_capture(
+        wp.callbacks.user_data,
+        wp.plugin_id,
+        .{ .cmd = cmd, .cwd = cwd, .timeout_ms = timeout_ms, .include_stderr = include_stderr },
+        out_buf,
+    );
+    result.* = @as(u64, @bitCast(@as(i64, rc)));
+}
+
+/// env.stem_subscribe_event(topic_ptr, topic_len) -> i32
+fn hostStemSubscribeEvent(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 2) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const topic = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const rc = wp.callbacks.on_subscribe_event(wp.callbacks.user_data, wp.plugin_id, topic);
+    result.* = @as(u64, @bitCast(@as(i64, rc)));
+}
+
+/// env.stem_read_file(path_ptr, path_len, out_ptr, out_max) -> i32
+fn hostStemReadFile(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 4) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const path = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const out_buf = instance.slice(@truncate(args[2]), @truncate(args[3])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const rc = wp.callbacks.on_read_file(wp.callbacks.user_data, wp.plugin_id, path, out_buf);
+    result.* = @as(u64, @bitCast(@as(i64, rc)));
+}
+
+/// env.stem_write_file(path_ptr, path_len, content_ptr, content_len) -> i32
+fn hostStemWriteFile(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 4) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const path = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const content = instance.slice(@truncate(args[2]), @truncate(args[3])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const rc = wp.callbacks.on_write_file(wp.callbacks.user_data, wp.plugin_id, path, content);
+    result.* = @as(u64, @bitCast(@as(i64, rc)));
+}
+
+/// env.stem_set_status_item(id_ptr, id_len, text_ptr, text_len, alignment, priority) -> ()
+fn hostStemSetStatusItem(instance: *interp.Instance, args: []const u64, _: *u64) interp.Error!void {
+    if (args.len < 6) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const id = instance.slice(@truncate(args[0]), @truncate(args[1])) catch return;
+    const text = instance.slice(@truncate(args[2]), @truncate(args[3])) catch return;
+    const alignment: u8 = @truncate(args[4]);
+    const priority: i8 = @bitCast(@as(u8, @truncate(args[5])));
+    wp.callbacks.on_set_status_item(wp.callbacks.user_data, wp.plugin_id, id, text, alignment, priority);
+}
+
+/// env.stem_clear_status_item(id_ptr, id_len) -> ()
+fn hostStemClearStatusItem(instance: *interp.Instance, args: []const u64, _: *u64) interp.Error!void {
+    if (args.len < 2) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const id = instance.slice(@truncate(args[0]), @truncate(args[1])) catch return;
+    wp.callbacks.on_clear_status_item(wp.callbacks.user_data, wp.plugin_id, id);
+}
+
+/// env.stem_set_panel(id_ptr, id_len, title_ptr, title_len, content_ptr, content_len, position, width_percent) -> ()
+fn hostStemSetPanel(instance: *interp.Instance, args: []const u64, _: *u64) interp.Error!void {
+    if (args.len < 8) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const id = instance.slice(@truncate(args[0]), @truncate(args[1])) catch return;
+    const title = instance.slice(@truncate(args[2]), @truncate(args[3])) catch return;
+    const content = instance.slice(@truncate(args[4]), @truncate(args[5])) catch return;
+    const position: u8 = @truncate(args[6]);
+    const width_percent: u8 = @truncate(args[7]);
+    wp.callbacks.on_set_panel(wp.callbacks.user_data, wp.plugin_id, id, title, content, position, width_percent);
+}
+
+/// env.stem_clear_panel(id_ptr, id_len) -> ()
+fn hostStemClearPanel(instance: *interp.Instance, args: []const u64, _: *u64) interp.Error!void {
+    if (args.len < 2) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const id = instance.slice(@truncate(args[0]), @truncate(args[1])) catch return;
+    wp.callbacks.on_clear_panel(wp.callbacks.user_data, wp.plugin_id, id);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,9 +507,22 @@ const TestState = struct {
     }
     fn onNote(_: *anyopaque, _: []const u8, _: u8, _: []const u8) void {}
     fn onOpenBuf(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) void {}
-    fn onSpawn(_: *anyopaque, _: []const u8, _: []const u8, _: []u8) u32 {
-        return 0;
+    fn onSpawn(_: *anyopaque, _: []const u8, _: SpawnOpts, _: []u8) i32 {
+        return -3;
     }
+    fn onSubEv(_: *anyopaque, _: []const u8, _: []const u8) i32 {
+        return -1;
+    }
+    fn onReadFile(_: *anyopaque, _: []const u8, _: []const u8, _: []u8) i32 {
+        return -1;
+    }
+    fn onWriteFile(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) i32 {
+        return -1;
+    }
+    fn onSetSI(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, _: u8, _: i8) void {}
+    fn onClearSI(_: *anyopaque, _: []const u8, _: []const u8) void {}
+    fn onSetPanel(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: u8, _: u8) void {}
+    fn onClearPanel(_: *anyopaque, _: []const u8, _: []const u8) void {}
     fn deinit(self: *TestState) void {
         for (self.logs.items) |s| self.allocator.free(s);
         for (self.commands.items) |s| self.allocator.free(s);
@@ -332,6 +563,13 @@ test "load + activate + dispatchCommand against the built echo-wasm.wasm" {
         .on_show_notification = TestState.onNote,
         .on_open_buffer = TestState.onOpenBuf,
         .on_spawn_capture = TestState.onSpawn,
+        .on_subscribe_event = TestState.onSubEv,
+        .on_read_file = TestState.onReadFile,
+        .on_write_file = TestState.onWriteFile,
+        .on_set_status_item = TestState.onSetSI,
+        .on_clear_status_item = TestState.onClearSI,
+        .on_set_panel = TestState.onSetPanel,
+        .on_clear_panel = TestState.onClearPanel,
     };
 
     const wp = try load(a, io, "echo-wasm", abs_path, cbs);

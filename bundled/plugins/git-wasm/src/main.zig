@@ -42,6 +42,15 @@ extern "env" fn stem_spawn_capture(
 /// repo's diff exceeds this, we just show the leading bytes.
 var scratch: [256 * 1024]u8 = undefined;
 
+// Host-dispatch scratch region — see echo-wasm for the protocol.
+var stem_scratch: [4096]u8 = undefined;
+export fn __stem_scratch_addr() i32 {
+    return @intCast(@intFromPtr(&stem_scratch));
+}
+export fn __stem_scratch_size() i32 {
+    return @intCast(stem_scratch.len);
+}
+
 const CMD_STATUS = "git.status";
 const CMD_DIFF = "git.diff";
 const CMD_DIFF_STAGED = "git.diff_staged";

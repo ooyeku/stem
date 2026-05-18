@@ -17,6 +17,17 @@
 
 const std = @import("std");
 
+// Host-dispatch scratch region. The stem host writes inbound command
+// ids / event names into this buffer before invoking the plugin's
+// handle_* exports.
+var stem_scratch: [4096]u8 = undefined;
+export fn __stem_scratch_addr() i32 {
+    return @intCast(@intFromPtr(&stem_scratch));
+}
+export fn __stem_scratch_size() i32 {
+    return @intCast(stem_scratch.len);
+}
+
 extern "env" fn stem_log(level: i32, msg_ptr: [*]const u8, msg_len: i32) void;
 extern "env" fn stem_register_command(
     id_ptr: [*]const u8,

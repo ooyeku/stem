@@ -33,9 +33,37 @@
           '';
 
           installPhase = ''
-            # `zig build install` already wrote to $out/bin and $out/lib
+            # `zig build install` writes the host binary to $out/bin
+            # and each wasm plugin's artifact to $out/bin/*.wasm. The
+            # bundled plugin directories (plugin.json + entry
+            # artifact) need to be assembled separately so they land
+            # under the conventional `<prefix>/lib/stem/plugins/<name>/`
+            # layout that the editor's install.sh produces.
             mkdir -p $out/lib/stem/plugins
-            cp -r $out/lib/*.dylib $out/lib/*.so $out/lib/stem/plugins/ 2>/dev/null || true
+            install_plugin_dir() {
+              local name="$1"
+              local artifact="$2"
+              local src="bundled/plugins/$name"
+              [ -d "$src" ] || return 0
+              local dest="$out/lib/stem/plugins/$name"
+              mkdir -p "$dest"
+              cp "$src/plugin.json" "$dest/"
+              if [ -f "$out/bin/$artifact" ]; then
+                cp "$out/bin/$artifact" "$dest/"
+              fi
+            }
+            install_plugin_dir echo-wasm           echo-wasm.wasm
+            install_plugin_dir git-wasm            git-wasm.wasm
+            install_plugin_dir markdown-viewer-wasm markdown-viewer-wasm.wasm
+            install_plugin_dir plugin-manager-wasm plugin-manager-wasm.wasm
+            # Exec reference plugin (echo).
+            if [ -d bundled/plugins/echo ]; then
+              mkdir -p $out/lib/stem/plugins/echo
+              cp bundled/plugins/echo/plugin.json $out/lib/stem/plugins/echo/
+              if [ -f $out/bin/stem-echo ]; then
+                cp $out/bin/stem-echo $out/lib/stem/plugins/echo/
+              fi
+            fi
           '';
 
           meta = with pkgs.lib; {
