@@ -1,187 +1,227 @@
-# Stem Plugin System
+# Stem Plugin Development
 
-This document describes the plugin system architecture and how to develop plugins for stem.
+This guide describes the current plugin system and how to build plugins
+for stem. The old in-process dynamic-library SDK has been removed; new
+plugins use either the `wasm` runtime or the `exec` runtime.
+
+For host internals, see [Plugin Architecture](plugin-architecture.md).
 
 ## Overview
 
-Stem's plugin system is built on:
-- **Dynamic Libraries**: Plugins are compiled as shared libraries (`.dylib`, `.so`, `.dll`)
-- **Native Zig Interface**: Simple struct-based plugin interface
-- **Actor Model**: Each plugin runs in its own thread with message-passing communication
-- **Vigil Inboxes**: Thread-safe message queues for plugin ↔ core communication
+Stem plugins are manifest-driven extensions loaded from
+`~/.stem/plugins/<name>/`.
 
-## Architecture
+| Runtime | Artifact | Isolation | Best for |
+| --- | --- | --- | --- |
+| `wasm` | `<name>.wasm` | Stem's pure-Zig wasm interpreter | Small, sandboxed commands that call narrow host imports |
+| `exec` | executable binary | Child process over stdio | Plugins that need their own process, dependencies, or language runtime |
 
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Plugin A      │    │   Plugin B      │    │   Plugin C      │
-│   Thread        │    │   Thread        │    │   Thread        │
-│  ┌───────────┐  │    │  ┌───────────┐  │    │  ┌───────────┐  │
-│  │   Inbox   │◄─┼────┼──│   Inbox   │◄─┼────┼──│   Inbox   │  │
-│  └───────────┘  │    │  └───────────┘  │    │  └───────────┘  │
-└────────┬────────┘    └────────┬────────┘    └────────┬────────┘
-         │                      │                      │
-         └─────────────┬────────┴────────────┬─────────┘
-                       │                     │
-                       ▼                     ▼
-          ┌─────────────────────┐   ┌─────────────────────┐
-          │   Core Thread       │   │   Event Bus         │
-          │   PluginManager     │   │   (Shared events)   │
-          │   CommandRegistry   │   └─────────────────────┘
-          └─────────────────────┘
-```
+Both runtimes share:
 
-## Plugin Locations
+- `plugin.json` metadata and command declarations.
+- Permission declarations for host capabilities.
+- Command palette registration through `PluginManager`.
+- Cleanup of registered commands and permission records on unload.
 
-- **User plugins**: `~/.stem/plugins/` (auto-loaded on startup)
-- **Bundled plugins**: `bundled/plugins/` (built with stem)
+## Plugin Directory Layout
 
-## Creating a Plugin
+Each plugin lives in its own directory:
 
-### Project Structure
-
-```
+```text
 my-plugin/
-├── build.zig
-├── build.zig.zon
-└── src/
-    └── main.zig
+├── plugin.json
+└── my-plugin.wasm        # runtime: "wasm"
 ```
 
-### src/main.zig
+or:
 
-```zig
-const stem = @import("stem");
+```text
+my-plugin/
+├── plugin.json
+└── stem-my-plugin        # runtime: "exec"
+```
 
-// Plugin state (optional)
-var plugin_ctx: ?*stem.PluginContext = null;
+Bundled examples live under `bundled/plugins/`.
 
-fn init(ctx: *stem.PluginContext) i32 {
-    plugin_ctx = ctx;
-    stem.log(ctx, "My Plugin initialized", .{});
-    
-    // Register commands (optional)
-    stem.registerCommand(ctx, "my-plugin.hello", "My Plugin: Hello", "Say hello") catch |err| {
-        stem.log(ctx, "Failed to register command: {}", .{err});
-        return -1;
-    };
-    
-    return 0;
-}
+## Manifest
 
-fn deinit(ctx: *stem.PluginContext) void {
-    stem.log(ctx, "My Plugin shutting down", .{});
-    stem.deinitSdk(ctx);  // Clean up SDK resources
-    plugin_ctx = null;
-}
+Every plugin must provide `plugin.json`:
 
-fn handleMessage(ctx: *stem.PluginContext, msg: *const stem.PluginMessage) i32 {
-    // Handle standard messages (command execution, etc.)
-    if (stem.handleStandardMessages(ctx, msg)) {
-        return 0;
+```json
+{
+  "name": "my_plugin",
+  "version": "0.1.0",
+  "description": "Example stem plugin",
+  "runtime": "wasm",
+  "entry": "my-plugin.wasm",
+  "permissions": {
+    "spawn": ["git"],
+    "events": ["buffer.*"],
+    "filesystem": ["read:."]
+  },
+  "commands": [
+    {
+      "id": "my_plugin.hello",
+      "title": "[My Plugin] Hello",
+      "description": "Log a greeting"
     }
-    // Handle custom messages here
-    return 0;
+  ]
 }
-
-// Export the plugin entry point
-pub export const plugin_entry = stem.createPlugin(.{
-    .name = "my_plugin",
-    .description = "My custom stem plugin",
-    .init = init,
-    .deinit = deinit,
-    .handleMessage = handleMessage,
-});
 ```
 
-## SDK API Reference
+Fields:
 
-### Core Functions
+| Field | Required | Notes |
+| --- | --- | --- |
+| `name` | yes | Stable plugin id. Must be unique across loaded plugins. |
+| `version` | yes | Plugin version shown by `stem plugin list/info`. |
+| `description` | yes | Human-readable summary. |
+| `runtime` | yes | `wasm` or `exec`. |
+| `entry` | yes | Artifact path relative to the plugin directory. |
+| `permissions` | no | Capability allowlists. Missing permissions default to deny. |
+| `commands` | no | Commands registered into the palette before runtime activation. |
 
-| Function | Description |
-|----------|-------------|
-| `createPlugin(config)` | Create a plugin interface from config |
-| `log(ctx, fmt, args)` | Log a message with plugin prefix |
-| `registerCommand(ctx, id, title, desc, callback)` | Register a command with Core |
-| `handleStandardMessages(ctx, msg)` | Handle built-in message types |
-| `requestEditorState(ctx, callback)` | Request current editor state |
-| `subscribeEvent(ctx, event, callback)` | Subscribe to core events |
-| `deinitSdk(ctx)` | Clean up SDK resources (call in deinit) |
-| `requestPluginList(ctx, callback)` | Get metadata for all loaded plugins |
-| `loadPlugin(ctx, path)` | Request core to load a plugin from path |
-| `unloadPlugin(ctx, id)` | Request core to unload a plugin by ID |
-| `emitEvent(ctx, name, data)` | Broadcast a custom event to all plugins |
-| `subscribeCustomEvent(ctx, name, cb)` | Subscribe to a custom event |
+Manifest command registration is the primary path. Runtime registration
+is useful for conditional commands and dedupes against manifest-declared
+ids.
 
-### UI Extension Functions
+## Permissions
 
-| Function | Description |
-|----------|-------------|
-| `createStatusItem(ctx, id, text, align, priority)` | Create a status bar item |
-| `updateStatusItem(ctx, id, text)` | Update status item text |
-| `destroyStatusItem(ctx, id)` | Remove a status item |
-| `createPanel(ctx, id, title, pos, width)` | Create a side panel |
-| `updatePanelContent(ctx, id, content)` | Update panel content lines |
-| `destroyPanel(ctx, id)` | Remove a panel |
+Permissions are declared in the manifest and enforced by the host where
+the corresponding capability is wired.
 
-### UI Isolation
-The `UIManager` ensures that plugins cannot interfere with each other's UI elements. All UI IDs provided by plugins are internally converted to composite keys in the format `{plugin_id}:{element_id}`. This means two different plugins can both use the ID "status" without conflict.
+| Permission | Status | Description |
+| --- | --- | --- |
+| `spawn` | enforced for wasm | Allowlist of executable names accepted by `stem_spawn_capture`. |
+| `events` | checked on subscribe | Validates requested event topics; delivery into plugins is still pending. |
+| `filesystem` | declared only | Reserved for future file access gates. |
 
-## Inter-plugin Communication
-Plugins can communicate with each other using a shared Event Bus. This is useful for plugins that provide services (like `git`) to notify other plugins (like `plugin-manager` or `status-line`) about state changes.
+Entries can end with `*` for prefix matches, such as `buffer.*`.
 
-- **Emitting**: `stem.emitEvent(ctx, "my.event", "payload")`
-- **Subscribing**: `stem.subscribeCustomEvent(ctx, "my.event", myCallback)`
+## Wasm Plugins
 
-## Plugin Management
-The `PluginManager` provides a way to inspect and manage the lifecycle of other plugins.
+Wasm plugins are compiled as `wasm32-freestanding` executables with no
+entry point. They export lifecycle functions and import a narrow host
+surface from the `env` namespace.
 
-- **Resource Monitoring**: Each plugin's `uptime` and `widget_count` is tracked by the core.
-- **Dynamic Loading**: Plugins can be loaded or unloaded at runtime via the `loadPlugin` and `unloadPlugin` APIs.
-- **Cleanup**: When a plugin is unloaded, the core automatically cleans up its registered commands, UI items, and event subscriptions.
+### Host Imports
 
-## Plugin Interface
+| Import | Purpose |
+| --- | --- |
+| `stem_log(level, ptr, len)` | Write to stem's log. |
+| `stem_register_command(id, title, desc)` | Register a runtime command. |
+| `stem_show_notification(level, ptr, len)` | Host callback exists; visible UI presentation is still being wired. |
+| `stem_open_buffer(name, content)` | Open a virtual buffer in the editor. |
+| `stem_spawn_capture(cmd, out_buf, out_max)` | Run an allowed process and copy stdout into wasm memory. |
 
-Plugins export a `plugin_entry` symbol of type `PluginInterface`:
+### Exports
+
+| Export | Called when |
+| --- | --- |
+| `activate()` | Plugin load. |
+| `handle_command(id_ptr, id_len)` | A command owned by the plugin is invoked. |
+| `deactivate()` | Optional best-effort shutdown hook. |
+
+Minimal wasm plugin:
 
 ```zig
-pub const PluginInterface = struct {
-    version: u32 = 1,
-    name: []const u8,
-    description: []const u8,
-    
-    // Lifecycle hooks
-    init: ?*const fn(ctx: *anyopaque) i32,
-    deinit: ?*const fn(ctx: *anyopaque) void,
-    handleMessage: ?*const fn(ctx: *anyopaque, msg: *const PluginMessage) i32,
-    
-    // Capabilities
-    capabilities: PluginCapabilities,
-};
+const std = @import("std");
+
+extern "env" fn stem_log(level: i32, ptr: [*]const u8, len: i32) void;
+extern "env" fn stem_register_command(
+    id_ptr: [*]const u8,
+    id_len: i32,
+    title_ptr: [*]const u8,
+    title_len: i32,
+    desc_ptr: [*]const u8,
+    desc_len: i32,
+) void;
+
+const CMD_ID = "my_plugin.hello";
+const TITLE = "[My Plugin] Hello";
+const DESC = "Log a greeting";
+
+export fn activate() void {
+    stem_register_command(CMD_ID.ptr, CMD_ID.len, TITLE.ptr, TITLE.len, DESC.ptr, DESC.len);
+}
+
+export fn handle_command(id_ptr: [*]const u8, id_len: i32) void {
+    const id = id_ptr[0..@intCast(id_len)];
+    if (std.mem.eql(u8, id, CMD_ID)) {
+        const msg = "hello from wasm";
+        stem_log(1, msg.ptr, msg.len);
+    }
+}
 ```
 
-## Plugin Lifecycle
+The bundled `echo-wasm`, `git`, `markdown_viewer`, and
+`plugin_manager` plugins are the current references.
 
-1. **Load**: `PluginManager.loadPlugin()` opens the dynamic library
-2. **Validate**: Check `plugin_entry` symbol and version
-3. **Initialize**: Create inbox, context, and spawn plugin thread
-4. **Init Hook**: Call plugin's `init` function
-5. **Message Loop**: Plugin receives and processes messages
-6. **Shutdown**: On quit, inbox is closed, thread joins, `deinit` called
-7. **Cleanup**: Plugin resources freed
+## Exec Plugins
 
-## File Structure
+Exec plugins are ordinary executables. Stem spawns the process and uses
+JSON-RPC 2.0 over stdio with LSP-style framing:
 
+```text
+Content-Length: <bytes>\r\n
+\r\n
+{"jsonrpc":"2.0","method":"plugin/log","params":{"level":1,"message":"ready"}}
 ```
-src/
-├── plugins/
-│   ├── interface.zig # Plugin interface definitions
-│   ├── api.zig       # Internal API helpers
-│   ├── context.zig   # PluginContext (communication channels)
-│   ├── manager.zig   # PluginManager (loading, lifecycle)
-│   └── plugin.zig    # Plugin struct (state, thread, inbox)
-├── sdk/
-│   ├── api.zig       # Public SDK for plugin developers
-│   └── build.zig     # Build helpers for plugins
-└── yap_plugin.zig    # SDK entry point (plugins import this)
+
+Host-to-plugin notifications:
+
+| Method | Purpose |
+| --- | --- |
+| `plugin/initialize` | First message after spawn. |
+| `command/execute` | User invoked a command owned by the plugin. |
+| `plugin/shutdown` | Request clean exit. |
+
+Plugin-to-host notifications:
+
+| Method | Purpose |
+| --- | --- |
+| `plugin/log` | Write a log line. |
+| `plugin/registerCommand` | Register a runtime command. |
+| `plugin/subscribeEvent` | Request an event topic; permission is checked, delivery is pending. |
+| `editor/showNotification` | Host accepts the message; visible UI presentation is still being wired. |
+
+The bundled `echo` plugin is the reference implementation.
+
+## Plugin CLI
+
+Use the built-in CLI for local operator workflows:
+
+```bash
+stem plugin list
+stem plugin info <name>
+stem plugin install <path>
+stem plugin remove <name>
+stem plugin test <path>
 ```
+
+`stem plugin test` validates the manifest and entry artifact. For wasm
+plugins it also decodes the module and runs `activate()` against mocked
+host imports.
+
+## Bundled Plugins
+
+| Name | Runtime | Commands |
+| --- | --- | --- |
+| `echo` | exec | `echo.hello` |
+| `echo-wasm` | wasm | `echo-wasm.hello` |
+| `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` |
+| `markdown_viewer` | wasm | `markdown.preview`, `markdown.edit`, `markdown.toggle_panel` |
+| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin.load`, `plugin.unload` |
+
+## Current Limitations
+
+- Event delivery into plugins is not complete yet. `events`
+  permissions are checked, but broadcasts are not bridged into exec or
+  wasm runtimes.
+- Panel and status-item UI extension APIs from the old SDK have not
+  been replaced by wasm/exec host imports yet.
+- Notification callbacks exist in both runtimes, but the main UI loop
+  still needs to render them.
+- `filesystem` permissions are stored but not enforced.
+- Remote plugin install, signing, and auto-update are future registry
+  work.

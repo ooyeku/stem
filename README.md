@@ -88,7 +88,7 @@ To install system-wide from source:
 
 ### Additional Features
 - **Command palette** (`Space a`) — Quick access to all commands
-- **Plugin system** — Extend functionality with dynamic plugins
+- **Plugin system** — Extend functionality with manifest-based wasm/exec plugins
 - **Integrated terminal** — Run commands without leaving the editor
 - **Git integration** — View file status and changes (via plugin)
 
@@ -287,16 +287,21 @@ All dependencies are fetched by Zig's package manager — see [build.zig.zon](bu
 
 ## Plugins
 
-Bundled plugins ship with `stem` and are auto-copied to `~/.stem/plugins/` on
-first launch:
+Bundled plugins ship with `stem` and are installed into
+`~/.stem/plugins/<name>/` with a `plugin.json` manifest. Plugins run
+either as sandboxed wasm modules or as child-process exec plugins.
 
-| Plugin | Description |
-|--------|-------------|
-| `plugin-manager` | List and manage installed plugins |
-| `git` | Git status, blame, and diff integration |
-| `markdown-viewer` | Live markdown preview |
+| Plugin | Runtime | Description |
+|--------|---------|-------------|
+| `echo` | exec | Reference JSON-RPC plugin |
+| `echo-wasm` | wasm | Reference WebAssembly plugin |
+| `git` | wasm | Git status and diff integration |
+| `markdown_viewer` | wasm | Markdown commands; live panel rebuild is pending |
+| `plugin_manager` | wasm | Plugin dashboard and operator commands |
 
-See the [Plugin Development Guide](docs/plugin-design.md) to build your own.
+See the [Plugin Development Guide](docs/plugin-design.md) to build your
+own, and [Plugin Architecture](docs/plugin-architecture.md) for host
+internals.
 
 ## Troubleshooting
 
@@ -321,6 +326,7 @@ See the [Plugin Development Guide](docs/plugin-design.md) to build your own.
 
 - [Developer Guide](docs/dev-guide.md) — architecture and internals
 - [Plugin Design](docs/plugin-design.md) — creating plugins
+- [Plugin Architecture](docs/plugin-architecture.md) — runtime internals
 
 ## License
 

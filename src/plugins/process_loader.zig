@@ -1,9 +1,9 @@
-//! Out-of-process plugin loader (Phase 1, shipping).
+//! Out-of-process plugin loader.
 //!
 //! Spawns a plugin executable, pipes stdin/stdout, and translates
-//! between the plugin's JSON-RPC channel and stem's internal protocol
-//! (the same `protocol.PluginMessage` events the in-process .dylib
-//! plugins see).
+//! between the plugin's JSON-RPC channel and stem's internal
+//! `protocol.PluginMessage` events that the rest of the editor
+//! consumes (UI notifications, virtual buffers, …).
 //!
 //! Architecture:
 //!
@@ -28,8 +28,8 @@
 //! ```
 //!
 //! Crash recovery: when the child exits, the reader thread sees EOF
-//! and sets `state = .stopped`; the manager picks that up on the next
-//! tick and applies the same `RestartPolicy` as in-process plugins.
+//! and sets `state = .stopped`. The manager cleans process plugin
+//! resources during unload/shutdown; automatic restart is not wired.
 
 const std = @import("std");
 const vigil = @import("vigil");
@@ -162,9 +162,13 @@ pub const ProcessPlugin = struct {
         const shutdown = jsonrpc.buildNotification(self.allocator, "plugin/shutdown", "{}") catch null;
         if (shutdown) |s| self.enqueueRaw(s);
 
-        // Give writer thread a moment to flush, then close stdin and
-        // signal exit.
-        vigil.compat.sleep(50 * std.time.ns_per_ms);
+        // Yield briefly so the writer thread has a chance to flush
+        // the shutdown notification before we yank stdin out from
+        // under it. The 50 ms we used to wait here was overkill —
+        // 5 ms is plenty for a single small frame and keeps the
+        // editor's exit feel snappy. Plugins that miss the
+        // notification still see EOF on stdin and exit cleanly.
+        vigil.compat.sleep(5 * std.time.ns_per_ms);
 
         self.stop_flag.store(true, .release);
 

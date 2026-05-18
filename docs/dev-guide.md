@@ -31,7 +31,7 @@ Communication uses [Vigil](https://github.com/ooyeku/vigil) inboxes with binary-
                           │
                     ┌─────┴─────┐
                     │  Plugins  │
-                    │   (dylib) │
+                    │ wasm/exec │
                     └───────────┘
 ```
 
@@ -114,20 +114,23 @@ Language Server Protocol client for code intelligence.
 
 ### 6. Plugin System
 
-Dynamic library based plugin architecture.
+Manifest-driven plugin architecture with two runtimes: sandboxed wasm
+modules and out-of-process exec plugins.
 
 | Subsystem | Description | Files |
 |-----------|-------------|-------|
-| **Plugin Manager** | Discovery, loading, lifecycle | `src/plugins/manager.zig` |
-| **Plugin Interface** | Plugin interface definitions | `src/plugins/interface.zig` |
-| **Plugin Context** | Runtime context passed to plugins | `src/plugins/context.zig` |
-| **UI Manager** | Plugin panel rendering | `src/plugins/ui_manager.zig` |
-| **Plugin SDK** | High-level Zig API for plugin developers | `src/sdk/api.zig`, `src/yap_plugin.zig` |
+| **Plugin Manager** | Manifest discovery, command registration, permissions, runtime dispatch | `src/plugins/manager.zig` |
+| **Manifest Parser** | `plugin.json` parsing and validation | `src/plugins/manifest.zig` |
+| **Exec Runtime** | Child process lifecycle and stdio transport | `src/plugins/process_loader.zig`, `src/plugins/jsonrpc.zig` |
+| **Wasm Runtime** | Pure-Zig wasm interpreter and host imports | `src/plugins/wasm/interpreter.zig`, `src/plugins/wasm/loader.zig` |
+| **Plugin CLI** | `stem plugin list/info/install/remove/test` | `src/tools/plugin_cli.zig` |
 
 **Bundled Plugins:**
-- `plugin-manager` - List loaded plugins
-- `git` - Git integration
-- `markdown-viewer` - Live markdown preview
+- `echo` - Reference exec JSON-RPC plugin
+- `echo-wasm` - Reference wasm plugin
+- `git` - Wasm git status/diff integration
+- `markdown_viewer` - Wasm markdown commands; live panel rebuild pending
+- `plugin_manager` - Wasm plugin dashboard/operator commands
 
 ---
 
@@ -224,11 +227,16 @@ Shared infrastructure services.
 - [ ] Rust
 
 ### Plugin System
-- [x] Dynamic library loading
+- [x] Manifest-based plugin directories
+- [x] Wasm runtime
+- [x] Exec runtime
 - [x] Plugin discovery from `~/.stem/plugins/`
 - [x] Command registration
 - [x] Buffer creation from plugins
-- [x] Panel rendering
+- [x] Spawn permission enforcement for wasm
+- [ ] Event delivery into plugins
+- [ ] Panel/status-item host imports
+- [ ] Filesystem permission enforcement
 - [ ] Plugin settings UI
 - [ ] Plugin marketplace
 
@@ -264,7 +272,7 @@ Shared infrastructure services.
 - [ ] Branch switching
 
 ### v1.0.0 - Production Ready
-- [ ] Stable plugin API
+- [ ] Stable wasm/exec plugin API
 - [ ] Comprehensive documentation
 - [ ] Performance optimization
 - [ ] Cross-platform testing
@@ -288,7 +296,7 @@ zig build -Doptimize=ReleaseFast  # Release build
 | `src/ui/` | Rendering and UI components |
 | `src/services/` | LSP, logging, terminal |
 | `src/syntax/` | Tree-sitter integration |
-| `src/plugins/` | Plugin system |
+| `src/plugins/` | Manifest, wasm, and exec plugin runtimes |
 | `src/config/` | Configuration handling |
 | `bundled/plugins/` | Built-in plugins |
 | `vendor/` | Third-party dependencies |
@@ -302,4 +310,4 @@ zig build -Doptimize=ReleaseFast  # Release build
 
 ---
 
-*Last updated: December 2025*
+*Last updated: May 2026*

@@ -860,60 +860,6 @@ pub const Core = struct {
                             self.sendUpdate() catch |err| {
                                 log.warn("Failed to send UI update after plugin buffer change: {}", .{err});
                             };
-                        } else if (pm.message_type == .get_state) {
-                            const active_buf = self.buffer_manager.getActive();
-                            const state_view = protocol.EditorStateView{
-                                .buffer_id = active_buf.id,
-                                .buffer_name = active_buf.name,
-                                .file_path = active_buf.file_path,
-                                .cursor_row = active_buf.state.cursor_row,
-                                .cursor_col = active_buf.state.cursor_col,
-                                .mode = self.mode,
-                                .file_modified = active_buf.state.modified,
-                                .total_lines = active_buf.state.buffer.lineCount(),
-                                .selection_start_row = null,
-                                .selection_start_col = null,
-                                .selection_end_row = null,
-                                .selection_end_col = null,
-                            };
-
-                            const resp = protocol.PluginMessage{
-                                .plugin_id = pm.plugin_id,
-                                .message_type = .state_response,
-                                .payload = .{ .state = state_view },
-                                // Echo back so the SDK's RequestTracker
-                                // can match this reply to the originating
-                                // `requestEditorState` call.
-                                .correlation_id = pm.correlation_id,
-                            };
-
-                            if (self.plugin_manager.plugins.get(pm.plugin_id)) |plugin| {
-                                if (plugin.inbox) |plugin_inbox| {
-                                    const outer = protocol.Message{ .plugin_message = resp };
-                                    const encoded = outer.encode(self.allocator) catch continue;
-                                    defer self.allocator.free(encoded);
-                                    plugin_inbox.send(encoded) catch {};
-                                }
-                            }
-                        } else if (pm.message_type == .get_buffer_content) {
-                            const active_buf = self.buffer_manager.getActive();
-                            const content = active_buf.state.buffer.toString(self.allocator) catch "";
-                            defer self.allocator.free(content);
-
-                            const resp = protocol.PluginMessage{
-                                .plugin_id = pm.plugin_id,
-                                .message_type = .buffer_content_response,
-                                .payload = .{ .buffer_content_response = .{ .id = active_buf.id, .content = content } },
-                                .correlation_id = pm.correlation_id,
-                            };
-                            if (self.plugin_manager.plugins.get(pm.plugin_id)) |plugin| {
-                                if (plugin.inbox) |plugin_inbox| {
-                                    const outer = protocol.Message{ .plugin_message = resp };
-                                    const encoded = outer.encode(self.allocator) catch continue;
-                                    defer self.allocator.free(encoded);
-                                    plugin_inbox.send(encoded) catch {};
-                                }
-                            }
                         } else if (pm.message_type == .switch_buffer) {
                             const target_id = pm.payload.buffer_switch;
                             for (self.buffer_manager.buffers.items, 0..) |b, i| {
@@ -935,21 +881,18 @@ pub const Core = struct {
                             self.command_registry.execute(cmd_id, self) catch |err| {
                                 log.err("Failed to execute core command '{s}' from plugin: {}", .{ cmd_id, err });
                             };
-                        } else {
-                            self.plugin_manager.handlePluginMessage(pm) catch |err| {
-                                std.log.err("Error handling plugin message: {}", .{err});
-                            };
                         }
+                        // Other PluginMessage variants (state/buffer
+                        // requests, command registers, status items,
+                        // panels, event subs) were the dylib SDK's
+                        // wire surface; the wasm + exec runtimes use
+                        // their own callback/JSON-RPC paths and never
+                        // emit those tags.
                     },
                     .tick => {
                         // Drain any paths discovered by background directory
                         // scanners into the buffer list. Bounded per tick.
                         self.drainScanPaths();
-
-                        // Restart crashed plugins under the per-plugin
-                        // RestartPolicy. Bounded: at most one reload per
-                        // tick so a flapping plugin can't monopolize core.
-                        self.plugin_manager.tickRestarts();
 
                         // If the user is currently looking at the [STATS]
                         // dashboard, refresh its content so the counters
@@ -3809,9 +3752,9 @@ pub const Core = struct {
             .split_enabled = split_enabled,
             .panes = pane_snapshots,
             .focused_pane_id = focused_pane_id,
-            .plugin_count = self.plugin_manager.plugins.count(),
-            .plugin_status_items = try self.plugin_manager.ui_manager.getStatusItems(alloc),
-            .plugin_panels = try self.plugin_manager.ui_manager.getPanels(alloc),
+            .plugin_count = self.plugin_manager.wasm_plugins.count() + self.plugin_manager.process_plugins.count(),
+            .plugin_status_items = &.{},
+            .plugin_panels = &.{},
             .lsp_status = try self.lsp_manager.getActiveServerStatus(alloc),
             .logs = logs_slice,
             .editor_config = .{
@@ -4250,7 +4193,13 @@ pub const Core = struct {
                 self.mode = self.previous_mode;
                 self.command_palette_input.clearRetainingCapacity();
 
-                try cmd.execute(self, cmd.context);
+                // Trap command-execution errors at the palette boundary
+                // so a misbehaving plugin can't take the editor down.
+                // The error is logged (and visible in `:logs`) but the
+                // editor keeps running.
+                cmd.execute(self, cmd.context) catch |err| {
+                    log.err("command '{s}' failed: {s}", .{ cmd.id, @errorName(err) });
+                };
             }
             return true;
         }

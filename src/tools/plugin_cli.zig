@@ -125,17 +125,12 @@ fn runList(ctx: Context) !void {
                     // Stray directory without manifest — skip silently.
                 }
             },
-            .file => {
-                // Legacy flat .dylib layout — kept for backwards compatibility.
-                const looks_dylib = std.mem.endsWith(u8, entry.name, ".dylib") or
-                    std.mem.endsWith(u8, entry.name, ".so") or
-                    std.mem.endsWith(u8, entry.name, ".dll");
-                if (looks_dylib) {
-                    try ctx.out.print("  {s:<24} (legacy .dylib — package as a plugin dir for Phase 3)\n", .{entry.name});
-                    count += 1;
-                }
+            else => {
+                // Files at the top of `~/.stem/plugins/` are stale
+                // artifacts from older releases (e.g. leftover .dylib
+                // files); `install.sh` sweeps them. Plugins live as
+                // directories now.
             },
-            else => {},
         }
     }
     if (count == 0) {
@@ -421,9 +416,8 @@ fn runTest(ctx: Context) !void {
             }
         },
         .exec => {
-            // We can verify the executable bit + that the file
-            // exists. A real hermetic test would spawn it with mocked
-            // stdio; that's a follow-up.
+            // Verify the entry binary exists. Deeper exec testing
+            // would spawn the child with mocked stdio — follow-up.
             const f = std.Io.Dir.openFileAbsolute(ctx.io, entry_path, .{}) catch |err| {
                 try ctx.err.print("FAIL: exec entry not found at {s}: {s}\n", .{ entry_path, @errorName(err) });
                 return;
@@ -431,22 +425,6 @@ fn runTest(ctx: Context) !void {
             f.close(ctx.io);
             try ctx.out.print("✓ exec entry exists ({s})\n", .{entry_path});
             try ctx.out.print("  (deeper exec testing requires spawning the child — not yet wired)\n", .{});
-        },
-        .dylib => {
-            // dlopen the library to confirm symbols resolve without
-            // actually entering plugin code (which would race host setup).
-            var lib = std.DynLib.open(entry_path) catch |err| {
-                try ctx.err.print("FAIL: dlopen failed: {s}\n", .{@errorName(err)});
-                return;
-            };
-            defer lib.close();
-            const has_entry = lib.lookup(*const anyopaque, "plugin_entry") != null;
-            if (!has_entry) {
-                try ctx.err.print("FAIL: dylib missing `plugin_entry` symbol\n", .{});
-                return;
-            }
-            try ctx.out.print("✓ dylib has `plugin_entry` symbol\n", .{});
-            try ctx.out.print("  (dylib runtime is deprecated — prefer wasm or exec)\n", .{});
         },
     }
 }

@@ -41,34 +41,34 @@ pub const SystemCommands = struct {
         defer core.allocator.free(info);
         try text.appendSlice(core.allocator, info);
 
-        const plugin_count = core.plugin_manager.plugins.count();
-        const count_line = try std.fmt.allocPrint(core.allocator, "- `Loaded Plugins`: {d}\n\n", .{plugin_count});
+        const wasm_count = core.plugin_manager.wasm_plugins.count();
+        const proc_count = core.plugin_manager.process_plugins.count();
+        const total = wasm_count + proc_count;
+        const count_line = try std.fmt.allocPrint(core.allocator, "- `Loaded Plugins`: {d} ({d} wasm, {d} exec)\n\n", .{ total, wasm_count, proc_count });
         defer core.allocator.free(count_line);
         try text.appendSlice(core.allocator, count_line);
 
         try text.appendSlice(core.allocator, "## Installed Plugins\n\n");
 
-        if (plugin_count == 0) {
+        if (total == 0) {
             try text.appendSlice(core.allocator, "- No plugins loaded.\n");
-            try text.appendSlice(core.allocator, "- Plugins are loaded from: `~/.stem/plugins/`\n");
+            try text.appendSlice(core.allocator, "- Plugins live as directories under `~/.stem/plugins/`.\n");
         } else {
-            var it = core.plugin_manager.plugins.valueIterator();
             var idx: usize = 1;
-            while (it.next()) |plugin_ptr| {
-                const plugin = plugin_ptr.*;
-                const p_header = try std.fmt.allocPrint(core.allocator, "### {d}. {s}\n", .{ idx, plugin.id });
-                defer core.allocator.free(p_header);
-                try text.appendSlice(core.allocator, p_header);
-
-                const line2 = try std.fmt.allocPrint(core.allocator, "- `Path`: {s}\n", .{plugin.path});
-                defer core.allocator.free(line2);
-                try text.appendSlice(core.allocator, line2);
-
-                const state_str = @tagName(plugin.state);
-                const line3 = try std.fmt.allocPrint(core.allocator, "- `Status`: {s}\n\n", .{state_str});
-                defer core.allocator.free(line3);
-                try text.appendSlice(core.allocator, line3);
-
+            var w_it = core.plugin_manager.wasm_plugins.valueIterator();
+            while (w_it.next()) |wp_ptr| {
+                const wp = wp_ptr.*;
+                const line = try std.fmt.allocPrint(core.allocator, "### {d}. {s}\n- `Runtime`: wasm\n\n", .{ idx, wp.plugin_id });
+                defer core.allocator.free(line);
+                try text.appendSlice(core.allocator, line);
+                idx += 1;
+            }
+            var p_it = core.plugin_manager.process_plugins.valueIterator();
+            while (p_it.next()) |pp_ptr| {
+                const pp = pp_ptr.*;
+                const line = try std.fmt.allocPrint(core.allocator, "### {d}. {s}\n- `Runtime`: exec\n- `Entry`: {s}\n\n", .{ idx, pp.name, pp.entry });
+                defer core.allocator.free(line);
+                try text.appendSlice(core.allocator, line);
                 idx += 1;
             }
         }
@@ -76,9 +76,10 @@ pub const SystemCommands = struct {
         try text.appendSlice(core.allocator,
             \\## Instructions
             \\
-            \\- `Install`: Copy .dylib/.so/.dll files to `~/.stem/plugins/`
-            \\- `Restart`: Restart stem to load new plugins
-            \\- `q`: Close this buffer
+            \\- `Install`: Run `stem plugin install <path>` or copy a plugin
+            \\  directory into `~/.stem/plugins/<name>/`.
+            \\- `Restart`: Restart stem to load new plugins.
+            \\- `q`: Close this buffer.
             \\
         );
 

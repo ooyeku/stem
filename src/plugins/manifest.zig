@@ -33,15 +33,12 @@
 const std = @import("std");
 
 pub const Runtime = enum {
-    /// In-process dynamic library (Phase 0).
-    dylib,
-    /// Separate executable speaking JSON-RPC over stdio (Phase 1).
+    /// Separate executable speaking JSON-RPC over stdio.
     exec,
-    /// WebAssembly module loaded into stem's wasm runtime (Phase 2).
+    /// WebAssembly module loaded into stem's pure-Zig wasm runtime.
     wasm,
 
     pub fn fromString(s: []const u8) ?Runtime {
-        if (std.mem.eql(u8, s, "dylib")) return .dylib;
         if (std.mem.eql(u8, s, "exec")) return .exec;
         if (std.mem.eql(u8, s, "wasm")) return .wasm;
         return null;

@@ -135,8 +135,18 @@ pub const LSPManager = struct {
         log.info("[LSP WATCHDOG] started", .{});
         defer log.info("[LSP WATCHDOG] exited", .{});
 
+        // Sleep in short slices that re-check `watchdog_stop`, so
+        // shutdown is bounded by `slice_ms` rather than the full
+        // 3-second interval. A single long sleep makes stem feel
+        // glacial when the user hits :q.
+        const slice_ms: u64 = 100;
+        const slices_per_interval = watchdog_interval_ms / slice_ms;
         while (!self.watchdog_stop.load(.acquire)) {
-            std.Io.sleep(self.io, .fromMilliseconds(@intCast(watchdog_interval_ms)), .awake) catch return;
+            var i: u64 = 0;
+            while (i < slices_per_interval) : (i += 1) {
+                if (self.watchdog_stop.load(.acquire)) return;
+                std.Io.sleep(self.io, .fromMilliseconds(slice_ms), .awake) catch return;
+            }
             if (self.watchdog_stop.load(.acquire)) return;
 
             // Snapshot under the manager lock so we don't hold it during the

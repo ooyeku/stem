@@ -12,11 +12,9 @@
 //! and stem already handles it on the LSP side. One framing, two
 //! consumers.
 //!
-//! Why JSON-RPC 2.0 (vs the binary wire we use for in-process .dylib
-//! plugins): out-of-process plugins are language-agnostic. The whole
-//! point of Phase 1 is that someone can write a plugin in Rust, Go,
-//! Python, or Bun and have it work. Binary wire would require
-//! per-language encoders; JSON works everywhere.
+//! Why JSON-RPC 2.0: out-of-process plugins are language-agnostic by
+//! design — someone can write a plugin in Rust, Go, Python, or Bun
+//! and have it work. JSON is the lowest-friction encoding for that.
 
 const std = @import("std");
 

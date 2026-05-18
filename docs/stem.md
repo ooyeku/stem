@@ -929,87 +929,96 @@ Embedded query files in `src/syntax/queries/`:
 
 ## Plugin System
 
-Stem features a robust, thread-safe plugin system allowing extensions to run isolated from the core editor logic.
+Stem has a manifest-driven plugin system that keeps extensions outside
+the old in-process dylib boundary. Plugins live in
+`~/.stem/plugins/<name>/`, declare their commands and permissions in
+`plugin.json`, and run through either the `wasm` or `exec` runtime.
 
 ### Architecture
 
 ```mermaid
 graph TB
-    subgraph "Main Process"
+    subgraph "Stem Process"
         PM[PluginManager]
         CR[CommandRegistry]
+        CORE[Core Inbox]
         UI[UI Inbox]
+        WASM[Wasm Interpreter]
     end
-    
-    subgraph "Plugin Thread 1"
-        P1[Plugin: Git]
-        CTX1[Context]
-        INBOX1[Inbox]
+
+    subgraph "Wasm Plugin"
+        WP[git.wasm]
+        MEM[Linear Memory]
     end
-    
-    subgraph "Plugin Thread 2"
-        P2[User Plugin]
-        CTX2[Context]
-        INBOX2[Inbox]
+
+    subgraph "Exec Plugin Process"
+        EP[stem-echo]
+        STDIO[JSON-RPC over stdio]
     end
-    
-    PM -->|Load/Init| P1
-    PM -->|Load/Init| P2
-    
-    P1 <-->|Binary Protocol| PM
-    P2 <-->|Binary Protocol| PM
+
+    PM --> CR
+    PM --> WASM
+    WASM <--> WP
+    WP <--> MEM
+    PM <--> STDIO
+    STDIO <--> EP
+    PM --> CORE
+    PM --> UI
 ```
 
 ### Key Components
 
-#### 1. Dynamic Loading
-Plugins are compiled as dynamic libraries (`.dylib`/`.so`/`.dll`) and loaded at runtime.
-- **Auto-Discovery**: Scans `~/.stem/plugins/` on startup.
-- **Version Verification**: Checks `plugin_entry` symbol and version compatibility.
+#### 1. Manifest Loading
+- **Auto-Discovery**: Scans `~/.stem/plugins/<name>/plugin.json` on startup.
+- **Command Registration**: Registers manifest-declared commands into the palette before runtime activation.
+- **Runtime Dispatch**: Routes `runtime: "wasm"` to the wasm loader and `runtime: "exec"` to the process loader.
 
 #### 2. Isolation & Safety
-- **Thread Isolation**: Each plugin runs in its own thread (`pluginMain`).
-- **Crash Resilience**: A plugin crash does not take down the editor (though currently they share the process address space, logical isolation is enforced).
-- **Resource Cleanup**: `PluginManager` tracks all allocations (commands, subscriptions) and frees them on unload.
+- **Wasm Isolation**: Wasm plugins execute inside stem's pure-Zig interpreter with linear-memory host imports.
+- **Process Isolation**: Exec plugins run as child processes and communicate over framed JSON-RPC on stdio.
+- **Permission Gates**: The host stores manifest permissions and enforces the wired capabilities, such as wasm `spawn`.
+- **Resource Cleanup**: `PluginManager` removes commands, permissions, and runtime state on unload/shutdown.
 
-#### 3. SDK (`yap_plugin.zig`)
-Plugins interface with the editor through a high-level Zig SDK that abstracts the binary protocol.
+#### 3. Runtime Surfaces
 
-```zig
-pub fn init(ctx: *PluginContext) callconv(.C) i32 {
-    // Register commands
-    stem.registerCommand("git.status", "Git Status", "Show repo status");
-    
-    // Subscribe to events
-    stem.subscribeEvent(.buffer_save);
-    
-    return 0;
-}
-```
+Wasm plugins import host functions such as `stem_log`,
+`stem_register_command`, `stem_open_buffer`, and
+`stem_spawn_capture`, then export `activate()` and
+`handle_command(id_ptr, id_len)`.
+
+Exec plugins receive `plugin/initialize`, `command/execute`, and
+`plugin/shutdown`; they send JSON-RPC notifications such as
+`plugin/log`, `plugin/registerCommand`, and `editor/showNotification`.
 
 ### Communication Protocol
 
-Plugins communicate entirely via asynchronous message passing using `vigil` inboxes.
+Plugins communicate through runtime-specific envelopes. The host bridges
+plugin output back into core and UI message queues.
 
-| Message Type | Direction | Purpose |
-|--------------|-----------|---------|
-| `register_command` | Plugin -> Core | Add command to palette |
-| `execute_command` | Core -> Plugin | Trigger command logic |
-| `log_message` | Plugin -> Core | Log to editor output |
-| `set_config` | Plugin -> Core | Store persistent settings |
-| `event_notification`| Core -> Plugin | Buffer save, mode change, etc. |
+| Surface | Direction | Purpose |
+|---------|-----------|---------|
+| Manifest `commands` | Plugin metadata -> Core | Add commands to the palette before startup |
+| `handle_command` / `command/execute` | Core -> Plugin | Trigger command logic |
+| `stem_log` / `plugin/log` | Plugin -> Host | Write to stem logs |
+| `stem_open_buffer` | Wasm -> Core | Open a virtual buffer |
+| `stem_spawn_capture` | Wasm -> Host | Run allowlisted child processes |
+| `plugin/subscribeEvent` | Exec -> Host | Validate event subscriptions; delivery is pending |
 
 ### Bundled Plugins
 
 Stem comes with several plugins pre-installed:
 
-#### 1. Git Integration
-- **Features**: Status indicators (gutter), diff highlighting, branch display.
-- **Commands**: `git.status`
+| Plugin | Runtime | Commands |
+|--------|---------|----------|
+| `echo` | exec | `echo.hello` |
+| `echo-wasm` | wasm | `echo-wasm.hello` |
+| `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` |
+| `markdown_viewer` | wasm | `markdown.preview`, `markdown.edit`, `markdown.toggle_panel` |
+| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin.load`, `plugin.unload` |
 
-#### 2. Markdown Viewer
-- **Features**: Live preview of Markdown files.
-- **Commands**: `markdown.preview`
+Current plugin UI extension gaps: event delivery into plugins, visible
+notifications, panel/status-item host imports, and filesystem
+permission enforcement are still follow-up work.
 
 ---
 
@@ -1337,19 +1346,18 @@ stem/
 │   │       ├── installer.zig # LSP installation
 │   │       └── server.zig    # LSP server management
 │   ├── plugins/
-│   │   ├── manager.zig       # Plugin lifespan & IPC
-│   │   ├── context.zig       # Plugin execution context
-│   │   ├── interface.zig    # Plugin interface definitions
-│   │   ├── api.zig           # Internal API helpers
-│   │   ├── plugin.zig        # Plugin struct definition
-│   │   └── ui_manager.zig    # Plugin UI components
-│   ├── sdk/
-│   │   ├── api.zig           # High-level Plugin API
-│   │   └── build.zig         # Plugin build utilities
+│   │   ├── manager.zig       # Manifest loading, permissions, runtime dispatch
+│   │   ├── manifest.zig      # plugin.json parser
+│   │   ├── process_loader.zig # Exec plugin lifecycle
+│   │   ├── jsonrpc.zig       # JSON-RPC framing helpers
+│   │   └── wasm/
+│   │       ├── interpreter.zig # Pure-Zig wasm runtime
+│   │       └── loader.zig    # Wasm host imports and lifecycle
 │   ├── tools/
 │   │   ├── search.zig        # Thread.Pool search
 │   │   ├── vfind.zig         # Vigil actor search
-│   │   └── scope.zig
+│   │   ├── scope.zig
+│   │   └── plugin_cli.zig    # stem plugin list/info/install/remove/test
 │   ├── syntax/
 │   │   ├── manager.zig       # Syntax highlighting & tree-sitter enhancements
 │   │   ├── tree_sitter.zig   # Tree-sitter C bindings

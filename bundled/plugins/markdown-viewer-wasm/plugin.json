@@ -4,9 +4,7 @@
   "description": "Markdown viewer commands. Live preview/panel toggling is deferred; this build registers the commands and surfaces a how-to buffer.",
   "runtime": "wasm",
   "entry": "markdown-viewer-wasm.wasm",
-  "permissions": {
-    "spawn": ["cat", "pandoc"]
-  },
+  "permissions": {},
   "commands": [
     {"id": "markdown.preview", "title": "[Markdown] Preview", "description": "Render the current markdown file"},
     {"id": "markdown.edit", "title": "[Markdown] Edit", "description": "Switch back to edit mode"},

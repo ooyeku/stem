@@ -272,20 +272,6 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addOptions("config", options);
     exe.root_module.link_libc = true;
-    // Plugin v3 ABI exports (stem_send_to_core, stem_log, etc.) live in
-    // `src/plugins/host_abi.zig` as `export fn …`. Nothing INSIDE the
-    // stem binary calls them — the plugin .dylibs resolve them via the
-    // dynamic linker at dlopen time. macOS/Mach-O ld strips
-    // non-referenced exports by default. `rdynamic = true` maps to
-    // `-export_dynamic` on macOS / `-rdynamic` on Linux, forcing the
-    // symbols into the export trie so dlopen'd plugins can bind to them.
-    exe.rdynamic = true;
-    // Release-mode default is to strip symbols, which nukes the
-    // dynamic export trie along with debug info — leaving every
-    // `_stem_*` host accessor unresolvable from plugin dylibs. We
-    // disable stripping unconditionally so `rdynamic` actually
-    // works under ReleaseFast / ReleaseSafe.
-    exe.root_module.strip = false;
     const vaxis_dep = b.dependency("vaxis", .{
         .target = target,
         .optimize = optimize,
@@ -421,23 +407,6 @@ pub fn build(b: *std.Build) void {
     const run_query_check = b.addRunArtifact(query_check);
     const query_check_step = b.step("query-check", "Verify every shipped tree-sitter query compiles");
     query_check_step.dependOn(&run_query_check.step);
-
-    // Plugin probe — dlopens a plugin and runs its `init` outside the
-    // editor so we can debug plugin segfaults with a real stack trace.
-    const plugin_probe = b.addExecutable(.{
-        .name = "plugin-probe",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tools/plugin_probe.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "stem", .module = mod },
-                .{ .name = "vigil", .module = vigil_dep.module("vigil") },
-            },
-        }),
-    });
-    plugin_probe.root_module.link_libc = true;
-    b.installArtifact(plugin_probe);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);

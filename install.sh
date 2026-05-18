@@ -147,19 +147,17 @@ for name in $WASM_PLUGINS; do
 done
 install_plugin_dir "bundled/plugins/echo" "stem-echo" "$USER_PLUGIN_DIR"
 
-# Phase 4 cleanup: previous releases installed flat .dylib plugins
-# (libgit.dylib, libmarkdown_viewer.dylib, libplugin_manager.dylib)
-# at the per-user plugin dir's root. They've been replaced by their
-# wasm equivalents under their own subdirectories, so the legacy
-# files would now be redundant — and a real liability, since stem's
-# loader would happily dlopen any leftover dylib with the same
-# plugin name, racing the wasm replacement. Sweep them up here.
-for stale in libgit.dylib libmarkdown_viewer.dylib libplugin_manager.dylib; do
-    if [ -f "$USER_PLUGIN_DIR/$stale" ]; then
-        rm -f "$USER_PLUGIN_DIR/$stale"
-        echo "  removed legacy $USER_PLUGIN_DIR/$stale"
-    fi
-done
+# Sweep dylib plugins from older releases out of the per-user dir.
+# stem no longer has a dylib loader at all; any leftover .dylib would
+# just be dead bytes on disk, but removing them keeps `~/.stem/plugins`
+# clean and avoids confusion in `stem plugin list`.
+if [ -d "$USER_PLUGIN_DIR" ]; then
+    for stale in "$USER_PLUGIN_DIR"/*.dylib "$USER_PLUGIN_DIR"/*.so "$USER_PLUGIN_DIR"/*.dll; do
+        [ -f "$stale" ] || continue
+        rm -f "$stale"
+        echo "  removed legacy $stale"
+    done
+fi
 
 echo ""
 echo "Installed:"

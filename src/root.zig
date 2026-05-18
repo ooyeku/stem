@@ -1,11 +1,6 @@
 const std = @import("std");
 
 pub const piece_table = @import("core/piece_table.zig");
-pub const interface = @import("plugins/interface.zig");
-pub const context = @import("plugins/context.zig");
-pub const crash_isolation = @import("plugins/crash_isolation.zig");
-pub const abi = @import("plugins/abi.zig");
-pub const ABI_VERSION = abi.ABI_VERSION;
 pub const state = @import("core/state.zig");
 pub const vfs = @import("kernel/vfs.zig");
 pub const schema = @import("config/schema.zig");
@@ -42,9 +37,6 @@ test {
 
     _ = @import("lsp/client.zig");
 
-    _ = @import("plugins/ui_manager.zig");
-    _ = @import("plugins/plugin.zig");
-
     _ = @import("services/lsp_manager_test.zig");
     _ = @import("services/terminal.zig");
     _ = @import("services/global_search.zig");
@@ -52,9 +44,6 @@ test {
     _ = @import("kernel/safe.zig");
     _ = @import("config/schema.zig");
     _ = @import("plugins/manager.zig");
-    _ = @import("plugins/crash_isolation.zig");
-    _ = @import("plugins/host_abi.zig");
-    _ = @import("plugins/schema.zig");
     _ = @import("plugins/manifest.zig");
     _ = @import("plugins/process_loader.zig");
     _ = @import("plugins/wasm/interpreter.zig");

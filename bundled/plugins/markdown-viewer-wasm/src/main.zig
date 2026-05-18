@@ -56,13 +56,6 @@ const PREVIEW_HINT =
     \\live side-panel preview.
 ;
 
-const EDIT_HINT =
-    \\You're already in edit mode. The dylib version of this plugin
-    \\swapped between a preview buffer and the source buffer; that
-    \\round-trip needs wasm event dispatch (not yet shipped). For
-    \\now this command is a no-op aside from this notice.
-;
-
 const PANEL_HINT =
     \\Side-panel preview is not yet wired in the wasm runtime —
     \\panel/status-item host imports are queued for the next
@@ -101,7 +94,6 @@ export fn handle_command(id_ptr: [*]const u8, id_len: i32) void {
     if (std.mem.eql(u8, id, CMD_EDIT)) {
         const msg = "markdown.edit: already in edit mode";
         stem_show_notification(0, msg.ptr, msg.len);
-        _ = EDIT_HINT;
         return;
     }
     if (std.mem.eql(u8, id, CMD_TOGGLE_PANEL)) {
