@@ -1,19 +1,23 @@
 # Stem
 
-A modern, approachable modal text editor for the terminal. Built with Zig, powered by tree-sitter for syntax highlighting, and featuring built-in LSP support.
+A modal text editor for the terminal. Built in Zig, with tree-sitter
+syntax highlighting and built-in LSP integration for 20+ languages.
 
-Stem aims to enable "flow state" editing while being more approachable than Vim/Neovim/Helix. It combines the efficiency of modal editing with modern IDE features like intelligent code completion, go-to-definition, and real-time diagnostics.
+Stem aims to keep modal editing approachable: Vim-style modes, a Space
+leader, and a discoverable command palette. ZLS is embedded so Zig
+works with no setup; other language servers install on request via
+`stem lsp install`.
 
-![Version](https://img.shields.io/badge/version-0.6.0--dev-blue)
-![Zig](https://img.shields.io/badge/zig-0.16.x-orange)
+![Version](https://img.shields.io/badge/version-0.4.0-blue)
+![Zig](https://img.shields.io/badge/zig-0.16%2B-orange)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-green)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
-## Quick Start
+## Install
 
-### Install a prebuilt binary (macOS / Linux)
+### Prebuilt binary (macOS / Linux)
 
-Download `scripts/install.sh` from the repo, review it, then run it:
+Download the install script, review it, and run it:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/ooyeku/stem/main/scripts/install.sh
@@ -21,21 +25,22 @@ less install.sh                  # review what it does
 sh install.sh                    # run it once you're satisfied
 ```
 
-The installer fetches the latest release archive for your platform, verifies
-its SHA-256 against the published `.sha256`, and installs `stem` to
-`/usr/local/bin` (or `~/.local/bin` if you can't write to `/usr/local`).
+The script downloads the latest release archive for your platform,
+verifies its SHA-256 against the published `.sha256`, and installs
+`stem` to `/usr/local/bin` (or `~/.local/bin` if `/usr/local` isn't
+writable).
 
-Pin a specific release with `STEM_VERSION` and the install prefix with
-`STEM_PREFIX`:
+Pin a specific release with `STEM_VERSION` and the install prefix
+with `STEM_PREFIX`:
 
 ```bash
-STEM_VERSION=v0.6.0 STEM_PREFIX=$HOME/.local sh install.sh
+STEM_VERSION=v0.4.0 STEM_PREFIX=$HOME/.local sh install.sh
 ```
 
-### Or build from source
+### From source
 
-Requires **Zig 0.16+** and a C compiler. No other setup step — all
-dependencies (tree-sitter, language grammars) are fetched by `zig build`.
+Requires **Zig 0.16+** and a C compiler. All other dependencies
+(tree-sitter, language grammars, ZLS) are fetched by `zig build`.
 
 ```bash
 git clone https://github.com/ooyeku/stem.git
@@ -43,7 +48,7 @@ cd stem
 zig build run
 ```
 
-To install system-wide from source:
+To build and install system-wide from source:
 
 ```bash
 ./install.sh                  # builds ReleaseFast and installs
@@ -59,38 +64,60 @@ To install system-wide from source:
 
 ## Features
 
-### Core Editing
-- **Modal editing** — Select, Insert, Visual, View, and Terminal modes
-- **Multi-buffer support** — Work with multiple files via tab bar
-- **Split panes** — Horizontal and vertical splits for side-by-side editing
-- **Transactional undo/redo** — Never lose your changes
-- **Fuzzy file picker** — Instant search across your project
+- Modal editing — Select, Insert, Visual, View, and Terminal modes
+- Multi-buffer workflow with a tab bar
+- Horizontal and vertical split panes
+- Transactional undo/redo with cursor restoration
+- Fuzzy file picker, buffer picker, and command palette
+- Project-wide search (`Space /`) with replace
+- Tree-sitter syntax highlighting for 29 languages
+- LSP integration for 23 external language servers plus embedded ZLS
+  for Zig
+- Integrated terminal mode
+- Manifest-driven plugin system with wasm and exec runtimes
+- Auto-completion, hover docs, go-to-definition, references,
+  diagnostics, and document symbols (via LSP)
+- Session restore with crash-recovery snapshots
+- Background workspace file index for instant `Find` queries
+- CLI search tools (`stem --find`, `--vfind`, `--scope`)
 
-### Language Intelligence
-- **Syntax highlighting** — Tree-sitter powered highlighting for 10+ languages
-- **LSP integration** — Go-to-definition, hover docs, diagnostics
-- **Embedded ZLS** — Zig works out of the box, zero configuration
-- **Optional LSP servers** for Python, JS/TS, Go, Rust (installed on request — see below)
+### Language coverage
 
-### Supported Languages
-| Language | Syntax Highlighting | LSP Support |
-|----------|:------------------:|:-----------:|
-| Zig | Yes | Yes (embedded ZLS) |
-| Python | Yes | Yes (Pyright) |
-| JavaScript | Yes | Yes (tsserver) |
-| TypeScript | Yes | Yes (tsserver) |
-| Go | Yes | Yes (gopls) |
-| Rust | Yes | Yes (rust-analyzer) |
-| JSON | Yes | - |
-| Bash/Shell | Yes | - |
-| HTML | Yes | - |
-| CSS | Yes | - |
+Syntax highlighting works for:
+Zig, Python, JavaScript, TypeScript, TSX, JSON, Bash, Go, HTML, CSS,
+Rust, C, C++, Java, Ruby, C#, PHP, Swift, Kotlin, Lua, Dart, Elixir,
+Haskell, OCaml, Scala, R, Perl, Erlang, Markdown.
 
-### Additional Features
-- **Command palette** (`Space a`) — Quick access to all commands
-- **Plugin system** — Extend functionality with manifest-based wasm/exec plugins
-- **Integrated terminal** — Run commands without leaving the editor
-- **Git integration** — View file status and changes (via plugin)
+Language servers installable via `stem lsp install <name>`:
+
+| Language | Server | External requirement |
+|---|---|---|
+| Zig | ZLS (embedded) | — |
+| Python | Pyright | Node |
+| JavaScript / TypeScript | typescript-language-server | Node |
+| Go | gopls | Go |
+| Rust | rust-analyzer | — |
+| C / C++ | clangd | LLVM / Xcode CLT |
+| Ruby | ruby-lsp | Ruby + gem |
+| C# | OmniSharp | — |
+| Java | jdtls | Java runtime |
+| Bash | bash-language-server | Node |
+| Lua | lua-language-server | — |
+| Swift | sourcekit-lsp | Swift toolchain |
+| R | languageserver | R |
+| CSS / HTML / JSON | vscode-langservers-extracted | Node |
+| PHP | intelephense | Node |
+| Perl | perlnavigator | Node |
+| Dart | dart language-server | Dart SDK |
+| Elixir | elixir-ls | install via brew or releases |
+| Erlang | erlang_ls | rebar3 |
+| Haskell | haskell-language-server | ghcup |
+| Kotlin | kotlin-language-server | brew or releases |
+| OCaml | ocaml-lsp-server | opam |
+| Scala | metals | coursier |
+
+`stem lsp install all` walks the list and installs every server whose
+prerequisites are available.
 
 ## Usage
 
@@ -98,98 +125,104 @@ To install system-wide from source:
 stem                       # empty buffer
 stem myfile.zig            # open a file
 stem file1.zig file2.zig   # open multiple files
-stem ./src                 # open a directory (recursively finds files)
+stem ./src                 # open a directory
 
-# CLI tools
+# CLI search tools
 stem --find "pattern"      # grep-like text search
 stem --vfind "pattern"     # interactive visual search
 stem --scope file.zig fn   # search within a specific file
+
 stem --help                # all options
+stem --version             # version info
 ```
 
-### Language servers
+## Key bindings
 
-Language servers are installed on request (not at startup). ZLS is bundled —
-nothing to install for Zig.
+Stem leans on a Space leader and a discoverable command palette
+(`Space a`) for most actions. The bindings below cover everyday
+editing; everything else is reachable through the palette.
 
-```bash
-stem lsp install python        # Pyright
-stem lsp install typescript    # tsserver (also handles JavaScript)
-stem lsp install go            # gopls (requires Go on PATH)
-stem lsp install rust          # rust-analyzer
-stem lsp install all           # install every supported server
-```
+### Modes
 
-## Key Bindings
-
-### Mode Switching
 | Key | Action |
 |-----|--------|
 | `i` | Enter Insert mode |
-| `v` | Enter Visual mode |
+| `v` | Enter Visual mode (selection from cursor) |
+| `V` | Visual-select the syntax node under the cursor |
+| `t` | Enter Terminal mode |
 | `Esc` | Return to Select mode |
-| `:` | Enter command mode |
 
-### Navigation (Select Mode)
+### Navigation (Select / Visual)
+
 | Key | Action |
 |-----|--------|
 | `h` `j` `k` `l` | Move left/down/up/right |
-| `w` / `b` | Jump word forward/backward |
-| `0` / `$` | Start/end of line |
-| `gg` / `G` | First/last line of file |
-| `Ctrl+d` / `Ctrl+u` | Half-page down/up |
-| `{` / `}` | Jump paragraph up/down |
+| Arrow keys | Move left/down/up/right |
+| `Home` / `End` | Start / end of line |
+| `PageUp` / `PageDown` | Scroll one page |
+| `[` / `]` | Previous / next buffer (Cmd+Shift on macOS) |
 
-### Editing
+### Save / open / quit
+
+On macOS use `Cmd`, on Linux/Windows use `Ctrl`:
+
 | Key | Action |
 |-----|--------|
-| `d` | Delete selection/line |
-| `y` | Yank (copy) |
-| `p` | Paste |
-| `u` | Undo |
-| `Ctrl+r` | Redo |
-| `>>` / `<<` | Indent/unindent |
+| `Cmd/Ctrl+S` | Save current buffer |
+| `Cmd/Ctrl+O` | Open file picker |
+| `Cmd/Ctrl+W` | Close active buffer |
+| `Cmd/Ctrl+Q` | Quit |
 
-### Leader Commands (`Space` + key)
+### Space leader
+
 | Key | Action |
 |-----|--------|
-| `a` | Open command palette |
-| `f` | File picker (fuzzy search) |
-| `b` | Buffer picker |
-| `s` | Save current file |
-| `w` | Save and close buffer |
-| `q` | Quit |
-| `\|` | Split vertically |
-| `-` | Split horizontally |
-| `h` `j` `k` `l` | Focus split left/down/up/right |
+| `Space a` | Command palette |
+| `Space f` | File picker (fuzzy) |
+| `Space b` | Buffer picker |
+| `Space /` | Project-wide search & replace |
+| `Space s` | Save |
+| `Space q` | Quit |
+| `Space k` | Close current pane / buffer |
+| `Space w` | Help view |
+| `Space n` / `Space p` | Next / previous buffer |
+| `Space u` / `Space r` | Undo / redo |
+| `Space c` / `Space x` / `Space v` | Copy / cut / paste |
+| `Space -` / `` Space ` `` | Horizontal / vertical split |
+| `Space ←/→/↑/↓` | Focus split pane in that direction |
+| `Space g` | LSP go-to-definition |
+| `Space l` | LSP find references |
+| `Space h` | LSP hover |
+| `Space d` | LSP diagnostics |
+| `Space m` | LSP rename |
+| `Space o` | Document symbols |
+| `Space ,` / `Space .` | Jump back / forward |
+| `Space j` | Background jobs list |
+| `Space D` | Git diff (via bundled git plugin) |
+| `Space Esc` | Cancel the leader |
 
-### LSP Commands
+### Split navigation
+
 | Key | Action |
 |-----|--------|
-| `K` | Show hover documentation |
-| `gd` | Go to definition |
-| `gr` | Find all references |
-
-### Window Management
-| Key | Action |
-|-----|--------|
-| `Ctrl+w h/j/k/l` | Move focus between splits |
-| `Ctrl+w q` | Close current split |
-| `gt` / `gT` | Next/previous tab |
+| `Ctrl+h` / `Ctrl+l` | Focus split left / right |
+| `Ctrl+j` / `Ctrl+k` | Focus split down / up |
 
 ## Configuration
 
-Configuration is stored in `~/.stem/`:
+Configuration lives in `~/.stem/`:
 
 ```
 ~/.stem/
 ├── config.json     # User settings
-├── plugins/        # Installed plugins (auto-seeded from bundled plugins on first run)
+├── plugins/        # Installed plugins (seeded from bundled on first run)
 ├── lsp/            # Language servers installed via `stem lsp install`
+├── cache/          # Background workspace index, etc.
 └── logs/           # Debug logs (stem-*.log)
 ```
 
-Edit via CLI:
+Manage settings from the CLI:
+
 ```bash
 stem config list
 stem config get editor.tab_size
@@ -218,113 +251,107 @@ Or edit `~/.stem/config.json` directly:
 }
 ```
 
-## Platform Support
+## Platform support
 
 | Platform | Status | Notes |
 |----------|--------|-------|
-| macOS (ARM64) | Full | Primary development platform |
-| macOS (x86_64) | Full | Tested |
-| Linux (x86_64) | Full | All features work |
-| Linux (ARM64) | Full | Tested on Raspberry Pi |
+| macOS (ARM64) | Supported | Primary development target |
+| macOS (x86_64) | Supported | |
+| Linux (x86_64) | Supported | |
+| Linux (ARM64) | Supported | |
 | Windows | Experimental | No integrated terminal |
 
 ## Building from source
 
-### Debug build (faster compile, slower runtime)
 ```bash
-zig build
-```
-
-### Release build
-```bash
-zig build -Doptimize=ReleaseFast
-```
-
-### Run tests
-```bash
-zig build test
-```
-
-### Cross-compilation
-```bash
+zig build                                  # Debug
+zig build run                              # Debug + run
+zig build -Doptimize=ReleaseFast           # Release
+zig build test                             # Tests
 zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast
 zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast    # experimental
 ```
 
 | Option | Description |
 |--------|-------------|
-| `-Doptimize=ReleaseFast` | Optimized build |
-| `-Doptimize=ReleaseSafe` | Optimized with safety checks |
-| `-Doptimize=ReleaseSmall` | Optimized for size |
+| `-Doptimize=ReleaseFast` | Optimised build |
+| `-Doptimize=ReleaseSafe` | Optimised with safety checks |
+| `-Doptimize=ReleaseSmall` | Optimised for size |
 
 ## Architecture
-
-Stem is built with a modular architecture:
 
 ```
 src/
 ├── main.zig           # Entry point and CLI handling
-├── kernel/            # Core editor engine (event loop, state management)
-├── core/              # Buffer management, text operations
-├── ui/                # Terminal rendering, views
-├── syntax/            # Tree-sitter integration, highlighting
-├── services/          # LSP, logging, background tasks
-├── config/            # Configuration management
-└── tools/             # CLI tools (find, vfind, scope)
+├── cli.zig            # Subcommand dispatch (config, logs, lsp, plugin)
+├── kernel/            # Event loop, buffer manager, sessions, commands
+├── core/              # Piece-table buffer, editor state, file I/O
+├── ui/                # Terminal rendering (vaxis), pickers, themes
+├── syntax/            # Tree-sitter integration and language queries
+├── services/          # LSP, logging, terminal, global search
+├── lsp/               # LSP protocol client and transport
+├── plugins/           # Manifest, wasm interpreter, exec runtime
+├── config/            # Config schema, keys, persistent storage
+├── tools/             # CLI tools (find, vfind, scope, plugin)
+└── fuzz/              # Fuzz targets (piece table, state, URIs)
 ```
 
 ### Dependencies
 
-All dependencies are fetched by Zig's package manager — see [build.zig.zon](build.zig.zon).
+All Zig dependencies are pinned in [build.zig.zon](build.zig.zon):
 
-**Zig packages:**
-- [libvaxis](https://github.com/rockorager/libvaxis) — Terminal UI
-- [vigil](https://github.com/ooyeku/vigil) — Message passing
-- [zls](https://github.com/zigtools/zls) — Embedded Zig LSP
+- [libvaxis](https://github.com/rockorager/libvaxis) — terminal UI
+- [vigil](https://github.com/ooyeku/vigil) — actor-style message passing
+- [zls](https://github.com/zigtools/zls) — embedded Zig LSP
 - [lsp-kit](https://github.com/zigtools/lsp-kit) — LSP protocol types
-- [uucode](https://github.com/jacobsandlund/uucode) — Unicode handling
-- [tree-sitter](https://github.com/tree-sitter/tree-sitter) plus grammars for Zig, Python, JS/TS, JSON, Bash, Go, HTML, CSS, Rust
+- [uucode](https://github.com/jacobsandlund/uucode) — Unicode tables
+- [tree-sitter](https://github.com/tree-sitter/tree-sitter) plus
+  per-language grammars
 
 ## Plugins
 
-Bundled plugins ship with `stem` and are installed into
-`~/.stem/plugins/<name>/` with a `plugin.json` manifest. Plugins run
-either as sandboxed wasm modules or as child-process exec plugins.
+Bundled plugins are installed into `~/.stem/plugins/<name>/` with a
+`plugin.json` manifest. Both wasm modules and child-process exec
+plugins are supported.
 
 | Plugin | Runtime | Description |
 |--------|---------|-------------|
-| `echo` | wasm | Reference plugin (palette command pops a notification) |
-| `git` | wasm | Git status and diff integration |
-| `plugin_manager` | wasm | Plugin dashboard and operator commands |
+| `echo` | wasm | Reference plugin: a single command that pops a notification |
+| `git` | wasm | Status / diff / staged-diff plus a live branch indicator |
+| `plugin_manager` | wasm | Plugin dashboard and reload commands |
 
-See the [Plugin Development Guide](docs/plugin-design.md) to build your
-own, and [Plugin Architecture](docs/plugin-architecture.md) for host
-internals.
+See the [Plugin Development Guide](docs/plugin-design.md) to write
+your own and [Plugin Architecture](docs/plugin-architecture.md) for
+host internals.
 
 ## Troubleshooting
 
-**LSP doesn't work for a language.** Run `stem lsp install <language>` and check
-`stem logs`. Increase verbosity with `stem config set logging.level debug`.
+**An LSP isn't working for a language.** Run
+`stem lsp install <language>` and check `stem logs`. Bump verbosity
+with `stem config set logging.level debug`.
 
-**Colors look wrong.** Make sure your terminal supports 24-bit color:
-`export COLORTERM=truecolor`.
+**Colours look wrong.** Make sure your terminal advertises 24-bit
+colour: `export COLORTERM=truecolor`.
 
-**`./install.sh` says "no write access to /usr/local".** Either re-run with
-`--prefix $HOME/.local` (no sudo needed), or grant sudo access.
+**`./install.sh` says "no write access to /usr/local".** Either
+re-run with `--prefix $HOME/.local` (no sudo needed), or grant sudo
+access.
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch
-3. `zig build` and `zig build test`
-4. Cross-check: `zig build -Dtarget=x86_64-linux-gnu`
-5. Submit a pull request
+3. Make sure `zig build` and `zig build test` pass
+4. Cross-check at least one other target:
+   `zig build -Dtarget=x86_64-linux-gnu`
+5. Open a pull request
 
 ## Documentation
 
-- [Developer Guide](docs/dev-guide.md) — architecture and internals
-- [Plugin Design](docs/plugin-design.md) — creating plugins
-- [Plugin Architecture](docs/plugin-architecture.md) — runtime internals
+- [Developer Guide](docs/dev-guide.md) — architecture and module map
+- [Plugin Design](docs/plugin-design.md) — writing plugins
+- [Plugin Architecture](docs/plugin-architecture.md) — host internals
+- [stem.md](docs/stem.md) — long-form reference
 
 ## License
 
@@ -332,6 +359,8 @@ internals.
 
 ## Acknowledgments
 
-- Modal editing concepts from [Vim](https://www.vim.org/), [Kakoune](https://kakoune.org/), and [Helix](https://helix-editor.com/)
+- Modal-editing ideas from [Vim](https://www.vim.org/),
+  [Kakoune](https://kakoune.org/), and [Helix](https://helix-editor.com/)
 - Built with [Zig](https://ziglang.org/)
-- Syntax highlighting powered by [tree-sitter](https://tree-sitter.github.io/)
+- Syntax highlighting powered by
+  [tree-sitter](https://tree-sitter.github.io/)

@@ -18,6 +18,15 @@ pub const EditorState = struct {
 
     selection_anchor: ?struct { row: usize, col: usize } = null,
 
+    /// Sticky column the cursor would prefer to land on during
+    /// vertical motion. Set lazily on the first up/down step in a
+    /// chain so bouncing through varying-length lines doesn't lose
+    /// the user's place — e.g. cursor at col 400 on a long line,
+    /// press Up onto a 5-char line (cursor clamps to col 5), press
+    /// Down again, cursor restored to col 400. Cleared by any
+    /// deliberate horizontal motion or text edit.
+    preferred_col: ?usize = null,
+
     pub fn init(allocator: Allocator, io: std.Io, content: []const u8) EditorState {
         return EditorState{
             .allocator = allocator,
@@ -29,6 +38,7 @@ pub const EditorState = struct {
             .file_path = null,
             .modified = false,
             .selection_anchor = null,
+            .preferred_col = null,
         };
     }
 
@@ -78,6 +88,7 @@ pub const EditorState = struct {
         self.cursor_col = 0;
         self.scroll_offset = 0;
         self.modified = false;
+        self.preferred_col = null;
     }
 
     pub fn saveFile(self: *EditorState) !void {
@@ -155,6 +166,7 @@ pub const EditorState = struct {
         } else {
             self.cursor_col += 1;
         }
+        self.preferred_col = null;
     }
 
     pub fn insertNewline(self: *EditorState) !void {
@@ -253,6 +265,7 @@ pub const EditorState = struct {
 
         try self.buffer.delete(offset, 1);
         self.markModified();
+        self.preferred_col = null;
     }
 
     pub fn backspaceChar(self: *EditorState) !void {
@@ -262,6 +275,7 @@ pub const EditorState = struct {
         try self.buffer.delete(offset - 1, 1);
         self.markModified();
         self.updateCursorFromOffset(offset - 1);
+        self.preferred_col = null;
     }
 
     pub fn getOffsetFor(self: *EditorState, target_row: usize, target_col: usize) usize {
@@ -296,6 +310,7 @@ pub const EditorState = struct {
         try self.buffer.delete(start_offset, len);
         self.markModified();
         self.updateCursorFromOffset(start_offset);
+        self.preferred_col = null;
     }
 
     pub fn updateCursorFromOffset(self: *EditorState, target_offset: usize) void {
@@ -547,6 +562,7 @@ pub const EditorState = struct {
                 self.cursor_col += 1;
             }
         }
+        self.preferred_col = null;
     }
 
     pub fn getLineLength(self: *EditorState, row: usize) usize {
@@ -567,6 +583,7 @@ pub const EditorState = struct {
     }
 
     pub fn moveCursorLeftGrapheme(self: *EditorState) !void {
+        self.preferred_col = null;
         const line_content = try self.getLineContent(self.cursor_row);
         defer self.allocator.free(line_content);
 
@@ -584,6 +601,7 @@ pub const EditorState = struct {
     }
 
     pub fn moveCursorRightGrapheme(self: *EditorState) !void {
+        self.preferred_col = null;
         const line_content = try self.getLineContent(self.cursor_row);
         defer self.allocator.free(line_content);
 
@@ -591,7 +609,7 @@ pub const EditorState = struct {
 
         if (self.cursor_col >= line_len) {
             const line_count = self.buffer.lineCount();
-            if (self.cursor_row < line_count - 1) {
+            if (line_count > 0 and self.cursor_row + 1 < line_count) {
                 self.cursor_row += 1;
                 self.cursor_col = 0;
             }
@@ -602,7 +620,39 @@ pub const EditorState = struct {
         }
     }
 
+    /// Vertical-motion helpers that honour `preferred_col` so the
+    /// cursor doesn't lose its column when stepping through lines
+    /// of mixed length. Capture the current column on the first
+    /// step of a chain; subsequent steps clamp to the new line's
+    /// length but remember the original intent.
+    pub fn moveCursorUp(self: *EditorState, n: usize) void {
+        if (self.preferred_col == null) self.preferred_col = self.cursor_col;
+        self.cursor_row -|= n;
+        const line_len = self.getLineLength(self.cursor_row);
+        self.cursor_col = @min(self.preferred_col.?, line_len);
+    }
+
+    pub fn moveCursorDown(self: *EditorState, n: usize) void {
+        if (self.preferred_col == null) self.preferred_col = self.cursor_col;
+        const line_count = self.buffer.lineCount();
+        const max_row: usize = if (line_count == 0) 0 else line_count - 1;
+        self.cursor_row = @min(self.cursor_row + n, max_row);
+        const line_len = self.getLineLength(self.cursor_row);
+        self.cursor_col = @min(self.preferred_col.?, line_len);
+    }
+
+    pub fn moveCursorToLineStart(self: *EditorState) void {
+        self.cursor_col = 0;
+        self.preferred_col = null;
+    }
+
+    pub fn moveCursorToLineEnd(self: *EditorState) void {
+        self.cursor_col = self.getLineLength(self.cursor_row);
+        self.preferred_col = null;
+    }
+
     pub fn moveCursorNextWord(self: *EditorState) !void {
+        self.preferred_col = null;
         const line_content = try self.getLineContent(self.cursor_row);
         defer self.allocator.free(line_content);
 
@@ -610,7 +660,7 @@ pub const EditorState = struct {
             self.cursor_col = new_col;
         } else {
             const line_count = self.buffer.lineCount();
-            if (self.cursor_row < line_count - 1) {
+            if (line_count > 0 and self.cursor_row + 1 < line_count) {
                 self.cursor_row += 1;
                 self.cursor_col = 0;
             }
@@ -618,6 +668,7 @@ pub const EditorState = struct {
     }
 
     pub fn moveCursorPrevWord(self: *EditorState) !void {
+        self.preferred_col = null;
         const line_content = try self.getLineContent(self.cursor_row);
         defer self.allocator.free(line_content);
 
@@ -1148,4 +1199,93 @@ test "EditorState insertNewlineWithIndent basic" {
     try std.testing.expectEqualStrings("    Hello\n    ", text);
     try std.testing.expectEqual(@as(usize, 1), state.cursor_row);
     try std.testing.expectEqual(@as(usize, 4), state.cursor_col);
+}
+
+test "moveCursorLeftGrapheme wraps from blank line to previous" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    // Three lines: "hello", "", "world". Cursor on the blank middle line.
+    var state = EditorState.init(allocator, io, "hello\n\nworld");
+    defer state.deinit();
+
+    state.cursor_row = 1;
+    state.cursor_col = 0;
+
+    try state.moveCursorLeftGrapheme();
+    try std.testing.expectEqual(@as(usize, 0), state.cursor_row);
+    try std.testing.expectEqual(@as(usize, 5), state.cursor_col);
+}
+
+test "moveCursorRightGrapheme wraps from blank line to next" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var state = EditorState.init(allocator, io, "hello\n\nworld");
+    defer state.deinit();
+
+    state.cursor_row = 1;
+    state.cursor_col = 0;
+
+    try state.moveCursorRightGrapheme();
+    try std.testing.expectEqual(@as(usize, 2), state.cursor_row);
+    try std.testing.expectEqual(@as(usize, 0), state.cursor_col);
+}
+
+test "preferred_col survives a trip through a shorter line" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    // Row 0: 20 chars. Row 1: 3 chars. Row 2: 20 chars.
+    var state = EditorState.init(allocator, io, "abcdefghij1234567890\nfoo\nlongerlineofstuff!!");
+    defer state.deinit();
+
+    state.cursor_row = 0;
+    state.cursor_col = 18;
+
+    // Down onto the short line: column clamps to 3, but preferred is 18.
+    state.moveCursorDown(1);
+    try std.testing.expectEqual(@as(usize, 1), state.cursor_row);
+    try std.testing.expectEqual(@as(usize, 3), state.cursor_col);
+    try std.testing.expectEqual(@as(?usize, 18), state.preferred_col);
+
+    // Down again onto a long line: column restored to 18.
+    state.moveCursorDown(1);
+    try std.testing.expectEqual(@as(usize, 2), state.cursor_row);
+    try std.testing.expectEqual(@as(usize, 18), state.cursor_col);
+}
+
+test "preferred_col cleared by horizontal motion" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var state = EditorState.init(allocator, io, "abcdefghij1234567890\nfoo\nlongerlineofstuff!!");
+    defer state.deinit();
+
+    state.cursor_row = 0;
+    state.cursor_col = 18;
+    state.moveCursorDown(1); // sets preferred_col = 18
+
+    try state.moveCursorLeftGrapheme(); // any horizontal motion clears it
+    try std.testing.expectEqual(@as(?usize, null), state.preferred_col);
+}
+
+test "preferred_col cleared by edit" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var state = EditorState.init(allocator, io, "abcdefghij\nfoo");
+    defer state.deinit();
+
+    state.cursor_row = 0;
+    state.cursor_col = 8;
+    state.moveCursorDown(1); // preferred_col = 8
+
+    try state.insertChar('x');
+    try std.testing.expectEqual(@as(?usize, null), state.preferred_col);
 }

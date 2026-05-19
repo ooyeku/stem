@@ -1,311 +1,248 @@
-# Stem Editor - Developer Guide
+# Stem Developer Guide
 
-> A terminal-based modal editor inspired by Vim, built in Zig.
+A map of the codebase and the moving parts inside it.
 
----
+## Contents
 
-## Table of Contents
+- [Architecture overview](#architecture-overview)
+- [Systems reference](#systems-reference)
+- [Languages](#languages)
+- [Build, test, run](#build-test-run)
+- [Layout reference](#layout-reference)
 
-- [Architecture Overview](#architecture-overview)
-- [Systems Reference](#systems-reference)
-- [Feature Tracker](#feature-tracker)
-- [Known Issues](#known-issues)
-- [Roadmap](#roadmap)
+## Architecture overview
 
----
+Stem is built around message passing between three long-running threads
+plus a heartbeat:
 
-## Architecture Overview
+1. **Input thread** — captures terminal events through `vaxis` and posts
+   them to the main inbox.
+2. **Core thread** — owns the editor state machine. Drains the core
+   inbox, runs commands, and posts render snapshots back to the UI.
+3. **UI thread (main)** — consumes render snapshots and draws frames
+   with `vaxis`.
 
-Stem follows a **message-passing architecture** with three main threads:
-1. **Input Thread** - Captures terminal events via vaxis, sends to Core
-2. **Core Thread** - Processes all editor logic, sends render snapshots to UI
-3. **Heartbeat Thread** - Sends periodic ticks for hover/auto-save features
+A 100 ms heartbeat thread ticks the core inbox so timers (hover delay,
+debounced LSP updates, recovery snapshots, etc.) can fire without
+incoming input. LSP servers run in their own threads (one per
+language, plus the embedded ZLS) and exchange JSON-RPC frames over a
+zero-copy in-memory pipe.
 
-Communication uses [Vigil](https://github.com/ooyeku/vigil) inboxes with binary-encoded protocol messages.
+All inter-thread channels are [`vigil`](https://github.com/ooyeku/vigil)
+inboxes carrying binary-encoded protocol messages from
+`src/kernel/protocol.zig`.
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Input Thread│────▶│    Core     │────▶│  UI Thread  │
+│ Input thread│────▶│   Core      │────▶│  UI thread  │
 │   (vaxis)   │     │  (kernel)   │     │   (view)    │
-└─────────────┘     └─────────────┘     └─────────────┘
-                          │
-                    ┌─────┴─────┐
-                    │  Plugins  │
-                    │ wasm/exec │
-                    └───────────┘
+└─────────────┘     └──────┬──────┘     └─────────────┘
+                           │
+                  ┌────────┴────────┐
+                  │  LSP threads    │
+                  │  Plugin runtime │
+                  │  Job manager    │
+                  └─────────────────┘
 ```
 
----
+## Systems reference
 
-## Systems Reference
-
-### 1. Editor Core
-
-The central orchestrator handling input, commands, modes, and state coordination.
+### Editor core
 
 | Subsystem | Description | Files |
-|-----------|-------------|-------|
-| **Core Engine** | Main event loop, mode switching, input dispatch | `src/kernel/core.zig` |
-| **Protocol** | Binary message encoding/decoding between threads | `src/kernel/protocol.zig` |
-| **Command Registry** | Named commands registered for palette/keybindings | `src/kernel/command.zig` |
-| **Entry Point** | Application bootstrap, thread spawning | `src/main.zig` |
+|---|---|---|
+| Core engine | Event loop, mode switching, command dispatch | [src/kernel/core.zig](../src/kernel/core.zig) |
+| Protocol | Binary message encoding | [src/kernel/protocol.zig](../src/kernel/protocol.zig) |
+| Command registry | Named commands with fuzzy palette search | [src/kernel/command.zig](../src/kernel/command.zig) |
+| Modular commands | Edit / LSP / split / git / build groups | [src/kernel/commands/](../src/kernel/commands/) |
+| Entry point | Boot sequence, thread spawning, signal handling | [src/main.zig](../src/main.zig) |
 
----
-
-### 2. Buffer Management
-
-Handles text storage, editing operations, and multi-buffer workflows.
+### Buffers and text
 
 | Subsystem | Description | Files |
-|-----------|-------------|-------|
-| **Buffer Manager** | Multi-buffer handling, switching, file I/O | `src/kernel/buffer_manager.zig` |
-| **Piece Table** | Efficient text data structure for edits | `src/core/piece_table.zig` |
-| **Editor State** | Cursor, selection, scroll, per-buffer state | `src/core/state.zig` |
-| **File Manager** | File reading/writing utilities | `src/core/file_manager.zig` |
-| **History (Undo/Redo)** | Transactional undo with automatic grouping | `src/kernel/history.zig` |
-| **Virtual File System** | URI schemes (file://, git://) abstraction | `src/kernel/vfs.zig` |
+|---|---|---|
+| Buffer manager | Open buffers, switching, file I/O | [src/kernel/buffer_manager.zig](../src/kernel/buffer_manager.zig) |
+| Piece table | Buffer storage with O(visible) line extraction | [src/core/piece_table.zig](../src/core/piece_table.zig) |
+| Editor state | Cursor, selection, scroll, modification flags | [src/core/state.zig](../src/core/state.zig) |
+| File manager | File reading / atomic save with fsync | [src/core/file_manager.zig](../src/core/file_manager.zig) |
+| History | Transactional undo / redo with cursor restore | [src/kernel/history.zig](../src/kernel/history.zig) |
+| Virtual file system | `file://`, `memory://`, `git://` schemes | [src/kernel/vfs.zig](../src/kernel/vfs.zig) |
+| Sessions | Per-workspace session save + crash-recovery snapshot | [src/kernel/session.zig](../src/kernel/session.zig), [src/config/storage.zig](../src/config/storage.zig) |
 
----
-
-### 3. UI Rendering
-
-Terminal rendering via vaxis with syntax-highlighted views.
+### UI
 
 | Subsystem | Description | Files |
-|-----------|-------------|-------|
-| **Main View** | Window composition, text rendering, highlighting | `src/ui/view.zig` |
-| **Status Bar** | Mode indicator, file info, cursor position | `src/ui/status_bar.zig` |
-| **Tab Bar** | Buffer tabs with numbers | `src/ui/tab_bar.zig` |
-| **File Picker** | Fuzzy file search overlay | `src/ui/file_picker.zig` |
-| **Buffer Picker** | Buffer switching overlay | `src/ui/buffer_picker.zig` |
-| **Help View** | Markdown rendering for help content | `src/ui/help_view.zig`, `src/ui/help.zig` |
+|---|---|---|
+| Main view | Window composition, line drawing, overlays | [src/ui/view.zig](../src/ui/view.zig) |
+| Status bar | Mode indicator, cursor position, branch | [src/ui/status_bar.zig](../src/ui/status_bar.zig) |
+| Tab bar | Open buffers | [src/ui/tab_bar.zig](../src/ui/tab_bar.zig) |
+| File picker | Fuzzy file picker overlay | [src/ui/file_picker.zig](../src/ui/file_picker.zig) |
+| Buffer picker | Buffer switcher overlay | [src/ui/buffer_picker.zig](../src/ui/buffer_picker.zig) |
+| Help view | Markdown-rendered help | [src/ui/help.zig](../src/ui/help.zig), [src/ui/help_view.zig](../src/ui/help_view.zig) |
+| Log view | Live log overlay | [src/ui/log_view.zig](../src/ui/log_view.zig) |
+| Theme | One Dark-inspired colour palette | [src/ui/theme.zig](../src/ui/theme.zig) |
 
----
-
-### 4. Syntax Highlighting
-
-Tree-sitter based parsing and token generation.
+### Syntax
 
 | Subsystem | Description | Files |
-|-----------|-------------|-------|
-| **Syntax Manager** | Parser lifecycle, language detection | `src/syntax/manager.zig` |
-| **Tree-sitter Bindings** | C FFI layer for tree-sitter | `src/syntax/tree_sitter.zig` |
-| **Query Files** | Language-specific highlight queries | `src/syntax/queries/*.scm` |
+|---|---|---|
+| Syntax manager | Parser lifecycle, language detection, async parses | [src/syntax/manager.zig](../src/syntax/manager.zig) |
+| Tree-sitter bindings | C FFI for tree-sitter | [src/syntax/tree_sitter.zig](../src/syntax/tree_sitter.zig) |
+| Queries | Highlight queries for each language | [src/syntax/queries/](../src/syntax/queries/) |
 
-**Supported Languages:** Zig, Python, JavaScript, TypeScript, TSX, JSON, Bash
+Parses run on a background worker; the core thread polls
+`tree_updated` on tick and triggers a re-render once a fresh tree is
+installed.
 
----
-
-### 5. LSP Integration
-
-Language Server Protocol client for code intelligence.
+### LSP
 
 | Subsystem | Description | Files |
-|-----------|-------------|-------|
-| **LSP Manager** | Server lifecycle, request routing | `src/services/lsp_manager.zig` |
-| **LSP Server** | JSON-RPC communication, protocol handling | `src/services/lsp/server.zig` |
-| **External LSP** | Support for external language servers | `src/services/lsp/external.zig` |
-| **LSP Installer** | Auto-install of language servers | `src/services/lsp/installer.zig` |
-| **Embedded ZLS** | Built-in Zig language server | `src/services/lsp/zls_embedded.zig` |
+|---|---|---|
+| LSP manager | Per-language server lifecycle, request routing, debounced `didChange` | [src/services/lsp_manager.zig](../src/services/lsp_manager.zig) |
+| LSP server | Per-server request bookkeeping | [src/services/lsp/server.zig](../src/services/lsp/server.zig) |
+| External LSP | Child-process LSP wrapper with global kill registry | [src/services/lsp/external.zig](../src/services/lsp/external.zig) |
+| Installer | On-demand server install for 23 languages | [src/services/lsp/installer.zig](../src/services/lsp/installer.zig) |
+| Supervisor | Worker that processes serialised LSP commands | [src/services/lsp/supervisor.zig](../src/services/lsp/supervisor.zig) |
+| Embedded ZLS | In-process Zig LSP | [src/services/lsp/zls_embedded.zig](../src/services/lsp/zls_embedded.zig) |
+| Transport | In-memory pipe used by embedded ZLS | [src/lsp/transport.zig](../src/lsp/transport.zig) |
 
-**Features:** Go-to-definition, hover, references, diagnostics, completions
-
----
-
-### 6. Plugin System
-
-Manifest-driven plugin architecture with two runtimes: sandboxed wasm
-modules and out-of-process exec plugins.
+### Plugins
 
 | Subsystem | Description | Files |
-|-----------|-------------|-------|
-| **Plugin Manager** | Manifest discovery, command registration, permissions, runtime dispatch | `src/plugins/manager.zig` |
-| **Manifest Parser** | `plugin.json` parsing and validation | `src/plugins/manifest.zig` |
-| **Exec Runtime** | Child process lifecycle and stdio transport | `src/plugins/process_loader.zig`, `src/plugins/jsonrpc.zig` |
-| **Wasm Runtime** | Pure-Zig wasm interpreter and host imports | `src/plugins/wasm/interpreter.zig`, `src/plugins/wasm/loader.zig` |
-| **Plugin CLI** | `stem plugin list/info/install/remove/test` | `src/tools/plugin_cli.zig` |
+|---|---|---|
+| Plugin manager | Manifest discovery, command registration, permission checks, restart policy | [src/plugins/manager.zig](../src/plugins/manager.zig) |
+| Manifest | `plugin.json` schema, including restart policy | [src/plugins/manifest.zig](../src/plugins/manifest.zig) |
+| Exec runtime | Child-process plugins over JSON-RPC | [src/plugins/process_loader.zig](../src/plugins/process_loader.zig), [src/plugins/jsonrpc.zig](../src/plugins/jsonrpc.zig) |
+| Wasm runtime | Pure-Zig interpreter and host imports | [src/plugins/wasm/interpreter.zig](../src/plugins/wasm/interpreter.zig), [src/plugins/wasm/loader.zig](../src/plugins/wasm/loader.zig) |
+| Plugin CLI | `stem plugin list/info/install/remove/test` | [src/tools/plugin_cli.zig](../src/tools/plugin_cli.zig) |
 
-**Bundled Plugins:**
-- `echo` - Reference wasm plugin (palette command pops a notification)
-- `git` - Wasm git status/diff integration
-- `plugin_manager` - Wasm plugin dashboard/operator commands
+Bundled plugins: `echo`, `git`, and `plugin_manager` — all wasm.
 
----
-
-### 7. Configuration
-
-User preferences and keybinding configuration.
+### Configuration
 
 | Subsystem | Description | Files |
-|-----------|-------------|-------|
-| **Config Schema** | Configuration structure, getters/setters | `src/config/schema.zig` |
-| **Storage Manager** | Directory creation, config file I/O | `src/config/storage.zig` |
-| **Keybindings** | Key definitions, leader key mappings | `src/config/keys.zig` |
+|---|---|---|
+| Schema | Config struct, getters / setters | [src/config/schema.zig](../src/config/schema.zig) |
+| Storage | Directory creation, atomic JSON writes | [src/config/storage.zig](../src/config/storage.zig) |
+| Keybindings | Keymap constants | [src/config/keys.zig](../src/config/keys.zig) |
 
-**Config Location:** `~/.stem/config.json`
+User data lives under `~/.stem/`: `config.json`, `plugins/`, `lsp/`,
+`cache/`, `logs/`.
 
----
-
-### 8. Workspace & Build
-
-Project-aware features and Zig build integration.
+### Workspace & build
 
 | Subsystem | Description | Files |
-|-----------|-------------|-------|
-| **Workspace Manager** | Project root detection, file tracking | `src/kernel/workspace.zig` |
-| **Build Jobs** | Background build execution | `src/kernel/build_jobs.zig` |
-| **Job Manager** | Background task orchestration | `src/kernel/jobs.zig` |
-| **Decorations** | Build error overlays | `src/kernel/decorations.zig` |
+|---|---|---|
+| Workspace manager | Detects Zig project roots from `build.zig` | [src/kernel/workspace.zig](../src/kernel/workspace.zig) |
+| Build jobs | Runs `zig build` / `zig build test` with diagnostic parsing | [src/kernel/build_jobs.zig](../src/kernel/build_jobs.zig) |
+| Job manager | Cancellable background tasks | [src/kernel/jobs.zig](../src/kernel/jobs.zig) |
+| Decorations | Diagnostic / search overlays | [src/kernel/decorations.zig](../src/kernel/decorations.zig) |
 
----
-
-### 9. Split Panes
-
-Window splitting and pane management.
+### Splits & panes
 
 | Subsystem | Description | Files |
-|-----------|-------------|-------|
-| **Split Manager** | Horizontal/vertical splits, focus navigation | `src/kernel/split_manager.zig` |
+|---|---|---|
+| Split manager | Tree-based horizontal/vertical splits with per-pane state | [src/kernel/split_manager.zig](../src/kernel/split_manager.zig) |
 
----
-
-### 10. CLI Tools
-
-Command-line utilities for search and scope.
+### CLI tools
 
 | Subsystem | Description | Files |
-|-----------|-------------|-------|
-| **Search** | `--find` grep-like search | `src/tools/search.zig` |
-| **Visual Find** | `--vfind` search with result navigation | `src/tools/vfind.zig` |
-| **Scope** | `--scope` search within file | `src/tools/scope.zig` |
+|---|---|---|
+| Search | `stem --find` (`std.Thread.Pool` work-stealing) | [src/tools/search.zig](../src/tools/search.zig) |
+| Visual find | `stem --vfind` (vigil actor model) | [src/tools/vfind.zig](../src/tools/vfind.zig) |
+| Scope | `stem --scope` for in-file search | [src/tools/scope.zig](../src/tools/scope.zig) |
+| Format | Code formatting subcommand | [src/tools/format.zig](../src/tools/format.zig) |
+| Query check | Validate tree-sitter queries | [src/tools/query_check.zig](../src/tools/query_check.zig) |
+| Plugin CLI | Plugin lifecycle subcommand | [src/tools/plugin_cli.zig](../src/tools/plugin_cli.zig) |
 
----
-
-### 11. Services
-
-Shared infrastructure services.
+### Services
 
 | Subsystem | Description | Files |
-|-----------|-------------|-------|
-| **Logger** | Unified logging to `~/.stem/logs/stem.log` | `src/services/logger.zig` |
-| **Terminal** | Integrated terminal emulation | `src/services/terminal.zig` |
+|---|---|---|
+| Logger | File-backed logging at `~/.stem/logs/stem-*.log` | [src/services/logger.zig](../src/services/logger.zig) |
+| Terminal | Integrated terminal mode | [src/services/terminal.zig](../src/services/terminal.zig) |
+| Global search | Project-wide grep with parallel workers | [src/services/global_search.zig](../src/services/global_search.zig) |
+| Search index | Background workspace file-list cache for `Find` | [src/services/search_index.zig](../src/services/search_index.zig) |
+| Telemetry | Lightweight in-process counters | [src/services/telemetry.zig](../src/services/telemetry.zig) |
 
----
+## Languages
 
-## Feature Tracker
+Tree-sitter syntax highlighting is wired up for 29 languages:
+Zig, Python, Go, JavaScript, TypeScript, TSX, JSON, Bash, HTML, CSS,
+Rust, C, C++, Java, Ruby, C#, PHP, Swift, Kotlin, Lua, Dart, Elixir,
+Haskell, OCaml, Scala, R, Perl, Erlang, Markdown.
 
-### Core Features
-- [x] Modal editing (Select, Insert, Visual, View, Terminal)
-- [x] Multi-buffer support with tab bar
-- [x] Fuzzy file picker
-- [x] Command palette with fuzzy search
-- [x] Space leader key with chaining
-- [x] Transactional undo/redo
-- [x] Split panes (horizontal/vertical)
-- [x] Clipboard integration (copy/cut/paste)
+LSP integration is available for 23 external servers (see the
+[README's language table](../README.md#language-coverage)) plus
+embedded ZLS for Zig. Servers install on demand:
 
-### LSP Features
-- [x] Embedded ZLS for Zig
-- [x] External LSP support (TypeScript, Python)
-- [x] Go-to-definition with cursor snapping
-- [x] Hover information
-- [x] Find references
-- [x] Diagnostics display
-- [x] Auto-completion
-
-### Syntax Highlighting
-- [x] Zig
-- [x] Python
-- [x] JavaScript/TypeScript/TSX
-- [x] JSON
-- [x] Bash/Shell
-- [x] Markdown
-- [ ] HTML/CSS
-- [ ] Go
-- [ ] Rust
-
-### Plugin System
-- [x] Manifest-based plugin directories
-- [x] Wasm runtime
-- [x] Exec runtime
-- [x] Plugin discovery from `~/.stem/plugins/`
-- [x] Command registration
-- [x] Buffer creation from plugins
-- [x] Spawn permission enforcement for wasm
-- [ ] Event delivery into plugins
-- [ ] Panel/status-item host imports
-- [ ] Filesystem permission enforcement
-- [ ] Plugin settings UI
-- [ ] Plugin marketplace
-
----
-
-## Known Issues
-
-| ID | Severity | Description | Status |
-|----|----------|-------------|--------|
-| #1 | Low | Some terminals may not support all key combinations | Open |
-| #2 | Medium | Syntax highlighting can fail on very large files | Open |
-| #3 | Low | External LSP servers require manual installation | Open |
-| #4 | Low | List Reference command returns poorly structured references |
----
-
-## Roadmap
-
-### v0.1.0 - Foundation ✅
-- Basic modal editing
-- Multi-buffer support
-- Syntax highlighting (Zig)
-- Embedded ZLS
-
-### v0.2.0 - Enhanced Experience (Current)
-- [ ] More language support (Go, Rust)
-- [ ] Improved diagnostics inline display
-- [ ] File tree sidebar
-- [ ] Better search (regex support)
-
-### v0.3.0 - Collaboration
-- [ ] Git integration improvements
-- [ ] Diff view
-- [ ] Branch switching
-
-### v1.0.0 - Production Ready
-- [ ] Stable wasm/exec plugin API
-- [ ] Comprehensive documentation
-- [ ] Performance optimization
-- [ ] Cross-platform testing
-
----
-
-## Quick Reference
-
-### Build Commands
 ```bash
-zig build              # Debug build
-zig build run          # Run in debug mode
-zig build -Doptimize=ReleaseFast  # Release build
-./install.sh           # Install to /usr/local/bin
+stem lsp install <language>     # one server
+stem lsp install all            # every server whose prerequisites are met
+stem lsp list                   # what's installed
 ```
 
-### Key Directories
-| Directory | Purpose |
-|-----------|---------|
-| `src/kernel/` | Core editor logic |
-| `src/ui/` | Rendering and UI components |
-| `src/services/` | LSP, logging, terminal |
-| `src/syntax/` | Tree-sitter integration |
-| `src/plugins/` | Manifest, wasm, and exec plugin runtimes |
-| `src/config/` | Configuration handling |
-| `bundled/plugins/` | Built-in plugins |
-| `vendor/` | Third-party dependencies |
+## Build, test, run
 
-### User Data
+```bash
+zig build                                 # Debug build
+zig build run                             # Debug + run
+zig build -Doptimize=ReleaseFast          # Release
+zig build test                            # Unit tests
+zig build fuzz                            # Fuzz suite (macOS)
+zig build test --fuzz                     # Fuzz suite (Linux)
+./install.sh                              # Build ReleaseFast + install
+```
+
+Fuzz targets live in [src/fuzz/](../src/fuzz/) — piece table, editor
+state, and URI parsing.
+
+## Layout reference
+
+```
+src/
+├── main.zig
+├── cli.zig                # Subcommand dispatch
+├── kernel/                # Core editor logic
+│   ├── commands/          # buffer/edit/file/git/lsp/nav/split/system/build
+│   ├── core.zig
+│   ├── protocol.zig
+│   ├── command.zig
+│   ├── buffer_manager.zig
+│   ├── history.zig
+│   ├── session.zig
+│   ├── split_manager.zig
+│   ├── workspace.zig
+│   ├── build_jobs.zig
+│   ├── jobs.zig
+│   ├── decorations.zig
+│   └── vfs.zig
+├── core/                  # Buffer primitives
+│   ├── piece_table.zig
+│   ├── state.zig
+│   ├── file_manager.zig
+│   ├── unicode.zig
+│   └── auto_pair.zig
+├── ui/                    # Rendering
+├── syntax/                # Tree-sitter + .scm queries
+├── services/              # LSP, logging, search, telemetry, terminal
+│   └── lsp/
+├── lsp/                   # Protocol client + in-memory transport
+├── plugins/               # Wasm + exec runtimes, manifest parser
+├── config/
+├── tools/                 # CLI subcommands
+└── fuzz/                  # Fuzz targets
+bundled/plugins/           # Wasm artifacts shipped with the binary
+docs/                      # This guide and related docs
+scripts/                   # Install scripts and shell completions
+```
+
+### User data
+
 | Path | Purpose |
-|------|---------|
+|---|---|
 | `~/.stem/config.json` | User configuration |
-| `~/.stem/plugins/` | User plugins |
-| `~/.stem/logs/stem.log` | Application logs |
-
----
-
-*Last updated: May 2026*
+| `~/.stem/plugins/` | Installed plugins |
+| `~/.stem/lsp/` | LSP servers installed via `stem lsp install` |
+| `~/.stem/cache/` | Search index, etc. |
+| `~/.stem/logs/stem-*.log` | Rolling log files |

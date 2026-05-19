@@ -1,98 +1,125 @@
-# Stem Editor
+# Stem — Architecture Reference
 
-**Yet Another Powerful** text editor — built in Zig for speed, extensibility, and a smooth terminal experience.
+Long-form notes on how stem fits together. For the source-code map
+see the [Developer Guide](dev-guide.md). For the user-facing feature
+list see the [README](../README.md).
 
 ---
 
-## Architecture Overview
+## Contents
 
-Stem employs a **multi-threaded, message-passing architecture** that cleanly decouples UI rendering, input handling, and text processing. This design enables high performance, eliminates UI jank, and provides a solid foundation for extensibility.
+- [Architecture overview](#architecture-overview)
+- [Binary message protocol](#binary-message-protocol)
+- [Kernel internals](#kernel-internals)
+- [Rendering pipeline](#rendering-pipeline)
+- [UI layer](#ui-layer)
+- [Language intelligence (LSP)](#language-intelligence-lsp)
+- [Syntax layer (tree-sitter)](#syntax-layer-tree-sitter)
+- [Plugin system](#plugin-system)
+- [CLI tools](#cli-tools)
+- [Editor modes](#editor-modes)
+- [Session and recovery](#session-and-recovery)
+- [Configuration](#configuration)
+- [Project structure](#project-structure)
+- [Dependencies and build requirements](#dependencies-and-build-requirements)
+- [Contributing](#contributing)
+
+---
+
+## Architecture overview
+
+Stem is a multi-threaded, message-passing editor. Each thread owns
+its state and communicates by sending binary-encoded protocol
+messages through [`vigil`](https://github.com/ooyeku/vigil) inboxes.
 
 ```mermaid
 graph TB
-    subgraph "User Interface"
+    subgraph "User interface"
         VX[vaxis Terminal Engine]
         VIEW[View Renderer]
     end
-    
-    subgraph "Main Thread"
-        UI_LOOP[UI Event Loop]
+
+    subgraph "Main thread"
+        UI_LOOP[UI event loop]
         MAIN_INBOX[main_inbox]
     end
-    
-    subgraph "Input Thread"
-        INPUT[Input Handler]
+
+    subgraph "Input thread"
+        INPUT[Input handler]
     end
-    
-    subgraph "Heartbeat Thread"
-        TICK[Tick Generator<br/>100ms interval]
+
+    subgraph "Heartbeat thread"
+        TICK[100ms tick]
     end
-    
-    subgraph "Core Thread"
-        CORE[Core Controller]
+
+    subgraph "Core thread"
+        CORE[Core controller]
         CORE_INBOX[core_inbox]
-        BM[Buffer Manager]
-        CMD[Command Registry]
-        LSP[LSP Manager]
-        SPLIT[Split Manager]
+        BM[Buffer manager]
+        CMD[Command registry]
+        LSP[LSP manager]
+        SPLIT[Split manager]
+        PLUG[Plugin manager]
     end
-    
-    subgraph "LSP Thread"
+
+    subgraph "LSP threads"
         ZLS[Embedded ZLS]
-        TRANSPORT[MemPipe Transport]
+        EXTERNAL[External servers]
+        TRANSPORT[MemPipe / stdio]
     end
-    
-    INPUT -->|binary encode| MAIN_INBOX
-    TICK -->|binary encode| CORE_INBOX
+
+    INPUT -->|binary| MAIN_INBOX
+    TICK -->|binary| CORE_INBOX
     UI_LOOP -->|forward| CORE_INBOX
     CORE -->|render_update| MAIN_INBOX
     CORE <-->|JSON-RPC| ZLS
-    
+    CORE <-->|JSON-RPC| EXTERNAL
+
     MAIN_INBOX --> UI_LOOP
     CORE_INBOX --> CORE
     UI_LOOP --> VIEW --> VX
 ```
 
-### Thread Model
+### Thread model
 
 | Thread | Role | Communication |
-|--------|------|---------------|
-| **Main Thread (UI)** | Renders via `vaxis`, manages app lifecycle, processes `render_update` messages | Consumes from `main_inbox`, forwards input to `core_inbox` |
-| **Core Thread (Kernel)** | Text editing logic, buffer management, LSP orchestration, command execution | Consumes from `core_inbox`, produces `render_update` to `main_inbox` |
-| **Input Thread** | Listens for `vaxis` input events (keyboard, mouse, resize) | Produces to `main_inbox` |
-| **Heartbeat Thread** | Generates tick events every 100ms for hover, polling, animations | Produces to `core_inbox` |
-| **LSP Thread** | Runs embedded Zig Language Server | Communicates via `MemPipe` with `LSPManager` |
+|---|---|---|
+| Main thread (UI) | Render via `vaxis`, manage app lifecycle, process `render_update` messages | Consumes `main_inbox`, forwards input to `core_inbox` |
+| Core thread | Text editing logic, buffer management, LSP orchestration, command execution | Consumes `core_inbox`, produces `render_update` to `main_inbox` |
+| Input thread | Listens for `vaxis` input events (keyboard, mouse, resize) | Produces to `main_inbox` |
+| Heartbeat thread | 100 ms ticks for hover delay, debounced LSP updates, recovery snapshots | Produces to `core_inbox` |
+| LSP threads | Per-language server I/O (embedded ZLS plus external child processes) | JSON-RPC over `MemPipe` (ZLS) or stdio (external) |
 
 ---
 
-## Binary Message Protocol
+## Binary message protocol
 
-Stem uses a **compact binary protocol** for inter-thread communication, replacing traditional JSON serialization for maximum performance.
-
-### Protocol Definition ([protocol.zig](file:///src/kernel/protocol.zig))
+All inter-thread channels carry binary-encoded protocol messages
+defined in [`protocol.zig`](../src/kernel/protocol.zig). The compact
+encoding keeps the hot path allocation-free.
 
 ```zig
 pub const Message = union(enum) {
-    input: vaxis.Key,           // Keyboard input
-    mouse: vaxis.Mouse,         // Mouse events
-    command: Command,           // Command execution
-    render_update: RenderUpdateMessage,  // UI update
-    resize: vaxis.Winsize,      // Terminal resize
-    mode_change: Mode,          // Editor mode switch
+    input: vaxis.Key,
+    mouse: vaxis.Mouse,
+    command: Command,
+    render_update: RenderUpdateMessage,
+    resize: vaxis.Winsize,
+    mode_change: Mode,
     terminal_execute: []const u8,
     terminal_output_chunk: []const u8,
     terminal_result: TerminalResult,
     quit,
-    tick,                       // Heartbeat tick
+    tick,
 };
 ```
 
-### Binary Encoding Format
+### Wire format
 
-Each message type has a fixed-size binary representation:
+Each message has a fixed-size representation. Examples:
 
-| Message Type | Tag | Size | Layout |
-|-------------|-----|------|--------|
+| Message | Tag | Size | Layout |
+|---|---|---|---|
 | `input` | 0x01 | 6 bytes | `tag(1) + codepoint(4) + mods(1)` |
 | `mouse` | 0x02 | 8 bytes | `tag(1) + col(2) + row(2) + button(1) + type(1) + mods(1)` |
 | `command` | 0x03 | 2 bytes | `tag(1) + command_id(1)` |
@@ -100,23 +127,26 @@ Each message type has a fixed-size binary representation:
 | `resize` | 0x05 | 5 bytes | `tag(1) + rows(2) + cols(2)` |
 | `tick` | 0x0A | 1 byte | `tag(1)` |
 
-### Memory Management
+### Memory ownership
 
-The protocol uses explicit memory ownership:
-1. `encode()` allocates bytes using the provided allocator
-2. The `Inbox.send()` copies the payload internally
-3. **Caller must free** the original bytes after sending (via `defer allocator.free(bytes)`)
-4. Receiver calls `msg.deinit()` to free the inbox's copy
+1. `encode()` allocates bytes using the caller's allocator.
+2. `Inbox.send()` copies the payload internally.
+3. The caller frees the original buffer (`defer allocator.free(bytes)`).
+4. The receiver calls `msg.deinit()` to free the inbox's copy.
+
+For render snapshots the message carries a pointer to a per-frame
+arena; the receiver renders directly from that arena and the arena
+is freed in a single call when the next frame arrives.
 
 ---
 
-## Kernel Architecture
+## Kernel internals
 
-The `src/kernel/` directory contains the core business logic.
+The `src/kernel/` directory contains the core editor state machine.
 
-### Core Controller ([core.zig](file:///src/kernel/core.zig))
+### Core controller — [`core.zig`](../src/kernel/core.zig)
 
-The `Core` struct (3900+ LOC) is the central controller orchestrating all editor functionality.
+The `Core` struct is the central orchestrator. Notable fields:
 
 ```zig
 pub const Core = struct {
@@ -124,45 +154,42 @@ pub const Core = struct {
     buffer_manager: BufferManager,
     ui_inbox: *vigil.Inbox,
     core_inbox: ?*vigil.Inbox,
-    
-    // Editor State
+
     mode: protocol.Mode,
     version: u64,
     needs_render: bool,
-    
-    // Services
+
     lsp_manager: LSPManager,
+    plugin_manager: PluginManager,
     command_registry: CommandRegistry,
     split_manager: ?SplitManager,
-    
+    search_index: SearchIndex,
     // ...
 };
 ```
 
-**Key Responsibilities:**
+Key responsibilities:
 
-| Function | Description |
-|----------|-------------|
+| Method | Description |
+|---|---|
 | `run()` | Main event loop processing messages from `core_inbox` |
-| `handleKey()` | Keyboard input dispatch based on current mode |
-| `handleMouse()` | Mouse click, scroll, and drag handling |
-| `sendUpdate()` | Creates `RenderSnapshot` and sends to UI |
-| `checkHover()` | Triggers LSP hover after 150ms delay |
-| `ensureLspDocument()` | Syncs buffer state with LSP on buffer switch |
+| `handleKey()` | Keyboard input dispatch based on the active mode |
+| `handleMouse()` | Mouse click, scroll, drag handling |
+| `sendUpdate()` | Builds a `RenderSnapshot` and posts it to UI |
+| `checkHover()` | LSP hover trigger after the idle timer fires |
+| `ensureLspDocument()` | Re-syncs the buffer with the LSP on buffer switch |
+| `writeRecoverySnapshot()` | Periodic crash-recovery save (every 30 s + on every user save) |
 
-### Buffer Management
+### Buffer management
 
-#### PieceTable ([piece_table.zig](file:///src/core/piece_table.zig))
-
-The underlying data structure for text storage, optimized for efficient edits.
+#### Piece table — [`piece_table.zig`](../src/core/piece_table.zig)
 
 ```zig
 pub const PieceTable = struct {
-    original: []const u8,      // Original file content (immutable)
-    add: std.ArrayListUnmanaged(u8),  // Append-only add buffer
-    pieces: std.ArrayListUnmanaged(Piece),  // Piece descriptors
-    
-    // Cached stats (invalidated on edit)
+    original: []const u8,
+    add: std.ArrayListUnmanaged(u8),
+    pieces: std.ArrayListUnmanaged(Piece),
+
     cached_total_len: ?usize,
     cached_line_count: ?usize,
 };
@@ -174,49 +201,50 @@ pub const Piece = struct {
 };
 ```
 
-**Performance Characteristics:**
-- Insert/Delete: O(pieces) in worst case, typically O(1)
+Performance characteristics:
+
+- Insert / delete: typically O(1), worst case O(pieces)
 - Rendering: O(visible_lines) — only extracts what's needed
-- Memory: Efficient for large files with localized edits
+- Memory: efficient for large files with localised edits
 
-**Key Methods:**
-- `getVisibleLines(start, count)` — O(visible) line extraction
-- `insert(offset, text)` — Splits pieces, appends to add buffer
-- `delete(offset, length)` — Adjusts piece boundaries
-- `toString()` — Full content reconstruction
+Selected methods:
 
-#### EditorState ([state.zig](file:///src/core/state.zig))
+- `getVisibleLines(start, count)` — viewport extraction
+- `insert(offset, text)` — split a piece, append to add buffer
+- `delete(offset, length)` — adjust piece boundaries
+- `toString()` — full reconstruction
 
-Wraps a `PieceTable` with cursor, viewport, and selection state.
+#### Editor state — [`state.zig`](../src/core/state.zig)
+
+Wraps a `PieceTable` with viewport, cursor, selection, and file
+metadata. Saves are atomic: write to `<path>.tmp`, fsync, rename.
 
 ```zig
 pub const EditorState = struct {
     allocator: Allocator,
     buffer: PieceTable,
-    
-    // Viewport State
+
     cursor_row: usize,
     cursor_col: usize,
     scroll_offset: usize,
-    
-    // File State
+
     file_path: ?[]u8,
     modified: bool,
-    
-    // Selection
+
     selection_anchor: ?struct { row: usize, col: usize },
 };
 ```
 
-**Smart Editing Features:**
-- `insertNewlineWithIndent()` — Auto-indentation based on context
-- `insertTab()` — 4-space tab insertion
-- `deleteBackspace()` — Smart backspace with bracket handling
-- `duplicateLine()`, `swapAdjacentLines()`, `joinLines()` — Line operations
+Notable helpers:
 
-#### BufferManager ([buffer_manager.zig](file:///src/kernel/buffer_manager.zig))
+- `insertNewlineWithIndent()` — auto-indent based on syntax context
+- `insertTab()` — configurable tab insertion
+- `deleteBackspace()` — bracket-aware backspace
+- `duplicateLine()`, `swapAdjacentLines()`, `joinLines()`
 
-Manages multiple open buffers with tab-style switching.
+#### Buffer manager — [`buffer_manager.zig`](../src/kernel/buffer_manager.zig)
+
+Multi-buffer workflow with tab-style switching:
 
 ```zig
 pub const BufferManager = struct {
@@ -226,22 +254,21 @@ pub const BufferManager = struct {
 };
 ```
 
-**Operations:**
-- `nextBuffer()` / `prevBuffer()` — Cycle through buffers
-- `closeBuffer()` / `closeOthers()` — Buffer lifecycle
-- `createBuffer()` — New untitled buffer
-- `pickerReset()` / `pickerFilter()` — Buffer picker integration
+- `nextBuffer()` / `prevBuffer()` — cycle through buffers
+- `closeBuffer()` / `closeOthers()` — buffer lifecycle
+- `createBuffer()` — new untitled buffer
+- `pickerReset()` / `pickerFilter()` — buffer picker integration
 
-### Command System ([command.zig](file:///src/kernel/command.zig))
+### Command registry — [`command.zig`](../src/kernel/command.zig)
 
-A registry-based command system with fuzzy search for the command palette.
+A flat command registry with fuzzy search for the palette:
 
 ```zig
 pub const Command = struct {
-    id: []const u8,          // "file.save"
-    title: []const u8,       // "Save File"
-    description: []const u8, // "Save the current file to disk"
-    execute: CommandFn,      // Function pointer
+    id: []const u8,          // e.g. "file.save"
+    title: []const u8,
+    description: []const u8,
+    execute: CommandFn,
 };
 
 pub const CommandRegistry = struct {
@@ -250,22 +277,13 @@ pub const CommandRegistry = struct {
 };
 ```
 
-**Fuzzy Search Algorithm:**
+The matcher combines substring search, subsequence scoring (with
+consecutive / word-boundary / camelCase bonuses), and word-initials
+matching ("gtl" → "Go To Line"). Title matches get a score boost.
 
-The `search()` function implements a sophisticated multi-strategy fuzzy matcher:
+### Split manager — [`split_manager.zig`](../src/kernel/split_manager.zig)
 
-1. **Substring Match** (highest priority) — Case-insensitive exact substring
-2. **Subsequence Match** — Characters in order with scoring bonuses:
-   - Consecutive matches: +5 points
-   - Word boundary matches: +15 points
-   - CamelCase matches: +10 points
-3. **Word Initials** — "gtl" matches "Go To Line"
-
-Results are sorted by score descending, with title matches receiving a +50 boost.
-
-### Split Manager ([split_manager.zig](file:///src/kernel/split_manager.zig))
-
-Manages split pane layouts using a tree structure.
+Splits are stored as a binary tree:
 
 ```zig
 pub const SplitNode = union(enum) {
@@ -275,7 +293,7 @@ pub const SplitNode = union(enum) {
 
 pub const Container = struct {
     direction: SplitDirection,  // horizontal or vertical
-    split_ratio: f32,           // 0.0-1.0 divider position
+    split_ratio: f32,
     first: *SplitNode,
     second: *SplitNode,
 };
@@ -286,19 +304,15 @@ pub const Pane = struct {
     cursor_row: usize,
     cursor_col: usize,
     scroll_offset: usize,
-    // ...
 };
 ```
 
-**Features:**
-- Horizontal (left|right) and vertical (top/bottom) splits
-- Focus navigation: `focusLeft()`, `focusRight()`, `focusUp()`, `focusDown()`
-- Per-pane cursor and scroll state
-- Recursive bounds calculation for rendering
+Focus navigation: `focusLeft/Right/Up/Down`. Each pane keeps its
+own cursor and scroll state.
 
-### History Manager (Undo/Redo) ([history.zig](file:///src/kernel/history.zig))
+### History — [`history.zig`](../src/kernel/history.zig)
 
-Transactional undo/redo system with automatic grouping of rapid edits.
+Transactional undo / redo with automatic grouping of rapid edits:
 
 ```zig
 pub const HistoryManager = struct {
@@ -306,11 +320,6 @@ pub const HistoryManager = struct {
     undo_stack: std.ArrayListUnmanaged(Transaction),
     redo_stack: std.ArrayListUnmanaged(Transaction),
     current_transaction: ?Transaction,
-    
-    pub fn undo(self: *HistoryManager) ?Transaction;
-    pub fn redo(self: *HistoryManager) ?Transaction;
-    pub fn recordInsert(self: *HistoryManager, pos: usize, len: usize) !void;
-    pub fn recordDelete(self: *HistoryManager, pos: usize, text: []const u8) !void;
 };
 
 pub const Transaction = struct {
@@ -321,506 +330,284 @@ pub const Transaction = struct {
 };
 ```
 
-**Features:**
-- **Transaction Grouping** — Rapid edits (within 500ms) are grouped into single undo operations
-- **Cursor Restoration** — Undo/redo restores cursor to original position
-- **Inverse Operations** — Records the inverse of each edit for precise undo
-- **Max Stack Size** — Limits undo history to prevent memory bloat (1000 transactions)
+- Edits within ~500 ms collapse into a single transaction
+- Undo / redo restores the cursor to its original position
+- Each action stores the inverse so the reverse is exact
+- Max stack size caps memory use
 
-**Usage:**
-- `Space + u` — Undo last change
-- `Space + r` — Redo last undone change
-- Command palette: `edit.undo`, `edit.redo`
+User bindings: `Space u` (undo), `Space r` (redo); palette commands
+`edit.undo` and `edit.redo`.
 
-### Virtual File System ([vfs.zig](file:///src/kernel/vfs.zig))
+### Virtual file system — [`vfs.zig`](../src/kernel/vfs.zig)
 
-URI-based file abstraction supporting multiple schemes.
+URI-based file abstraction:
 
 ```zig
-pub const VirtualUri = struct {
-    scheme: UriScheme,
-    path: []const u8,
-    
-    pub fn parse(uri_string: []const u8) VirtualUri;
-};
-
 pub const UriScheme = enum {
     file,      // file:///path/to/file.zig
     memory,    // memory://scratch-buffer
-    git,       // git://HEAD:path/file.zig (future)
-};
-
-pub const VirtualFileSystem = struct {
-    pub fn read(self: *VirtualFileSystem, uri: VirtualUri) ![]u8;
-    pub fn write(self: *VirtualFileSystem, uri: VirtualUri, content: []const u8) !void;
-    pub fn exists(self: *VirtualFileSystem, uri: VirtualUri) bool;
+    git,       // git://HEAD:path/file.zig
 };
 ```
 
-**Supported Schemes:**
-- `file://` — Local filesystem access
-- `memory://` — In-memory scratch buffers
-- `git://` — (Planned) Git object access for diff views
+`memory://` powers virtual buffers (help view, plugin output);
+`git://` is reserved for diff views.
 
-### Decorations Layer ([decorations.zig](file:///src/kernel/decorations.zig))
+### Decorations — [`decorations.zig`](../src/kernel/decorations.zig)
 
-Visual overlay system for annotations, highlights, and markers.
+Visual overlay system covering search highlights, matching brackets,
+git change markers, LSP diagnostics, and build errors. Decorations
+have a priority (for layering), a kind (drives gutter vs inline
+rendering), an optional tooltip, and a source string (for bulk-clear
+by source).
 
-```zig
-pub const DecorationKind = enum {
-    // Search
-    search_match,
-    search_current,
-    matching_bracket,
-    
-    // Git
-    git_added,
-    git_modified,
-    git_deleted,
-    
-    // Diagnostics
-    error_squiggle,
-    warning_squiggle,
-    info_squiggle,
-    
-    // Build
-    build_error,
-    build_warning,
-    build_note,
-    // ...
-};
+### Job manager — [`jobs.zig`](../src/kernel/jobs.zig)
 
-pub const DecorationManager = struct {
-    pub fn add(self, range: Range, kind: DecorationKind, priority: u8, tooltip: ?[]const u8, source: ?[]const u8) !u64;
-    pub fn remove(self, id: u64) void;
-    pub fn clearByKind(self, kind: DecorationKind) void;
-    pub fn clearBySource(self, source: []const u8) void;
-    pub fn getForLine(self, line: usize, allocator: Allocator) ![]DecorationSnapshot;
-};
-```
+Cancellable background tasks with progress tracking. Each job runs
+on its own thread with atomic status updates the UI can observe.
 
-**Features:**
-- **Priority Layering** — Higher priority decorations render on top
-- **Source Tracking** — Clear decorations by source (e.g., "search", "build")
-- **Tooltips** — Optional hover text for decorations
-- **Gutter vs Inline** — Kind determines rendering location
+User binding: `Space j` opens the active-job list. Palette command:
+`job.list`.
 
-### Job Manager ([jobs.zig](file:///src/kernel/jobs.zig))
+### Workspace — [`workspace.zig`](../src/kernel/workspace.zig)
 
-Asynchronous background task runner with progress tracking.
+Zig project detection: walks up the tree looking for `build.zig`,
+attaches each buffer to its detected workspace, and feeds the
+workspace root to the LSP on buffer switch.
 
-```zig
-pub const JobManager = struct {
-    allocator: std.mem.Allocator,
-    jobs: std.ArrayListUnmanaged(Job),
-    next_id: u64,
-    
-    pub fn spawn(self, name: []const u8, func: JobFn, context: *anyopaque) !u64;
-    pub fn cancel(self, job_id: u64) bool;
-    pub fn getActiveJobs(self, allocator: Allocator) ![]Job;
-};
+### Build integration — [`build_jobs.zig`](../src/kernel/build_jobs.zig)
 
-pub const Job = struct {
-    id: u64,
-    name: []const u8,
-    status: std.atomic.Value(JobStatus),
-    progress: u8,  // 0-100
-    thread: ?std.Thread,
-};
+Runs `zig build`, `zig build test`, etc., parses compiler
+diagnostics, and surfaces errors as decorations over open files.
 
-pub const JobStatus = enum(u8) {
-    pending,
-    running,
-    completed,
-    failed,
-    cancelled,
-};
-```
+Palette commands:
 
-**Features:**
-- **Progress Reporting** — Jobs can update progress percentage
-- **Cancellation** — Long-running jobs can be cancelled
-- **Status Tracking** — Atomic status updates visible to UI
-- **Thread-Safe** — Jobs run in separate threads
+| Command | Description |
+|---|---|
+| `Zig: Build` | `zig build` |
+| `Zig: Test` | `zig build test` |
+| `Zig: Show Build Output` | view last result |
 
-**Usage:**
-- `Space + j` — View active background jobs
-- Command palette: `job.list`
+### Global search — [`global_search.zig`](../src/services/global_search.zig)
 
-### Workspace Manager ([workspace.zig](file:///src/kernel/workspace.zig))
+Project-wide grep with parallel per-file scan. Phase 1 walks the
+file tree (or consumes the pre-built path list from the search
+index); phase 2 fan-outs the scan across `std.Thread.Pool` workers.
+Auto-excluded directories include `.git`, `node_modules`,
+`zig-cache`, `zig-out`, plus a dozen other tooling caches.
 
-Zig project detection and per-buffer workspace association.
-
-```zig
-pub const ZigWorkspace = struct {
-    root_path: []const u8,      // Directory containing build.zig
-    build_zig_path: []const u8, // Full path to build.zig
-    has_zon: bool,              // Whether build.zig.zon exists
-    name: []const u8,           // Project name
-};
-
-pub const WorkspaceManager = struct {
-    buffer_workspaces: std.AutoHashMap(u32, ZigWorkspace),
-    active_workspace: ?ZigWorkspace,
-    
-    pub fn detectWorkspace(self, file_path: []const u8) !?ZigWorkspace;
-    pub fn registerBuffer(self, buffer_id: u32, file_path: []const u8) !void;
-    pub fn getBufferWorkspace(self, buffer_id: u32) ?ZigWorkspace;
-};
-```
-
-**Features:**
-- **Auto-Detection** — Walks up directory tree to find `build.zig`
-- **Per-Buffer Association** — Each buffer tracks its workspace
-- **LSP Integration** — LSP restarts with correct workspace root on buffer switch
-- **Status Bar Display** — Active workspace name shown in status
-
-### Build Integration ([build_jobs.zig](file:///src/kernel/build_jobs.zig))
-
-Run Zig build commands with diagnostic parsing and output display.
-
-```zig
-pub const BuildCommand = enum {
-    run,
-    @"test",
-    build_only,
-    
-    pub fn displayName(self) []const u8;
-    pub fn toArgs(self) []const []const u8;
-};
-
-pub const BuildOutput = struct {
-    success: bool,
-    stdout: []const u8,
-    stderr: []const u8,
-    exit_code: u8,
-    diagnostics: []Diagnostic,
-    duration_ms: i64,
-};
-
-pub const Diagnostic = struct {
-    file_path: []const u8,
-    line: u32,
-    column: u32,
-    kind: enum { @"error", warning, note },
-    message: []const u8,
-};
-```
-
-**Commands (via Command Palette):**
-
-| Command | Description | Buffer Name |
-|---------|-------------|-------------|
-| `Zig: Build` | Run `zig build` | `[Zig Build]` |
-| `Zig: Test` | Run `zig build test` | `[Zig Test]` |
-| `Zig: Show Build Output` | View last result | — |
-
-**Features:**
-- **Workspace Detection** — Automatically finds `build.zig` from current file
-- **Formatted Output** — Success/failure banner, duration, diagnostics
-- **Diagnostic Parsing** — Extracts errors/warnings from compiler output
-- **Source Decorations** — Errors highlighted in open source files
-
-### Global Search ([global_search.zig](file:///src/services/global_search.zig))
-
-Project-wide text search with file grouping and match navigation.
-
-```zig
-pub const GlobalSearchService = struct {
-    allocator: std.mem.Allocator,
-    results: std.ArrayList(protocol.GlobalSearchFileGroup),
-    total_matches: usize,
-    search_complete: bool,
-    
-    pub fn search(self, query: []const u8, root_dir: []const u8, options: GlobalSearchOptions) !void;
-    pub fn getResults(self) []const GlobalSearchFileGroup;
-    pub fn toggleCollapse(self, file_index: usize) void;
-};
-```
-
-**Key Bindings (in Global Search mode):**
+In-mode key bindings:
 
 | Key | Action |
-|-----|--------|
+|---|---|
 | `Tab` | Toggle case sensitivity |
-| `Up/Down` | Navigate files/matches |
-| `Enter` | Jump to selected match |
-| `Esc` | Exit search mode |
+| Up / Down | Navigate files / matches |
+| Enter | Jump to selected match |
+| Esc | Exit search mode |
 
-**Auto-excluded Directories:**
-- `.git`, `zig-cache`, `zig-out`, `node_modules`
+### Search index — [`search_index.zig`](../src/services/search_index.zig)
 
-**Search Options:**
-- Case-sensitive/insensitive
-- Whole word matching
-- Regex support (planned)
+A persistent, in-memory list of the workspace's text-file paths.
+Eliminates the directory walk on every `:Find` query — once the
+index is warm, queries skip straight to the parallel scan. Persisted
+across restarts in
+`~/.stem/cache/search/<workspace-hash>.lst` so even the first query
+in a new session is warm. The cache file carries a header tagged
+with the absolute workspace root; mismatches are rejected.
 
 ---
 
-## Rendering Pipeline
+## Rendering pipeline
 
-### Zero-Copy Architecture
+### Zero-copy snapshots
 
-Traditional editors serialize state to JSON for thread communication, causing allocation churn. Stem uses **pointer-based message passing** for near-zero overhead.
+The core thread builds each render snapshot inside a per-frame
+arena. The protocol message only carries two pointers (snapshot and
+arena), so the UI thread reads the snapshot in place and frees the
+whole arena in a single call when it's done.
 
 ```mermaid
 sequenceDiagram
-    participant Core as Core Thread
+    participant Core as Core thread
     participant Arena as ArenaAllocator
     participant Inbox as main_inbox
-    participant UI as Main Thread
-    
+    participant UI as Main thread
+
     Core->>Arena: Create frame arena
     Core->>Arena: Allocate RenderSnapshot
     Core->>Arena: Allocate visible_lines, tokens, etc.
     Core->>Inbox: Send (snapshot_ptr, arena_ptr)
     Note over Inbox: 17 bytes total!
-    
+
     UI->>Inbox: Receive message
     UI->>Arena: Cast pointers to access data
     UI->>UI: Render frame directly from arena memory
     UI->>Arena: deinit() — single free!
 ```
 
-### RenderSnapshot
-
-The complete render state passed to the UI:
+### `RenderSnapshot`
 
 ```zig
 pub const RenderSnapshot = struct {
-    // Text Content
+    // Text content
     visible_lines: []const []const u8,
     first_visible_line: usize,
     total_lines: usize,
-    
-    // Cursor & Selection
+
+    // Cursor & selection
     cursor_row: usize,
     cursor_col: usize,
     selection_anchor_row: ?usize,
     selection_anchor_col: ?usize,
-    
-    // UI State
+
+    // UI state
     mode: Mode,
     file_path: ?[]const u8,
     terminal_output: ?[]const u8,
-    
-    // LSP Integration
+
+    // LSP & syntax
     syntax_tokens: ?[]const SyntaxToken,
     hover_content: ?[]const u8,
     completion_active: bool,
     completion_items: ?[]const CompletionEntry,
-    
+
     // Pickers
     file_picker_entries: ?[]const FileEntry,
     buffer_picker_entries: ?[]const BufferInfo,
     command_palette_results: ?[]const Command,
-    
-    // Split Layout
+
+    // Split layout
     split_enabled: bool,
     panes: []const PaneSnapshot,
     focused_pane_id: u32,
 };
 ```
 
-### Performance Optimizations
+### Frame pacing
 
-1. **Frame Rate Limiting** — 16ms minimum interval (~60fps cap)
-2. **Dirty Flag Coalescing** — `needs_render` flag prevents redundant updates
-3. **Arena Per Frame** — Single allocation/deallocation per render cycle
-4. **O(visible) Line Extraction** — Only the visible portion is processed
-
----
-
-## UI Layer
-
-The `src/ui/` directory contains stateless rendering components.
-
-### View Renderer ([view.zig](file:///src/ui/view.zig))
-
-Main editor renderer (1800+ LOC) with defensive programming for robustness.
-
-```zig
-pub const View = struct {
-    allocator: std.mem.Allocator,
-    status_bar: StatusBar,
-    help_view: HelpView,
-    
-    pub fn draw(
-        self: *View,
-        vx: *vaxis.Vaxis,
-        snapshot: *const protocol.RenderSnapshot,
-        frame_allocator: std.mem.Allocator,
-    ) !void;
-};
-```
-
-**Features:**
-- **Soft Wrapping** — Dynamic line wrapping based on viewport width
-- **Syntax Highlighting** — Overlays semantic tokens from LSP
-- **Selection Rendering** — Visual/visual-search mode highlighting
-- **Cursor Display** — Block/line cursor based on mode
-
-**Defensive Hardening:**
-- Window dimension validation (early return on zero)
-- Snapshot sanity checks (>100k lines warning)
-- UTF-8 bounds checking before slicing
-- Scoped logging (`std.log.scoped(.ui_view)`)
-
-### Popup Rendering
-
-| Popup | Function | Features |
-|-------|----------|----------|
-| Hover | `drawHoverPopup()` | Text wrapping, max height, positioned near cursor |
-| Completion | `drawCompletionPopup()` | Scrollable list, kind icons, selection highlight |
-| Command Palette | `drawCommandPalette()` | Fuzzy search input, filtered results |
-| File/Buffer Picker | `drawFilePicker()` | Directory tree navigation |
-
-### Status Bar ([status_bar.zig](file:///src/ui/status_bar.zig))
-
-Single-line status display showing:
-- Current mode indicator (SELECT/INSERT/VISUAL/TERMINAL)
-- File path and modification status
-- Cursor position (line:column)
-- Keyboard hints for current mode
-
-### Theme System ([theme.zig](file:///src/ui/theme.zig))
-
-Centralized color and style definitions using a **One Dark** inspired palette.
-
-**Color Categories:**
-
-| Category | Purpose |
-|----------|---------|
-| Syntax | Keywords, functions, strings, numbers, comments |
-| Diff | Add (green), remove (red), hunk (cyan) |
-| Palette | 16-color terminal palette (black, red, green, etc.) |
-
-**Style Definitions:**
-
-| Element | Customization |
-|---------|---------------|
-| Mode Indicators | Colors per mode (select, insert, visual, etc.) |
-| Status Bar | Background, text, modified indicator |
-| Tab Bar | Active, inactive, modified states |
-| Picker | Overlay, selection, input field |
-| Editor | Gutter, cursor, selection |
-| Split Panes | Borders, focused state |
-
-### Logging Service ([logger.zig](file:///src/services/logger.zig))
-
-Unified file logging for debugging and diagnostics.
-
-```zig
-pub const Logger = struct {
-    pub fn log(self, level: LogLevel, scope: []const u8, msg: []const u8) void;
-    pub fn clear(self) void;
-    pub fn getRecentLogs(self, count: usize, allocator: Allocator) ![]LogEntry;
-};
-```
-
-**Features:**
-- **Log File**: `~/.stem/logs/stem.log`
-- **Configurable Levels**: debug, info, warn, err
-- **std.log Bridge**: All std.log output redirected to file
-- **CLI Access**: `stem logs`, `stem logs --clear`
-- **In-Editor View**: `:logs` mode for runtime log viewing
+- Minimum 3 ms between renders, dynamically bumped to ~16 ms during
+  scroll
+- `needs_render` coalesces redundant updates
+- Single allocation / deallocation per render cycle (arena)
+- `O(visible_lines)` extraction from the piece table
 
 ---
 
-## Language Intelligence (LSP)
+## UI layer
 
-Stem embeds **zls** (Zig Language Server) directly for zero-latency code intelligence.
+### Main view — [`view.zig`](../src/ui/view.zig)
 
-### Architecture
+The view is stateless — every frame is drawn from the snapshot.
+Features include soft wrapping driven by viewport width, syntax
+highlighting overlays from the tokens in the snapshot, selection /
+cursor rendering keyed to the current mode, and defensive guards
+against malformed snapshots (zero-size windows, oversized line
+counts, mid-codepoint slices).
+
+### Popups
+
+| Popup | Function | Notes |
+|---|---|---|
+| Hover | `drawHoverPopup` | Text wrapping, max height, anchored near cursor |
+| Completion | `drawCompletionPopup` | Scrollable list with kind icons |
+| Command palette | `drawCommandPalette` | Fuzzy input + filtered results |
+| File / buffer picker | `drawFilePicker` | Directory-tree navigation |
+
+### Status bar — [`status_bar.zig`](../src/ui/status_bar.zig)
+
+Single-line strip showing mode, file path + modified marker, cursor
+position, and mode-specific keyboard hints. The bundled git plugin
+populates a `Git: <branch>` indicator via event subscriptions.
+
+### Theme — [`theme.zig`](../src/ui/theme.zig)
+
+One Dark-inspired palette. Colours grouped by category (syntax,
+diff, terminal palette) and styles by element (mode indicators,
+status bar, tab bar, picker, editor, split borders).
+
+### Logger — [`logger.zig`](../src/services/logger.zig)
+
+Rolling file log under `~/.stem/logs/stem-*.log`. All `std.log`
+output is bridged into the file. CLI: `stem logs`, `stem logs
+--clear`. In-editor view: `:logs`.
+
+---
+
+## Language intelligence (LSP)
+
+Stem ships ZLS embedded (in-process) for Zig and integrates with 23
+external language servers installed on demand via `stem lsp install`.
+See the [README table](../README.md#language-coverage) for the full
+list.
+
+### Embedded ZLS
 
 ```mermaid
 graph LR
-    subgraph "Stem Process"
+    subgraph "Stem process"
         LM[LSPManager]
-        CLIENT[LSP Client]
+        CLIENT[LSP client]
         TO[to_zls MemPipe]
         FROM[from_zls MemPipe]
     end
-    
-    subgraph "ZLS Thread"
+
+    subgraph "ZLS thread"
         ZLS[Embedded ZLS]
     end
-    
+
     LM --> CLIENT
     CLIENT --> TO --> ZLS
     ZLS --> FROM --> LM
 ```
 
-### LSPManager ([lsp_manager.zig](file:///src/services/lsp_manager.zig))
+The in-memory pipe ([`transport.zig`](../src/lsp/transport.zig))
+replaces TCP / stdio for the embedded case so there's no kernel
+round-trip on every JSON-RPC frame.
 
-High-level abstraction over the ZLS instance (1600+ LOC).
+### External servers
 
-```zig
-pub const LSPManager = struct {
-    allocator: std.mem.Allocator,
-    to_zls: Transport.MemPipe,
-    from_zls: Transport.MemPipe,
-    server_running: bool,
-    is_initialized: bool,
-    
-    // Pending request tracking
-    pending_completion_request: ?i64,
-    pending_hover_request: ?i64,
-    pending_definition_request: ?i64,
-    pending_format_request: ?i64,
-    
-    // Results (protected by mutexes)
-    completion_result: ?[]const CompletionItem,
-    hover_result: ?[]const u8,
-    syntax_tokens: std.ArrayListUnmanaged(SyntaxToken),
-    // ...
-};
-```
+External servers are spawned as child processes through
+[`external.zig`](../src/services/lsp/external.zig). Each spawned
+PID is registered in a process-wide kill registry; on stem's quit
+path the registry is drained with `SIGKILL` so the editor never
+sits waiting on a misbehaving server.
 
-**Integrated Features:**
+The installer ([`installer.zig`](../src/services/lsp/installer.zig))
+knows how to install each supported server in the user's local
+toolchain (npm, go install, rustup, brew, gem, opam, etc.). Once
+installed they live under `~/.stem/lsp/<server>/`.
 
-| Feature | LSP Method | Stem Integration |
-|---------|-----------|-----------------|
-| Auto-Completion | `textDocument/completion` | Popup with filtered results |
-| Hover Documentation | `textDocument/hover` | Popup at cursor after 150ms delay |
-| Semantic Tokens | `textDocument/semanticTokens/full` | Syntax highlighting |
-| Formatting | `textDocument/formatting` | On-demand code format |
-| Go to Definition | `textDocument/definition` | Jump to symbol definition |
-| Find References | `textDocument/references` | List all usages |
-| Diagnostics | `textDocument/publishDiagnostics` | Inline error markers |
+### LSP manager — [`lsp_manager.zig`](../src/services/lsp_manager.zig)
 
-### MemPipe Transport ([transport.zig](file:///src/lsp/transport.zig))
+Owns per-language server lifecycles, routes incoming results back to
+the core thread, and debounces outbound `didChange` notifications so
+typing doesn't flood the server. Per-buffer `version` numbers keep
+each request anchored to a specific snapshot.
 
-In-memory pipe implementation replacing TCP/stdio for zero-copy IPC.
+Wired features:
 
-```zig
-pub const MemPipe = struct {
-    buffer: std.ArrayListUnmanaged(u8),
-    mutex: std.Thread.Mutex,
-    condition: std.Thread.Condition,
-    closed: bool,
-    
-    pub fn write(self: *MemPipe, data: []const u8) !usize;
-    pub fn read(self: *MemPipe, buf: []u8) !usize;
-};
-```
+| Feature | LSP method | Stem integration |
+|---|---|---|
+| Auto-completion | `textDocument/completion` | Popup with filtered results |
+| Hover docs | `textDocument/hover` | Popup at cursor after idle delay |
+| Semantic tokens | `textDocument/semanticTokens/full` | Highlighting overlay |
+| Formatting | `textDocument/formatting` | On-demand |
+| Go to definition | `textDocument/definition` | Jump |
+| Find references | `textDocument/references` | List in pane |
+| Document symbols | `textDocument/documentSymbol` | Symbol picker |
+| Diagnostics | `textDocument/publishDiagnostics` | Inline markers + gutter |
+| Rename | `textDocument/rename` | Cross-file rename |
 
 ---
 
-## Syntax Layer (Tree-Sitter)
+## Syntax layer (tree-sitter)
 
-Stem integrates **tree-sitter** for fast, accurate syntax analysis across multiple languages. This layer complements LSP by providing immediate structural analysis without network roundtrips.
+Stem integrates tree-sitter for fast, structural analysis across all
+supported languages. Tree-sitter complements the LSP: LSP gives deep
+semantic answers, tree-sitter gives immediate syntactic ones used
+for highlighting, navigation, indentation, and folding.
 
-### Design Principle: Complementary Roles
-
-| Layer | Strengths | Use Cases |
-|-------|-----------|-----------|
-| **LSP (Zig only)** | Deep semantic analysis, cross-file refs | Completions, definitions, diagnostics |
-| **Tree-Sitter (All languages)** | Fast structural analysis, syntax-aware | Navigation, indentation, folding, selection |
-
-### SyntaxManager ([manager.zig](file:///src/syntax/manager.zig))
-
-Central hub for tree-sitter operations (665 LOC).
+### Syntax manager — [`manager.zig`](../src/syntax/manager.zig)
 
 ```zig
 pub const SyntaxManager = struct {
@@ -830,127 +617,67 @@ pub const SyntaxManager = struct {
     language: ?*const c.TSLanguage,
     query: ?*c.TSQuery,
     cursor: *c.TSQueryCursor,
-    current_lang: Language,  // .zig, .python, .javascript, .typescript, .tsx
+    current_lang: Language,
 };
 ```
 
-**Supported Languages:**
-- Zig (`.zig`)
-- Python (`.py`, `.pyw`)
-- JavaScript (`.js`, `.mjs`, `.cjs`)
-- TypeScript (`.ts`, `.mts`, `.cts`)
-- TSX/JSX (`.tsx`, `.jsx`)
+Parses run on a background worker (`submitParse`). The core thread
+polls a `tree_updated` flag on tick and triggers a re-render when a
+new tree lands — so typing is never blocked on parsing, even for
+big files.
 
-### Core Features
+### Highlight + bracket caches
 
-#### 1. Syntax Highlighting (`highlight()`)
+Highlight and bracket-matching results are memoised under the
+current resource id. The bracket cache is also invalidated on every
+recorded edit so a same-length find/replace (`foo` → `bar`) never
+serves stale positions.
 
-Query-based token extraction for the visible viewport.
+### Features
 
-```zig
-pub fn highlight(self, allocator, start_line, end_line) ![]SyntaxToken;
-```
+- `highlight(start_line, end_line)` — viewport-scoped token list
+- `getSymbols(source)` — fast in-file symbol navigation
+- `expandSelection()` — grow selection to the next syntactic boundary
+  (powers `nav.expand_selection` and the `V` key)
+- `getSmartIndent(line)` — language-aware indent
+- `getFoldableRegions()` — collapsible regions for fold rendering
+- `applyIncrementalEdit()` — feed edit deltas to tree-sitter so the
+  reparse is incremental
 
-#### 2. Symbol Extraction (`getSymbols()`)
+### Queries
 
-Fast in-file symbol navigation using tree walking.
-
-```zig
-pub fn getSymbols(self, allocator, source) ![]Symbol;
-```
-
-### Tree-Sitter Enhancements
-
-#### Selection Expansion (`expandSelection()`)
-
-Expand selection to next syntactic boundary — powers `nav.expand_selection` command.
-
-```zig
-pub const Selection = struct {
-    start_line: usize,
-    start_col: usize,
-    end_line: usize,
-    end_col: usize,
-};
-
-pub fn expandSelection(self, start_line, start_col, end_line, end_col) Selection;
-```
-
-**Expansion Chain:** cursor → token → expression → statement → function → file
-
-#### Smart Indentation (`getSmartIndent()`)
-
-Syntax-aware indentation based on language structure.
-
-```zig
-pub fn getSmartIndent(self, line_idx: usize) usize;
-```
-
-**Language-Specific Rules:**
-- **Python:** `block`, `function_definition`, `class_definition`, `if_statement`
-- **JS/TS:** `statement_block`, `function_declaration`, `object`, `array`
-- **Zig:** `Block`, `ContainerDecl`, `SwitchExpr`, `IfExpr`
-
-#### Code Folding (`getFoldableRegions()`)
-
-Identify collapsible code regions for UI folding.
-
-```zig
-pub const FoldableRegion = struct {
-    start_line: usize,
-    end_line: usize,
-    kind: FoldKind,  // function, class, block, comment, import
-};
-
-pub fn getFoldableRegions(self, allocator) ![]FoldableRegion;
-```
-
-#### Incremental Parsing (`applyIncrementalEdit()`)
-
-Inform tree-sitter about edits for faster reparsing.
-
-```zig
-pub fn applyIncrementalEdit(self, start_byte, old_end_byte, new_end_byte, ...) void;
-```
-
-### Tree-Sitter Queries
-
-Embedded query files in `src/syntax/queries/`:
-
-| File | Patterns | Purpose |
-|------|----------|---------|
-| `zig.scm` | Zig-specific | Keywords, functions, types |
-| `python.scm` | 8 patterns | Python syntax elements |
-| `javascript.scm` | 17 patterns | JS/JSX tokens |
-| `typescript.scm` | TypeScript | TS-specific additions |
+Tree-sitter `.scm` files live under
+[`src/syntax/queries/`](../src/syntax/queries/) — one per language.
 
 ---
 
-
-## Plugin System
+## Plugin system
 
 Stem has a manifest-driven plugin system. Plugins live in
-`~/.stem/plugins/<name>/`, declare their commands and permissions in
+`~/.stem/plugins/<name>/`, declare commands and permissions in
 `plugin.json`, and run through either the `wasm` or `exec` runtime.
+See the [Plugin Architecture](plugin-architecture.md) doc for the
+host-side internals and [Plugin Design](plugin-design.md) for the
+authoring guide.
 
 ### Architecture
 
 ```mermaid
 graph TB
-    subgraph "Stem Process"
+    subgraph "Stem process"
         PM[PluginManager]
         CR[CommandRegistry]
-        CORE[Core Inbox]
-        UI[UI Inbox]
-        WASM[Wasm Interpreter]
+        CORE[Core inbox]
+        UI[UI inbox]
+        WASM[Wasm interpreter]
     end
 
-    subgraph "Wasm Plugin"
+    subgraph "Wasm plugin"
         WP[git.wasm]
-        MEM[Linear Memory]
+        MEM[Linear memory]
     end
 
-    subgraph "Exec Plugin Process"
+    subgraph "Exec plugin process"
         EP[third-party.bin]
         STDIO[JSON-RPC over stdio]
     end
@@ -965,266 +692,114 @@ graph TB
     PM --> UI
 ```
 
-### Key Components
+### Key components
 
-#### 1. Manifest Loading
-- **Auto-Discovery**: Scans `~/.stem/plugins/<name>/plugin.json` on startup.
-- **Command Registration**: Registers manifest-declared commands into the palette before runtime activation.
-- **Runtime Dispatch**: Routes `runtime: "wasm"` to the wasm loader and `runtime: "exec"` to the process loader.
+- **Manifest loading.** Auto-discovers `~/.stem/plugins/<name>/plugin.json`
+  on startup and seeds commands into the palette before runtime
+  activation.
+- **Isolation.** Wasm plugins run inside the pure-Zig interpreter
+  with `(ptr, len)` host imports; exec plugins run as child
+  processes communicating over framed JSON-RPC on stdio.
+- **Permissions.** Manifest declarations gate the wired capabilities
+  (`spawn`, `events`, `manage_plugins`). Missing entries default to
+  deny.
+- **Restart policy.** Exec plugins can opt into automatic restart on
+  crash with a 1 s → 5 s → 30 s backoff. Restarts run on the core
+  tick so spawns never originate from a reader thread that's still
+  unwinding.
 
-#### 2. Isolation & Safety
-- **Wasm Isolation**: Wasm plugins execute inside stem's pure-Zig interpreter with linear-memory host imports.
-- **Process Isolation**: Exec plugins run as child processes and communicate over framed JSON-RPC on stdio.
-- **Permission Gates**: The host stores manifest permissions and enforces the wired capabilities, such as wasm `spawn`.
-- **Resource Cleanup**: `PluginManager` removes commands, permissions, and runtime state on unload/shutdown.
-
-#### 3. Runtime Surfaces
-
-Wasm plugins import host functions such as `stem_log`,
-`stem_register_command`, `stem_open_buffer`, and
-`stem_spawn_capture`, then export `activate()` and
-`handle_command(id_ptr, id_len)`.
-
-Exec plugins receive `plugin/initialize`, `command/execute`, and
-`plugin/shutdown`; they send JSON-RPC notifications such as
-`plugin/log`, `plugin/registerCommand`, and `editor/showNotification`.
-
-### Communication Protocol
-
-Plugins communicate through runtime-specific envelopes. The host bridges
-plugin output back into core and UI message queues.
-
-| Surface | Direction | Purpose |
-|---------|-----------|---------|
-| Manifest `commands` | Plugin metadata -> Core | Add commands to the palette before startup |
-| `handle_command` / `command/execute` | Core -> Plugin | Trigger command logic |
-| `stem_log` / `plugin/log` | Plugin -> Host | Write to stem logs |
-| `stem_open_buffer` | Wasm -> Core | Open a virtual buffer |
-| `stem_spawn_capture` | Wasm -> Host | Run allowlisted child processes |
-| `plugin/subscribeEvent` | Exec -> Host | Validate event subscriptions; delivery is pending |
-
-### Bundled Plugins
-
-Stem comes with several plugins pre-installed:
+### Bundled plugins
 
 | Plugin | Runtime | Commands |
-|--------|---------|----------|
+|---|---|---|
 | `echo` | wasm | `echo.hello` |
 | `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` |
 | `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` |
 
-Current plugin UI extension gaps: event delivery into plugins, visible
-notifications, panel/status-item host imports, and filesystem
-permission enforcement are still follow-up work.
+### Operator CLI
+
+```bash
+stem plugin list
+stem plugin info <name>
+stem plugin install <path>
+stem plugin remove <name>
+stem plugin test <path>
+```
 
 ---
 
-## Command Line Tools
-
-Stem includes high-performance search utilities.
-
-### Search Options
-
-Both `--find` and `--vfind` support:
+## CLI tools
 
 ```bash
 stem [filename]
-stem --find "query" [options]
+stem --find "query"  [options]
 stem --vfind "query" [options]
+stem --scope FILE QUERY
 ```
 
 | Option | Short | Description |
-|--------|-------|-------------|
+|---|---|---|
 | `--path` | `-p` | Search directories (multiple allowed) |
 | `--ext` | `-e` | File extensions (default: `.zig`) |
 | `--exclude` | `-x` | Exclude patterns |
 | `--after` | `-A` | Context lines after match |
 | `--before` | `-B` | Context lines before match |
 
-### Implementation Comparison
+Implementations:
 
-| Tool | Implementation | Concurrency Model |
-|------|---------------|-------------------|
-| `--find` | [search.zig](file:///src/tools/search.zig) | `std.Thread.Pool` (work-stealing) |
-| `--vfind` | [vfind.zig](file:///src/tools/vfind.zig) | Vigil actor model (inbox-based) |
+| Tool | Implementation | Concurrency |
+|---|---|---|
+| `--find` | [search.zig](../src/tools/search.zig) | `std.Thread.Pool` (work-stealing) |
+| `--vfind` | [vfind.zig](../src/tools/vfind.zig) | Vigil actor model (inbox-based) |
+| `--scope` | [scope.zig](../src/tools/scope.zig) | In-file search |
 
-**vfind Architecture:**
-
-```mermaid
-graph TB
-    MAIN[Main Thread<br/>Task Dispatcher]
-    
-    subgraph "Worker Pool"
-        W1[Worker 1]
-        W2[Worker 2]
-        WN[Worker N]
-    end
-    
-    COLLECTOR[Collector Thread]
-    
-    TASK_INBOX[task_inbox]
-    RESULT_INBOX[result_inbox]
-    
-    MAIN -->|file paths| TASK_INBOX
-    TASK_INBOX --> W1 & W2 & WN
-    W1 & W2 & WN -->|matches| RESULT_INBOX
-    RESULT_INBOX --> COLLECTOR
-    COLLECTOR -->|stdout| OUTPUT[Terminal Output]
-```
-
-### Performance Notes
-
-- `--find` is typically 7-8% faster than `--vfind`
-- Both are 1.3-1.5x slower than native `find | grep`
-- Excluding `.zig-cache` and `zig-out` significantly improves speed
+`--find` is the workhorse; `--vfind` is the interactive variant
+backed by an actor pipeline.
 
 ---
 
-## Editor Modes
+## Editor modes
 
-| Mode | Key | Description |
-|------|-----|-------------|
-| `select` | Default | Navigation, selection, commands |
-| `insert` | `i` | Text input mode |
+| Mode | Entry | Description |
+|---|---|---|
+| `select` | default | Navigation, selection, leader commands |
+| `insert` | `i` | Text input |
 | `visual` | `v` | Visual selection |
 | `visual_search` | `/` | Search with highlighting |
-| `terminal` | `:term` | Embedded terminal |
-| `file_picker` | `:e` | File browser |
-| `buffer_picker` | `:b` | Buffer switcher |
-| `command_palette` | `:` | Command search |
-| `go_to_line` | `g` | Line number input |
-| `save_as_mode` | `:saveas` | Save with new name |
-| `symbol_picker` | `@` | In-file symbol navigation |
+| `terminal` | `t` | Integrated terminal |
+| `file_picker` | `Space f` | Fuzzy file picker |
+| `buffer_picker` | `Space b` | Buffer switcher |
+| `command_palette` | `Space a` | Fuzzy command search |
+| `go_to_line` | palette | Line number input |
+| `save_as_mode` | palette | Save with new name |
+| `symbol_picker` | `Space o` | Document symbols |
 | `log_view` | `:logs` | Runtime log viewer |
-| `global_search` | `Space+f` | Project-wide search/replace |
-| `view` | `Space+w` | Help/documentation view |
+| `global_search` | `Space /` | Project-wide search and replace |
+| `view` | `Space w` | Help / docs view |
+
+For the full key map see the
+[README](../README.md#key-bindings).
 
 ---
 
-## Session Management
+## Session and recovery
 
-Stem automatically manages your session state to provide a seamless workflow.
+Stem auto-saves per-workspace session state — open buffers, cursor
+positions, scroll offsets, and split layouts. Sessions live under
+`~/.stem/sessions/<workspace-hash>.json`.
 
-**Features:**
-- **Auto-Save**: Session state is saved automatically.
-- **Buffers**: Restores open files, cursor positions, and scroll offsets.
-- **Splits**: Restores your window split layout (JSON serialized).
-- **Workspace-aware**: Session data is isolated per workspace/project.
-
-The session implementation (`src/kernel/session.zig`) ensures valid state restoration while handling edge cases like missing files.
-
----
-
-## Key Bindings (Select Mode)
-
-| Key | Action |
-|-----|--------|
-| `h/j/k/l` | Left/Down/Up/Right |
-| `w/b` | Word forward/backward |
-| `0/$` | Line start/end |
-| `gg/G` | File start/end |
-| `i` | Insert mode |
-| `v` | Visual mode |
-| `/` | Search |
-| `:` | Command palette |
-| `@` | Symbol picker |
-| `Ctrl+S` | Save |
-| `Ctrl+Q` | Quit |
-| `Ctrl+Space` | Trigger completion |
-
-### Space Leader Commands
-
-| Key | Action |
-|-----|--------|
-| `Space + f` | Global search |
-| `Space + w` | Help view |
-| `Space + u` | Undo |
-| `Space + r` | Redo |
-| `Space + g` | Go to definition |
-| `Space + n` | Next buffer |
-| `Space + p` | Previous buffer |
-| `Space + -` | Horizontal split |
-| `Space + \`` | Vertical split |
-
-### Split Navigation
-
-| Key | Action |
-|-----|--------|
-| `Ctrl+h` | Focus left pane |
-| `Ctrl+l` | Focus right pane |
-| `Ctrl+k` | Focus upper pane |
-| `Ctrl+j` | Focus lower pane |
-
-### Tree-Sitter Commands (via Command Palette)
-
-| Command | Description |
-|---------|-------------|
-| `nav.expand_selection` | Expand selection to syntax boundary |
-| `nav.go_to_symbol` | Jump to function/struct in file |
-
----
-
-## Dependencies
-
-| Dependency | Purpose | Integration |
-|------------|---------|-------------|
-| [vaxis](https://github.com/rockorager/libvaxis) | Terminal UI engine | Direct rendering |
-| [vigil](https://github.com/ooyeku/vigil) | Actor-based message passing | Thread communication |
-| [zls](https://github.com/zigtools/zls) | Zig Language Server | Embedded, in-process |
-
-**Build Requirements:**
-- Zig 0.15.x or later
-- POSIX-compatible system (macOS, Linux)
-
-### Fuzz Testing
-
-Stem includes comprehensive fuzz testing for critical components.
-
-To run fuzz tests:
-- **macOS**: `zig build fuzz`
-- **Linux**: `zig build test --fuzz`
-
-**Components Tested:**
-- `PieceTable` (Text buffer operations)
-- `EditorState` (Cursor movement and editing)
-- `VirtualUri` (URI parsing)
-
----
-
-
-## Installation
-
-Stem provides convenient scripts for building and installing the editor.
-
-### Install
-
-To build release mode and install `stem` to `/usr/local/bin`:
-
-```bash
-./install.sh
-```
-
-### Uninstall
-
-To remove the `stem` binary:
-
-```bash
-./uninstall.sh
-```
-
-To remove the binary AND the configuration directory (`~/.stem`):
-
-```bash
-./uninstall-clean.sh
-```
+A second snapshot at `<session>.recover` is written on every save
+plus every 30 s of activity. On clean shutdown this recovery file is
+deleted; if stem finds it at launch the previous run crashed and the
+file is used to restore state. Each save is atomic (write to
+`.tmp`, fsync, rename) so a crash mid-write can never produce a
+zero-byte session file.
 
 ---
 
 ## Configuration
 
-Stem supports a persistent JSON configuration system located at `~/.stem/config.json`. The configuration is automatically created on first run if it doesn't exist.
-
-### Configuration File (`config.json`)
+`~/.stem/config.json`, created on first run:
 
 ```json
 {
@@ -1245,135 +820,147 @@ Stem supports a persistent JSON configuration system located at `~/.stem/config.
 }
 ```
 
-**Logging Levels:** `debug`, `info`, `warn`, `err`
+Logging levels: `debug`, `info`, `warn`, `err`.
 
-### CLI Configuration
+### CLI
 
-You can manage settings directly from the command line without editing the JSON file manually.
-
-- **List all settings:**
-  ```bash
-  stem config list
-  ```
-
-- **Get a specific value:**
-  ```bash
-  stem config get editor.tab_size
-  ```
-
-- **Set a value:**
-  ```bash
-  stem config set editor.tab_size 2
-  stem config set ui.show_status_bar false
-  stem config set editor.line_numbers absolute
-  stem config set logging.level debug
-  ```
-
-### Logging CLI
-
-- **View logs:**
-  ```bash
-  stem logs
-  ```
-
-- **Clear logs:**
-  ```bash
-  stem logs --clear
-  ```
-
-Logs are stored at `~/.stem/logs/stem.log`.
-
-### Help
-
-Display command-line usage and options:
 ```bash
+stem config list
+stem config get editor.tab_size
+stem config set editor.tab_size 2
+stem config set ui.show_status_bar false
+stem config set editor.line_numbers absolute
+stem config set logging.level debug
+
+stem logs
+stem logs --clear
+
 stem help
 stem --help
+stem --version
 ```
+
+Logs land at `~/.stem/logs/stem-*.log`.
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
 stem/
 ├── src/
-│   ├── main.zig              # Entry point, thread orchestration
+│   ├── main.zig
+│   ├── cli.zig
 │   ├── kernel/
-│   │   ├── core.zig          # Central controller (3000+ LOC)
-│   │   ├── protocol.zig      # Binary message protocol
-│   │   ├── commands/         # Modular command system
-│   │   │   ├── buffer_commands.zig
-│   │   │   ├── edit_commands.zig
-│   │   │   └── ...
-│   │   ├── command.zig       # Command registry & fuzzy search
-│   │   ├── session.zig       # Session save/restore logic
+│   │   ├── core.zig
+│   │   ├── protocol.zig
+│   │   ├── command.zig
+│   │   ├── commands/
 │   │   ├── buffer_manager.zig
+│   │   ├── history.zig
+│   │   ├── session.zig
 │   │   ├── split_manager.zig
-│   │   ├── history.zig       # Undo/Redo system
-│   │   ├── vfs.zig           # Virtual File System
-│   │   ├── decorations.zig   # Visual overlays
-│   │   ├── jobs.zig          # Background task runner
-│   │   ├── workspace.zig     # Zig project detection
-│   │   └── build_jobs.zig    # Build command execution
+│   │   ├── workspace.zig
+│   │   ├── build_jobs.zig
+│   │   ├── jobs.zig
+│   │   ├── decorations.zig
+│   │   └── vfs.zig
 │   ├── core/
-│   │   ├── piece_table.zig   # Text data structure
-│   │   ├── state.zig         # Editor state
-│   │   └── file_manager.zig
+│   │   ├── piece_table.zig
+│   │   ├── state.zig
+│   │   ├── file_manager.zig
+│   │   ├── unicode.zig
+│   │   └── auto_pair.zig
 │   ├── ui/
-│   │   ├── view.zig          # Main renderer (1800+ LOC)
+│   │   ├── view.zig
 │   │   ├── status_bar.zig
-│   │   ├── tab_bar.zig       # Buffer tabs
+│   │   ├── tab_bar.zig
 │   │   ├── file_picker.zig
 │   │   ├── buffer_picker.zig
-│   │   ├── help.zig          # Help content
-│   │   ├── help_view.zig     # Help renderer
-│   │   ├── log_view.zig      # Runtime log viewer
-│   │   └── theme.zig         # Color/style definitions
+│   │   ├── help.zig
+│   │   ├── help_view.zig
+│   │   ├── log_view.zig
+│   │   └── theme.zig
 │   ├── lsp/
-│   │   ├── client.zig        # LSP protocol client
-│   │   └── transport.zig     # MemPipe implementation
+│   │   ├── client.zig
+│   │   └── transport.zig
 │   ├── services/
-│   │   ├── lsp_manager.zig   # ZLS orchestration (1400+ LOC)
+│   │   ├── lsp_manager.zig
+│   │   ├── global_search.zig
+│   │   ├── search_index.zig
+│   │   ├── logger.zig
+│   │   ├── telemetry.zig
 │   │   ├── terminal.zig
-│   │   ├── global_search.zig # Project-wide search
-│   │   ├── logger.zig        # File logging service
-│   │   └── lsp/              # External LSP support
-│   │       ├── external.zig  # External server wrapper
-│   │       ├── installer.zig # LSP installation
-│   │       └── server.zig    # LSP server management
+│   │   └── lsp/
+│   │       ├── external.zig
+│   │       ├── installer.zig
+│   │       ├── server.zig
+│   │       ├── supervisor.zig
+│   │       └── zls_embedded.zig
 │   ├── plugins/
-│   │   ├── manager.zig       # Manifest loading, permissions, runtime dispatch
-│   │   ├── manifest.zig      # plugin.json parser
-│   │   ├── process_loader.zig # Exec plugin lifecycle
-│   │   ├── jsonrpc.zig       # JSON-RPC framing helpers
+│   │   ├── manager.zig
+│   │   ├── manifest.zig
+│   │   ├── process_loader.zig
+│   │   ├── jsonrpc.zig
 │   │   └── wasm/
-│   │       ├── interpreter.zig # Pure-Zig wasm runtime
-│   │       └── loader.zig    # Wasm host imports and lifecycle
+│   │       ├── interpreter.zig
+│   │       └── loader.zig
 │   ├── tools/
-│   │   ├── search.zig        # Thread.Pool search
-│   │   ├── vfind.zig         # Vigil actor search
+│   │   ├── search.zig
+│   │   ├── vfind.zig
 │   │   ├── scope.zig
-│   │   └── plugin_cli.zig    # stem plugin list/info/install/remove/test
+│   │   ├── format.zig
+│   │   ├── query_check.zig
+│   │   └── plugin_cli.zig
 │   ├── syntax/
-│   │   ├── manager.zig       # Syntax highlighting & tree-sitter enhancements
-│   │   ├── tree_sitter.zig   # Tree-sitter C bindings
-│   │   └── queries/          # Tree-sitter query files (.scm)
+│   │   ├── manager.zig
+│   │   ├── tree_sitter.zig
+│   │   └── queries/
 │   ├── config/
-│   │   ├── keys.zig          # Keybinding configuration
-│   │   ├── schema.zig        # Config schema types
-│   │   └── storage.zig       # Persistent config storage
-│   └── fuzz/                 # Fuzz testing modules
+│   │   ├── keys.zig
+│   │   ├── schema.zig
+│   │   └── storage.zig
+│   └── fuzz/
 │       ├── mod.zig
 │       ├── piece_table_fuzz.zig
 │       ├── editor_state_fuzz.zig
+│       ├── config_setbypath_fuzz.zig
+│       ├── lsp_json_fuzz.zig
 │       └── uri_fuzz.zig
-├── vendor/
-│   └── vigil/                # Vendored dependencies
+├── bundled/plugins/
 ├── docs/
-│   └── stem.md               # This documentation
+├── scripts/
 ├── build.zig
 └── build.zig.zon
+```
+
+---
+
+## Dependencies and build requirements
+
+| Dependency | Purpose | Integration |
+|---|---|---|
+| [vaxis](https://github.com/rockorager/libvaxis) | Terminal UI engine | Direct rendering |
+| [vigil](https://github.com/ooyeku/vigil) | Actor-style message passing | Thread communication |
+| [zls](https://github.com/zigtools/zls) | Zig Language Server | Embedded, in-process |
+| [lsp-kit](https://github.com/zigtools/lsp-kit) | LSP protocol types | Shared with ZLS |
+| [uucode](https://github.com/jacobsandlund/uucode) | Unicode tables | Width / case folding |
+| [tree-sitter](https://github.com/tree-sitter/tree-sitter) | Parser core + grammars | Syntax / nav |
+
+Build requirements:
+
+- Zig 0.16+
+- POSIX-like host (macOS, Linux). Windows is experimental.
+
+### Fuzz testing
+
+Fuzz targets in [src/fuzz/](../src/fuzz/) cover the piece table,
+editor state, URI parser, JSON LSP messages, and the
+`config.setByPath` API.
+
+```bash
+zig build fuzz                   # macOS
+zig build test --fuzz            # Linux
 ```
 
 ---
@@ -1382,11 +969,17 @@ stem/
 
 1. Fork the repository
 2. Create a feature branch
-3. Make changes with tests
-4. Submit a pull request
+3. Add tests where it makes sense; keep `zig build` and
+   `zig build test` green
+4. Cross-check at least one other target with
+   `-Dtarget=x86_64-linux-gnu`
+5. Open a pull request
 
-**Code Style:**
-- Follow Zig standard style
-- Use `std.log.scoped` for module logging
-- Add defensive checks for edge cases
-- Document public APIs
+Code style:
+
+- Follow `zig fmt`
+- Use `std.log.scoped` for module-level logging
+- Validate at boundaries (user input, external APIs); trust
+  internal callers
+- Comment the *why*, not the *what* — well-named identifiers cover
+  the latter

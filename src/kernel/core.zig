@@ -681,6 +681,7 @@ pub const Core = struct {
             const new_state = self.state();
             new_state.cursor_row = location.row;
             new_state.cursor_col = location.col;
+            new_state.preferred_col = null;
 
             const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
             const half = visible_rows / 2;
@@ -710,6 +711,7 @@ pub const Core = struct {
             const new_state = self.state();
             new_state.cursor_row = location.row;
             new_state.cursor_col = location.col;
+            new_state.preferred_col = null;
 
             const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
             const half = visible_rows / 2;
@@ -1086,6 +1088,7 @@ pub const Core = struct {
                                 const target_state = self.state();
                                 target_state.cursor_row = location.line;
                                 target_state.cursor_col = location.col;
+                                target_state.preferred_col = null;
 
                                 const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
                                 const half = visible_rows / 2;
@@ -1549,6 +1552,7 @@ pub const Core = struct {
 
                                     s.cursor_row = target_row;
                                     s.cursor_col = target_col;
+                                    s.preferred_col = null;
 
                                     s.selection_anchor = null;
                                     if (self.mode == .visual) {
@@ -1566,6 +1570,7 @@ pub const Core = struct {
 
                                     s.cursor_row = target_row;
                                     s.cursor_col = 0;
+                                    s.preferred_col = null;
                                     s.selection_anchor = null;
                                     if (self.mode == .visual) {
                                         self.mode = .select;
@@ -1587,6 +1592,7 @@ pub const Core = struct {
 
                                     s.cursor_row = target_row;
                                     s.cursor_col = target_col;
+                                    s.preferred_col = null;
 
                                     try self.sendUpdate();
                                 }
@@ -2096,51 +2102,42 @@ pub const Core = struct {
 
         if (key.matches(vaxis.Key.left, .{}) or key.matches(Keys.nav_left, .{})) {
             const s = self.state();
-            s.cursor_col -|= count;
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorLeftGrapheme();
             return true;
         }
         if (key.matches(vaxis.Key.right, .{}) or key.matches(Keys.nav_right, .{})) {
             const s = self.state();
-            s.cursor_col += count;
-            s.clampCursorToLine();
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorRightGrapheme();
             return true;
         }
         if (key.matches(vaxis.Key.down, .{}) or key.matches(Keys.nav_down, .{})) {
-            const s = self.state();
-            s.cursor_row += count;
-            s.clampCursorToLine();
+            self.state().moveCursorDown(count);
             return true;
         }
         if (key.matches(vaxis.Key.up, .{}) or key.matches(Keys.nav_up, .{})) {
-            const s = self.state();
-            s.cursor_row -|= count;
-            s.clampCursorToLine();
+            self.state().moveCursorUp(count);
             return true;
         }
         if (key.matches(vaxis.Key.page_down, .{})) {
-            const s = self.state();
-            s.cursor_row += 20 * count;
-            s.clampCursorToLine();
+            self.state().moveCursorDown(20 * count);
             self.scroll_in_progress = true;
             self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
             return true;
         }
         if (key.matches(vaxis.Key.page_up, .{})) {
-            const s = self.state();
-            s.cursor_row -|= 20 * count;
-            s.clampCursorToLine();
+            self.state().moveCursorUp(20 * count);
             self.scroll_in_progress = true;
             self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
             return true;
         }
         if (key.matches(vaxis.Key.home, .{})) {
-            self.state().cursor_col = 0;
+            self.state().moveCursorToLineStart();
             return true;
         }
         if (key.matches(vaxis.Key.end, .{})) {
-            const s = self.state();
-            s.cursor_col = std.math.maxInt(usize);
-            s.clampCursorToLine();
+            self.state().moveCursorToLineEnd();
             return true;
         }
 
@@ -2285,45 +2282,41 @@ pub const Core = struct {
 
         const s = self.state();
         if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
-            s.cursor_col -|= count;
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorLeftGrapheme();
             return true;
         }
         if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{})) {
-            s.cursor_col += count;
-            s.clampCursorToLine();
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorRightGrapheme();
             return true;
         }
         if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            s.cursor_row += count;
-            s.clampCursorToLine();
+            s.moveCursorDown(count);
             return true;
         }
         if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-            s.cursor_row -|= count;
-            s.clampCursorToLine();
+            s.moveCursorUp(count);
             return true;
         }
         if (key.matches(vaxis.Key.page_down, .{})) {
-            s.cursor_row += 20 * count;
-            s.clampCursorToLine();
+            s.moveCursorDown(20 * count);
             self.scroll_in_progress = true;
             self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
             return true;
         }
         if (key.matches(vaxis.Key.page_up, .{})) {
-            s.cursor_row -|= 20 * count;
-            s.clampCursorToLine();
+            s.moveCursorUp(20 * count);
             self.scroll_in_progress = true;
             self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
             return true;
         }
         if (key.matches(vaxis.Key.home, .{})) {
-            s.cursor_col = 0;
+            s.moveCursorToLineStart();
             return true;
         }
         if (key.matches(vaxis.Key.end, .{})) {
-            s.cursor_col = std.math.maxInt(usize);
-            s.clampCursorToLine();
+            s.moveCursorToLineEnd();
             return true;
         }
 
@@ -2466,29 +2459,25 @@ pub const Core = struct {
 
         const s = self.state();
         if (key.matches(vaxis.Key.left, .{})) {
-            if (s.cursor_col > 0) s.cursor_col -= 1;
+            try s.moveCursorLeftGrapheme();
         } else if (key.matches(vaxis.Key.right, .{})) {
-            s.cursor_col += 1;
+            try s.moveCursorRightGrapheme();
         } else if (key.matches(vaxis.Key.down, .{})) {
-            s.cursor_row += 1;
+            s.moveCursorDown(1);
         } else if (key.matches(vaxis.Key.up, .{})) {
-            if (s.cursor_row > 0) s.cursor_row -= 1;
+            s.moveCursorUp(1);
         } else if (key.matches(vaxis.Key.page_down, .{})) {
-            s.cursor_row += 20;
+            s.moveCursorDown(20);
             self.scroll_in_progress = true;
             self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
         } else if (key.matches(vaxis.Key.page_up, .{})) {
-            if (s.cursor_row >= 20) {
-                s.cursor_row -= 20;
-            } else {
-                s.cursor_row = 0;
-            }
+            s.moveCursorUp(20);
             self.scroll_in_progress = true;
             self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
         } else if (key.matches(vaxis.Key.home, .{})) {
-            s.cursor_col = 0;
+            s.moveCursorToLineStart();
         } else if (key.matches(vaxis.Key.end, .{})) {
-            s.cursor_col = std.math.maxInt(usize);
+            s.moveCursorToLineEnd();
         } else if (key.matches(vaxis.Key.backspace, .{})) {
             const config = auto_pair.AutoPairConfig{
                 .enabled = self.storage.config.editor.auto_pairs,
@@ -2816,29 +2805,25 @@ pub const Core = struct {
 
         const s = self.state();
         if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
-            if (s.cursor_col > 0) s.cursor_col -= 1;
+            try s.moveCursorLeftGrapheme();
         } else if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{})) {
-            s.cursor_col += 1;
+            try s.moveCursorRightGrapheme();
         } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            s.cursor_row += 1;
+            s.moveCursorDown(1);
         } else if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-            if (s.cursor_row > 0) s.cursor_row -= 1;
+            s.moveCursorUp(1);
         } else if (key.matches(vaxis.Key.page_down, .{})) {
-            s.cursor_row += 20;
+            s.moveCursorDown(20);
             self.scroll_in_progress = true;
             self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
         } else if (key.matches(vaxis.Key.page_up, .{})) {
-            if (s.cursor_row >= 20) {
-                s.cursor_row -= 20;
-            } else {
-                s.cursor_row = 0;
-            }
+            s.moveCursorUp(20);
             self.scroll_in_progress = true;
             self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
         } else if (key.matches(vaxis.Key.home, .{})) {
-            s.cursor_col = 0;
+            s.moveCursorToLineStart();
         } else if (key.matches(vaxis.Key.end, .{})) {
-            s.cursor_col = 999;
+            s.moveCursorToLineEnd();
         }
         return true;
     }
@@ -3679,6 +3664,74 @@ pub const Core = struct {
         self.plugin_manager.replyToProcessPlugin(reply.correlation_id, aw.written());
     }
 
+    /// Approximate the cursor's visual row inside the viewport,
+    /// counting each soft-wrapped continuation as an extra row. Walks
+    /// lines from `top_row` up to (and into) `cursor_row`, accumulating
+    /// the wrap height contributed by each line.
+    fn visualRowOfCursor(
+        s: *EditorState,
+        top_row: usize,
+        cursor_row: usize,
+        cursor_col: usize,
+        text_width: usize,
+        tab_size: usize,
+        allocator: std.mem.Allocator,
+    ) !usize {
+        if (text_width == 0 or cursor_row < top_row) return 0;
+        var visual: usize = 0;
+        var row: usize = top_row;
+        while (row < cursor_row) : (row += 1) {
+            visual += wrappedRowsForLine(s, row, text_width, tab_size, allocator);
+        }
+        // Cursor row: count rows up to `cursor_col` characters in.
+        const line = s.getLineContent(cursor_row) catch return visual;
+        defer allocator.free(line);
+        var col_used: usize = 0;
+        var byte_idx: usize = 0;
+        var char_idx: usize = 0;
+        var extra_rows: usize = 0;
+        while (byte_idx < line.len and char_idx < cursor_col) {
+            const len = std.unicode.utf8ByteSequenceLength(line[byte_idx]) catch 1;
+            if (byte_idx + len > line.len) break;
+            const cw: usize = if (line[byte_idx] == '\t') tab_size else 1;
+            if (col_used + cw > text_width) {
+                extra_rows += 1;
+                col_used = 0;
+            }
+            col_used += cw;
+            byte_idx += len;
+            char_idx += 1;
+        }
+        return visual + extra_rows;
+    }
+
+    fn wrappedRowsForLine(
+        s: *EditorState,
+        row: usize,
+        text_width: usize,
+        tab_size: usize,
+        allocator: std.mem.Allocator,
+    ) usize {
+        if (text_width == 0) return 1;
+        const line = s.getLineContent(row) catch return 1;
+        defer allocator.free(line);
+        var rows: usize = 1;
+        var col_used: usize = 0;
+        var byte_idx: usize = 0;
+        while (byte_idx < line.len) {
+            const len = std.unicode.utf8ByteSequenceLength(line[byte_idx]) catch 1;
+            if (byte_idx + len > line.len) break;
+            const cw: usize = if (line[byte_idx] == '\t') tab_size else 1;
+            if (col_used + cw > text_width) {
+                rows += 1;
+                col_used = 0;
+            }
+            col_used += cw;
+            byte_idx += len;
+        }
+        return rows;
+    }
+
     pub fn sendUpdate(self: *Core) !void {
         const now = std.Io.Clock.real.now(self.io).toMilliseconds();
         self.last_render_time = now;
@@ -3730,6 +3783,49 @@ pub const Core = struct {
             s.scroll_offset = s.cursor_row;
         } else if (s.cursor_row >= s.scroll_offset + visible_rows) {
             s.scroll_offset = s.cursor_row - visible_rows + 1;
+        }
+
+        // Wrap-aware adjustment: long lines that soft-wrap to multiple
+        // visual rows can push the cursor's *visual* position out of
+        // the viewport even when its logical row is technically in
+        // range. Walk the lines from `scroll_offset` to `cursor_row`,
+        // summing wrapped row counts, and advance `scroll_offset` if
+        // the cursor's visual position would land below the visible
+        // area. The text width here approximates what the renderer
+        // uses; it's exact for an unsplit window and a conservative
+        // overestimate for splits, which only ever scrolls a hair too
+        // far — preferable to leaving the cursor invisible.
+        {
+            const total_lines = s.buffer.lineCount();
+            const gutter_digits: usize = if (total_lines > 0)
+                std.math.log10_int(total_lines) + 1
+            else
+                1;
+            const gutter_width = gutter_digits + 1;
+            const text_width: usize = if (self.win_size.cols > gutter_width)
+                self.win_size.cols - gutter_width
+            else
+                1;
+            const tab_size: usize = self.storage.config.editor.tab_size;
+
+            // Find a `scroll_offset` such that the cursor's visual
+            // row (relative to the top of the viewport) is < visible_rows.
+            // Cap the loop so a pathological line can't spin here.
+            var guard: usize = 0;
+            while (guard < 64) : (guard += 1) {
+                const visual_row = visualRowOfCursor(
+                    s,
+                    s.scroll_offset,
+                    s.cursor_row,
+                    s.cursor_col,
+                    text_width,
+                    tab_size,
+                    self.allocator,
+                ) catch break;
+                if (visual_row < visible_rows) break;
+                if (s.scroll_offset >= s.cursor_row) break;
+                s.scroll_offset += 1;
+            }
         }
 
         if (self.split_manager) |*sm| {
