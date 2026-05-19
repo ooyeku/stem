@@ -138,6 +138,18 @@ pub const StorageManager = struct {
         return self.session_file;
     }
 
+    /// Crash-recovery snapshot path. Sibling of the workspace's
+    /// session file with a `.recover` suffix so a clean shutdown and
+    /// an in-progress recovery can coexist without colliding. The
+    /// recovery file exists only while stem is running — written
+    /// periodically and on every save, cleared on clean quit. Its
+    /// presence at startup means the previous run crashed.
+    ///
+    /// Caller must free the returned slice.
+    pub fn getRecoveryPath(self: *StorageManager) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}.recover", .{self.session_file});
+    }
+
     fn ensureDir(io: std.Io, path: []const u8) !void {
         std.Io.Dir.createDirAbsolute(io, path, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},

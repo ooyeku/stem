@@ -55,6 +55,24 @@ pub const PluginManager = struct {
     /// destroying the very plugin still unwinding its callback stack.
     pending_exits: std.ArrayListUnmanaged([]u8) = .empty,
 
+    /// Per-plugin restart policy lifted from each manifest at load
+    /// time. The manifest's arena is freed right after parsing, so
+    /// we copy. Looked up by `drainPendingExits` to decide whether
+    /// a crashed plugin should respawn.
+    restart_policies: std.StringHashMapUnmanaged(manifest_mod.Restart) = .empty,
+
+    /// Backoff state for crashed-and-being-restarted plugins. Wiped
+    /// for a plugin once it survives long enough to be considered
+    /// healthy (currently: when it's still alive at the next drain
+    /// after restart). Keys are owned dupes of plugin names.
+    restart_state: std.StringHashMapUnmanaged(RestartState) = .empty,
+
+    /// Plugins waiting to be respawned by `drainPendingRestarts`.
+    /// Pending list rather than spawning inline so the restart runs
+    /// on the main loop, after the deinit of the previous instance
+    /// has fully unwound.
+    pending_restarts: std.ArrayListUnmanaged(PendingRestart) = .empty,
+
     /// Out-of-process plugins.
     process_plugins: std.StringHashMapUnmanaged(*ProcessPlugin) = .empty,
     /// WebAssembly plugins.
@@ -108,6 +126,30 @@ pub const PluginManager = struct {
     /// status-item / panel registration. Stable across the lifetime
     /// of the plugin manager.
     next_widget_id: u32 = 1,
+
+    pub const RestartState = struct {
+        attempts: u8 = 0,
+        last_attempt_ms: i64 = 0,
+    };
+
+    pub const PendingRestart = struct {
+        /// Owned dupe of the plugin name.
+        name: []u8,
+        due_ms: i64,
+    };
+
+    /// Backoff schedule: 1 s, 5 s, 30 s, then give up. Index is the
+    /// attempt count (0 = first restart). Returning null means we've
+    /// exhausted retries; the plugin stays down until the user
+    /// reloads explicitly.
+    fn restartDelayMs(attempts: u8) ?i64 {
+        return switch (attempts) {
+            0 => 1_000,
+            1 => 5_000,
+            2 => 30_000,
+            else => null,
+        };
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -191,6 +233,17 @@ pub const PluginManager = struct {
         var pr_it = self.pending_requests.iterator();
         while (pr_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.pending_requests.deinit(self.allocator);
+
+        var pol_it = self.restart_policies.iterator();
+        while (pol_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.restart_policies.deinit(self.allocator);
+
+        var rs_it = self.restart_state.iterator();
+        while (rs_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.restart_state.deinit(self.allocator);
+
+        for (self.pending_restarts.items) |pr| self.allocator.free(pr.name);
+        self.pending_restarts.deinit(self.allocator);
     }
 
     pub fn loadUserPlugins(self: *PluginManager) !void {
@@ -415,10 +468,13 @@ pub const PluginManager = struct {
             };
         }
         try self.installPluginPermissions(m.name, m.permissions);
+        try self.installRestartPolicy(m.name, m.restart);
 
         try pp.start();
 
         try self.process_plugins.put(self.allocator, name_dup, pp);
+        // Successful load — reset any prior crash backoff for this plugin.
+        self.clearRestartState(m.name);
 
         // Synchronous `initialize` handshake: tell the plugin which
         // ABI version it's talking to, and its assigned id. Plugins
@@ -667,13 +723,149 @@ pub const PluginManager = struct {
 
         for (names) |name| {
             telemetry.recordPluginCrash(name);
+            const policy: manifest_mod.Restart = blk: {
+                self.state_mu.lock();
+                defer self.state_mu.unlock();
+                break :blk self.restart_policies.get(name) orelse .never;
+            };
             self.unloadPlugin(name) catch |err| {
                 log.warn("unload of failed process plugin '{s}' failed: {s}", .{ name, @errorName(err) });
             };
-            log.warn("process plugin '{s}' exited; resources pruned", .{name});
-            self.allocator.free(name);
+            switch (policy) {
+                .never => {
+                    log.warn("process plugin '{s}' exited; resources pruned (no restart — manifest opted out)", .{name});
+                    self.allocator.free(name);
+                },
+                .on_crash, .always => {
+                    self.scheduleRestart(name) catch |err| {
+                        log.warn("schedule restart for '{s}' failed: {s}; resources pruned", .{ name, @errorName(err) });
+                        self.allocator.free(name);
+                    };
+                },
+            }
         }
         return names.len;
+    }
+
+    /// Insert (or refresh) the backoff entry for a crashed plugin and
+    /// append it to `pending_restarts`. Ownership of `name_owned`
+    /// transfers to the manager — either into the pending list (if
+    /// queued) or freed immediately (if we've exhausted retries).
+    fn scheduleRestart(self: *PluginManager, name_owned: []u8) !void {
+        // Snapshot a stable handle for the post-unlock inbox poke so
+        // we never call into another subsystem with `state_mu` held.
+        var inbox_snapshot: ?*vigil.Inbox = null;
+
+        {
+            self.state_mu.lock();
+            defer self.state_mu.unlock();
+
+            // Look up the existing backoff state, or initialise a fresh
+            // one. Cloning the key into a separate string for the
+            // restart_state map keeps lifetimes straight: the pending
+            // list owns its `name`, and restart_state owns its key.
+            const gop = try self.restart_state.getOrPut(self.allocator, name_owned);
+            if (!gop.found_existing) {
+                const key_dup = try self.allocator.dupe(u8, name_owned);
+                gop.key_ptr.* = key_dup;
+                gop.value_ptr.* = .{};
+            }
+
+            const delay = restartDelayMs(gop.value_ptr.attempts) orelse {
+                log.warn("process plugin '{s}' crashed too many times; giving up (re-load manually with `:Plugin Manager Reload All`)", .{name_owned});
+                // Drop the give-up entry so the bookkeeping doesn't
+                // hang around until manager deinit. The next manual
+                // reload will start fresh.
+                if (self.restart_state.fetchRemove(name_owned)) |kv| {
+                    self.allocator.free(kv.key);
+                }
+                self.allocator.free(name_owned);
+                return;
+            };
+
+            gop.value_ptr.attempts += 1;
+            gop.value_ptr.last_attempt_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+            const due = gop.value_ptr.last_attempt_ms + delay;
+
+            log.info("process plugin '{s}' crashed; restart scheduled in {d}ms (attempt {d})", .{
+                name_owned, delay, gop.value_ptr.attempts,
+            });
+            try self.pending_restarts.append(self.allocator, .{ .name = name_owned, .due_ms = due });
+
+            inbox_snapshot = self.core_inbox;
+        }
+
+        // Wake core promptly so it ticks soon and notices the pending
+        // restart — otherwise the restart only fires when something
+        // unrelated wakes the loop. Run *outside* `state_mu` so we
+        // never block the lock on inbox-side bookkeeping.
+        if (inbox_snapshot) |inbox| {
+            const tick_bytes = (protocol.Message{ .tick = {} }).encode(self.allocator) catch return;
+            defer self.allocator.free(tick_bytes);
+            inbox.send(tick_bytes) catch {};
+        }
+    }
+
+    /// Try to respawn any plugins whose backoff window has elapsed.
+    /// Called by core on tick. Same pattern as `drainPendingExits`:
+    /// move under the lock, process outside it.
+    pub fn drainPendingRestarts(self: *PluginManager) usize {
+        const now = std.Io.Clock.real.now(self.io).toMilliseconds();
+        self.state_mu.lock();
+
+        // Pre-reserve both partitions for the worst case (everything
+        // ready OR everything still pending). If reservation fails
+        // we'd otherwise be forced into a silent-drop fallback where
+        // `name` allocations leak; better to bail out and leave the
+        // queue intact so the next tick retries.
+        const total = self.pending_restarts.items.len;
+        var ready: std.ArrayListUnmanaged(PendingRestart) = .empty;
+        ready.ensureTotalCapacity(self.allocator, total) catch {
+            self.state_mu.unlock();
+            return 0;
+        };
+        errdefer ready.deinit(self.allocator);
+
+        var still_pending: std.ArrayListUnmanaged(PendingRestart) = .empty;
+        still_pending.ensureTotalCapacity(self.allocator, total) catch {
+            ready.deinit(self.allocator);
+            self.state_mu.unlock();
+            return 0;
+        };
+
+        for (self.pending_restarts.items) |pr| {
+            if (pr.due_ms <= now) {
+                ready.appendAssumeCapacity(pr);
+            } else {
+                still_pending.appendAssumeCapacity(pr);
+            }
+        }
+        self.pending_restarts.deinit(self.allocator);
+        self.pending_restarts = still_pending;
+        self.state_mu.unlock();
+        defer ready.deinit(self.allocator);
+
+        for (ready.items) |pr| {
+            defer self.allocator.free(pr.name);
+            self.loadPluginByName(pr.name) catch |err| {
+                log.warn("auto-restart of '{s}' failed: {s}", .{ pr.name, @errorName(err) });
+                continue;
+            };
+            log.info("process plugin '{s}' auto-restarted", .{pr.name});
+        }
+        return ready.items.len;
+    }
+
+    /// Clear the backoff counter for a plugin that's been running
+    /// cleanly. Called from the load path once a plugin enters its
+    /// running state via `tryLoadPluginDir` — a successful load
+    /// after a crash means we should forgive the previous attempts.
+    fn clearRestartState(self: *PluginManager, plugin_id: []const u8) void {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+        if (self.restart_state.fetchRemove(plugin_id)) |kv| {
+            self.allocator.free(kv.key);
+        }
     }
 
     fn registerProcessCommand(self: *PluginManager, params: std.json.Value) !void {
@@ -1103,6 +1295,22 @@ pub const PluginManager = struct {
         try self.plugin_permissions.put(self.allocator, key, stored);
     }
 
+    /// Record the manifest's restart policy so the exit handler can
+    /// consult it without re-parsing the manifest. Replaces any prior
+    /// policy on reload.
+    fn installRestartPolicy(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        policy: manifest_mod.Restart,
+    ) !void {
+        if (self.restart_policies.fetchRemove(plugin_id)) |kv| {
+            self.allocator.free(kv.key);
+        }
+        const key = try self.allocator.dupe(u8, plugin_id);
+        errdefer self.allocator.free(key);
+        try self.restart_policies.put(self.allocator, key, policy);
+    }
+
     /// True iff the plugin was granted the `manage_plugins` capability
     /// in its manifest. Wasm load/unload host imports gate on this.
     fn canManagePlugins(self: *PluginManager, plugin_id: []const u8) bool {
@@ -1270,6 +1478,7 @@ pub const PluginManager = struct {
             };
         }
         try self.installPluginPermissions(m.name, m.permissions);
+        try self.installRestartPolicy(m.name, m.restart);
 
         const wp = wasm_loader.load(
             self.allocator,

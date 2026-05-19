@@ -63,12 +63,33 @@ pub const CommandDecl = struct {
     keybinding: ?[]const u8 = null,
 };
 
+/// Restart policy for crashed plugins. `never` is the default — the
+/// host won't respawn a plugin that died, on the theory that a crash
+/// is usually a bug and respawning hides it. `on_crash` respawns once
+/// per backoff window (1 s → 5 s → 30 s, then give up) so well-tested
+/// plugins recover from transient OS issues. `always` is the same as
+/// `on_crash` today; reserved for future "restart even on a clean
+/// exit" semantics.
+pub const Restart = enum {
+    never,
+    on_crash,
+    always,
+
+    pub fn fromString(s: []const u8) ?Restart {
+        if (std.mem.eql(u8, s, "never")) return .never;
+        if (std.mem.eql(u8, s, "on_crash")) return .on_crash;
+        if (std.mem.eql(u8, s, "always")) return .always;
+        return null;
+    }
+};
+
 pub const Manifest = struct {
     arena: std.heap.ArenaAllocator,
     name: []const u8,
     version: []const u8,
     description: []const u8 = "",
     runtime: Runtime,
+    restart: Restart = .never,
     /// Path is interpreted relative to the manifest's directory.
     entry: []const u8,
     permissions: Permissions = .{},
@@ -109,6 +130,11 @@ pub fn parse(allocator: std.mem.Allocator, json_bytes: []const u8) !Manifest {
     if (root.get("description")) |v| {
         if (v != .string) return error.InvalidManifest;
         manifest.description = try aa.dupe(u8, v.string);
+    }
+
+    if (root.get("restart")) |v| {
+        if (v != .string) return error.InvalidManifest;
+        manifest.restart = Restart.fromString(v.string) orelse return error.InvalidManifest;
     }
 
     if (root.get("permissions")) |perms_val| {

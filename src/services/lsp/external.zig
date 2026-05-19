@@ -1,9 +1,11 @@
 const std = @import("std");
+const vigil = @import("vigil");
 const Transport = @import("../../lsp/transport.zig");
 const platform = @import("../../kernel/platform.zig");
 const installer_mod = @import("installer.zig");
 
 const log = std.log.scoped(.LSPExternal);
+const Mutex = vigil.compat.Mutex;
 
 /// Heap-allocated watchdog state for force-killing a stuck LSP child. The
 /// PID is captured as an integer (cheap, safe to copy across threads), so
@@ -15,6 +17,73 @@ fn isBareName(s: []const u8) bool {
     if (s.len == 0) return false;
     for (s) |c| if (c == '/' or c == '\\') return false;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Live-child registry.
+//
+// Every `runExternalServer` call registers the spawned child's PID
+// here; deregisters on natural exit. On stem's quit path, the editor
+// calls `requestGlobalShutdown` which SIGKILLs every entry in one
+// sweep — far quicker than the per-server graceful-shutdown handshake
+// the supervisor runs by default.
+// ---------------------------------------------------------------------------
+
+const LiveRegistry = struct {
+    mu: Mutex = .{},
+    pids: std.ArrayListUnmanaged(platform.Pid) = .empty,
+    shutdown_requested: std.atomic.Value(bool) = .{ .raw = false },
+};
+
+var live: LiveRegistry = .{};
+
+/// Returns true iff the pid was registered. Returns false when a
+/// global shutdown is already in flight — in that case the caller
+/// should SIGKILL the child immediately, because the shutdown sweep
+/// has already passed over the (then-empty) registry and won't come
+/// back.
+fn registerLiveChild(pid: platform.Pid) bool {
+    live.mu.lock();
+    defer live.mu.unlock();
+    if (live.shutdown_requested.load(.acquire)) return false;
+    live.pids.append(std.heap.page_allocator, pid) catch return false;
+    return true;
+}
+
+fn unregisterLiveChild(pid: platform.Pid) void {
+    live.mu.lock();
+    defer live.mu.unlock();
+    for (live.pids.items, 0..) |p, i| {
+        if (p == pid) {
+            _ = live.pids.swapRemove(i);
+            return;
+        }
+    }
+}
+
+/// Returns true after `requestGlobalShutdown` has been called. The
+/// runner threads use this to abort their `child.wait` without
+/// touching child state any further.
+pub fn isGlobalShutdownRequested() bool {
+    return live.shutdown_requested.load(.acquire);
+}
+
+/// Force-terminate every live LSP child. Non-blocking — once SIGKILL
+/// fires, the kernel reaps the processes and pumps/joins everywhere
+/// else become wait-free. Safe to call multiple times.
+pub fn requestGlobalShutdown() void {
+    live.shutdown_requested.store(true, .release);
+    live.mu.lock();
+    const pids = live.pids.toOwnedSlice(std.heap.page_allocator) catch {
+        live.mu.unlock();
+        return;
+    };
+    live.mu.unlock();
+    defer std.heap.page_allocator.free(pids);
+    for (pids) |pid| {
+        platform.killProcessForce(pid);
+    }
+    log.info("requestGlobalShutdown: killed {d} LSP child(ren)", .{pids.len});
 }
 
 const KillWatch = struct {
@@ -97,6 +166,28 @@ pub fn runExternalServer(
         log.err("spawn '{s}' failed: {} — closing pipes so init can bail fast", .{ resolved_slice[0], err });
         output_pipe.close();
         return err;
+    };
+
+    // Register the PID so `requestGlobalShutdown` can SIGKILL it
+    // during stem's quit path. Capture the pid now — `child.id` is
+    // cleared by `child.wait` and `child.kill`, so the defer would
+    // see `null` if we don't snapshot it first. If registration fails
+    // because shutdown is already underway, kill the child here so
+    // we don't leak a process the sweep already missed.
+    const captured_pid: ?platform.Pid = child.id;
+    var registered = false;
+    if (captured_pid) |pid| {
+        registered = registerLiveChild(pid);
+        if (!registered) {
+            log.info("LSP child {d} spawned during shutdown; killing immediately", .{pid});
+            platform.killProcessForce(pid);
+            _ = child.wait(io) catch {};
+            output_pipe.close();
+            return error.ShutdownInProgress;
+        }
+    }
+    defer if (registered) {
+        if (captured_pid) |pid| unregisterLiveChild(pid);
     };
     // If anything after the spawn fails before we reach `child.wait` below,
     // we'd otherwise leak a child process (zombie) and its three pipes. Kill

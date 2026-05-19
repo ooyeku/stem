@@ -102,6 +102,17 @@ pub const EditorState = struct {
             errdefer std.Io.Dir.cwd().deleteFile(self.io, tmp_path) catch {};
             defer tmp_file.close(self.io);
             try tmp_file.writePositionalAll(self.io, content, 0);
+            // fsync before the rename: POSIX `rename` is atomic for
+            // the *name*, but doesn't guarantee the file's *content*
+            // has hit disk. A crash / power loss between rename and
+            // the kernel's writeback would leave a 0-byte file with
+            // the new name — the worst possible outcome: looks saved,
+            // actually empty. `sync` forces the data + metadata out
+            // first so the rename only ever commits a fully-persisted
+            // file.
+            tmp_file.sync(self.io) catch |err| {
+                std.log.warn("fsync of {s} failed: {} — proceeding with rename anyway", .{ tmp_path, err });
+            };
         }
 
         std.Io.Dir.renameAbsolute(tmp_path, path, self.io) catch |err| {

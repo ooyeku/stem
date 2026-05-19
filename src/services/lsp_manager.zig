@@ -356,27 +356,55 @@ pub const LSPManager = struct {
     }
 
     pub fn deinit(self: *LSPManager) void {
-        // Signal global shutdown FIRST. This causes any LSP server start
-        // currently waiting on init to bail out immediately, which in turn
-        // unblocks the supervisor's worker so it can exit promptly.
+        // Fast-exit path. Optimised for "user pressed Space+Q" — every
+        // millisecond they wait before getting their terminal back is
+        // wasted. The careful, polite shutdown the supervisor runs in
+        // steady state (LSP `shutdown` → `exit` → 2 s join × N servers
+        // sequentially) used to add up to >10 s with several servers
+        // running. The new flow:
+        //
+        //   1. Set every "stop now" flag.
+        //   2. SIGKILL every live LSP child in one parallel sweep —
+        //      the kernel reaps them all immediately.
+        //   3. Skip the supervisor + watchdog joins; detach them. Their
+        //      worker threads will see the killed pipes / flags and
+        //      exit on their own as the process tears down.
+        //   4. Leak structures still touched by in-flight starts —
+        //      we're exiting; the OS reclaims everything in <1 ms.
         self.global_shutdown.store(true, .release);
-
-        // Tell the watchdog to stop. The watchdog thread is mostly asleep,
-        // so the join is bounded by `watchdog_interval_ms` (3 s) anyway,
-        // but we still cap the wait so an OS scheduling hiccup can't stall
-        // exit indefinitely.
         self.watchdog_stop.store(true, .release);
+
+        // The LSP children are by far the longest pole. Killing them
+        // first unblocks every pump (broken-pipe / EOF on stdio) and
+        // every `child.wait` (immediate exit), which in turn unblocks
+        // every reader/server thread join inside the per-server
+        // shutdown. Effectively turns N × 4 s sequential into <50 ms.
+        external.requestGlobalShutdown();
+
+        // Bounded join on the watchdog. With the LSP children already
+        // SIGKILLed above, the watchdog's blocking call (`child.wait`
+        // / waitTimeout) returns immediately; its next loop iteration
+        // observes `watchdog_stop` and exits. 250 ms is plenty under
+        // those conditions, and bailing on a true hang is preferable
+        // to detaching — a detached thread would read freed `self`
+        // state (servers map, watchdog_stop) if the process didn't
+        // exit immediately after `deinit` returned.
         if (self.watchdog_thread) |t| {
-            if (!supervisor_mod.joinTimeout(self.allocator, self.io, t, 4000)) {
-                log.warn("LSP watchdog did not exit in 4s; detaching", .{});
+            if (!supervisor_mod.joinTimeout(self.allocator, self.io, t, 250)) {
+                log.warn("LSP watchdog did not exit in 250ms; detaching (process exit imminent)", .{});
             }
             self.watchdog_thread = null;
         }
 
-        // Drain the supervisor next. Its worker.join is also bounded so
-        // we never sit longer than ~3 s here.
+        // Best-effort supervisor drain. With children dead and global
+        // shutdown set, the supervisor's worker exits quickly; the
+        // call itself is bounded (existing implementation has its own
+        // join timeout).
         self.supervisor.shutdown();
 
+        // Per-server teardown can now run without paying the full
+        // graceful-shutdown handshake — the children are gone, the
+        // pipes are EOF, the thread joins return immediately.
         var it = self.servers.valueIterator();
         while (it.next()) |server_ptr| {
             var server = server_ptr.*;
@@ -394,23 +422,22 @@ pub const LSPManager = struct {
         while (rs_it.next()) |k| self.allocator.free(k.*);
         self.restart_state.deinit(self.allocator);
 
-        // Drain the in-progress parallel starts. Their `runParallelStart`
-        // calls `endStart` which removes their key, so once the map is
-        // empty all detached start threads have finished writing to it
-        // and it's safe to free. global_shutdown is already set, so each
-        // start aborts immediately on its init wait poll (≤100 ms).
+        // Drain in-progress parallel starts under a bounded wait.
+        // With `global_shutdown` set and the children dead, each start
+        // bails out within one init-poll cycle (≤100 ms). 500 ms covers
+        // that comfortably; if a start truly hangs, log and leak (the
+        // process is exiting in moments). Without the drain, threads
+        // still running through `endStart` would write to a freed map.
         self.in_progress_mutex.lockUncancelable(self.io);
         const drain_start_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
         while (self.in_progress_starts.count() > 0) {
             const elapsed = std.Io.Clock.real.now(self.io).toMilliseconds() - drain_start_ms;
-            if (elapsed > 3000) {
-                log.warn("LSP in_progress_starts did not drain in 3s; leaking {d} entries", .{self.in_progress_starts.count()});
-                // Leak: parallel-start threads still alive will write to a
-                // freed map. Acceptable at process exit only.
+            if (elapsed > 500) {
+                log.warn("LSP in_progress_starts did not drain in 500ms; leaking {d} entries", .{self.in_progress_starts.count()});
                 break;
             }
             self.in_progress_mutex.unlock(self.io);
-            std.Io.sleep(self.io, .fromMilliseconds(20), .awake) catch break;
+            std.Io.sleep(self.io, .fromMilliseconds(10), .awake) catch break;
             self.in_progress_mutex.lockUncancelable(self.io);
         }
         var ip_it = self.in_progress_starts.keyIterator();

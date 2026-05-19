@@ -40,6 +40,7 @@ test {
     _ = @import("services/lsp_manager_test.zig");
     _ = @import("services/terminal.zig");
     _ = @import("services/global_search.zig");
+    _ = @import("services/search_index.zig");
     _ = @import("services/lsp/server.zig");
     _ = @import("kernel/safe.zig");
     _ = @import("config/schema.zig");

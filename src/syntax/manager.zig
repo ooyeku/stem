@@ -52,6 +52,15 @@ pub const SyntaxManager = struct {
     /// breathed near the editor.
     highlight_cache: HighlightCache = .{},
 
+    /// Same idea as `highlight_cache`, but for `findBrackets`. Brackets
+    /// don't change unless the file content changes, so on an idle
+    /// frame we'd otherwise walk the entire file byte-by-byte each
+    /// render. The cache key is `(resource_id, content_len,
+    /// start_line, end_line)` — `content_len` stands in for "did the
+    /// buffer change?" cheaply and is exact enough for the cache to
+    /// stay correct.
+    bracket_cache: BracketCache = .{},
+
     /// Pending edits queued by `recordEdit`. Drained on the next
     /// `submitParse` or cleared on `setLanguageEnum`.
     pending_edits: std.ArrayListUnmanaged(EditInfo) = .empty,
@@ -72,6 +81,20 @@ pub const SyntaxManager = struct {
         valid: bool = false,
 
         fn invalidate(self: *HighlightCache, allocator: std.mem.Allocator) void {
+            self.tokens.clearAndFree(allocator);
+            self.valid = false;
+        }
+    };
+
+    pub const BracketCache = struct {
+        resource_id: u64 = 0,
+        content_len: usize = 0,
+        start_line: usize = 0,
+        end_line: usize = 0,
+        tokens: std.ArrayListUnmanaged(protocol.SyntaxToken) = .empty,
+        valid: bool = false,
+
+        fn invalidate(self: *BracketCache, allocator: std.mem.Allocator) void {
             self.tokens.clearAndFree(allocator);
             self.valid = false;
         }
@@ -249,6 +272,7 @@ pub const SyntaxManager = struct {
         c.ts_parser_delete(self.parser);
         if (self.worker_parser) |p| c.ts_parser_delete(p);
         self.highlight_cache.invalidate(self.allocator);
+        self.bracket_cache.invalidate(self.allocator);
     }
 
     /// Spawn the background parse worker. Idempotent — safe to call if one
@@ -399,8 +423,9 @@ pub const SyntaxManager = struct {
                 if (self.tree) |old| c.ts_tree_delete(old);
                 self.tree = new_tree;
                 if (job.resource_id) |id| self.current_resource_id = id;
-                // Tree changed → memoized highlight is stale.
+                // Tree changed → memoized highlight + bracket pass stale.
                 self.highlight_cache.invalidate(self.allocator);
+                self.bracket_cache.invalidate(self.allocator);
             } else {
                 c.ts_tree_delete(new_tree);
             }
@@ -478,6 +503,13 @@ pub const SyntaxManager = struct {
             // OOM: drop the record. Worst case the next parse is a full
             // (non-incremental) reparse — slower but still correct.
         };
+        // Brackets are computed by a byte-walk over the buffer, not
+        // from the tree. The tree-update path also invalidates this
+        // cache, but that only fires once the async parse lands; an
+        // edit that preserves byte length (e.g. find/replace `foo`
+        // → `bar`) would otherwise serve stale positions in the
+        // intervening window.
+        self.bracket_cache.invalidate(self.allocator);
     }
 
     pub fn setLanguageEnum(self: *SyntaxManager, lang_enum: Language) !void {
@@ -570,6 +602,7 @@ pub const SyntaxManager = struct {
             if (self.tree) |t| c.ts_tree_delete(t);
             self.tree = null;
             self.highlight_cache.invalidate(self.allocator);
+            self.bracket_cache.invalidate(self.allocator);
             self.treeUnlock();
 
             if (self.query) |q| c.ts_query_delete(q);
@@ -725,6 +758,7 @@ pub const SyntaxManager = struct {
             self.tree = new_tree;
             if (resource_id) |id| self.current_resource_id = id;
             self.highlight_cache.invalidate(self.allocator);
+            self.bracket_cache.invalidate(self.allocator);
         } else if (new_tree) |t| {
             c.ts_tree_delete(t);
         }
@@ -1786,12 +1820,27 @@ pub const SyntaxManager = struct {
     };
 
     pub fn findBrackets(
-        _: *SyntaxManager,
+        self: *SyntaxManager,
         allocator: std.mem.Allocator,
         content: []const u8,
         start_line: usize,
         end_line: usize,
     ) ![]protocol.SyntaxToken {
+        // Cache lookup. `content_len` is the cheap "has the buffer
+        // changed?" check — exact enough since any edit changes the
+        // byte count by ±1 or more, and the few cases where two
+        // unrelated edits net to zero length delta are vanishingly
+        // rare. On cache hit we hand back a fresh copy so the caller
+        // can free it without touching our entry.
+        if (self.bracket_cache.valid and
+            self.bracket_cache.resource_id == self.current_resource_id and
+            self.bracket_cache.content_len == content.len and
+            self.bracket_cache.start_line == start_line and
+            self.bracket_cache.end_line == end_line)
+        {
+            return try allocator.dupe(protocol.SyntaxToken, self.bracket_cache.tokens.items);
+        }
+
         var tokens = std.ArrayListUnmanaged(protocol.SyntaxToken).empty;
         errdefer tokens.deinit(allocator);
 
@@ -1862,7 +1911,23 @@ pub const SyntaxManager = struct {
             col += 1;
         }
 
-        return tokens.toOwnedSlice(allocator);
+        const result = try tokens.toOwnedSlice(allocator);
+
+        // Populate the cache with our own copy. The caller's `result`
+        // slice (which we return) is allocated from the per-frame
+        // arena, so we re-copy into our long-lived allocator.
+        self.bracket_cache.invalidate(self.allocator);
+        self.bracket_cache.tokens.appendSlice(self.allocator, result) catch {
+            // OOM while populating cache is fine — just skip the
+            // cache, the caller still gets a correct result.
+            return result;
+        };
+        self.bracket_cache.resource_id = self.current_resource_id;
+        self.bracket_cache.content_len = content.len;
+        self.bracket_cache.start_line = start_line;
+        self.bracket_cache.end_line = end_line;
+        self.bracket_cache.valid = true;
+        return result;
     }
 
     pub fn findCurrentScope(

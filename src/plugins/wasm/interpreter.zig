@@ -134,6 +134,11 @@ pub const DataSegment = struct {
     memory_index: u32,
     offset: u32,
     bytes: []const u8,
+    /// Passive data segments aren't copied into linear memory at
+    /// instance init — they sit dormant until a `memory.init` op
+    /// pulls bytes from them. `data.drop` then marks them
+    /// unreachable.
+    passive: bool = false,
 };
 
 pub const Module = struct {
@@ -509,6 +514,7 @@ fn decodeDataSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void 
             .memory_index = mem_idx,
             .offset = offset,
             .bytes = try aa.dupe(u8, data),
+            .passive = !active,
         };
     }
     module.data_segments = segs;
@@ -549,10 +555,18 @@ pub const Instance = struct {
     /// accessible via `Instance` to keep the HostFn signature small).
     user_data: ?*anyopaque = null,
 
+    /// Per-segment "dropped" flag — one bool per `module.data_segments`
+    /// entry. `data.drop` flips a segment's entry to true; further
+    /// `memory.init` against a dropped segment traps. Per-instance
+    /// rather than on `Module` because two instances of the same
+    /// module track drops independently.
+    dropped_data: []bool = &.{},
+
     pub fn deinit(self: *Instance) void {
         if (self.memory.len > 0) self.allocator.free(self.memory);
         if (self.globals.len > 0) self.allocator.free(self.globals);
         if (self.host_funcs.len > 0) self.allocator.free(self.host_funcs);
+        if (self.dropped_data.len > 0) self.allocator.free(self.dropped_data);
     }
 
     /// Copy `len` bytes at wasm linear-memory offset `off` into a
@@ -616,8 +630,22 @@ pub fn instantiate(
         @memset(inst.memory, 0);
     }
 
-    // Apply data segments.
+    // Per-instance "is this segment unreachable?" bitmap. Active
+    // segments are pre-marked as dropped: per the bulk-memory spec,
+    // active segments are implicitly dropped right after their
+    // initialisation copy, so any `memory.init` referencing them
+    // post-instantiation must trap. Passive segments start alive and
+    // flip true when `data.drop` runs against them.
+    inst.dropped_data = try allocator.alloc(bool, module.data_segments.len);
+    for (module.data_segments, 0..) |ds, i| {
+        inst.dropped_data[i] = !ds.passive;
+    }
+
+    // Apply active data segments at their declared offsets. Passive
+    // segments stay dormant until a `memory.init` op references them
+    // (or `data.drop` marks them unreachable).
     for (module.data_segments) |ds| {
+        if (ds.passive) continue;
         if (ds.offset + ds.bytes.len > inst.memory.len) return error.OutOfBounds;
         @memcpy(inst.memory[ds.offset .. ds.offset + ds.bytes.len], ds.bytes);
     }
@@ -1092,6 +1120,32 @@ fn step(
 fn stepFC(inst: *Instance, vs: *std.ArrayListUnmanaged(u64), frame: *Frame) !void {
     const sub = try readU32Body(frame);
     switch (sub) {
+        // memory.init: copy from a passive data segment into linear
+        // memory. Immediates: `data_idx` (u32), `mem_idx` (u8). Pops
+        // n, src_offset, dst (i32 each).
+        0x08 => {
+            const data_idx = try readU32Body(frame);
+            _ = try readByteBody(frame); // memory index — only 0 in MVP
+            const n: u32 = @truncate(try pop(vs));
+            const src: u32 = @truncate(try pop(vs));
+            const dst: u32 = @truncate(try pop(vs));
+            if (data_idx >= inst.module.data_segments.len) return error.Trap;
+            if (data_idx >= inst.dropped_data.len or inst.dropped_data[data_idx]) return error.Trap;
+            const ds = inst.module.data_segments[data_idx];
+            const end_src = @as(u64, src) + n;
+            const end_dst = @as(u64, dst) + n;
+            if (end_src > ds.bytes.len or end_dst > inst.memory.len) return error.Trap;
+            if (n == 0) return;
+            @memcpy(inst.memory[dst .. dst + n], ds.bytes[src .. src + n]);
+        },
+        // data.drop: mark a passive data segment as no longer
+        // available. Further `memory.init` against it traps.
+        0x09 => {
+            const data_idx = try readU32Body(frame);
+            if (data_idx < inst.dropped_data.len) {
+                inst.dropped_data[data_idx] = true;
+            }
+        },
         // memory.copy: immediates are two memory indices (both 0 in
         // the MVP). Pops n, src, dst (i32 each), then copies n bytes
         // from `memory[src..]` to `memory[dst..]`. Handles overlap by

@@ -30,6 +30,7 @@ const build_jobs = @import("build_jobs.zig");
 const PluginManager = @import("../plugins/manager.zig").PluginManager;
 const session = @import("session.zig");
 const global_search = @import("../services/global_search.zig");
+const SearchIndex = @import("../services/search_index.zig").SearchIndex;
 const ArenaPool = @import("arena_pool.zig").ArenaPool;
 const terminal_proc = @import("terminal_proc.zig");
 const GitCommands = @import("commands/git_commands.zig").GitCommands;
@@ -123,6 +124,11 @@ pub const Core = struct {
     needs_render: bool = true,
     last_render_time: i64 = 0,
     min_render_interval_ms: i64 = 3,
+    /// Last time we wrote the crash-recovery snapshot. The tick
+    /// handler rewrites every 30 s of activity so a crash can lose
+    /// at most that much cursor / scroll position state.
+    last_recovery_ms: i64 = 0,
+    recovery_interval_ms: i64 = 30_000,
     lsp_dirty: bool = false,
     lsp_debounce_deadline: i64 = 0,
     lsp_debounce_ms: i64 = 100,
@@ -168,6 +174,11 @@ pub const Core = struct {
     git_branch: ?[]u8 = null,
     git_branch_refreshed_ms: i64 = 0,
     plugin_manager: PluginManager,
+    /// Background workspace file-list index. Eliminates the directory
+    /// walk on `:Find` queries (~30 ms saved per query on stem-sized
+    /// repos, more on monorepos) and persists across restarts so the
+    /// first query in a fresh session is also warm.
+    search_index: SearchIndex,
     mouse_pressed: bool = false,
     mouse_press_row: usize = 0,
     mouse_press_col: usize = 0,
@@ -262,10 +273,12 @@ pub const Core = struct {
             .job_manager = JobManager.init(allocator, io),
             .workspace_manager = WorkspaceManager.init(allocator, io),
             .plugin_manager = undefined,
+            .search_index = undefined,
             .initial_files = initial_files,
         };
 
         core.plugin_manager = PluginManager.init(allocator, io, environ_block, ui_bus, core.command_registry);
+        core.search_index = SearchIndex.init(allocator, io, environ_block);
         return core;
     }
 
@@ -298,6 +311,7 @@ pub const Core = struct {
         self.syntax_manager.deinit();
 
         self.plugin_manager.deinit();
+        self.search_index.deinit();
 
         self.command_registry.deinit();
         self.allocator.destroy(self.command_registry);
@@ -852,6 +866,13 @@ pub const Core = struct {
             _ = self.lsp_manager.prewarmWorkspaceLanguages(cwd) catch |err| {
                 std.log.warn("LSP workspace prewarm failed: {}", .{err});
             };
+            // Kick off the workspace file-list index. Detached
+            // worker; first `:Find` query that arrives within the
+            // first ~few hundred ms still pays the walk, but every
+            // subsequent query skips it.
+            self.search_index.startIndexing(cwd) catch |err| {
+                std.log.warn("Search index startup failed: {}", .{err});
+            };
         } else |_| {}
 
         // Eagerly send `didOpen` for the active buffer so the LSP is aware
@@ -1242,6 +1263,25 @@ pub const Core = struct {
                         // unwound by the time we destroy its state.
                         if (self.plugin_manager.drainPendingExits() > 0) {
                             self.requestRender();
+                        }
+                        // Same pattern for crashed plugins whose
+                        // backoff window has elapsed — restart on
+                        // the main loop so we never spawn from a
+                        // reader thread that's still unwinding.
+                        if (self.plugin_manager.drainPendingRestarts() > 0) {
+                            self.requestRender();
+                        }
+
+                        // Periodic crash recovery snapshot. Cheap
+                        // (a single session.save), runs at most once
+                        // every `recovery_interval_ms` so an idle
+                        // editor doesn't churn its disk for nothing.
+                        {
+                            const rnow = std.Io.Clock.real.now(self.io).toMilliseconds();
+                            if (rnow - self.last_recovery_ms >= self.recovery_interval_ms) {
+                                self.writeRecoverySnapshot();
+                                self.last_recovery_ms = rnow;
+                            }
                         }
 
                         if (self.needs_render) {
@@ -2183,6 +2223,12 @@ pub const Core = struct {
 
             s.selection_anchor = null;
             self.mode = .select;
+            // Send LSP didChange immediately, not via the debouncer:
+            // a hover / goto-def / signature-help fired right after
+            // the delete would otherwise see stale server-side text
+            // for up to `lsp_debounce_ms`. The tree-sitter parse
+            // inside `sendLspDocChanged` is already async (via
+            // `submitParse`), so this is cheap.
             try self.sendLspDocChanged();
             try self.sendUpdate();
             return true;
@@ -2591,7 +2637,14 @@ pub const Core = struct {
         s.cursor_col += item.label.len;
         s.modified = true;
 
-        try self.sendLspDocChanged();
+        // Send the didChange immediately. Resolve / signature-help
+        // queries that fire right after accept (e.g. on the dot the
+        // user types next) need the server to know about the inserted
+        // text, not see a 100 ms-stale document. The tree-sitter parse
+        // inside `sendLspDocChanged` is already async via `submitParse`.
+        self.sendLspDocChanged() catch |err| {
+            log.debug("LSP didChange after completion accept failed: {}", .{err});
+        };
         self.dismissCompletion();
     }
 
@@ -2640,9 +2693,15 @@ pub const Core = struct {
                     log.debug("LSP document change notification failed: {}", .{err});
                 };
 
+                // Hand the parse to the background worker so we never
+                // block typing on tree-sitter even when files get
+                // large. The worker flips `syntax_manager.tree_updated`
+                // when it installs the new tree; Core polls that flag
+                // on tick and triggers a render so the new highlights
+                // land within a frame or two of the worker finishing.
                 const buf_id = self.buffer_manager.getActive().id;
-                self.syntax_manager.parse(content, buf_id) catch |err| {
-                    log.debug("Syntax parse failed after edit: {}", .{err});
+                self.syntax_manager.submitParse(content, buf_id) catch |err| {
+                    log.debug("Syntax parse submit failed after edit: {}", .{err});
                 };
             }
         }
@@ -2942,8 +3001,12 @@ pub const Core = struct {
                     if (self.state().buffer.toString(self.allocator)) |content| {
                         defer self.allocator.free(content);
                         const buf_id = self.buffer_manager.getActive().id;
-                        self.syntax_manager.parse(content, buf_id) catch |err| {
-                            log.debug("Syntax parse failed after buffer load: {}", .{err});
+                        // Async — first render uses an empty token list,
+                        // then the worker's `tree_updated` flag triggers
+                        // a re-render with full syntax once the parse
+                        // completes (typically <100 ms even for big files).
+                        self.syntax_manager.submitParse(content, buf_id) catch |err| {
+                            log.debug("Syntax parse submit failed after buffer load: {}", .{err});
                         };
                     } else |_| {}
                 }
@@ -3419,6 +3482,14 @@ pub const Core = struct {
             } else {
                 try s.saveFile();
             }
+            // Keep the search index in sync: new files added since
+            // the index was built become searchable on save.
+            self.search_index.notePathSaved(path);
+            // Save is the most natural recovery checkpoint — every
+            // user-visible commit of state to disk also commits the
+            // session state.
+            self.writeRecoverySnapshot();
+            self.last_recovery_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
         } else {
             self.previous_mode = self.mode;
             self.mode = .save_as_mode;
@@ -3758,9 +3829,12 @@ pub const Core = struct {
                             log.warn("Failed to set syntax language to {}: {}", .{ lang, err });
                         };
                     }
+                    // Async — render proceeds with whatever tree we
+                    // currently have (possibly none), and re-fires
+                    // once the worker installs the new tree.
                     if (s.buffer.toString(alloc)) |content| {
-                        self.syntax_manager.parse(content, active_buffer_id) catch |err| {
-                            log.debug("Syntax reparse failed for active buffer: {}", .{err});
+                        self.syntax_manager.submitParse(content, active_buffer_id) catch |err| {
+                            log.debug("Syntax reparse submit failed for active buffer: {}", .{err});
                         };
                     } else |_| {}
                 }
@@ -3773,8 +3847,8 @@ pub const Core = struct {
                         };
                     }
                     if (s.buffer.toString(alloc)) |content| {
-                        self.syntax_manager.parse(content, active_buffer_id) catch |err| {
-                            log.debug("Syntax parse during scroll failed: {}", .{err});
+                        self.syntax_manager.submitParse(content, active_buffer_id) catch |err| {
+                            log.debug("Syntax parse submit during scroll failed: {}", .{err});
                         };
                     } else |_| {}
                 }
@@ -3914,8 +3988,8 @@ pub const Core = struct {
                                     };
                                 }
                                 if (p_state.buffer.toString(alloc)) |content| {
-                                    self.syntax_manager.parse(content, pane_buffer_id) catch |err| {
-                                        log.debug("Pane syntax parse failed: {}", .{err});
+                                    self.syntax_manager.submitParse(content, pane_buffer_id) catch |err| {
+                                        log.debug("Pane syntax parse submit failed: {}", .{err});
                                     };
                                 } else |_| {}
                             }
@@ -4352,21 +4426,91 @@ pub const Core = struct {
             log.warn("Failed to save session: {}", .{err});
         };
 
+        // Clean exit — drop the crash recovery snapshot so the next
+        // launch knows there's nothing to recover. If this fails we
+        // still proceed; worst case the next launch sees a stale
+        // recovery and offers it (then overwrites once the user saves).
+        if (self.storage.getRecoveryPath()) |rp| {
+            defer self.allocator.free(rp);
+            std.Io.Dir.cwd().deleteFile(self.io, rp) catch {};
+        } else |_| {}
+
         var msg = protocol.Message{ .command = .quit };
         const bytes = try msg.encode(self.allocator);
         defer self.allocator.free(bytes);
         try self.ui_bus.sendCritical(bytes);
     }
 
+    /// Periodic crash-safety snapshot. Same payload as the clean
+    /// session save, but to the recovery file; survives a crash so
+    /// the next launch can prompt to restore open buffers + cursors.
+    /// Called on every save and from the tick handler on a coarse
+    /// (~30 s) timer.
+    fn writeRecoverySnapshot(self: *Core) void {
+        const rp = self.storage.getRecoveryPath() catch return;
+        defer self.allocator.free(rp);
+
+        var splits_json: ?[]const u8 = null;
+        defer if (splits_json) |s| self.allocator.free(s);
+        if (self.split_manager) |*sm| {
+            splits_json = sm.toJson(self.allocator) catch null;
+        }
+
+        session.save(
+            self.allocator,
+            self.io,
+            rp,
+            self.buffer_manager.buffers,
+            self.buffer_manager.active_index,
+            splits_json,
+        ) catch |err| {
+            log.debug("Recovery snapshot write failed: {}", .{err});
+        };
+    }
+
     fn restoreSession(self: *Core) void {
-        const session_path = self.storage.getSessionPath();
-        const loaded = session.load(self.allocator, self.io, session_path) catch |err| {
-            log.warn("Failed to load session: {}", .{err});
-            return;
+        // Prefer a crash-recovery snapshot over the clean-shutdown
+        // session file if both exist. The recovery file is only
+        // present when the previous run didn't reach `sendQuitToUI`
+        // (which deletes it), so its existence is by itself a signal
+        // that something went wrong.
+        const recover_path = self.storage.getRecoveryPath() catch null;
+        defer if (recover_path) |p| self.allocator.free(p);
+
+        var loaded_from_recovery = false;
+        const loaded: ?session.Session = blk: {
+            if (recover_path) |rp| {
+                if (std.Io.Dir.accessAbsolute(self.io, rp, .{})) |_| {
+                    if (session.load(self.allocator, self.io, rp)) |sess_opt| {
+                        if (sess_opt) |s| {
+                            log.warn("Found crash recovery snapshot at {s}; restoring", .{rp});
+                            loaded_from_recovery = true;
+                            break :blk s;
+                        }
+                    } else |err| {
+                        log.warn("Recovery snapshot parse failed: {}; falling back to clean session", .{err});
+                    }
+                } else |_| {}
+            }
+            const session_path = self.storage.getSessionPath();
+            break :blk session.load(self.allocator, self.io, session_path) catch |err| {
+                log.warn("Failed to load session: {}", .{err});
+                return;
+            };
         };
 
         const sess = loaded orelse return;
         defer session.freeSession(self.allocator, sess);
+        if (loaded_from_recovery) {
+            log.info("Recovered {d} buffers from crash snapshot", .{sess.buffers.len});
+            // Consume the snapshot now that we've successfully loaded
+            // it. Without this, a launch-then-immediate-crash sequence
+            // (before the 30 s periodic rewrite fires) would resurface
+            // the same stale recovery on the next launch.
+            if (recover_path) |rp| {
+                std.Io.Dir.cwd().deleteFile(self.io, rp) catch {};
+            }
+        }
 
         if (sess.buffers.len == 0) return;
 
@@ -4728,12 +4872,27 @@ pub const Core = struct {
         const query = self.global_search_query.items;
         if (query.len < 2) return;
 
-        const results = global_search.search(
+        // Pull the cached path list from the search index — when it's
+        // populated, `global_search` skips the directory walk and goes
+        // straight to the parallel scan, shaving the first ~30 ms (and
+        // more on big repos) off every query.
+        const cached_paths = self.search_index.snapshot(self.allocator) catch null;
+        defer if (cached_paths) |cp| {
+            for (cp) |p| self.allocator.free(p);
+            self.allocator.free(cp);
+        };
+        const cached_view: ?[]const []const u8 = if (cached_paths) |cp|
+            if (cp.len == 0) null else @as([]const []const u8, cp)
+        else
+            null;
+
+        const results = global_search.searchWithPaths(
             self.allocator,
             self.io,
             query,
             ".",
             .{ .search = self.global_search_options },
+            cached_view,
         ) catch |err| {
             log.warn("Global search failed: {}", .{err});
             return;

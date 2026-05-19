@@ -15,6 +15,18 @@ pub fn getProcessId() i64 {
 }
 
 pub fn killProcess(pid: Pid) void {
+    killProcessWith(pid, false);
+}
+
+/// Force-terminate `pid`. Skips any chance for the child to clean up
+/// — used on stem's own exit path to avoid waiting on misbehaving LSP
+/// servers that ignore polite shutdowns. POSIX: SIGKILL. Windows:
+/// TerminateProcess (no clean variant exists).
+pub fn killProcessForce(pid: Pid) void {
+    killProcessWith(pid, true);
+}
+
+fn killProcessWith(pid: Pid, force: bool) void {
     if (builtin.os.tag == .windows) {
         const kernel32 = struct {
             const HANDLE = std.os.windows.HANDLE;
@@ -25,7 +37,8 @@ pub fn killProcess(pid: Pid) void {
         _ = kernel32.TerminateProcess(pid, 1);
         _ = kernel32.CloseHandle(pid);
     } else {
-        _ = std.posix.kill(pid, std.posix.SIG.INT) catch {};
+        const sig = if (force) std.posix.SIG.KILL else std.posix.SIG.INT;
+        _ = std.posix.kill(pid, sig) catch {};
     }
 }
 
