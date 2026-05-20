@@ -17,3 +17,4 @@ zig-pkg
 .bsp
 .metals
 .scala-build
+.ruby-lsp

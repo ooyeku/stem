@@ -2284,10 +2284,12 @@ pub const Core = struct {
                     self.leader_pending = false;
                 },
 
-                // Double Space (Space + Space) → reveal the
-                // which-key popup. Toggles, so a third Space hides
-                // it again without leaving the chord.
-                Keys.leader => {
+                // `Space ?` → reveal the which-key popup. Toggles, so a
+                // second `?` hides it again without leaving the chord.
+                // Picked `?` because every other leader binding is
+                // `Space <letter>`, and `?` matches the convention used
+                // by which-key.nvim / LazyVim / Spacemacs.
+                Keys.action_which_key => {
                     self.leader_help_requested = !self.leader_help_requested;
                 },
 
@@ -3147,10 +3149,12 @@ pub const Core = struct {
                     self.leader_pending = false;
                 },
 
-                // Double Space (Space + Space) → reveal the
-                // which-key popup. Toggles, so a third Space hides
-                // it again without leaving the chord.
-                Keys.leader => {
+                // `Space ?` → reveal the which-key popup. Toggles, so a
+                // second `?` hides it again without leaving the chord.
+                // Picked `?` because every other leader binding is
+                // `Space <letter>`, and `?` matches the convention used
+                // by which-key.nvim / LazyVim / Spacemacs.
+                Keys.action_which_key => {
                     self.leader_help_requested = !self.leader_help_requested;
                 },
 

@@ -27,6 +27,10 @@ pub const Keys = struct {
     pub const action_palette = 'a';
     pub const action_help = 'w';
     pub const action_jobs = 'j';
+    /// Toggle the which-key popup. Replaces the earlier "Double Space"
+    /// trigger so the chord follows the same `<leader> <letter>` shape
+    /// as every other binding.
+    pub const action_which_key = '?';
 
     pub const action_buffer = 'b';
     pub const action_next = 'n';
