@@ -152,6 +152,7 @@ fn parseSession(allocator: std.mem.Allocator, json: []const u8) !Session {
             const obj = json[obj_start .. obj_end + 1];
 
             var path: ?[]const u8 = null;
+            errdefer if (path) |p| allocator.free(p);
             if (std.mem.indexOf(u8, obj, "\"path\":\"")) |p| {
                 const path_start = p + 8;
                 if (std.mem.indexOfPos(u8, obj, path_start, "\"")) |path_end| {
@@ -188,14 +189,19 @@ fn parseSession(allocator: std.mem.Allocator, json: []const u8) !Session {
 
             if (path) |pth| {
                 const basename = std.fs.path.basename(pth);
+                const name_dup = try allocator.dupe(u8, basename);
+                errdefer allocator.free(name_dup);
                 try buffers.append(allocator, .{
                     .file_path = pth,
                     .cursor_row = row,
                     .cursor_col = col,
                     .scroll_offset = scroll,
                     .is_virtual = false,
-                    .name = try allocator.dupe(u8, basename),
+                    .name = name_dup,
                 });
+                // Ownership of pth + name_dup has been transferred to the
+                // appended entry; disable the path errdefer for this iteration.
+                path = null;
             }
 
             i = obj_end + 1;

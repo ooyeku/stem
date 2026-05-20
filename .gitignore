@@ -13,3 +13,7 @@ debug.log
 
 # Zig package manager cache
 zig-pkg
+
+.bsp
+.metals
+.scala-build

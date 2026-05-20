@@ -525,6 +525,13 @@ pub const SyntaxManager = struct {
         // edit that preserves byte length (e.g. find/replace `foo`
         // → `bar`) would otherwise serve stale positions in the
         // intervening window.
+        //
+        // Lock under treeLock — the parse worker and findBrackets
+        // both touch bracket_cache under treeLock; mixing edits_mutex
+        // alone here would let an invalidate race with a findBrackets
+        // dupe.
+        self.treeLock();
+        defer self.treeUnlock();
         self.bracket_cache.invalidate(self.allocator);
     }
 
@@ -1924,13 +1931,23 @@ pub const SyntaxManager = struct {
         // unrelated edits net to zero length delta are vanishingly
         // rare. On cache hit we hand back a fresh copy so the caller
         // can free it without touching our entry.
-        if (self.bracket_cache.valid and
-            self.bracket_cache.resource_id == self.current_resource_id and
-            self.bracket_cache.content_len == content.len and
-            self.bracket_cache.start_line == start_line and
-            self.bracket_cache.end_line == end_line)
+        //
+        // Lock around the cache + current_resource_id reads: the parse
+        // worker invalidates `bracket_cache` (frees tokens.items) under
+        // treeLock when it installs a new tree, so an unlocked read
+        // here would race with that and read freed memory — the SIGSEGV
+        // seen on rapid buffer toggle.
         {
-            return try allocator.dupe(protocol.SyntaxToken, self.bracket_cache.tokens.items);
+            self.treeLock();
+            defer self.treeUnlock();
+            if (self.bracket_cache.valid and
+                self.bracket_cache.resource_id == self.current_resource_id and
+                self.bracket_cache.content_len == content.len and
+                self.bracket_cache.start_line == start_line and
+                self.bracket_cache.end_line == end_line)
+            {
+                return try allocator.dupe(protocol.SyntaxToken, self.bracket_cache.tokens.items);
+            }
         }
 
         var tokens = std.ArrayListUnmanaged(protocol.SyntaxToken).empty;
@@ -2008,6 +2025,11 @@ pub const SyntaxManager = struct {
         // Populate the cache with our own copy. The caller's `result`
         // slice (which we return) is allocated from the per-frame
         // arena, so we re-copy into our long-lived allocator.
+        // Lock around the write so the parse worker can't invalidate
+        // partway through and leave us with a half-populated cache
+        // whose pointers no longer match `valid`.
+        self.treeLock();
+        defer self.treeUnlock();
         self.bracket_cache.invalidate(self.allocator);
         self.bracket_cache.tokens.appendSlice(self.allocator, result) catch {
             // OOM while populating cache is fine — just skip the

@@ -9,7 +9,7 @@ const FuzzContext = struct {
 fn fuzzRandomInserts(ctx: FuzzContext, input: []const u8) anyerror!void {
     if (input.len < 2) return;
 
-    var pt = PieceTable.init(ctx.allocator, "");
+    var pt = try PieceTable.init(ctx.allocator,"");
     defer pt.deinit();
 
     const offset_seed = input[0];
@@ -34,7 +34,7 @@ fn fuzzRandomDeletes(ctx: FuzzContext, input: []const u8) anyerror!void {
     const len_seed = input[1];
     const initial_content = input[2..];
 
-    var pt = PieceTable.init(ctx.allocator, initial_content);
+    var pt = try PieceTable.init(ctx.allocator,initial_content);
     defer pt.deinit();
 
     const total = pt.totalLength();
@@ -58,7 +58,7 @@ fn fuzzRandomDeletes(ctx: FuzzContext, input: []const u8) anyerror!void {
 fn fuzzInterleavedOps(ctx: FuzzContext, input: []const u8) anyerror!void {
     if (input.len < 4) return;
 
-    var pt = PieceTable.init(ctx.allocator, "initial");
+    var pt = try PieceTable.init(ctx.allocator,"initial");
     defer pt.deinit();
 
     var i: usize = 0;
@@ -91,7 +91,7 @@ fn fuzzInterleavedOps(ctx: FuzzContext, input: []const u8) anyerror!void {
 }
 
 fn fuzzEdgeOffsets(ctx: FuzzContext, input: []const u8) anyerror!void {
-    var pt = PieceTable.init(ctx.allocator, input);
+    var pt = try PieceTable.init(ctx.allocator,input);
     defer pt.deinit();
 
     pt.insert(0, "X") catch {};

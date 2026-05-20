@@ -175,11 +175,11 @@ pub fn waitUntil(io: std.Io, timeout_ms: u64, ctx: anytype, predicate: fn (@Type
 
 pub const PieceTableTestUtils = struct {
     pub fn createTestBuffer(allocator: std.mem.Allocator, content: []const u8) !PieceTable {
-        return PieceTable.init(allocator, content);
+        return try PieceTable.init(allocator, content);
     }
 
     pub fn createEmptyBuffer(allocator: std.mem.Allocator) !PieceTable {
-        return PieceTable.init(allocator, "");
+        return try PieceTable.init(allocator, "");
     }
 
     pub fn expectContent(pt: *PieceTable, expected: []const u8) !void {
@@ -196,17 +196,17 @@ pub const PieceTableTestUtils = struct {
             content[i] = @intCast('A' + (i % 26));
         }
 
-        return PieceTable.init(allocator, content);
+        return try PieceTable.init(allocator, content);
     }
 };
 
 pub const EditorStateTestUtils = struct {
     pub fn createTestState(allocator: std.mem.Allocator, io: std.Io, content: []const u8) !EditorState {
-        return EditorState.init(allocator, io, content);
+        return try EditorState.init(allocator, io, content);
     }
 
     pub fn createEmptyState(allocator: std.mem.Allocator, io: std.Io) !EditorState {
-        return EditorState.init(allocator, io, "");
+        return try EditorState.init(allocator, io, "");
     }
 
     pub fn setCursor(state: *EditorState, row: usize, col: usize) void {

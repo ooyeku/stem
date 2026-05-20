@@ -172,7 +172,7 @@ test "getSelectionRange with no selection" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello World");
+    var state = try EditorState.init(allocator, io, "Hello World");
     defer state.deinit();
 
     const range = getSelectionRange(&state);
@@ -184,7 +184,7 @@ test "getSelectionRange with forward selection" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello World");
+    var state = try EditorState.init(allocator, io, "Hello World");
     defer state.deinit();
 
     state.selection_anchor = .{ .row = 0, .col = 0 };
@@ -200,7 +200,7 @@ test "getSelectionRange with backward selection" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello World");
+    var state = try EditorState.init(allocator, io, "Hello World");
     defer state.deinit();
 
     state.cursor_col = 0;
@@ -216,7 +216,7 @@ test "wrapSelection wraps text in parentheses" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     state.selection_anchor = .{ .row = 0, .col = 0 };
@@ -237,7 +237,7 @@ test "wrapSelection with quotes" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "text");
+    var state = try EditorState.init(allocator, io, "text");
     defer state.deinit();
 
     state.selection_anchor = .{ .row = 0, .col = 0 };
@@ -255,7 +255,7 @@ test "isBetweenEmptyPair detects empty brackets" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "()");
+    var state = try EditorState.init(allocator, io, "()");
     defer state.deinit();
 
     state.cursor_col = 1;
@@ -269,7 +269,7 @@ test "isBetweenEmptyPair returns false when not between pair" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "( )");
+    var state = try EditorState.init(allocator, io, "( )");
     defer state.deinit();
 
     state.cursor_col = 1;
@@ -283,7 +283,7 @@ test "smartBackspace deletes matching pair" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "()");
+    var state = try EditorState.init(allocator, io, "()");
     defer state.deinit();
 
     state.cursor_col = 1;
@@ -301,7 +301,7 @@ test "smartBackspace doesn't delete when not between pair" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "ab");
+    var state = try EditorState.init(allocator, io, "ab");
     defer state.deinit();
 
     state.cursor_col = 1;
@@ -315,7 +315,7 @@ test "smartBackspace with quotes" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "\"\"");
+    var state = try EditorState.init(allocator, io, "\"\"");
     defer state.deinit();
 
     state.cursor_col = 1;
@@ -332,7 +332,7 @@ test "shouldSkipClosingChar detects skip condition" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "()");
+    var state = try EditorState.init(allocator, io, "()");
     defer state.deinit();
 
     state.cursor_col = 1;
@@ -346,7 +346,7 @@ test "handleCharInput wraps selection" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     state.selection_anchor = .{ .row = 0, .col = 0 };
@@ -367,7 +367,7 @@ test "handleCharInput skips closing char" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "()");
+    var state = try EditorState.init(allocator, io, "()");
     defer state.deinit();
 
     state.cursor_col = 1;
@@ -384,7 +384,7 @@ test "handleCharInput inserts pair" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "");
+    var state = try EditorState.init(allocator, io, "");
     defer state.deinit();
 
     const config = AutoPairConfig{};
@@ -401,7 +401,7 @@ test "handleCharInput with disabled config" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "");
+    var state = try EditorState.init(allocator, io, "");
     defer state.deinit();
 
     const config = AutoPairConfig{ .enabled = false };

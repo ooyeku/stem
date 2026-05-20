@@ -30,16 +30,9 @@ pub const PieceTable = struct {
     cached_total_len: ?usize = null,
     cached_line_count: ?usize = null,
 
-    pub fn init(allocator: Allocator, original_content: []const u8) PieceTable {
-        const owned_content = allocator.dupe(u8, original_content) catch {
-            return PieceTable{
-                .original = &.{},
-                .owns_original = false,
-                .add = .empty,
-                .pieces = .empty,
-                .allocator = allocator,
-            };
-        };
+    pub fn init(allocator: Allocator, original_content: []const u8) !PieceTable {
+        const owned_content = try allocator.dupe(u8, original_content);
+        errdefer allocator.free(owned_content);
 
         var pt = PieceTable{
             .original = owned_content,
@@ -50,25 +43,13 @@ pub const PieceTable = struct {
         };
 
         if (owned_content.len > 0) {
-            pt.pieces.append(allocator, .{
+            try pt.pieces.append(allocator, .{
                 .source = .Original,
                 .start = 0,
                 .length = owned_content.len,
                 .line_count = std.mem.count(u8, owned_content, "\n"),
                 .last_line_len = if (std.mem.lastIndexOfScalar(u8, owned_content, '\n')) |idx| owned_content.len - 1 - idx else owned_content.len,
-            }) catch {
-                // OOM on the single initial piece append: degrade to an empty piece table rather
-                // than leave a struct that claims owned content but has no pieces (which would
-                // confuse totalLength()/toString()).
-                allocator.free(@constCast(owned_content));
-                return PieceTable{
-                    .original = &.{},
-                    .owns_original = false,
-                    .add = .empty,
-                    .pieces = .empty,
-                    .allocator = allocator,
-                };
-            };
+            });
         }
 
         return pt;
@@ -577,7 +558,7 @@ test "PieceTable getVisibleLines" {
     const allocator = std.testing.allocator;
     const original = "Line 1\nLine 2\nLine 3\nLine 4\nLine 5";
 
-    var pt = PieceTable.init(allocator, original);
+    var pt = try PieceTable.init(allocator, original);
     defer pt.deinit();
 
     const lines = try pt.getVisibleLines(allocator, 1, 2);
@@ -606,7 +587,7 @@ test "PieceTable empty buffer" {
 
 test "PieceTable insert at start" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "World");
+    var pt = try PieceTable.init(allocator, "World");
     defer pt.deinit();
 
     try pt.insert(0, "Hello ");
@@ -618,7 +599,7 @@ test "PieceTable insert at start" {
 
 test "PieceTable insert at end" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello");
+    var pt = try PieceTable.init(allocator, "Hello");
     defer pt.deinit();
 
     try pt.insert(5, " World");
@@ -630,7 +611,7 @@ test "PieceTable insert at end" {
 
 test "PieceTable insert empty string" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello");
+    var pt = try PieceTable.init(allocator, "Hello");
     defer pt.deinit();
 
     try pt.insert(2, "");
@@ -642,7 +623,7 @@ test "PieceTable insert empty string" {
 
 test "PieceTable multiple inserts" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello");
+    var pt = try PieceTable.init(allocator, "Hello");
     defer pt.deinit();
 
     try pt.insert(5, " World");
@@ -656,7 +637,7 @@ test "PieceTable multiple inserts" {
 
 test "PieceTable delete entire buffer" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello World");
+    var pt = try PieceTable.init(allocator, "Hello World");
     defer pt.deinit();
 
     try pt.delete(0, 11);
@@ -669,7 +650,7 @@ test "PieceTable delete entire buffer" {
 
 test "PieceTable delete from middle" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello World");
+    var pt = try PieceTable.init(allocator, "Hello World");
     defer pt.deinit();
 
     try pt.delete(5, 6);
@@ -681,7 +662,7 @@ test "PieceTable delete from middle" {
 
 test "PieceTable delete at start" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello World");
+    var pt = try PieceTable.init(allocator, "Hello World");
     defer pt.deinit();
 
     try pt.delete(0, 6);
@@ -693,7 +674,7 @@ test "PieceTable delete at start" {
 
 test "PieceTable delete at end" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello World");
+    var pt = try PieceTable.init(allocator, "Hello World");
     defer pt.deinit();
 
     try pt.delete(5, 6);
@@ -705,7 +686,7 @@ test "PieceTable delete at end" {
 
 test "PieceTable delete zero length" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello");
+    var pt = try PieceTable.init(allocator, "Hello");
     defer pt.deinit();
 
     try pt.delete(2, 0);
@@ -717,7 +698,7 @@ test "PieceTable delete zero length" {
 
 test "PieceTable getCharAt bounds" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello");
+    var pt = try PieceTable.init(allocator, "Hello");
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(u8, 'H'), pt.getCharAt(0).?);
@@ -728,7 +709,7 @@ test "PieceTable getCharAt bounds" {
 
 test "PieceTable lineCount with newlines" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Line 1\nLine 2\nLine 3");
+    var pt = try PieceTable.init(allocator, "Line 1\nLine 2\nLine 3");
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), pt.lineCount());
@@ -739,7 +720,7 @@ test "PieceTable lineCount with newlines" {
 
 test "PieceTable lineCount single line no newline" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Single line");
+    var pt = try PieceTable.init(allocator, "Single line");
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), pt.lineCount());
@@ -747,7 +728,7 @@ test "PieceTable lineCount single line no newline" {
 
 test "PieceTable cache invalidation on insert" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello");
+    var pt = try PieceTable.init(allocator, "Hello");
     defer pt.deinit();
 
     const len1 = pt.totalLength();
@@ -760,7 +741,7 @@ test "PieceTable cache invalidation on insert" {
 
 test "PieceTable cache invalidation on delete" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello World");
+    var pt = try PieceTable.init(allocator, "Hello World");
     defer pt.deinit();
 
     const len1 = pt.totalLength();
@@ -773,7 +754,7 @@ test "PieceTable cache invalidation on delete" {
 
 test "PieceTable find simple string" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello World, Hello Universe");
+    var pt = try PieceTable.init(allocator, "Hello World, Hello Universe");
     defer pt.deinit();
 
     const pos1 = try pt.find("Hello", 0);
@@ -788,7 +769,7 @@ test "PieceTable find simple string" {
 
 test "PieceTable find not found" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello World");
+    var pt = try PieceTable.init(allocator, "Hello World");
     defer pt.deinit();
 
     const pos = try pt.find("Goodbye", 0);
@@ -797,7 +778,7 @@ test "PieceTable find not found" {
 
 test "PieceTable find empty query" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello World");
+    var pt = try PieceTable.init(allocator, "Hello World");
     defer pt.deinit();
 
     const pos = try pt.find("", 0);
@@ -806,7 +787,7 @@ test "PieceTable find empty query" {
 
 test "PieceTable findLast" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello World, Hello Universe, Hello");
+    var pt = try PieceTable.init(allocator, "Hello World, Hello Universe, Hello");
     defer pt.deinit();
 
     const pos = try pt.findLast("Hello", 35);
@@ -815,7 +796,7 @@ test "PieceTable findLast" {
 
 test "PieceTable findLast not found" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello World");
+    var pt = try PieceTable.init(allocator, "Hello World");
     defer pt.deinit();
 
     const pos = try pt.findLast("Goodbye", 11);
@@ -824,7 +805,7 @@ test "PieceTable findLast not found" {
 
 test "PieceTable getVisibleLines out of bounds" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Line 1\nLine 2");
+    var pt = try PieceTable.init(allocator, "Line 1\nLine 2");
     defer pt.deinit();
 
     const lines = try pt.getVisibleLines(allocator, 10, 5);
@@ -835,7 +816,7 @@ test "PieceTable getVisibleLines out of bounds" {
 
 test "PieceTable getVisibleLines empty buffer" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "");
+    var pt = try PieceTable.init(allocator, "");
     defer pt.deinit();
 
     const lines = try pt.getVisibleLines(allocator, 0, 5);
@@ -850,7 +831,7 @@ test "PieceTable getVisibleLines empty buffer" {
 
 test "PieceTable Unicode support" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello 世界");
+    var pt = try PieceTable.init(allocator, "Hello 世界");
     defer pt.deinit();
 
     try pt.insert(6, "美丽的");
@@ -878,7 +859,7 @@ test "PieceTable UTF-8 string manipulation" {
 
 test "PieceTable large insert and delete" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Start");
+    var pt = try PieceTable.init(allocator, "Start");
     defer pt.deinit();
 
     const large_str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" ** 100;
@@ -895,7 +876,7 @@ test "PieceTable large insert and delete" {
 
 test "PieceTable complex edit sequence" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "The quick brown fox");
+    var pt = try PieceTable.init(allocator, "The quick brown fox");
     defer pt.deinit();
 
     try pt.insert(4, "very ");
@@ -909,7 +890,7 @@ test "PieceTable complex edit sequence" {
 
 test "PieceTable iterateContent callback" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "ABC");
+    var pt = try PieceTable.init(allocator, "ABC");
     defer pt.deinit();
 
     const Context = struct {
@@ -931,7 +912,7 @@ test "PieceTable iterateContent callback" {
 
 test "PieceTable iterateContent early break" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "ABCDEF");
+    var pt = try PieceTable.init(allocator, "ABCDEF");
     defer pt.deinit();
 
     const Context = struct {
@@ -953,7 +934,7 @@ test "PieceTable iterateContent early break" {
 
 test "PieceTable alternating insert and delete" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Start");
+    var pt = try PieceTable.init(allocator, "Start");
     defer pt.deinit();
 
     var i: usize = 0;
@@ -969,7 +950,7 @@ test "PieceTable alternating insert and delete" {
 
 test "PieceTable many small inserts" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "");
+    var pt = try PieceTable.init(allocator, "");
     defer pt.deinit();
 
     var i: usize = 0;
@@ -986,7 +967,7 @@ test "PieceTable many small inserts" {
 
 test "PieceTable insert then delete in reverse" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "");
+    var pt = try PieceTable.init(allocator, "");
     defer pt.deinit();
 
     try pt.insert(0, "A");
@@ -1014,7 +995,7 @@ test "PieceTable getVisibleLines with many lines" {
         try writer.print("Line {d}\n", .{i});
     }
 
-    var pt = PieceTable.init(allocator, aw.written());
+    var pt = try PieceTable.init(allocator, aw.written());
     defer pt.deinit();
 
     const lines = try pt.getVisibleLines(allocator, 500, 10);
@@ -1028,7 +1009,7 @@ test "PieceTable getVisibleLines with many lines" {
 
 test "PieceTable find across piece boundaries" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello");
+    var pt = try PieceTable.init(allocator, "Hello");
     defer pt.deinit();
 
     try pt.insert(2, "XX");
@@ -1039,7 +1020,7 @@ test "PieceTable find across piece boundaries" {
 
 test "PieceTable multiple deletes creating gaps" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "ABCDEFGHIJ");
+    var pt = try PieceTable.init(allocator, "ABCDEFGHIJ");
     defer pt.deinit();
 
     try pt.delete(8, 1);
@@ -1055,7 +1036,7 @@ test "PieceTable multiple deletes creating gaps" {
 
 test "PieceTable insert at every position" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "ABC");
+    var pt = try PieceTable.init(allocator, "ABC");
     defer pt.deinit();
 
     try pt.insert(0, "X");
@@ -1070,7 +1051,7 @@ test "PieceTable insert at every position" {
 
 test "PieceTable cache consistency after edits" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Line1\nLine2\nLine3");
+    var pt = try PieceTable.init(allocator, "Line1\nLine2\nLine3");
     defer pt.deinit();
 
     const initial_lines = pt.lineCount();
@@ -1085,7 +1066,7 @@ test "PieceTable cache consistency after edits" {
 
 test "PieceTable find with offset beyond match" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello World Hello");
+    var pt = try PieceTable.init(allocator, "Hello World Hello");
     defer pt.deinit();
 
     const pos = try pt.find("Hello", 6);
@@ -1094,7 +1075,7 @@ test "PieceTable find with offset beyond match" {
 
 test "PieceTable delete spanning multiple pieces" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "AAAAA");
+    var pt = try PieceTable.init(allocator, "AAAAA");
     defer pt.deinit();
 
     try pt.insert(2, "BBB");
@@ -1109,7 +1090,7 @@ test "PieceTable delete spanning multiple pieces" {
 
 test "PieceTable empty buffer operations" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "");
+    var pt = try PieceTable.init(allocator, "");
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), pt.totalLength());
@@ -1125,7 +1106,7 @@ test "PieceTable empty buffer operations" {
 
 test "PieceTable newline handling" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "A\n\nB");
+    var pt = try PieceTable.init(allocator, "A\n\nB");
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 3), pt.lineCount());
@@ -1139,7 +1120,7 @@ test "PieceTable newline handling" {
 
 test "PieceTable findLast boundary" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "AAA BBB AAA");
+    var pt = try PieceTable.init(allocator, "AAA BBB AAA");
     defer pt.deinit();
 
     const pos = try pt.findLast("AAA", 11);
@@ -1151,7 +1132,7 @@ test "PieceTable findLast boundary" {
 
 test "PieceTable consecutive edits at same position" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Start End");
+    var pt = try PieceTable.init(allocator, "Start End");
     defer pt.deinit();
 
     try pt.insert(6, "A");
@@ -1165,7 +1146,7 @@ test "PieceTable consecutive edits at same position" {
 
 test "PieceTable getVisibleLines requesting more than available" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Line 1\nLine 2\nLine 3");
+    var pt = try PieceTable.init(allocator, "Line 1\nLine 2\nLine 3");
     defer pt.deinit();
 
     const lines = try pt.getVisibleLines(allocator, 0, 100);
@@ -1179,7 +1160,7 @@ test "PieceTable getVisibleLines requesting more than available" {
 
 test "PieceTable getVisibleLines at exact line boundary" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Line 1\nLine 2\nLine 3");
+    var pt = try PieceTable.init(allocator, "Line 1\nLine 2\nLine 3");
     defer pt.deinit();
 
     const line_count = pt.lineCount();
@@ -1195,7 +1176,7 @@ test "PieceTable getVisibleLines at exact line boundary" {
 
 test "PieceTable insert beyond buffer length behavior" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello");
+    var pt = try PieceTable.init(allocator, "Hello");
     defer pt.deinit();
 
     try pt.insert(100, " World");
@@ -1205,7 +1186,7 @@ test "PieceTable insert beyond buffer length behavior" {
 
 test "PieceTable delete beyond buffer end is safe" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello");
+    var pt = try PieceTable.init(allocator, "Hello");
     defer pt.deinit();
 
     try pt.delete(0, 1000);
@@ -1219,7 +1200,7 @@ test "PieceTable very long single line without newlines" {
     const allocator = std.testing.allocator;
 
     const long_line = "x" ** 10000;
-    var pt = PieceTable.init(allocator, long_line);
+    var pt = try PieceTable.init(allocator, long_line);
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), pt.lineCount());
@@ -1232,7 +1213,7 @@ test "PieceTable very long single line without newlines" {
 
 test "PieceTable paste large content at end of file" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Start\n");
+    var pt = try PieceTable.init(allocator, "Start\n");
     defer pt.deinit();
 
     const large_paste = "Pasted line\n" ** 100;
@@ -1243,7 +1224,7 @@ test "PieceTable paste large content at end of file" {
 
 test "PieceTable rapid typing simulation" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "");
+    var pt = try PieceTable.init(allocator, "");
     defer pt.deinit();
 
     const phrase = "The quick brown fox jumps over the lazy dog.";
@@ -1258,7 +1239,7 @@ test "PieceTable rapid typing simulation" {
 
 test "PieceTable backspace at position 0 is safe" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello");
+    var pt = try PieceTable.init(allocator, "Hello");
     defer pt.deinit();
 
     try pt.delete(0, 0);
@@ -1270,7 +1251,7 @@ test "PieceTable backspace at position 0 is safe" {
 
 test "PieceTable delete single char from empty string" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "");
+    var pt = try PieceTable.init(allocator, "");
     defer pt.deinit();
 
     try pt.delete(0, 1);
@@ -1279,7 +1260,7 @@ test "PieceTable delete single char from empty string" {
 
 test "PieceTable consecutive newlines" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "\n\n\n\n\n");
+    var pt = try PieceTable.init(allocator, "\n\n\n\n\n");
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 6), pt.lineCount());
@@ -1291,18 +1272,18 @@ test "PieceTable consecutive newlines" {
 test "PieceTable trailing newline handling" {
     const allocator = std.testing.allocator;
 
-    var pt_with = PieceTable.init(allocator, "Line1\nLine2\n");
+    var pt_with = try PieceTable.init(allocator, "Line1\nLine2\n");
     defer pt_with.deinit();
     try std.testing.expectEqual(@as(usize, 3), pt_with.lineCount());
 
-    var pt_without = PieceTable.init(allocator, "Line1\nLine2");
+    var pt_without = try PieceTable.init(allocator, "Line1\nLine2");
     defer pt_without.deinit();
     try std.testing.expectEqual(@as(usize, 2), pt_without.lineCount());
 }
 
 test "PieceTable position calculations with multi-byte UTF8" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Hello 🌍 World");
+    var pt = try PieceTable.init(allocator, "Hello 🌍 World");
     defer pt.deinit();
 
     const pos = pt.getPositionAtOffset(11);
@@ -1316,7 +1297,7 @@ test "PieceTable position calculations with multi-byte UTF8" {
 
 test "PieceTable getLineStartOffset edge cases" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Line1\nLine2\nLine3");
+    var pt = try PieceTable.init(allocator, "Line1\nLine2\nLine3");
     defer pt.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), pt.getLineStartOffset(0));
@@ -1328,7 +1309,7 @@ test "PieceTable getLineStartOffset edge cases" {
 
 test "PieceTable getOffsetForPosition out of bounds" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "Short\nLine");
+    var pt = try PieceTable.init(allocator, "Short\nLine");
     defer pt.deinit();
 
     const offset = pt.getOffsetForPosition(0, 100);
@@ -1358,7 +1339,7 @@ test "PieceTable property: random insert/delete matches naive model" {
     defer allocator.free(initial);
     for (initial) |*b| b.* = rand.intRangeAtMost(u8, 'a', 'z');
 
-    var pt = PieceTable.init(allocator, initial);
+    var pt = try PieceTable.init(allocator, initial);
     defer pt.deinit();
 
     var model: std.ArrayListUnmanaged(u8) = .empty;
@@ -1396,7 +1377,7 @@ test "PieceTable property: random insert/delete matches naive model" {
 
 test "PieceTable property: insert then delete back to original" {
     const allocator = std.testing.allocator;
-    var pt = PieceTable.init(allocator, "hello");
+    var pt = try PieceTable.init(allocator, "hello");
     defer pt.deinit();
 
     // Insert "X" at a bunch of positions, then verify deleting them all

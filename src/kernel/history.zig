@@ -48,19 +48,14 @@ pub const Transaction = struct {
         }
 
         for (self.actions.items) |action| {
-            const cloned = switch (action) {
-                .insert => |i| HistoryAction{
-                    .insert = .{
-                        .pos = i.pos,
-                        .text = try allocator.dupe(u8, i.text),
-                    },
-                },
-                .delete => |d| HistoryAction{
-                    .delete = .{
-                        .pos = d.pos,
-                        .text = try allocator.dupe(u8, d.text),
-                    },
-                },
+            const dup_text = switch (action) {
+                .insert => |i| try allocator.dupe(u8, i.text),
+                .delete => |d| try allocator.dupe(u8, d.text),
+            };
+            errdefer allocator.free(dup_text);
+            const cloned: HistoryAction = switch (action) {
+                .insert => |i| .{ .insert = .{ .pos = i.pos, .text = dup_text } },
+                .delete => |d| .{ .delete = .{ .pos = d.pos, .text = dup_text } },
             };
             try new_actions.append(allocator, cloned);
         }
@@ -180,6 +175,9 @@ pub const HistoryManager = struct {
 
         self.undo_stack.append(self.allocator, txn) catch |err| {
             log.err("Failed to push undo transaction: {} - undo history may be incomplete", .{err});
+            var owned = txn;
+            owned.deinit(self.allocator);
+            return;
         };
 
         for (self.redo_stack.items) |*redo_txn| {
@@ -202,9 +200,10 @@ pub const HistoryManager = struct {
 
         const txn = self.undo_stack.pop() orelse return null;
 
-        const redo_clone = txn.clone(self.allocator) catch return txn;
+        var redo_clone = txn.clone(self.allocator) catch return txn;
         self.redo_stack.append(self.allocator, redo_clone) catch |err| {
             log.warn("Failed to save redo state: {} - redo unavailable", .{err});
+            redo_clone.deinit(self.allocator);
         };
 
         return txn;
@@ -215,7 +214,7 @@ pub const HistoryManager = struct {
 
         const txn = self.redo_stack.pop() orelse return null;
 
-        const undo_clone = txn.clone(self.allocator) catch return txn;
+        var undo_clone = txn.clone(self.allocator) catch return txn;
         // Enforce max_stack_size here too — pushUndo does, but it also
         // clears redo, which we must not do mid-redo.
         while (self.undo_stack.items.len >= self.max_stack_size) {
@@ -224,6 +223,7 @@ pub const HistoryManager = struct {
         }
         self.undo_stack.append(self.allocator, undo_clone) catch |err| {
             log.warn("Failed to save undo state during redo: {}", .{err});
+            undo_clone.deinit(self.allocator);
         };
 
         return txn;

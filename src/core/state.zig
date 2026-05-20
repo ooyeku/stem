@@ -27,11 +27,11 @@ pub const EditorState = struct {
     /// deliberate horizontal motion or text edit.
     preferred_col: ?usize = null,
 
-    pub fn init(allocator: Allocator, io: std.Io, content: []const u8) EditorState {
+    pub fn init(allocator: Allocator, io: std.Io, content: []const u8) !EditorState {
         return EditorState{
             .allocator = allocator,
             .io = io,
-            .buffer = PieceTable.init(allocator, content),
+            .buffer = try PieceTable.init(allocator, content),
             .cursor_row = 0,
             .cursor_col = 0,
             .scroll_offset = 0,
@@ -71,13 +71,17 @@ pub const EditorState = struct {
             return err;
         };
 
-        // Dupe new path before swapping in the new buffer / freeing the
-        // old path — otherwise an OOM here would leave self.file_path
-        // dangling (UAF on next read, double-free in deinit).
+        // Dupe new path AND build the new piece table before swapping
+        // in / freeing the old path — otherwise an OOM here would leave
+        // self.file_path dangling (UAF on next read, double-free in
+        // deinit) or leave self.buffer pointing at a deinit'd table.
         const new_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(new_path);
+        var new_buffer = try PieceTable.init(self.allocator, content[0..read_n]);
+        errdefer new_buffer.deinit();
 
         self.buffer.deinit();
-        self.buffer = PieceTable.init(self.allocator, content[0..read_n]);
+        self.buffer = new_buffer;
 
         if (self.file_path) |old_path| {
             self.allocator.free(old_path);
@@ -701,7 +705,7 @@ test "EditorState initialization" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     try std.testing.expectEqual(state.cursor_row, 0);
@@ -715,7 +719,7 @@ test "EditorState insertChar marks modified" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     try std.testing.expect(!state.modified);
@@ -728,7 +732,7 @@ test "EditorState delete and backspace" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     state.cursor_col = 1;
@@ -751,7 +755,7 @@ test "EditorState insertNewline and Tab" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hi");
+    var state = try EditorState.init(allocator, io, "Hi");
     defer state.deinit();
 
     state.cursor_col = 2;
@@ -773,7 +777,7 @@ test "EditorState empty buffer initialization" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "");
+    var state = try EditorState.init(allocator, io, "");
     defer state.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), state.cursor_row);
@@ -787,7 +791,7 @@ test "EditorState cursor at end of buffer" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     state.cursor_col = 5;
@@ -804,7 +808,7 @@ test "EditorState cursor beyond line end" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hi");
+    var state = try EditorState.init(allocator, io, "Hi");
     defer state.deinit();
 
     state.cursor_col = 100;
@@ -818,7 +822,7 @@ test "EditorState deleteChar at end" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     state.cursor_col = 5;
@@ -834,7 +838,7 @@ test "EditorState backspaceChar at start" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     try state.backspaceChar();
@@ -850,7 +854,7 @@ test "EditorState multiline cursor movement" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
+    var state = try EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
     defer state.deinit();
 
     state.cursor_row = 1;
@@ -865,7 +869,7 @@ test "EditorState getOffsetFor" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello\nWorld");
+    var state = try EditorState.init(allocator, io, "Hello\nWorld");
     defer state.deinit();
 
     const offset1 = state.getOffsetFor(0, 0);
@@ -886,7 +890,7 @@ test "EditorState updateCursorFromOffset" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello\nWorld");
+    var state = try EditorState.init(allocator, io, "Hello\nWorld");
     defer state.deinit();
 
     state.updateCursorFromOffset(0);
@@ -907,7 +911,7 @@ test "EditorState getLineRange" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
+    var state = try EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
     defer state.deinit();
 
     const range1 = state.getLineRange(0);
@@ -928,7 +932,7 @@ test "EditorState getLineContent" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
+    var state = try EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
     defer state.deinit();
 
     const line1 = try state.getLineContent(0);
@@ -949,7 +953,7 @@ test "EditorState getLineContent empty line" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Line 1\n\nLine 3");
+    var state = try EditorState.init(allocator, io, "Line 1\n\nLine 3");
     defer state.deinit();
 
     const line2 = try state.getLineContent(1);
@@ -962,7 +966,7 @@ test "EditorState deleteLine" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
+    var state = try EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
     defer state.deinit();
 
     try state.deleteLine(1);
@@ -977,7 +981,7 @@ test "EditorState duplicateLine" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Line 1\nLine 2");
+    var state = try EditorState.init(allocator, io, "Line 1\nLine 2");
     defer state.deinit();
 
     try state.duplicateLine(0);
@@ -992,7 +996,7 @@ test "EditorState swapAdjacentLines adjacent" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
+    var state = try EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
     defer state.deinit();
 
     try state.swapAdjacentLines(0, 1);
@@ -1007,7 +1011,7 @@ test "EditorState swapAdjacentLines non-adjacent" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
+    var state = try EditorState.init(allocator, io, "Line 1\nLine 2\nLine 3");
     defer state.deinit();
 
     try state.swapAdjacentLines(0, 2);
@@ -1022,7 +1026,7 @@ test "EditorState joinLines" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello\nWorld");
+    var state = try EditorState.init(allocator, io, "Hello\nWorld");
     defer state.deinit();
 
     try state.joinLines(0);
@@ -1037,7 +1041,7 @@ test "EditorState joinLines with whitespace" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello\n    World");
+    var state = try EditorState.init(allocator, io, "Hello\n    World");
     defer state.deinit();
 
     try state.joinLines(0);
@@ -1052,7 +1056,7 @@ test "EditorState joinLines at last line" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Line 1\nLine 2");
+    var state = try EditorState.init(allocator, io, "Line 1\nLine 2");
     defer state.deinit();
 
     try state.joinLines(1);
@@ -1067,7 +1071,7 @@ test "EditorState insertTextAtCursor" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     state.cursor_col = 5;
@@ -1084,7 +1088,7 @@ test "EditorState insertTextAtCursor with newlines" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     state.cursor_col = 5;
@@ -1099,7 +1103,7 @@ test "EditorState deleteRange" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello World");
+    var state = try EditorState.init(allocator, io, "Hello World");
     defer state.deinit();
 
     try state.deleteRange(5, 11);
@@ -1114,7 +1118,7 @@ test "EditorState deleteRange inverted" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello World");
+    var state = try EditorState.init(allocator, io, "Hello World");
     defer state.deinit();
 
     try state.deleteRange(11, 5);
@@ -1129,7 +1133,7 @@ test "EditorState deleteRange same positions" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello World");
+    var state = try EditorState.init(allocator, io, "Hello World");
     defer state.deinit();
 
     try state.deleteRange(5, 5);
@@ -1144,7 +1148,7 @@ test "EditorState getCharAtOffset" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     try std.testing.expectEqual(@as(u8, 'H'), state.getCharAtOffset(0));
@@ -1158,7 +1162,7 @@ test "EditorState getCharBeforeCursor" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     state.cursor_col = 3;
@@ -1173,7 +1177,7 @@ test "EditorState getCharAfterCursor" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "Hello");
+    var state = try EditorState.init(allocator, io, "Hello");
     defer state.deinit();
 
     state.cursor_col = 2;
@@ -1188,7 +1192,7 @@ test "EditorState insertNewlineWithIndent basic" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "    Hello");
+    var state = try EditorState.init(allocator, io, "    Hello");
     defer state.deinit();
 
     state.cursor_col = 9;
@@ -1207,7 +1211,7 @@ test "moveCursorLeftGrapheme wraps from blank line to previous" {
     defer io_ctx.deinit();
     const io = io_ctx.io();
     // Three lines: "hello", "", "world". Cursor on the blank middle line.
-    var state = EditorState.init(allocator, io, "hello\n\nworld");
+    var state = try EditorState.init(allocator, io, "hello\n\nworld");
     defer state.deinit();
 
     state.cursor_row = 1;
@@ -1223,7 +1227,7 @@ test "moveCursorRightGrapheme wraps from blank line to next" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "hello\n\nworld");
+    var state = try EditorState.init(allocator, io, "hello\n\nworld");
     defer state.deinit();
 
     state.cursor_row = 1;
@@ -1240,7 +1244,7 @@ test "preferred_col survives a trip through a shorter line" {
     defer io_ctx.deinit();
     const io = io_ctx.io();
     // Row 0: 20 chars. Row 1: 3 chars. Row 2: 20 chars.
-    var state = EditorState.init(allocator, io, "abcdefghij1234567890\nfoo\nlongerlineofstuff!!");
+    var state = try EditorState.init(allocator, io, "abcdefghij1234567890\nfoo\nlongerlineofstuff!!");
     defer state.deinit();
 
     state.cursor_row = 0;
@@ -1263,7 +1267,7 @@ test "preferred_col cleared by horizontal motion" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "abcdefghij1234567890\nfoo\nlongerlineofstuff!!");
+    var state = try EditorState.init(allocator, io, "abcdefghij1234567890\nfoo\nlongerlineofstuff!!");
     defer state.deinit();
 
     state.cursor_row = 0;
@@ -1279,7 +1283,7 @@ test "preferred_col cleared by edit" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    var state = EditorState.init(allocator, io, "abcdefghij\nfoo");
+    var state = try EditorState.init(allocator, io, "abcdefghij\nfoo");
     defer state.deinit();
 
     state.cursor_row = 0;

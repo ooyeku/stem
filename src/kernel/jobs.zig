@@ -119,17 +119,32 @@ pub const JobManager = struct {
     }
 
     pub fn spawn(self: *JobManager, name: []const u8, func: JobFn, ctx: *anyopaque) !u64 {
-        self.lock();
-
-        const id = self.next_id;
-        self.next_id += 1;
-
+        // Allocate everything that can fail BEFORE taking the lock or
+        // appending to the job list. That way an OOM here doesn't
+        // either deadlock the manager (lock held across error return)
+        // or leave a Job in the list whose owned pointers have already
+        // been freed by errdefers.
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
 
         const cancelled_ptr = try self.allocator.create(std.atomic.Value(bool));
         errdefer self.allocator.destroy(cancelled_ptr);
         cancelled_ptr.* = std.atomic.Value(bool).init(false);
+
+        const wrapper = try self.allocator.create(JobWrapper);
+        errdefer self.allocator.destroy(wrapper);
+
+        self.lock();
+        errdefer self.unlock();
+
+        const id = self.next_id;
+
+        wrapper.* = JobWrapper{
+            .manager = self,
+            .job_id = id,
+            .func = func,
+            .ctx = ctx,
+        };
 
         const job = Job{
             .id = id,
@@ -145,19 +160,20 @@ pub const JobManager = struct {
 
         try self.jobs.append(self.allocator, job);
 
-        self.unlock();
-
-        const wrapper = try self.allocator.create(JobWrapper);
-        wrapper.* = JobWrapper{
-            .manager = self,
-            .job_id = id,
-            .func = func,
-            .ctx = ctx,
+        // Spawn the thread BEFORE incrementing next_id / unlocking, so
+        // that if spawn fails we can roll back cleanly: pop the job we
+        // just appended and let the errdefer chain free its pointers.
+        const thread = std.Thread.spawn(.{}, runJob, .{wrapper}) catch |err| {
+            _ = self.jobs.pop();
+            return err;
         };
-
-        const thread = try std.Thread.spawn(.{}, runJob, .{wrapper});
         thread.detach();
 
+        // Ownership of name_copy, cancelled_ptr, and wrapper has now
+        // been handed off to the live Job + worker thread. Cancel the
+        // earlier errdefers so an error from here on doesn't double-free.
+        self.next_id += 1;
+        self.unlock();
         return id;
     }
 

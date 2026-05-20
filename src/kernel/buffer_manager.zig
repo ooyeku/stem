@@ -68,7 +68,7 @@ pub const BufferManager = struct {
 
         const buffer = Buffer{
             .id = self.next_id,
-            .state = EditorState.init(self.allocator, self.io, ""),
+            .state = try EditorState.init(self.allocator, self.io, ""),
             .name = name,
             .file_path = null,
         };
@@ -107,7 +107,7 @@ pub const BufferManager = struct {
         const file_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(file_path);
 
-        var state = EditorState.init(self.allocator, self.io, content_slice);
+        var state = try EditorState.init(self.allocator, self.io, content_slice);
         errdefer state.deinit();
         if (state.file_path) |old| self.allocator.free(old);
         state.file_path = try self.allocator.dupe(u8, path);
@@ -139,7 +139,7 @@ pub const BufferManager = struct {
 
         const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
         errdefer self.allocator.free(name);
-        var state = EditorState.init(self.allocator, self.io, "");
+        var state = try EditorState.init(self.allocator, self.io, "");
         errdefer state.deinit();
         if (state.file_path) |old| self.allocator.free(old);
         state.file_path = try self.allocator.dupe(u8, path);
@@ -176,7 +176,7 @@ pub const BufferManager = struct {
 
         const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
         errdefer self.allocator.free(name);
-        var state = EditorState.init(self.allocator, self.io, "");
+        var state = try EditorState.init(self.allocator, self.io, "");
         errdefer state.deinit();
         if (state.file_path) |old| self.allocator.free(old);
         state.file_path = try self.allocator.dupe(u8, path);
@@ -207,7 +207,7 @@ pub const BufferManager = struct {
         const read_n = try file.readPositionalAll(self.io, content, 0);
 
         buffer.state.deinit();
-        buffer.state = EditorState.init(self.allocator, self.io, content[0..read_n]);
+        buffer.state = try EditorState.init(self.allocator, self.io, content[0..read_n]);
 
         if (buffer.state.file_path) |old| self.allocator.free(old);
         buffer.state.file_path = try self.allocator.dupe(u8, path);
@@ -225,7 +225,7 @@ pub const BufferManager = struct {
         for (self.buffers.items, 0..) |*buf, i| {
             if (std.mem.eql(u8, buf.name, name)) {
                 buf.state.deinit();
-                buf.state = EditorState.init(self.allocator, self.io, content);
+                buf.state = try EditorState.init(self.allocator, self.io, content);
                 buf.state.modified = false;
                 self.active_index = i;
                 return;
@@ -235,7 +235,7 @@ pub const BufferManager = struct {
         const buf_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(buf_name);
 
-        var state = EditorState.init(self.allocator, self.io, content);
+        var state = try EditorState.init(self.allocator, self.io, content);
         errdefer state.deinit();
         state.modified = false;
 
@@ -270,10 +270,19 @@ pub const BufferManager = struct {
     }
 
     fn resetBufferToUntitled(self: *BufferManager, buf: *Buffer) void {
+        // Build the fresh empty state first; if that fails there's no
+        // sane way to recover (the old state's allocations are still
+        // valid), so leave the buffer as-is.
+        var new_state = EditorState.init(self.allocator, self.io, "") catch |err| {
+            std.log.warn("Failed to allocate empty buffer state during reset: {}", .{err});
+            return;
+        };
+        errdefer new_state.deinit();
+
         const new_name = std.fmt.allocPrint(self.allocator, "untitled-{d}", .{self.untitled_counter}) catch |err| {
             std.log.warn("Failed to allocate buffer name during reset: {}", .{err});
             buf.state.deinit();
-            buf.state = EditorState.init(self.allocator, self.io, "");
+            buf.state = new_state;
             if (buf.file_path) |path| {
                 self.allocator.free(path);
                 buf.file_path = null;
@@ -282,7 +291,7 @@ pub const BufferManager = struct {
         };
 
         buf.state.deinit();
-        buf.state = EditorState.init(self.allocator, self.io, "");
+        buf.state = new_state;
         self.allocator.free(buf.name);
         buf.name = new_name;
         self.untitled_counter += 1;
@@ -725,7 +734,7 @@ test "buffer deinit frees memory" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    const state = EditorState.init(allocator, io, "test content");
+    const state = try EditorState.init(allocator, io, "test content");
     const name = try allocator.dupe(u8, "test-buffer");
     const path = try allocator.dupe(u8, "/test/path.zig");
 
@@ -745,7 +754,7 @@ test "buffer deinit with null file_path" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
-    const state = EditorState.init(allocator, io, "");
+    const state = try EditorState.init(allocator, io, "");
     const name = try allocator.dupe(u8, "untitled");
 
     var buffer = Buffer{
