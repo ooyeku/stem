@@ -221,6 +221,7 @@ pub const TerminalService = struct {
     }
 
     fn runAsyncWorker(ctx: *AsyncContext) void {
+        @import("thread_name.zig").set("stem-term");
         defer {
             ctx.allocator.free(ctx.command);
             if (ctx.cwd) |dir| ctx.allocator.free(dir);
@@ -331,6 +332,7 @@ pub const TerminalService = struct {
     };
 
     fn pumpStderrAsync(state: *StderrPumpState) void {
+        @import("thread_name.zig").set("stem-term-err");
         const stderr = state.stderr orelse return;
         var threaded = std.Io.Threaded.init(state.ctx.allocator, .{
             .environ = .{ .block = state.environ_block },

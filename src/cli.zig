@@ -22,7 +22,8 @@ const scope_tool = @import("tools/scope.zig");
 const plugin_cli = @import("tools/plugin_cli.zig");
 const StorageManager = @import("config/storage.zig").StorageManager;
 const LSPManager = @import("services/lsp_manager.zig").LSPManager;
-const Installer = @import("services/lsp/installer.zig").Installer;
+const installer_mod = @import("services/lsp/installer.zig");
+const Installer = installer_mod.Installer;
 const config_mod = @import("config");
 
 pub const Action = union(enum) {
@@ -83,6 +84,7 @@ const Verb = enum {
     logs,
     lsp,
     plugin,
+    doctor,
     help,
     version,
 };
@@ -94,6 +96,7 @@ fn resolveVerb(arg: [:0]const u8) ?Verb {
         .{ "--scope", Verb.scope },   .{ "config", Verb.config }, .{ "logs", Verb.logs },
         .{ "log", Verb.logs },        .{ "lsp", Verb.lsp },       .{ "help", Verb.help },
         .{ "plugin", Verb.plugin },   .{ "plugins", Verb.plugin },
+        .{ "doctor", Verb.doctor },   .{ "check", Verb.doctor },
         .{ "version", Verb.version },
     };
     inline for (table) |entry| {
@@ -119,6 +122,7 @@ fn dispatchVerb(ctx: Context, verb: Verb) !Action {
         .logs => try runLogs(ctx),
         .lsp => try runLsp(ctx),
         .plugin => try runPlugin(ctx),
+        .doctor => try runDoctor(ctx),
     }
     return .handled;
 }
@@ -651,6 +655,12 @@ const LspEntry = struct {
     display: []const u8,
     /// Aliases accepted on the `stem lsp install <name>` CLI.
     keys: []const []const u8,
+    /// Executable name to look for on PATH (or under ~/.stem/lsp/)
+    /// when probing whether this server is reachable. `null` means
+    /// the server isn't a standalone binary (e.g. R's languageserver
+    /// runs via `R -e 'languageserver::run()'`) — `stem doctor` skips
+    /// the probe in that case.
+    binary: ?[]const u8 = null,
     ensure: *const fn (*Installer, bool) anyerror![]const u8,
     path_only: bool = false,
     /// One-line note shown to the user before this server tries to
@@ -659,30 +669,31 @@ const LspEntry = struct {
 };
 
 const lsp_entries = [_]LspEntry{
-    .{ .display = "pyright (python)", .keys = &.{ "python", "py" }, .ensure = Installer.ensurePyright, .hint = "needs node on PATH" },
-    .{ .display = "typescript-language-server", .keys = &.{ "typescript", "ts", "javascript", "js" }, .ensure = Installer.ensureTypeScriptLS, .hint = "needs node on PATH" },
-    .{ .display = "gopls (go)", .keys = &.{"go"}, .ensure = Installer.ensureGopls, .hint = "needs go on PATH" },
-    .{ .display = "rust-analyzer", .keys = &.{ "rust", "rs" }, .ensure = Installer.ensureRustAnalyzer },
-    .{ .display = "clangd (c/c++)", .keys = &.{ "cpp", "c", "c++" }, .ensure = Installer.ensureClangd, .path_only = true, .hint = "ships with LLVM/Xcode — install via your OS package manager" },
-    .{ .display = "ruby-lsp", .keys = &.{"ruby"}, .ensure = Installer.ensureRubyLsp, .hint = "needs ruby + gem on PATH" },
-    .{ .display = "omnisharp (c#)", .keys = &.{ "csharp", "c#" }, .ensure = Installer.ensureOmniSharp },
-    .{ .display = "jdtls (java)", .keys = &.{"java"}, .ensure = Installer.ensureJdtls, .hint = "needs java on PATH at runtime" },
-    .{ .display = "bash-language-server", .keys = &.{ "bash", "sh" }, .ensure = Installer.ensureBashLanguageServer, .hint = "needs node on PATH" },
-    .{ .display = "lua-language-server", .keys = &.{"lua"}, .ensure = Installer.ensureLuaLanguageServer },
-    .{ .display = "sourcekit-lsp (swift)", .keys = &.{"swift"}, .ensure = Installer.ensureSourcekitLsp, .path_only = true, .hint = "ships with the Swift toolchain (Xcode CLT on macOS)" },
-    .{ .display = "languageserver (r)", .keys = &.{"r"}, .ensure = Installer.ensureRLanguageServer, .hint = "needs R on PATH; installs the R 'languageserver' package" },
-    .{ .display = "vscode-css-language-server", .keys = &.{"css"}, .ensure = Installer.ensureCssLanguageServer, .hint = "needs node on PATH; shares install with html + json" },
-    .{ .display = "vscode-html-language-server", .keys = &.{"html"}, .ensure = Installer.ensureHtmlLanguageServer, .hint = "needs node on PATH; shares install with css + json" },
-    .{ .display = "vscode-json-language-server", .keys = &.{"json"}, .ensure = Installer.ensureJsonLanguageServer, .hint = "needs node on PATH; shares install with css + html" },
-    .{ .display = "intelephense (php)", .keys = &.{"php"}, .ensure = Installer.ensureIntelephense, .hint = "needs node on PATH" },
-    .{ .display = "perlnavigator (perl)", .keys = &.{"perl"}, .ensure = Installer.ensurePerlNavigator, .hint = "needs node on PATH" },
-    .{ .display = "dart language-server", .keys = &.{"dart"}, .ensure = Installer.ensureDartLanguageServer, .path_only = true, .hint = "ships with the Dart SDK (https://dart.dev/get-dart)" },
-    .{ .display = "elixir-ls", .keys = &.{"elixir"}, .ensure = Installer.ensureElixirLs, .path_only = true, .hint = "install via brew or https://github.com/elixir-lsp/elixir-ls/releases" },
-    .{ .display = "erlang_ls", .keys = &.{"erlang"}, .ensure = Installer.ensureErlangLs, .path_only = true, .hint = "install via rebar3 from https://github.com/erlang-ls/erlang_ls" },
-    .{ .display = "haskell-language-server", .keys = &.{"haskell"}, .ensure = Installer.ensureHaskellLanguageServer, .path_only = true, .hint = "install via `ghcup install hls`" },
-    .{ .display = "kotlin-language-server", .keys = &.{"kotlin"}, .ensure = Installer.ensureKotlinLanguageServer, .path_only = true, .hint = "install via brew or https://github.com/fwcd/kotlin-language-server" },
-    .{ .display = "ocamllsp", .keys = &.{"ocaml"}, .ensure = Installer.ensureOcamlLsp, .path_only = true, .hint = "install via `opam install ocaml-lsp-server`" },
-    .{ .display = "metals (scala)", .keys = &.{"scala"}, .ensure = Installer.ensureMetals, .path_only = true, .hint = "install via `coursier install metals`" },
+    .{ .display = "pyright (python)", .keys = &.{ "python", "py" }, .binary = "pyright-langserver", .ensure = Installer.ensurePyright, .hint = "needs node on PATH" },
+    .{ .display = "typescript-language-server", .keys = &.{ "typescript", "ts", "javascript", "js" }, .binary = "typescript-language-server", .ensure = Installer.ensureTypeScriptLS, .hint = "needs node on PATH" },
+    .{ .display = "gopls (go)", .keys = &.{"go"}, .binary = "gopls", .ensure = Installer.ensureGopls, .hint = "needs go on PATH" },
+    .{ .display = "rust-analyzer", .keys = &.{ "rust", "rs" }, .binary = "rust-analyzer", .ensure = Installer.ensureRustAnalyzer },
+    .{ .display = "clangd (c/c++)", .keys = &.{ "cpp", "c", "c++" }, .binary = "clangd", .ensure = Installer.ensureClangd, .path_only = true, .hint = "ships with LLVM/Xcode — install via your OS package manager" },
+    .{ .display = "ruby-lsp", .keys = &.{"ruby"}, .binary = "ruby-lsp", .ensure = Installer.ensureRubyLsp, .hint = "needs ruby + gem on PATH" },
+    .{ .display = "omnisharp (c#)", .keys = &.{ "csharp", "c#" }, .binary = "OmniSharp", .ensure = Installer.ensureOmniSharp },
+    .{ .display = "jdtls (java)", .keys = &.{"java"}, .binary = "jdtls", .ensure = Installer.ensureJdtls, .hint = "needs java on PATH at runtime" },
+    .{ .display = "bash-language-server", .keys = &.{ "bash", "sh" }, .binary = "bash-language-server", .ensure = Installer.ensureBashLanguageServer, .hint = "needs node on PATH" },
+    .{ .display = "lua-language-server", .keys = &.{"lua"}, .binary = "lua-language-server", .ensure = Installer.ensureLuaLanguageServer },
+    .{ .display = "sourcekit-lsp (swift)", .keys = &.{"swift"}, .binary = "sourcekit-lsp", .ensure = Installer.ensureSourcekitLsp, .path_only = true, .hint = "ships with the Swift toolchain (Xcode CLT on macOS)" },
+    // R's language server runs inside the R process — no standalone binary.
+    .{ .display = "languageserver (r)", .keys = &.{"r"}, .binary = null, .ensure = Installer.ensureRLanguageServer, .hint = "needs R on PATH; installs the R 'languageserver' package" },
+    .{ .display = "vscode-css-language-server", .keys = &.{"css"}, .binary = "vscode-css-language-server", .ensure = Installer.ensureCssLanguageServer, .hint = "needs node on PATH; shares install with html + json" },
+    .{ .display = "vscode-html-language-server", .keys = &.{"html"}, .binary = "vscode-html-language-server", .ensure = Installer.ensureHtmlLanguageServer, .hint = "needs node on PATH; shares install with css + json" },
+    .{ .display = "vscode-json-language-server", .keys = &.{"json"}, .binary = "vscode-json-language-server", .ensure = Installer.ensureJsonLanguageServer, .hint = "needs node on PATH; shares install with css + html" },
+    .{ .display = "intelephense (php)", .keys = &.{"php"}, .binary = "intelephense", .ensure = Installer.ensureIntelephense, .hint = "needs node on PATH" },
+    .{ .display = "perlnavigator (perl)", .keys = &.{"perl"}, .binary = "perlnavigator", .ensure = Installer.ensurePerlNavigator, .hint = "needs node on PATH" },
+    .{ .display = "dart language-server", .keys = &.{"dart"}, .binary = "dart", .ensure = Installer.ensureDartLanguageServer, .path_only = true, .hint = "ships with the Dart SDK (https://dart.dev/get-dart)" },
+    .{ .display = "elixir-ls", .keys = &.{"elixir"}, .binary = "elixir-ls", .ensure = Installer.ensureElixirLs, .path_only = true, .hint = "install via brew or https://github.com/elixir-lsp/elixir-ls/releases" },
+    .{ .display = "erlang_ls", .keys = &.{"erlang"}, .binary = "erlang_ls", .ensure = Installer.ensureErlangLs, .path_only = true, .hint = "install via rebar3 from https://github.com/erlang-ls/erlang_ls" },
+    .{ .display = "haskell-language-server", .keys = &.{"haskell"}, .binary = "haskell-language-server-wrapper", .ensure = Installer.ensureHaskellLanguageServer, .path_only = true, .hint = "install via `ghcup install hls`" },
+    .{ .display = "kotlin-language-server", .keys = &.{"kotlin"}, .binary = "kotlin-language-server", .ensure = Installer.ensureKotlinLanguageServer, .path_only = true, .hint = "install via brew or https://github.com/fwcd/kotlin-language-server" },
+    .{ .display = "ocamllsp", .keys = &.{"ocaml"}, .binary = "ocamllsp", .ensure = Installer.ensureOcamlLsp, .path_only = true, .hint = "install via `opam install ocaml-lsp-server`" },
+    .{ .display = "metals (scala)", .keys = &.{"scala"}, .binary = "metals", .ensure = Installer.ensureMetals, .path_only = true, .hint = "install via `coursier install metals`" },
 };
 
 fn matchLspKey(entry: LspEntry, want: []const u8) bool {
@@ -818,6 +829,164 @@ fn runPlugin(ctx: Context) !void {
 }
 
 // ---------------------------------------------------------------------------
+// `doctor`
+// ---------------------------------------------------------------------------
+//
+// `stem doctor` probes the environment for the things stem cares
+// about and prints a ✓/✗ table. Read-only — never mutates state.
+// Useful as the very first thing to run when something feels off, and
+// as the suggested follow-up in error messages elsewhere.
+
+const DoctorStatus = enum { ok, warn, fail, info };
+
+fn doctorRow(io: std.Io, status: DoctorStatus, name: []const u8, comptime fmt: []const u8, args: anytype) !void {
+    const symbol: []const u8 = switch (status) {
+        .ok => "\u{2713}", // ✓
+        .warn => "\u{26a0}", // ⚠
+        .fail => "\u{2717}", // ✗
+        .info => "\u{2022}", // •
+    };
+    try outPrint(io, "  {s} {s}: ", .{ symbol, name });
+    try outPrint(io, fmt, args);
+    try outPrint(io, "\n", .{});
+}
+
+fn runDoctor(ctx: Context) !void {
+    try outPrint(ctx.io, "stem doctor — environment & install check\n\n", .{});
+
+    // Stem version itself.
+    try doctorRow(ctx.io, .info, "stem", "{s} ({s})", .{ config_mod.version, config_mod.git_hash });
+
+    // Zig: not required at runtime (we're already running), but useful
+    // to flag for source-build users.
+    if (installer_mod.findOnSystem(ctx.allocator, ctx.io, "zig", ctx.environ_block)) |path| {
+        defer ctx.allocator.free(path);
+        try doctorRow(ctx.io, .ok, "zig on PATH", "{s}", .{path});
+    } else {
+        try doctorRow(ctx.io, .warn, "zig on PATH", "not found — needed for `zig build` and source installs", .{});
+    }
+
+    try outPrint(ctx.io, "\nTerminal capabilities\n", .{});
+
+    // 24-bit colour detection: COLORTERM=truecolor|24bit is the
+    // standard signal. We don't try anything fancy beyond that.
+    const env: std.process.Environ = .{ .block = ctx.environ_block };
+    if (env.getPosix("COLORTERM")) |ct| {
+        if (std.mem.eql(u8, ct, "truecolor") or std.mem.eql(u8, ct, "24bit")) {
+            try doctorRow(ctx.io, .ok, "24-bit colour", "COLORTERM={s}", .{ct});
+        } else {
+            try doctorRow(ctx.io, .warn, "24-bit colour", "COLORTERM={s} — themes may look muted; try `export COLORTERM=truecolor`", .{ct});
+        }
+    } else {
+        try doctorRow(ctx.io, .warn, "24-bit colour", "COLORTERM unset — themes may look muted; try `export COLORTERM=truecolor`", .{});
+    }
+
+    if (env.getPosix("TERM")) |term| {
+        try doctorRow(ctx.io, .info, "TERM", "{s}", .{term});
+    } else {
+        try doctorRow(ctx.io, .warn, "TERM", "unset — stem expects a sane terminfo entry", .{});
+    }
+
+    try outPrint(ctx.io, "\nStem directories\n", .{});
+
+    try doctorDir(ctx, "config dir", ctx.storage.config_dir);
+    try doctorDir(ctx, "plugins dir", ctx.storage.plugins_dir);
+    try doctorDir(ctx, "logs dir", ctx.storage.logs_dir);
+    try doctorDir(ctx, "lsp dir", ctx.storage.lsp_dir);
+
+    // Bundled / user plugins.
+    try outPrint(ctx.io, "\nPlugins (~/.stem/plugins)\n", .{});
+    try doctorPluginList(ctx);
+
+    try outPrint(ctx.io, "\nLanguage servers\n", .{});
+    try doctorLspServers(ctx);
+
+    try outPrint(ctx.io, "\nAll done. For details on any single LSP, run `stem lsp list`.\n", .{});
+}
+
+fn doctorDir(ctx: Context, label: []const u8, path: []const u8) !void {
+    if (std.Io.Dir.accessAbsolute(ctx.io, path, .{})) |_| {
+        try doctorRow(ctx.io, .ok, label, "{s}", .{path});
+    } else |err| {
+        if (err == error.FileNotFound) {
+            try doctorRow(ctx.io, .warn, label, "{s} — not present (created on first use)", .{path});
+        } else {
+            try doctorRow(ctx.io, .fail, label, "{s}: {s}", .{ path, @errorName(err) });
+        }
+    }
+}
+
+fn doctorPluginList(ctx: Context) !void {
+    var dir = std.Io.Dir.openDirAbsolute(ctx.io, ctx.storage.plugins_dir, .{ .iterate = true }) catch |err| {
+        if (err == error.FileNotFound) {
+            try doctorRow(ctx.io, .info, "installed", "(none yet)", .{});
+            return;
+        }
+        try doctorRow(ctx.io, .fail, "scan", "{s}", .{@errorName(err)});
+        return;
+    };
+    defer dir.close(ctx.io);
+
+    var it = dir.iterate();
+    var count: usize = 0;
+    while (it.next(ctx.io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        count += 1;
+        const manifest_path = try std.fs.path.join(ctx.allocator, &.{ ctx.storage.plugins_dir, entry.name, "plugin.json" });
+        defer ctx.allocator.free(manifest_path);
+        if (std.Io.Dir.accessAbsolute(ctx.io, manifest_path, .{})) |_| {
+            try doctorRow(ctx.io, .ok, entry.name, "{s}", .{manifest_path});
+        } else |_| {
+            try doctorRow(ctx.io, .warn, entry.name, "no plugin.json — stem will skip this directory", .{});
+        }
+    }
+    if (count == 0) {
+        try doctorRow(ctx.io, .info, "installed", "(none yet)", .{});
+    }
+}
+
+fn doctorLspServers(ctx: Context) !void {
+    // Walk the same `lsp_entries` table the `stem lsp` subcommand uses
+    // so the doctor and `lsp list` never disagree. For each entry,
+    // probe the *binary* name (not the language alias) so `gopls (go)`
+    // doesn't get falsely greenlit by finding `go` itself on PATH.
+    var any_found = false;
+    for (lsp_entries) |entry| {
+        const bin = entry.binary orelse {
+            // No standalone binary (R's languageserver). Report
+            // informationally rather than probing.
+            try doctorRow(ctx.io, .info, entry.display, "no standalone binary — {s}", .{entry.hint});
+            continue;
+        };
+
+        // Probe PATH and well-known toolchain dirs first.
+        if (installer_mod.findOnSystem(ctx.allocator, ctx.io, bin, ctx.environ_block)) |path| {
+            defer ctx.allocator.free(path);
+            try doctorRow(ctx.io, .ok, entry.display, "{s}", .{path});
+            any_found = true;
+            continue;
+        }
+
+        // Fall back to stem's per-user install location.
+        const stem_path = std.fs.path.join(ctx.allocator, &.{ ctx.storage.lsp_dir, bin, bin }) catch null;
+        if (stem_path) |p| {
+            defer ctx.allocator.free(p);
+            if (std.Io.Dir.accessAbsolute(ctx.io, p, .{})) |_| {
+                try doctorRow(ctx.io, .ok, entry.display, "{s} (installed by stem)", .{p});
+                any_found = true;
+                continue;
+            } else |_| {}
+        }
+
+        const hint = if (entry.hint.len > 0) entry.hint else "run `stem lsp install`";
+        try doctorRow(ctx.io, .info, entry.display, "not installed — {s}", .{hint});
+    }
+    if (!any_found) {
+        try outPrint(ctx.io, "\n  (no external servers yet. Install one with `stem lsp install <name>`.)\n", .{});
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Help / version
 // ---------------------------------------------------------------------------
 
@@ -918,16 +1087,35 @@ const verb_specs = [_]VerbSpec{
         .name = "plugin <action>",
         .summary = "Manage installed plugins",
         .detail =
-        \\Usage: stem plugin <list|info|install|remove|test> [args]
+        \\Usage: stem plugin <list|info|inspect|install|remove|test> [args]
         \\
         \\  list                  List installed plugins
         \\  info <name>           Show a plugin's manifest
+        \\  inspect [name]        Capability inspector: manifest, permissions,
+        \\                        restart policy, artifact sanity. Omit name to
+        \\                        report on every installed plugin.
         \\  install <path>        Copy a plugin directory into ~/.stem/plugins
         \\  remove <name>         Delete an installed plugin
         \\  test <path>           Hermetic smoke test (manifest + entry artifact;
         \\                        for wasm plugins, runs `activate` against
         \\                        mocked host imports and reports registered
         \\                        commands).
+        ,
+    },
+    .{
+        .verb = .doctor,
+        .name = "doctor",
+        .summary = "Environment & install check",
+        .detail =
+        \\Usage: stem doctor
+        \\
+        \\Probes the host environment for the things stem needs:
+        \\  - 24-bit colour support in the terminal
+        \\  - ~/.stem directory layout (config, logs, plugins, lsp)
+        \\  - Installed plugins (with manifest sanity)
+        \\  - Each supported LSP server's presence on PATH
+        \\
+        \\Read-only; never modifies anything.
         ,
     },
     .{

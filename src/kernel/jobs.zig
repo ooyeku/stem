@@ -162,6 +162,7 @@ pub const JobManager = struct {
     }
 
     fn runJob(wrapper: *JobWrapper) void {
+        @import("../services/thread_name.zig").set("stem-job");
         const manager = wrapper.manager;
         const job_id = wrapper.job_id;
         const func = wrapper.func;

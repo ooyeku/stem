@@ -15,6 +15,7 @@ pub const RequestKind = enum {
     references,
     completion,
     document_symbols,
+    workspace_symbols,
 };
 
 /// LSP position encoding. Defaults to utf16 (the LSP-spec default) unless the
@@ -177,6 +178,9 @@ pub const LSPServer = struct {
     document_symbols_result: ?[]DocumentSymbol = null,
     document_symbols_mutex: std.Io.Mutex = .init,
 
+    workspace_symbols_result: ?[]WorkspaceSymbol = null,
+    workspace_symbols_mutex: std.Io.Mutex = .init,
+
     file_tokens: std.StringHashMapUnmanaged(FileTokens) = .empty,
     file_tokens_mutex: std.Io.Mutex = .init,
 
@@ -261,6 +265,18 @@ pub const LSPServer = struct {
             operator,
             type_parameter,
         };
+    };
+
+    pub const WorkspaceSymbol = struct {
+        /// Symbol name. Owned.
+        name: []const u8,
+        kind: DocumentSymbol.SymbolKind,
+        /// Absolute file path. Owned.
+        file_path: []const u8,
+        line: u32,
+        col: u32,
+        /// Optional container — class / module. Owned.
+        container_name: ?[]const u8 = null,
     };
 
     pub const DocumentSymbol = struct {
@@ -422,6 +438,17 @@ pub const LSPServer = struct {
             self.allocator.free(symbols);
         }
         self.document_symbols_mutex.unlock(self.io);
+
+        self.workspace_symbols_mutex.lockUncancelable(self.io);
+        if (self.workspace_symbols_result) |syms| {
+            for (syms) |sym| {
+                self.allocator.free(sym.name);
+                self.allocator.free(sym.file_path);
+                if (sym.container_name) |c| self.allocator.free(c);
+            }
+            self.allocator.free(syms);
+        }
+        self.workspace_symbols_mutex.unlock(self.io);
 
         self.to_server.deinit();
         self.from_server.deinit();
@@ -618,6 +645,7 @@ pub const LSPServer = struct {
     }
 
     fn readResponses(self: *LSPServer) void {
+        @import("../thread_name.zig").set("stem-lsp-read");
         log.info("[LSP READER] {s} response reader thread started", .{self.lang});
         defer {
             self.server_healthy.store(false, .release);
@@ -744,11 +772,21 @@ pub const LSPServer = struct {
                 // First check the semantic-tokens map (URI-carrying, separate
                 // lock). Semantic tokens flow through their own bookkeeping
                 // because each response needs the URI it was originally for.
+                //
+                // CRITICAL: remove + own the URI inside the same lock window
+                // we used to look it up. Previously we did `.get(id)`, unlocked,
+                // and then used the borrowed slice — but the core thread's
+                // `requestSemanticTokens` stale-cleanup can fire between unlock
+                // and use, fetchRemove the same id, and free the bytes we're
+                // about to read. The user-visible symptom was a segfault when
+                // toggling between 10+ open files (which is exactly when the
+                // map's count > 10 stale-cleanup branch trips).
                 self.file_tokens_mutex.lockUncancelable(self.io);
-                const maybe_uri = self.pending_semantic_requests.get(id);
+                const owned_uri: ?[]u8 = if (self.pending_semantic_requests.fetchRemove(id)) |kv| kv.value else null;
                 self.file_tokens_mutex.unlock(self.io);
 
-                if (maybe_uri) |uri| {
+                if (owned_uri) |uri| {
+                    defer self.allocator.free(uri);
                     self.last_response_time.store(std.Io.Clock.real.now(self.io).toMilliseconds(), .release);
                     _ = self.pending_request_count.fetchSub(1, .monotonic);
 
@@ -757,11 +795,6 @@ pub const LSPServer = struct {
                             log.warn("[LSP] {s} failed to handle semantic tokens result: {}", .{ self.lang, err });
                         };
                     }
-                    self.file_tokens_mutex.lockUncancelable(self.io);
-                    if (self.pending_semantic_requests.fetchRemove(id)) |kv| {
-                        self.allocator.free(kv.value);
-                    }
-                    self.file_tokens_mutex.unlock(self.io);
                     return;
                 }
 
@@ -817,6 +850,9 @@ pub const LSPServer = struct {
                     },
                     .document_symbols => if (result) |r| {
                         self.handleDocumentSymbolsResult(r) catch |err| log.warn("[LSP] document symbols handler: {}", .{err});
+                    },
+                    .workspace_symbols => if (result) |r| {
+                        self.handleWorkspaceSymbolsResult(r) catch |err| log.warn("[LSP] workspace symbols handler: {}", .{err});
                     },
                 }
                 return;
@@ -1068,27 +1104,40 @@ pub const LSPServer = struct {
             }
         }
 
-        var stale_ids = std.ArrayListUnmanaged(i64).empty;
-        defer stale_ids.deinit(self.allocator);
-
-        var req_it = self.pending_semantic_requests.iterator();
-        while (req_it.next()) |entry| {
-            if (self.pending_semantic_requests.count() > 10) {
-                // best-effort: stale request cleanup; if OOM we just skip pruning this iteration
+        // Bound the pending-request map. We don't have wall-clock
+        // timestamps per request, so use the request id ordering as
+        // a proxy for "oldest" — when the map grows past the cap,
+        // collect the lowest ids and evict them. Capped at 32 in
+        // flight (one cycle of rapid buffer switching never exceeds
+        // this in practice; an old hard limit of 10 was tripping
+        // every time on workspaces with more than a handful of files).
+        const max_in_flight: usize = 32;
+        if (self.pending_semantic_requests.count() > max_in_flight) {
+            var stale_ids = std.ArrayListUnmanaged(i64).empty;
+            defer stale_ids.deinit(self.allocator);
+            var req_it = self.pending_semantic_requests.iterator();
+            while (req_it.next()) |entry| {
                 stale_ids.append(self.allocator, entry.key_ptr.*) catch {};
             }
-        }
-
-        for (stale_ids.items) |stale_id| {
-            if (self.pending_semantic_requests.fetchRemove(stale_id)) |kv| {
-                self.allocator.free(kv.value);
-                log.info("[LSP CLEANUP] Removed stale pending request id={d}", .{stale_id});
+            // Sort ascending and drop the oldest until we're back under cap.
+            std.mem.sort(i64, stale_ids.items, {}, std.sort.asc(i64));
+            const to_drop = stale_ids.items.len -| max_in_flight;
+            for (stale_ids.items[0..to_drop]) |stale_id| {
+                if (self.pending_semantic_requests.fetchRemove(stale_id)) |kv| {
+                    self.allocator.free(kv.value);
+                    log.info("[LSP CLEANUP] Removed stale pending request id={d}", .{stale_id});
+                }
             }
         }
 
-        const gop = try self.last_request_times.getOrPut(self.allocator, uri);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.allocator.dupe(u8, uri);
+        // Dupe-before-put: keeps `last_request_times` from ever
+        // holding the caller's borrowed slice as a key (which would
+        // dangle as soon as the caller's stack frame unwinds).
+        const lrt_key = try self.allocator.dupe(u8, uri);
+        errdefer self.allocator.free(lrt_key);
+        const gop = try self.last_request_times.getOrPut(self.allocator, lrt_key);
+        if (gop.found_existing) {
+            self.allocator.free(lrt_key);
         }
         gop.value_ptr.* = now;
 
@@ -1236,6 +1285,21 @@ pub const LSPServer = struct {
         try self.sendRequestWithId(id, "textDocument/documentSymbol", params.written());
     }
 
+    /// LSP `workspace/symbol` — workspace-wide fuzzy match against the
+    /// server's symbol table. `query` may be empty (servers return
+    /// everything, or a server-defined subset).
+    pub fn requestWorkspaceSymbol(self: *LSPServer, query: []const u8) !void {
+        var params: std.Io.Writer.Allocating = .init(self.allocator);
+        defer params.deinit();
+        const w = &params.writer;
+        try w.writeAll("{\"query\":\"");
+        try writeJsonEscapedString(w, query);
+        try w.writeAll("\"}");
+        const id = self.nextRequestId();
+        try self.setPending(.workspace_symbols, id);
+        try self.sendRequestWithId(id, "workspace/symbol", params.written());
+    }
+
     pub fn handleSemanticTokensResult(self: *LSPServer, result: std.json.Value, uri: []const u8) !void {
         if (result != .object) return;
         const obj = result.object;
@@ -1245,12 +1309,23 @@ pub const LSPServer = struct {
         const arr = data_val.array.items;
         log.info("Received semantic tokens: {d} items for {s}", .{ arr.len, uri });
 
+        // Dupe the URI *before* getOrPut so the map never observes
+        // a borrowed slice as its key. The previous pattern (put
+        // then conditionally overwrite key_ptr.* with a dupe) left
+        // the map holding the caller's borrowed slice as the key if
+        // the dupe failed with OOM — subsequent lookups would
+        // dereference freed memory.
+        const key_dup = try self.allocator.dupe(u8, uri);
+        errdefer self.allocator.free(key_dup);
+
         self.file_tokens_mutex.lockUncancelable(self.io);
         defer self.file_tokens_mutex.unlock(self.io);
 
-        const gop = try self.file_tokens.getOrPut(self.allocator, uri);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.allocator.dupe(u8, uri);
+        const gop = try self.file_tokens.getOrPut(self.allocator, key_dup);
+        if (gop.found_existing) {
+            // Map already has its own duped key for this URI.
+            self.allocator.free(key_dup);
+        } else {
             gop.value_ptr.* = .{
                 .tokens = .empty,
                 .last_updated = std.Io.Clock.real.now(self.io).toMilliseconds(),
@@ -1413,12 +1488,20 @@ pub const LSPServer = struct {
         const expected_size: usize = 29 + count * 13;
         if (buf.len < expected_size) return false;
 
+        // Same dupe-before-put pattern as the live-result handler.
+        const key_dup = self.allocator.dupe(u8, uri) catch return false;
+        errdefer self.allocator.free(key_dup);
+
         self.file_tokens_mutex.lockUncancelable(self.io);
         defer self.file_tokens_mutex.unlock(self.io);
 
-        const gop = self.file_tokens.getOrPut(self.allocator, uri) catch return false;
-        if (!gop.found_existing) {
-            gop.key_ptr.* = self.allocator.dupe(u8, uri) catch return false;
+        const gop = self.file_tokens.getOrPut(self.allocator, key_dup) catch {
+            self.allocator.free(key_dup);
+            return false;
+        };
+        if (gop.found_existing) {
+            self.allocator.free(key_dup);
+        } else {
             gop.value_ptr.* = .{
                 .tokens = .empty,
                 .last_updated = std.Io.Clock.real.now(self.io).toMilliseconds(),
@@ -1605,8 +1688,22 @@ pub const LSPServer = struct {
     }
 
     fn handleReferencesResult(self: *LSPServer, result: std.json.Value) !void {
-        if (result == .null) return;
-        if (result != .array) return;
+        // LSP returns `null` when the server has no references for
+        // the symbol (or doesn't know what's at the cursor). Treat
+        // that as an explicit empty result so the UI handler can
+        // surface "No references found" rather than spinning on a
+        // never-arriving response. Non-array, non-null payloads are
+        // genuinely malformed — drop them with the empty result too.
+        if (result == .null or result != .array) {
+            self.references_mutex.lockUncancelable(self.io);
+            if (self.references_result) |old| {
+                for (old) |r| self.allocator.free(r.file_path);
+                self.allocator.free(old);
+            }
+            self.references_result = try self.allocator.alloc(Location, 0);
+            self.references_mutex.unlock(self.io);
+            return;
+        }
 
         var locations = std.ArrayListUnmanaged(Location).empty;
         errdefer {
@@ -1825,6 +1922,106 @@ pub const LSPServer = struct {
         }
         self.document_symbols_result = owned;
         self.document_symbols_mutex.unlock(self.io);
+    }
+
+    /// Parse a `workspace/symbol` response. Accepts both the older
+    /// `SymbolInformation[]` shape (one flat array, each item with
+    /// `location: { uri, range }`) and the newer `WorkspaceSymbol[]`
+    /// shape (same envelope; some servers omit `range` and provide
+    /// only `uri`). Bad / missing entries are skipped rather than
+    /// aborting the whole result.
+    fn handleWorkspaceSymbolsResult(self: *LSPServer, result: std.json.Value) !void {
+        if (result != .array) return;
+        const items = result.array.items;
+
+        var out = std.ArrayListUnmanaged(WorkspaceSymbol).empty;
+        errdefer {
+            for (out.items) |sym| {
+                self.allocator.free(sym.name);
+                self.allocator.free(sym.file_path);
+                if (sym.container_name) |c| self.allocator.free(c);
+            }
+            out.deinit(self.allocator);
+        }
+
+        for (items) |item| {
+            if (item != .object) continue;
+            const name_val = item.object.get("name") orelse continue;
+            if (name_val != .string or name_val.string.len == 0) continue;
+
+            var kind: DocumentSymbol.SymbolKind = .function;
+            if (item.object.get("kind")) |kv| {
+                if (kv == .integer) {
+                    const k = kv.integer;
+                    if (k >= 1 and k <= 26) kind = @enumFromInt(@as(u8, @intCast(k)));
+                }
+            }
+
+            // Location can be on `location` (SymbolInformation) or
+            // directly under the item itself (rare).
+            const loc_val = item.object.get("location") orelse continue;
+            if (loc_val != .object) continue;
+            const uri_val = loc_val.object.get("uri") orelse continue;
+            if (uri_val != .string) continue;
+
+            var line: u32 = 0;
+            var col: u32 = 0;
+            if (loc_val.object.get("range")) |range| {
+                if (range == .object) {
+                    if (range.object.get("start")) |range_start| {
+                        if (range_start == .object) {
+                            line = toU32(range_start.object.get("line") orelse continue) orelse 0;
+                            col = toU32(range_start.object.get("character") orelse continue) orelse 0;
+                        }
+                    }
+                }
+            }
+
+            const file_path = fileUriToPath(self.allocator, uri_val.string) catch continue;
+            errdefer self.allocator.free(file_path);
+            const name_dup = try self.allocator.dupe(u8, name_val.string);
+            errdefer self.allocator.free(name_dup);
+
+            var container_name: ?[]const u8 = null;
+            if (item.object.get("containerName")) |cn| {
+                if (cn == .string and cn.string.len > 0) {
+                    container_name = try self.allocator.dupe(u8, cn.string);
+                }
+            }
+
+            try out.append(self.allocator, .{
+                .name = name_dup,
+                .kind = kind,
+                .file_path = file_path,
+                .line = line,
+                .col = col,
+                .container_name = container_name,
+            });
+        }
+
+        log.info("Received {d} workspace symbols", .{out.items.len});
+
+        const owned = out.toOwnedSlice(self.allocator) catch |err| {
+            for (out.items) |sym| {
+                self.allocator.free(sym.name);
+                self.allocator.free(sym.file_path);
+                if (sym.container_name) |c| self.allocator.free(c);
+            }
+            out.deinit(self.allocator);
+            return err;
+        };
+
+        self.workspace_symbols_mutex.lockUncancelable(self.io);
+        if (self.workspace_symbols_result) |old| {
+            for (old) |sym| {
+                self.allocator.free(sym.name);
+                self.allocator.free(sym.file_path);
+                if (sym.container_name) |c| self.allocator.free(c);
+            }
+            self.allocator.free(old);
+        }
+        self.workspace_symbols_result = owned;
+        self.workspace_symbols_mutex.unlock(self.io);
     }
 
     pub fn handleDiagnostics(self: *LSPServer, root: std.json.Value) !void {

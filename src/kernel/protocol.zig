@@ -1,6 +1,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const safe = @import("safe.zig");
+const hover_doc = @import("../services/hover_doc.zig");
 
 pub const Mode = enum {
     select,
@@ -15,6 +16,7 @@ pub const Mode = enum {
     command_palette,
     go_to_line,
     symbol_picker,
+    workspace_symbol_picker,
     log_view,
     global_search,
 };
@@ -80,6 +82,16 @@ pub const SymbolEntry = struct {
     name: []const u8,
     kind: []const u8,
     line: usize,
+};
+
+pub const WorkspaceSymbolEntry = struct {
+    name: []const u8,
+    kind: []const u8,
+    /// Absolute path of the file the symbol lives in. Renderer
+    /// truncates this to the basename for display.
+    file_path: []const u8,
+    line: usize,
+    col: usize,
 };
 
 pub const PluginInfo = struct {
@@ -202,6 +214,16 @@ pub const NotificationLevel = enum(u8) {
     err = 2,
 };
 
+/// Visual treatment for transient `status_message` toasts. Drives the
+/// icon and colour chosen by `status_bar.zig` so a save success and a
+/// save failure don't both render as a green ✓.
+pub const StatusLevel = enum(u8) {
+    info = 0,
+    success = 1,
+    warning = 2,
+    err = 3,
+};
+
 pub const CompletionEntry = struct {
     label: []const u8,
     kind: []const u8,
@@ -305,6 +327,32 @@ pub const RenderSnapshot = struct {
     syntax_tokens: ?[]const SyntaxToken = null,
 
     hover_content: ?[]const u8 = null,
+    /// Parsed-and-cloned hover document. Lives in the same arena as
+    /// the rest of the snapshot, freed when the snapshot is. Null
+    /// when there's no hover (or the parse failed and we fell back
+    /// to the raw `hover_content`).
+    hover_document: ?hover_doc.HoverDocument = null,
+    /// Anchor cell — token start, not the cursor — used by the
+    /// renderer to position the popup. Buffer-space coordinates;
+    /// view converts to screen.
+    hover_anchor_row: usize = 0,
+    hover_anchor_col: usize = 0,
+    /// Per-section scroll offset for the popup. The signature panel
+    /// is never scrolled; only the body sections move.
+    hover_scroll_offset: usize = 0,
+    /// True for hover triggered by `Space h` (sticky — Esc dismisses,
+    /// scroll keys scroll). False for idle-timer auto-hover
+    /// (dismissed by any keypress / cursor move).
+    hover_sticky: bool = false,
+    /// LSP has been asked, no response yet, and enough time has
+    /// elapsed that we want to show a "Loading…" affordance. The
+    /// 150 ms grace period keeps fast hovers from flickering.
+    hover_loading: bool = false,
+
+    /// Which-key panel: surfaces every available leader binding once
+    /// the Space leader has been held idle for a short delay. `null`
+    /// when the popup isn't currently visible.
+    which_key_visible: bool = false,
 
     command_palette_query: ?[]const u8 = null,
     command_palette_results: ?[]const CommandEntry = null,
@@ -315,6 +363,11 @@ pub const RenderSnapshot = struct {
     symbol_picker_query: ?[]const u8 = null,
     symbol_picker_results: ?[]const SymbolEntry = null,
     symbol_picker_selected: usize = 0,
+
+    workspace_symbol_query: ?[]const u8 = null,
+    workspace_symbol_results: ?[]const WorkspaceSymbolEntry = null,
+    workspace_symbol_selected: usize = 0,
+    workspace_symbol_pending: bool = false,
 
     completion_active: bool = false,
     completion_items: ?[]const CompletionEntry = null,
@@ -360,6 +413,7 @@ pub const RenderSnapshot = struct {
     active_job_count: u32 = 0,
 
     status_message: ?[]const u8 = null,
+    status_message_level: StatusLevel = .success,
 
     pub fn clone(self: RenderSnapshot, allocator: std.mem.Allocator) !RenderSnapshot {
         var new = self;
@@ -372,6 +426,10 @@ pub const RenderSnapshot = struct {
 
         if (self.terminal_output) |out| new.terminal_output = try allocator.dupe(u8, out);
         if (self.terminal_input) |in| new.terminal_input = try allocator.dupe(u8, in);
+        if (self.terminal_cwd) |cwd| new.terminal_cwd = try allocator.dupe(u8, cwd);
+        if (self.diff_highlight_lines) |lines| {
+            new.diff_highlight_lines = try allocator.dupe(DiffLineHighlight, lines);
+        }
 
         if (self.file_path) |path| new.file_path = try allocator.dupe(u8, path);
 
@@ -404,6 +462,10 @@ pub const RenderSnapshot = struct {
             new.hover_content = try allocator.dupe(u8, content);
         }
 
+        if (self.hover_document) |doc| {
+            new.hover_document = try doc.clone(allocator);
+        }
+
         if (self.command_palette_query) |query| new.command_palette_query = try allocator.dupe(u8, query);
         if (self.command_palette_results) |results| {
             const new_results = try allocator.alloc(CommandEntry, results.len);
@@ -427,6 +489,18 @@ pub const RenderSnapshot = struct {
                 new_results[i].kind = try allocator.dupe(u8, res.kind);
             }
             new.symbol_picker_results = new_results;
+        }
+
+        if (self.workspace_symbol_query) |query| new.workspace_symbol_query = try allocator.dupe(u8, query);
+        if (self.workspace_symbol_results) |results| {
+            const new_results = try allocator.alloc(WorkspaceSymbolEntry, results.len);
+            for (results, 0..) |res, i| {
+                new_results[i] = res;
+                new_results[i].name = try allocator.dupe(u8, res.name);
+                new_results[i].kind = try allocator.dupe(u8, res.kind);
+                new_results[i].file_path = try allocator.dupe(u8, res.file_path);
+            }
+            new.workspace_symbol_results = new_results;
         }
 
         if (self.completion_items) |items| {
@@ -2223,6 +2297,7 @@ test "message all modes encode decode" {
         .select,       .insert,          .visual,      .visual_search,
         .view,         .terminal,        .file_picker, .buffer_picker,
         .save_as_mode, .command_palette, .go_to_line,  .symbol_picker,
+        .workspace_symbol_picker,
     };
 
     for (modes) |mode| {

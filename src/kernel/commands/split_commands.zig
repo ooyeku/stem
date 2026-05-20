@@ -9,6 +9,7 @@ pub const SplitCommands = struct {
             try sm.splitVertical(core.buffer_manager.active_index);
         }
         core.invalidatePaneHeightCache();
+        core.setStatusLiteral("Split vertical", 1200);
         try core.sendUpdate();
     }
 
@@ -18,6 +19,7 @@ pub const SplitCommands = struct {
             try sm.splitHorizontal(core.buffer_manager.active_index);
         }
         core.invalidatePaneHeightCache();
+        core.setStatusLiteral("Split horizontal", 1200);
         try core.sendUpdate();
     }
 
@@ -36,6 +38,7 @@ pub const SplitCommands = struct {
                     sm.deinit();
                     core.split_manager = null;
                 }
+                core.setStatusLiteral("Closed pane", 1200);
             } else {
                 const pane = sm.getFocusedPane();
                 if (pane.buffer_index < core.buffer_manager.buffers.items.len) {

@@ -242,6 +242,7 @@ pub fn runExternalServer(
 }
 
 fn killWatchRun(watch: *KillWatch, io: std.Io, allocator: std.mem.Allocator) void {
+    @import("../thread_name.zig").set("stem-lsp-watch");
     defer allocator.destroy(watch);
 
     // Phase 1: wait for the input pump to signal "shutdown started," or
@@ -268,6 +269,7 @@ fn killWatchRun(watch: *KillWatch, io: std.Io, allocator: std.mem.Allocator) voi
 }
 
 fn pumpInput(pipe: *Transport.MemPipe, child_stdin: std.Io.File, environ_block: std.process.Environ.Block, watch: ?*KillWatch) void {
+    @import("../thread_name.zig").set("stem-lsp-in");
     // Signal the watchdog when this pump exits (regardless of cause). The
     // watchdog uses this as its "child should be exiting now" cue.
     defer if (watch) |w| w.pump_done.store(true, .release);
@@ -290,6 +292,7 @@ fn pumpInput(pipe: *Transport.MemPipe, child_stdin: std.Io.File, environ_block: 
 }
 
 fn pumpOutput(child_stdout: std.Io.File, pipe: *Transport.MemPipe, environ_block: std.process.Environ.Block) void {
+    @import("../thread_name.zig").set("stem-lsp-out");
     // Pump runs in its own std.Thread.spawn worker; needs its own Threaded io.
     // Forward the parent's environ block.
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{
@@ -309,6 +312,7 @@ fn pumpOutput(child_stdout: std.Io.File, pipe: *Transport.MemPipe, environ_block
 }
 
 fn pumpStderr(child_stderr: std.Io.File, environ_block: std.process.Environ.Block) void {
+    @import("../thread_name.zig").set("stem-lsp-err");
     // Pump runs in its own std.Thread.spawn worker; needs its own Threaded io.
     // Forward the parent's environ block.
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{

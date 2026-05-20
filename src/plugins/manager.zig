@@ -590,13 +590,13 @@ pub const PluginManager = struct {
         };
         const outer = protocol.Message{ .plugin_message = pm };
         const encoded = outer.encode(self.allocator) catch {
-            _ = self.takePendingRequest(id);
+            if (self.takePendingRequest(id)) |stale| self.allocator.free(stale);
             self.replyProcessPluginByName(plugin_id, id, null, -32603, "encode failed");
             return;
         };
         defer self.allocator.free(encoded);
         core_inbox.send(encoded) catch {
-            _ = self.takePendingRequest(id);
+            if (self.takePendingRequest(id)) |stale| self.allocator.free(stale);
             self.replyProcessPluginByName(plugin_id, id, null, -32603, "core inbox closed");
         };
     }
@@ -854,6 +854,95 @@ pub const PluginManager = struct {
             log.info("process plugin '{s}' auto-restarted", .{pr.name});
         }
         return ready.items.len;
+    }
+
+    /// Snapshot of a plugin's live state, returned by
+    /// `liveStateOf`. All fields are by-value or borrow into the
+    /// manager's storage — caller must not free.
+    pub const LiveState = struct {
+        loaded: bool,
+        runtime: enum { wasm, process, none },
+        restart_policy: manifest_mod.Restart,
+        restart_attempts: u8,
+        last_attempt_ms: i64,
+        pending_restart_due_ms: ?i64,
+        spawn_allowlist: []const []const u8,
+        events: []const []const u8,
+        filesystem: []const []const u8,
+        manage_plugins: bool,
+    };
+
+    /// Best-effort read of the live state for `plugin_id`. Holds
+    /// `state_mu` for the duration so the snapshot is internally
+    /// consistent, but the strings remain owned by the manager —
+    /// callers should consume them before releasing the lock (or
+    /// dupe).
+    pub fn liveStateOf(self: *PluginManager, plugin_id: []const u8) LiveState {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+
+        const runtime: @TypeOf(@as(LiveState, undefined).runtime) = if (self.process_plugins.contains(plugin_id))
+            .process
+        else if (self.wasm_plugins.contains(plugin_id))
+            .wasm
+        else
+            .none;
+
+        const policy = self.restart_policies.get(plugin_id) orelse .never;
+
+        var attempts: u8 = 0;
+        var last_ms: i64 = 0;
+        if (self.restart_state.get(plugin_id)) |st| {
+            attempts = st.attempts;
+            last_ms = st.last_attempt_ms;
+        }
+
+        var pending_due: ?i64 = null;
+        for (self.pending_restarts.items) |pr| {
+            if (std.mem.eql(u8, pr.name, plugin_id)) {
+                pending_due = pr.due_ms;
+                break;
+            }
+        }
+
+        var spawn_allow: []const []const u8 = &.{};
+        var events_list: []const []const u8 = &.{};
+        var fs_list: []const []const u8 = &.{};
+        var has_manage = false;
+        if (self.plugin_permissions.get(plugin_id)) |perms| {
+            spawn_allow = perms.spawn_allowlist;
+            events_list = perms.events;
+            fs_list = perms.filesystem;
+            has_manage = perms.manage_plugins;
+        }
+
+        return .{
+            .loaded = runtime != .none,
+            .runtime = runtime,
+            .restart_policy = policy,
+            .restart_attempts = attempts,
+            .last_attempt_ms = last_ms,
+            .pending_restart_due_ms = pending_due,
+            .spawn_allowlist = spawn_allow,
+            .events = events_list,
+            .filesystem = fs_list,
+            .manage_plugins = has_manage,
+        };
+    }
+
+    /// Names of every plugin currently in either runtime map. Caller
+    /// owns the outer slice; the inner strings borrow into the
+    /// manager.
+    pub fn loadedPluginNames(self: *PluginManager, allocator: std.mem.Allocator) ![][]const u8 {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+        var out = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer out.deinit(allocator);
+        var p_it = self.process_plugins.keyIterator();
+        while (p_it.next()) |k| try out.append(allocator, k.*);
+        var w_it = self.wasm_plugins.keyIterator();
+        while (w_it.next()) |k| try out.append(allocator, k.*);
+        return out.toOwnedSlice(allocator);
     }
 
     /// Clear the backoff counter for a plugin that's been running
@@ -1719,6 +1808,7 @@ pub const PluginManager = struct {
             fired: std.atomic.Value(bool) = .{ .raw = false },
 
             fn run(ctx: *@This()) void {
+                @import("../services/thread_name.zig").set("stem-plug-wd");
                 const step_ms: u32 = 25;
                 var elapsed: u32 = 0;
                 while (elapsed < ctx.timeout_ms) {

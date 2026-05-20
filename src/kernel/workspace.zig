@@ -14,11 +14,20 @@ pub const ZigWorkspace = struct {
     }
 
     pub fn clone(self: ZigWorkspace, allocator: std.mem.Allocator) !ZigWorkspace {
+        // Allocate each field in order with errdefer cleanup so a
+        // mid-clone OOM doesn't leak the earlier dupes. Previous
+        // version put the three dupes directly in a struct literal,
+        // which evaluates left-to-right but offers no rollback.
+        const root_path = try allocator.dupe(u8, self.root_path);
+        errdefer allocator.free(root_path);
+        const build_zig_path = try allocator.dupe(u8, self.build_zig_path);
+        errdefer allocator.free(build_zig_path);
+        const name = try allocator.dupe(u8, self.name);
         return ZigWorkspace{
-            .root_path = try allocator.dupe(u8, self.root_path),
-            .build_zig_path = try allocator.dupe(u8, self.build_zig_path),
+            .root_path = root_path,
+            .build_zig_path = build_zig_path,
             .has_zon = self.has_zon,
-            .name = try allocator.dupe(u8, self.name),
+            .name = name,
         };
     }
 

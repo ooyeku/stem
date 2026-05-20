@@ -263,6 +263,7 @@ pub const ProcessPlugin = struct {
     }
 
     fn writerMain(self: *ProcessPlugin) void {
+        @import("../services/thread_name.zig").set("stem-plug-w");
         const child = self.child orelse return;
         const stdin = child.stdin orelse return;
 
@@ -293,6 +294,7 @@ pub const ProcessPlugin = struct {
     }
 
     fn readerMain(self: *ProcessPlugin) void {
+        @import("../services/thread_name.zig").set("stem-plug-r");
         const child = self.child orelse return;
         const stdout = child.stdout orelse return;
 

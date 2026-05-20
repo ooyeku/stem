@@ -49,6 +49,7 @@ pub const Keys = struct {
     pub const action_lsp_rename = 'm';
     pub const action_lsp_diagnostics = 'd';
     pub const action_document_symbols = 'o';
+    pub const action_workspace_symbols = 'O';
 
     pub const action_jump_back = ',';
     pub const action_jump_forward = '.';

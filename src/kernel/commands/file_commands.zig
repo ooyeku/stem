@@ -17,6 +17,7 @@ pub const FileCommands = struct {
 
     pub fn cmdFileNew(core: anytype) anyerror!void {
         _ = try core.buffer_manager.openVirtual("[Scratch]", "");
+        core.setStatusLiteral("New scratch buffer", 1500);
     }
 
     pub fn cmdFileReload(core: anytype) anyerror!void {
@@ -63,9 +64,12 @@ pub const FileCommands = struct {
                 defer core.allocator.free(err_msg);
                 try core.buffer_manager.openVirtual("[Error]", err_msg);
                 core.mode = .view;
+                core.setStatusLiteral("Reload failed (see [Error] buffer)", 2500);
                 try core.sendUpdate();
                 return;
             };
+            const basename = std.fs.path.basename(path_dupe);
+            core.setStatus("Reloaded {s}", .{basename}, 1500);
             try core.sendUpdate();
         }
     }

@@ -71,6 +71,7 @@ pub const StatusBar = struct {
             .command_palette => theme.styles.mode.command_palette,
             .go_to_line => theme.styles.mode.go_to_line,
             .symbol_picker => theme.styles.mode.symbol_picker,
+            .workspace_symbol_picker => theme.styles.mode.symbol_picker,
             .log_view => theme.styles.mode.log_view,
             .global_search => theme.styles.mode.global_search,
         };
@@ -88,6 +89,7 @@ pub const StatusBar = struct {
             .command_palette => " CMD ",
             .go_to_line => " GOTO ",
             .symbol_picker => " SYMBOL ",
+            .workspace_symbol_picker => " W-SYMBOL ",
             .log_view => " LOGS ",
             .global_search => " SEARCH ",
         };
@@ -135,12 +137,28 @@ pub const StatusBar = struct {
             left_offset += u16Sat(display_path.len);
 
             if (snapshot.status_message) |msg| {
+                // Per-level icon + colour. We use a small palette of
+                // terminal-index colours rather than full RGB so the
+                // toasts read correctly on themes where the default
+                // background is something other than black.
+                const icon: []const u8 = switch (snapshot.status_message_level) {
+                    .success => "✓",
+                    .info => "•",
+                    .warning => "⚠",
+                    .err => "✗",
+                };
+                const fg_index: u8 = switch (snapshot.status_message_level) {
+                    .success => 10, // bright green
+                    .info => 12, // bright blue
+                    .warning => 11, // bright yellow
+                    .err => 9, // bright red
+                };
                 const status_style: vaxis.Cell.Style = .{
-                    .fg = .{ .index = 10 },
+                    .fg = .{ .index = fg_index },
                     .bg = .{ .index = 0 },
                     .bold = true,
                 };
-                const padded_msg = try std.fmt.allocPrint(allocator, "  ✓ {s}", .{msg});
+                const padded_msg = try std.fmt.allocPrint(allocator, "  {s} {s}", .{ icon, msg });
                 _ = win.printSegment(.{ .text = padded_msg, .style = status_style }, .{ .col_offset = left_offset });
                 left_offset += u16Sat(padded_msg.len);
             }

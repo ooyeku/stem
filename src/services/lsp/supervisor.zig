@@ -120,6 +120,7 @@ pub fn joinTimeout(allocator: std.mem.Allocator, io: std.Io, t: std.Thread, time
 
     const Helper = struct {
         fn run(target: std.Thread, d: *Done) void {
+            @import("../thread_name.zig").set("stem-lsp-shut");
             var owned = target;
             owned.join();
             d.flag.store(true, .release);
@@ -282,6 +283,7 @@ pub const LSPSupervisor = struct {
     }
 
     fn workerMain(self: *LSPSupervisor) void {
+        @import("../thread_name.zig").set("stem-lsp-sup");
         log.info("worker thread started", .{});
         defer log.info("worker thread exited", .{});
 

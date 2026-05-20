@@ -20,6 +20,7 @@ const std = @import("std");
 const manifest_mod = @import("../plugins/manifest.zig");
 const wasm_loader = @import("../plugins/wasm/loader.zig");
 const wasm_interp = @import("../plugins/wasm/interpreter.zig");
+const plugin_inspect = @import("../plugins/inspect.zig");
 
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -38,7 +39,20 @@ pub fn run(ctx: Context) !void {
     if (std.mem.eql(u8, ctx.sub, "install")) return runInstall(ctx);
     if (std.mem.eql(u8, ctx.sub, "remove")) return runRemove(ctx);
     if (std.mem.eql(u8, ctx.sub, "test")) return runTest(ctx);
-    try ctx.err.print("error: unknown 'plugin' subcommand '{s}'. Try `list`, `info`, `install`, `remove`, or `test`.\n", .{ctx.sub});
+    if (std.mem.eql(u8, ctx.sub, "inspect")) return runInspect(ctx);
+    try ctx.err.print("error: unknown 'plugin' subcommand '{s}'. Try `list`, `info`, `inspect`, `install`, `remove`, or `test`.\n", .{ctx.sub});
+}
+
+fn runInspect(ctx: Context) !void {
+    const root = try pluginsRoot(ctx.allocator, ctx.environ_block);
+    defer ctx.allocator.free(root);
+
+    if (ctx.sub_args.len == 0) {
+        // Report on every installed plugin.
+        try plugin_inspect.writeReport(ctx.allocator, ctx.io, ctx.environ_block, null, ctx.out);
+        return;
+    }
+    try plugin_inspect.writeOne(ctx.allocator, ctx.io, root, ctx.sub_args[0], null, ctx.out);
 }
 
 // ---------------------------------------------------------------------------

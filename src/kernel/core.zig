@@ -11,6 +11,7 @@ const BufferManager = @import("buffer_manager.zig").BufferManager;
 const JumpList = @import("jump_list.zig").JumpList;
 const protocol = @import("protocol.zig");
 const LSPManager = @import("../services/lsp_manager.zig").LSPManager;
+const LspServer = @import("../services/lsp/server.zig").LSPServer;
 const filetype = @import("filetype.zig");
 const SyntaxManager = @import("../syntax/manager.zig").SyntaxManager;
 const Help = @import("../ui/help.zig");
@@ -31,6 +32,7 @@ const PluginManager = @import("../plugins/manager.zig").PluginManager;
 const session = @import("session.zig");
 const global_search = @import("../services/global_search.zig");
 const SearchIndex = @import("../services/search_index.zig").SearchIndex;
+const hover_doc_mod = @import("../services/hover_doc.zig");
 const ArenaPool = @import("arena_pool.zig").ArenaPool;
 const terminal_proc = @import("terminal_proc.zig");
 const GitCommands = @import("commands/git_commands.zig").GitCommands;
@@ -39,6 +41,7 @@ const LspCommands = @import("commands/lsp_commands.zig").LspCommands;
 const SplitCommands = @import("commands/split_commands.zig").SplitCommands;
 const SystemCommands = @import("commands/system_commands.zig").SystemCommands;
 const EditCommands = @import("commands/edit_commands.zig").EditCommands;
+const PluginCommands = @import("commands/plugin_commands.zig").PluginCommands;
 const NavCommands = @import("commands/nav_commands.zig").NavCommands;
 const BufferCommands = @import("commands/buffer_commands.zig").BufferCommands;
 const FileCommands = @import("commands/file_commands.zig").FileCommands;
@@ -120,6 +123,35 @@ pub const Core = struct {
     last_cursor_move_time: i64 = 0,
     hover_content: ?[]u8 = null,
     hover_pending: bool = false,
+    /// Parsed hover content — owned by Core, lives until the popup
+    /// is dismissed or replaced. Avoids re-parsing per frame.
+    hover_doc: ?hover_doc_mod.HoverDocument = null,
+    /// Cursor cell of the token the hover was requested against;
+    /// drives popup placement so the anchor stays stable even if
+    /// the cursor drifts mid-identifier.
+    hover_anchor_row: usize = 0,
+    hover_anchor_col: usize = 0,
+    /// Scroll offset (in rendered rows) for the popup body. Reset
+    /// to 0 every time a fresh hover lands.
+    hover_scroll_offset: usize = 0,
+    /// True if the user explicitly invoked hover (Space h); stays
+    /// visible until Esc. Auto-hover (idle timer) is false and
+    /// dismisses on cursor move / keypress.
+    hover_sticky: bool = false,
+    /// Wall-clock ms when the in-flight hover request was sent.
+    /// `hover_loading` becomes true once the gap exceeds the grace
+    /// period so a fast hover doesn't flicker a loading toast.
+    hover_request_sent_ms: i64 = 0,
+    /// Grace before we show "Loading…" inside the popup so quick
+    /// responses (≤ this) don't flash the loader.
+    hover_loading_grace_ms: i64 = 150,
+
+    /// Opt-in flag for the which-key popup. Set when the user taps
+    /// Space twice in a row (the second tap inside an active leader
+    /// chord). Cleared whenever `leader_pending` is cleared. The
+    /// popup is never shown on a timer — auto-popup on small
+    /// terminals hid the active line, so we wait for explicit intent.
+    leader_help_requested: bool = false,
     definition_pending: bool = false,
     needs_render: bool = true,
     last_render_time: i64 = 0,
@@ -133,6 +165,12 @@ pub const Core = struct {
     lsp_debounce_deadline: i64 = 0,
     lsp_debounce_ms: i64 = 100,
     references_pending: bool = false,
+    /// Wall-clock ms when the in-flight `textDocument/references`
+    /// request was sent. If `references_pending` stays true longer
+    /// than `references_timeout_ms`, the tick handler drops the
+    /// request and surfaces a "no response" toast.
+    references_request_sent_ms: i64 = 0,
+    references_timeout_ms: i64 = 3000,
     references_symbol_name: ?[]u8 = null,
     references_source_file: ?[]u8 = null,
     references_source_line: usize = 0,
@@ -147,6 +185,16 @@ pub const Core = struct {
     symbol_picker_results: std.ArrayListUnmanaged(protocol.SymbolEntry) = .empty,
     symbol_picker_all_symbols: std.ArrayListUnmanaged(protocol.SymbolEntry) = .empty,
     symbol_picker_selected: usize = 0,
+
+    /// Workspace symbol picker (`Space O`). Server-side fuzzy match
+    /// via `workspace/symbol`; we send a fresh request on each query
+    /// edit and replace the result list when it lands.
+    workspace_symbol_query: std.ArrayListUnmanaged(u8) = .empty,
+    workspace_symbol_results: std.ArrayListUnmanaged(protocol.WorkspaceSymbolEntry) = .empty,
+    workspace_symbol_selected: usize = 0,
+    workspace_symbol_pending: bool = false,
+    workspace_symbol_last_request_ms: i64 = 0,
+    workspace_symbol_debounce_ms: i64 = 120,
     global_search_query: std.ArrayListUnmanaged(u8) = .empty,
     global_search_replace: std.ArrayListUnmanaged(u8) = .empty,
     global_search_results: std.ArrayListUnmanaged(protocol.GlobalSearchFileGroup) = .empty,
@@ -197,6 +245,7 @@ pub const Core = struct {
     scroll_timeout_ms: i64 = 200,
     status_message: ?[]const u8 = null,
     status_message_expires: i64 = 0,
+    status_message_level: protocol.StatusLevel = .success,
     /// Scratch buffer for `status_message` slices that need to outlive the
     /// stack frame that built them (e.g. "Skipped N unsupported files"
     /// after a directory open). Fixed-size; messages truncate if longer.
@@ -205,6 +254,12 @@ pub const Core = struct {
     /// race the `skip_status_buf` writers. Sized larger because plugin
     /// messages can include identifiers / file paths.
     plugin_notification_buf: [512]u8 = undefined,
+    /// Buffer for transient action feedback ("Saved foo.zig", "Pasted
+    /// 3 lines", etc.). Routed through `setStatus` so any caller gets a
+    /// single, consistent place to land. Distinct from the other
+    /// buffers so concurrent file-scan / plugin events can't clobber a
+    /// fresh action toast (and vice versa).
+    action_status_buf: [256]u8 = undefined,
 
     /// Wall-clock ms of last autosave sweep. Set by `maybeAutosave`.
     last_autosave_ms: i64 = 0,
@@ -308,6 +363,8 @@ pub const Core = struct {
         self.lsp_manager.deinit();
         if (self.references_symbol_name) |name| self.allocator.free(name);
         if (self.references_source_file) |path| self.allocator.free(path);
+        if (self.hover_content) |c| self.allocator.free(c);
+        if (self.hover_doc) |*doc| doc.deinit();
         self.syntax_manager.deinit();
 
         self.plugin_manager.deinit();
@@ -318,6 +375,14 @@ pub const Core = struct {
         self.command_palette_input.deinit(self.allocator);
         self.command_palette_results.deinit(self.allocator);
         self.go_to_line_input.deinit(self.allocator);
+        self.workspace_symbol_query.deinit(self.allocator);
+        for (self.workspace_symbol_results.items) |entry| {
+            self.allocator.free(entry.name);
+            self.allocator.free(entry.kind);
+            self.allocator.free(entry.file_path);
+        }
+        self.workspace_symbol_results.deinit(self.allocator);
+
         self.symbol_picker_query.deinit(self.allocator);
         for (self.symbol_picker_results.items) |entry| {
             self.allocator.free(entry.name);
@@ -665,6 +730,101 @@ pub const Core = struct {
         try self.sendUpdate();
     }
 
+    fn cmdWorkspaceSymbols(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
+        _ = context;
+        const self: *Core = @ptrCast(@alignCast(ctx));
+        try self.openWorkspaceSymbolPicker();
+    }
+
+    /// Pretty-name the LSP symbol kind enum for the picker UI. Same
+    /// kinds the document-symbol path uses (file/module/.../method/
+    /// .../typeParameter); keep this in sync so the two pickers
+    /// display consistently.
+    fn symbolKindString(k: LspServer.DocumentSymbol.SymbolKind) []const u8 {
+        return switch (k) {
+            .file => "file",
+            .module => "module",
+            .namespace => "namespace",
+            .package => "package",
+            .class => "class",
+            .method => "method",
+            .property => "property",
+            .field => "field",
+            .constructor => "constructor",
+            .enumType => "enum",
+            .interface => "interface",
+            .function => "function",
+            .variable => "variable",
+            .constant => "constant",
+            .string => "string",
+            .number => "number",
+            .boolean => "boolean",
+            .array => "array",
+            .object => "object",
+            .key => "key",
+            .null_type => "null",
+            .enumMember => "enumMember",
+            .struct_type => "struct",
+            .event => "event",
+            .operator => "operator",
+            .type_parameter => "typeParameter",
+        };
+    }
+
+    fn openWorkspaceSymbolPicker(self: *Core) !void {
+        // Reset state, switch mode. The first request goes out empty
+        // immediately so the popup has *something* to show; further
+        // requests fire as the user types, debounced.
+        for (self.workspace_symbol_results.items) |entry| {
+            self.allocator.free(entry.name);
+            self.allocator.free(entry.kind);
+            self.allocator.free(entry.file_path);
+        }
+        self.workspace_symbol_results.clearRetainingCapacity();
+        self.workspace_symbol_query.clearRetainingCapacity();
+        self.workspace_symbol_selected = 0;
+        self.workspace_symbol_pending = true;
+        self.workspace_symbol_last_request_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+
+        self.previous_mode = self.mode;
+        self.mode = .workspace_symbol_picker;
+
+        // Try to derive a language from the active buffer. If we
+        // can't, drop a friendly status toast — workspace symbols
+        // need a server.
+        const s = self.state();
+        if (s.file_path) |path| {
+            if (LSPManager.getLangFromPath(path)) |lang| {
+                self.lsp_manager.requestWorkspaceSymbol(lang, "") catch |err| {
+                    log.warn("workspace symbol request failed: {}", .{err});
+                };
+            } else {
+                self.setStatusLiteralLeveled(.info, "Workspace symbols need an LSP-supported buffer", 2000);
+            }
+        } else {
+            self.setStatusLiteralLeveled(.info, "Open a file in an LSP-supported language first", 2000);
+        }
+        try self.sendUpdate();
+    }
+
+    /// Issue another workspace/symbol request with the current query
+    /// after honouring a tiny debounce so typing fast doesn't blast
+    /// the server.
+    fn dispatchWorkspaceSymbolQuery(self: *Core) !void {
+        const now = std.Io.Clock.real.now(self.io).toMilliseconds();
+        if (now - self.workspace_symbol_last_request_ms < self.workspace_symbol_debounce_ms) return;
+
+        const s = self.state();
+        const path = s.file_path orelse return;
+        const lang = LSPManager.getLangFromPath(path) orelse return;
+
+        self.workspace_symbol_pending = true;
+        self.workspace_symbol_last_request_ms = now;
+        self.lsp_manager.requestWorkspaceSymbol(lang, self.workspace_symbol_query.items) catch |err| {
+            log.warn("workspace symbol request failed: {}", .{err});
+        };
+    }
+
     fn cmdJumpBack(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
         _ = context;
         const self: *Core = @ptrCast(@alignCast(ctx));
@@ -771,6 +931,7 @@ pub const Core = struct {
         try R.register("lsp.prewarm", "LSP: Prewarm Workspace", "Scan the workspace and start servers for every detected language", Wrap(LspCommands.cmdLspPrewarm).run, null);
         try R.register("lsp.hover", "LSP: Hover", "Trigger hover information for symbol under cursor", Wrap(LspCommands.cmdLspHover).run, null);
         try R.register("lsp.references", "LSP: Find References", "Find all references to symbol under cursor", Wrap(LspCommands.cmdLspFindReferences).run, null);
+        try R.register("lsp.workspace_symbols", "LSP: Workspace Symbols", "Fuzzy find symbols across the workspace via LSP", cmdWorkspaceSymbols, null);
 
         try R.register("mode.insert", "Mode: Insert", "Switch to insert mode", Wrap(SystemCommands.cmdModeInsert).run, null);
         try R.register("mode.visual", "Mode: Visual", "Switch to visual mode", Wrap(SystemCommands.cmdModeVisual).run, null);
@@ -779,6 +940,7 @@ pub const Core = struct {
 
         try R.register("help.show", "Help: Show", "Show editor help", Wrap(SystemCommands.cmdShowHelp).run, null);
         try R.register("plugin.show", "Plugins: List Loaded", "Show plugins currently loaded in the running stem instance", Wrap(SystemCommands.cmdShowPlugins).run, null);
+        try R.register("plugin.inspect", "Plugins: Inspect", "Open a capability inspector showing manifest, permissions, restart policy, and live state for every installed plugin", Wrap(PluginCommands.cmdPluginInspect).run, null);
         try R.register("stats.show", "Stats: Message Bus", "Live view of stem's Vigil-backed message bus stats", Wrap(SystemCommands.cmdShowStats).run, null);
         try R.register("job.list", "Jobs: List Active", "Show all active background jobs (Space+j)", Wrap(SystemCommands.cmdJobList).run, null);
         try R.register("view.logs", "View: Logs", "Open log viewer", Wrap(SystemCommands.cmdViewLogs).run, null);
@@ -1038,6 +1200,49 @@ pub const Core = struct {
                         // formatter or git checkout rewrites the file.
                         self.maybeCheckExternalChange();
 
+                        // Hover and which-key are both user-driven —
+                        // the auto-hover idle timer used to fire
+                        // here, but it stole focus on small terminals
+                        // every time the cursor paused over a word.
+                        // Hover now only appears via `Space h`.
+
+                        // Drain any in-flight workspace/symbol
+                        // response so the picker updates without
+                        // waiting for user input.
+                        if (self.workspace_symbol_pending) {
+                            if (self.lsp_manager.popWorkspaceSymbolsResult()) |syms| {
+                                defer self.lsp_manager.freeWorkspaceSymbols(syms);
+                                self.workspace_symbol_pending = false;
+
+                                for (self.workspace_symbol_results.items) |entry| {
+                                    self.allocator.free(entry.name);
+                                    self.allocator.free(entry.kind);
+                                    self.allocator.free(entry.file_path);
+                                }
+                                self.workspace_symbol_results.clearRetainingCapacity();
+
+                                const max_show: usize = 200;
+                                for (syms, 0..) |sym, i| {
+                                    if (i >= max_show) break;
+                                    const kind_str = symbolKindString(sym.kind);
+                                    const name_dup = try self.allocator.dupe(u8, sym.name);
+                                    const kind_dup = try self.allocator.dupe(u8, kind_str);
+                                    const path_dup = try self.allocator.dupe(u8, sym.file_path);
+                                    try self.workspace_symbol_results.append(self.allocator, .{
+                                        .name = name_dup,
+                                        .kind = kind_dup,
+                                        .file_path = path_dup,
+                                        .line = sym.line,
+                                        .col = sym.col,
+                                    });
+                                }
+                                if (self.workspace_symbol_selected >= self.workspace_symbol_results.items.len) {
+                                    self.workspace_symbol_selected = 0;
+                                }
+                                self.requestRender();
+                            }
+                        }
+
                         // If the async tree-sitter parse worker just
                         // finished a parse, the new tree is sitting in
                         // SyntaxManager but the screen still shows whatever
@@ -1050,9 +1255,53 @@ pub const Core = struct {
                         if (self.hover_pending) {
                             if (self.lsp_manager.popHoverResult()) |content| {
                                 self.hover_pending = false;
-                                if (self.hover_content) |old| self.allocator.free(old);
-                                self.hover_content = content;
-                                self.requestRender();
+                                const trimmed = std.mem.trim(u8, content, " \t\r\n");
+                                if (trimmed.len == 0) {
+                                    // Whitespace-only response → treat
+                                    // as "no hover here". Free the
+                                    // content and stay silent on auto,
+                                    // toast on sticky.
+                                    self.allocator.free(content);
+                                    if (self.hover_sticky) {
+                                        self.dismissHover();
+                                        self.setStatusLiteralLeveled(.info, "No hover information here", 1500);
+                                    } else {
+                                        self.dismissHover();
+                                    }
+                                    self.requestRender();
+                                } else {
+                                    if (self.hover_content) |old| self.allocator.free(old);
+                                    self.hover_content = content;
+                                    // Re-parse into the structured form.
+                                    // Failures keep the raw text around
+                                    // so the popup still has something
+                                    // to show.
+                                    if (self.hover_doc) |*old| old.deinit();
+                                    self.hover_doc = hover_doc_mod.parse(self.allocator, content) catch null;
+                                    self.hover_scroll_offset = 0;
+                                    self.requestRender();
+                                }
+                            } else {
+                                // Time out hover requests that never get
+                                // answered (LSP returned null, server
+                                // died, no language support). Without
+                                // this, a stuck request leaves a
+                                // permanent "Loading…" popup. 3 s is
+                                // long enough that a slow server still
+                                // works, short enough that the user
+                                // doesn't notice the empty state.
+                                const elapsed = std.Io.Clock.real.now(self.io).toMilliseconds() - self.hover_request_sent_ms;
+                                if (elapsed > 3000) {
+                                    self.hover_pending = false;
+                                    if (self.hover_sticky and self.hover_content == null and self.hover_doc == null) {
+                                        // Sticky request with no
+                                        // result: drop the loading
+                                        // popup and let the user know.
+                                        self.dismissHover();
+                                        self.setStatusLiteralLeveled(.info, "No hover information here", 1500);
+                                    }
+                                    self.requestRender();
+                                }
                             }
                         }
 
@@ -1097,6 +1346,8 @@ pub const Core = struct {
                                 } else {
                                     target_state.scroll_offset = 0;
                                 }
+                                const dest_name = std.fs.path.basename(location.file_path);
+                                self.setStatus("Jumped to {s}:{d}", .{ dest_name, location.line + 1 }, 1500);
                                 self.requestRender();
                             }
                         }
@@ -1201,12 +1452,29 @@ pub const Core = struct {
                                     }
 
                                     try self.openVirtualBuffer("[References]", text.items);
+                                    self.setStatus("Found {d} reference{s}", .{ refs.len, if (refs.len == 1) "" else "s" }, 2000);
                                     try self.sendUpdate();
                                 } else {
                                     const sym = self.references_symbol_name orelse "symbol";
                                     const no_refs_msg = try std.fmt.allocPrint(self.allocator, "+------------------------------------------------------------------+\n|  SYMBOL REFERENCES                                               |\n+------------------------------------------------------------------+\n\nNo references found for: {s}\n", .{sym});
                                     defer self.allocator.free(no_refs_msg);
                                     try self.openVirtualBuffer("[References]", no_refs_msg);
+                                    self.setStatusLiteralLeveled(.warning, "No references found", 2000);
+                                    self.requestRender();
+                                }
+                            } else {
+                                // No response yet — give up after the
+                                // timeout. Catches the case where the
+                                // LSP doesn't support
+                                // textDocument/references for this
+                                // language, or the server died
+                                // mid-request. Without this the user
+                                // sees "Looking up references…" once
+                                // and then nothing else, ever.
+                                const elapsed = std.Io.Clock.real.now(self.io).toMilliseconds() - self.references_request_sent_ms;
+                                if (elapsed > self.references_timeout_ms) {
+                                    self.references_pending = false;
+                                    self.setStatusLiteralLeveled(.warning, "No response from language server", 2500);
                                     self.requestRender();
                                 }
                             }
@@ -1309,14 +1577,50 @@ pub const Core = struct {
                     },
                     .input => |key| {
                         self.last_cursor_move_time = std.Io.Clock.real.now(self.io).toMilliseconds();
-                        if (self.hover_content) |c| {
-                            self.allocator.free(c);
-                            self.hover_content = null;
-                            self.hover_pending = false;
+
+                        // Hover dispatch runs before mode-specific input.
+                        // Two cases:
+                        //   - sticky hover (Space h): intercept scroll
+                        //     keys + Esc; everything else falls
+                        //     through after dismiss.
+                        //   - auto hover (idle timer): any keypress
+                        //     dismisses and falls through.
+                        if (self.hoverVisible()) {
+                            if (self.hover_sticky) {
+                                if (self.tryHoverScroll(key)) {
+                                    try self.sendUpdate();
+                                    continue;
+                                }
+                                if (key.matches(vaxis.Key.escape, .{})) {
+                                    self.dismissHover();
+                                    try self.sendUpdate();
+                                    continue;
+                                }
+                            }
+                            // Auto hover, or sticky hover + non-scroll
+                            // non-Esc key: dismiss and let the key fall
+                            // through to normal handling.
+                            self.dismissHover();
                             try self.sendUpdate();
                         }
 
                         if (key.matches(vaxis.Key.escape, .{})) {
+                            // Cancelling a leader chord is the most
+                            // common reason a Select-mode user hits
+                            // Esc, but the per-mode dispatch below
+                            // early-returns before the leader switch
+                            // gets a chance to clear the flag. Catch
+                            // it up here so the which-key popup
+                            // closes immediately and a future Space
+                            // starts fresh.
+                            if (self.leader_pending) {
+                                self.leader_pending = false;
+                                self.leader_help_requested = false;
+                                self.leader_number_input.clearRetainingCapacity();
+                                self.plugin_chord_buf.clearRetainingCapacity();
+                                try self.sendUpdate();
+                                continue;
+                            }
                             if (self.mode == .file_picker or self.mode == .buffer_picker or self.mode == .log_view) {
                                 self.mode = self.previous_mode;
                                 try self.sendUpdate();
@@ -1339,6 +1643,11 @@ pub const Core = struct {
                             } else if (self.mode == .symbol_picker) {
                                 self.mode = self.previous_mode;
                                 self.symbol_picker_query.clearRetainingCapacity();
+                                try self.sendUpdate();
+                                continue;
+                            } else if (self.mode == .workspace_symbol_picker) {
+                                self.mode = self.previous_mode;
+                                self.workspace_symbol_query.clearRetainingCapacity();
                                 try self.sendUpdate();
                                 continue;
                             } else if (self.mode != .select) {
@@ -1421,6 +1730,11 @@ pub const Core = struct {
                                     try self.sendUpdate();
                                 }
                             },
+                            .workspace_symbol_picker => {
+                                if (try self.handleWorkspaceSymbolPickerInput(key)) {
+                                    try self.sendUpdate();
+                                }
+                            },
                             .global_search => {
                                 if (try self.handleGlobalSearchInput(key)) {
                                     try self.sendUpdate();
@@ -1430,6 +1744,19 @@ pub const Core = struct {
                     },
 
                     .mouse => |mouse| {
+                        // Mouse activity dismisses an auto-hover —
+                        // the cursor / anchor is about to change.
+                        // Sticky hover survives mouse so the user can
+                        // scroll the popup with the wheel later.
+                        if (self.hoverVisible() and !self.hover_sticky) {
+                            self.dismissHover();
+                        }
+                        // Anything that isn't a wheel event counts as
+                        // a deliberate move — reset the idle timer so
+                        // auto-hover doesn't fire immediately after a
+                        // click.
+                        self.last_cursor_move_time = std.Io.Clock.real.now(self.io).toMilliseconds();
+
                         if (self.mode == .terminal) {
                             if (mouse.button == .wheel_up) {
                                 const scroll_amount: usize = 3;
@@ -1446,6 +1773,21 @@ pub const Core = struct {
                                 continue;
                             }
                             continue;
+                        }
+
+                        // Sticky hover claims the scroll wheel — the
+                        // user is reading docs; scrolling the buffer
+                        // would feel wrong.
+                        if (self.hover_sticky and self.hoverVisible()) {
+                            if (mouse.button == .wheel_up) {
+                                self.hover_scroll_offset -|= 1;
+                                try self.sendUpdate();
+                                continue;
+                            } else if (mouse.button == .wheel_down) {
+                                self.hover_scroll_offset +|= 1;
+                                try self.sendUpdate();
+                                continue;
+                            }
                         }
 
                         if (mouse.button == .wheel_up) {
@@ -1870,6 +2212,7 @@ pub const Core = struct {
                 Keys.action_lsp_hover => try LspCommands.cmdLspHover(self),
                 Keys.action_lsp_diagnostics => try LspCommands.cmdLspShowDiagnostics(self),
                 Keys.action_document_symbols => try cmdDocumentSymbols(self, null),
+                Keys.action_workspace_symbols => try cmdWorkspaceSymbols(self, null),
 
                 Keys.action_jump_back => try cmdJumpBack(self, null),
                 Keys.action_jump_forward => try cmdJumpForward(self, null),
@@ -1941,10 +2284,16 @@ pub const Core = struct {
                     self.leader_pending = false;
                 },
 
-                Keys.leader => {},
+                // Double Space (Space + Space) → reveal the
+                // which-key popup. Toggles, so a third Space hides
+                // it again without leaving the chord.
+                Keys.leader => {
+                    self.leader_help_requested = !self.leader_help_requested;
+                },
 
                 else => {
                     self.leader_pending = false;
+                    self.leader_help_requested = false;
                 },
             }
             return true;
@@ -1966,6 +2315,11 @@ pub const Core = struct {
 
         if (key.matches(Keys.leader, .{})) {
             self.leader_pending = true;
+            self.leader_help_requested = false;
+            // Toast the hint so the user knows the chord is open and
+            // there's a way to see all the bindings without trial
+            // and error. Short enough to never get in the way.
+            self.setStatusLiteralLeveled(.info, "Space again for command help", 1500);
             return true;
         }
 
@@ -2154,12 +2508,17 @@ pub const Core = struct {
 
                 if (try s.buffer.find(query, start_offset)) |found_offset| {
                     s.updateCursorFromOffset(found_offset);
+                    s.preferred_col = null;
+                    self.setStatus("Next match: {s}", .{query}, 1500);
+                } else if (try s.buffer.find(query, 0)) |found_offset| {
+                    s.updateCursorFromOffset(found_offset);
+                    s.preferred_col = null;
+                    self.setStatusLeveled(.info, "Search wrapped to top: {s}", .{query}, 1500);
                 } else {
-                    if (try s.buffer.find(query, 0)) |found_offset| {
-                        s.updateCursorFromOffset(found_offset);
-                        log.info("Search wrapped around to beginning", .{});
-                    }
+                    self.setStatusLeveled(.warning, "No match for {s}", .{query}, 1500);
                 }
+            } else {
+                self.setStatusLiteralLeveled(.info, "No previous search", 1500);
             }
             return true;
         }
@@ -2171,12 +2530,20 @@ pub const Core = struct {
 
                 if (try s.buffer.findLast(query, end_offset)) |found_offset| {
                     s.updateCursorFromOffset(found_offset);
-                } else {
+                    s.preferred_col = null;
+                    self.setStatus("Previous match: {s}", .{query}, 1500);
+                } else blk: {
                     const len = s.buffer.totalLength();
                     if (try s.buffer.findLast(query, len)) |found_offset| {
                         s.updateCursorFromOffset(found_offset);
+                        s.preferred_col = null;
+                        self.setStatusLeveled(.info, "Search wrapped to bottom: {s}", .{query}, 1500);
+                        break :blk;
                     }
+                    self.setStatusLeveled(.warning, "No match for {s}", .{query}, 1500);
                 }
+            } else {
+                self.setStatusLiteralLeveled(.info, "No previous search", 1500);
             }
             return true;
         }
@@ -2780,10 +3147,16 @@ pub const Core = struct {
                     self.leader_pending = false;
                 },
 
-                Keys.leader => {},
+                // Double Space (Space + Space) → reveal the
+                // which-key popup. Toggles, so a third Space hides
+                // it again without leaving the chord.
+                Keys.leader => {
+                    self.leader_help_requested = !self.leader_help_requested;
+                },
 
                 else => {
                     self.leader_pending = false;
+                    self.leader_help_requested = false;
                 },
             }
             return true;
@@ -2791,6 +3164,8 @@ pub const Core = struct {
 
         if (key.matches(Keys.leader, .{})) {
             self.leader_pending = true;
+            self.leader_help_requested = false;
+            self.setStatusLiteralLeveled(.info, "Space again for command help", 1500);
             return true;
         }
 
@@ -3146,6 +3521,7 @@ pub const Core = struct {
 
     /// Thread entry: take ownership of `dir_path`, walk it, then signal exit.
     fn scanWorkerEntry(self: *Core, dir_path: []u8) void {
+        @import("../services/thread_name.zig").set("stem-scan");
         defer {
             self.allocator.free(dir_path);
             _ = self.scan_workers_running.fetchSub(1, .release);
@@ -3462,11 +3838,24 @@ pub const Core = struct {
     pub fn saveCurrentFile(self: *Core) !void {
         const s = self.state();
         if (s.file_path) |path| {
+            const basename = std.fs.path.basename(path);
+
+            // Surface failures in the status bar instead of letting
+            // them propagate silently — the user just hit save and
+            // deserves to know it didn't take. We still bubble the
+            // error up so callers can react.
             if (std.mem.endsWith(u8, path, ".zig")) {
-                try self.formatAndSave();
+                self.formatAndSave() catch |err| {
+                    self.setStatusError("Save failed for {s}: {s}", .{ basename, @errorName(err) }, 3000);
+                    return err;
+                };
             } else {
-                try s.saveFile();
+                s.saveFile() catch |err| {
+                    self.setStatusError("Save failed for {s}: {s}", .{ basename, @errorName(err) }, 3000);
+                    return err;
+                };
             }
+
             // Keep the search index in sync: new files added since
             // the index was built become searchable on save.
             self.search_index.notePathSaved(path);
@@ -3475,11 +3864,78 @@ pub const Core = struct {
             // session state.
             self.writeRecoverySnapshot();
             self.last_recovery_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+
+            self.setStatus("Saved {s}", .{basename}, 2000);
         } else {
             self.previous_mode = self.mode;
             self.mode = .save_as_mode;
             self.save_as_input.clearRetainingCapacity();
         }
+    }
+
+    /// Show a transient success toast in the status bar. Renders with
+    /// a green ✓; for other severities use `setStatusLeveled` /
+    /// `setStatusError`.
+    pub fn setStatus(
+        self: *Core,
+        comptime fmt: []const u8,
+        args: anytype,
+        duration_ms: i64,
+    ) void {
+        self.setStatusLeveled(.success, fmt, args, duration_ms);
+    }
+
+    /// Like `setStatus` but with explicit severity so the renderer can
+    /// pick an appropriate icon and colour (✓ green for success, ✗ red
+    /// for errors, etc.). The message lands in `action_status_buf`
+    /// which keeps the slice stable for the next few frames.
+    pub fn setStatusLeveled(
+        self: *Core,
+        level: protocol.StatusLevel,
+        comptime fmt: []const u8,
+        args: anytype,
+        duration_ms: i64,
+    ) void {
+        const written = std.fmt.bufPrint(&self.action_status_buf, fmt, args) catch blk: {
+            break :blk self.action_status_buf[0..];
+        };
+        self.status_message = written;
+        self.status_message_level = level;
+        self.status_message_expires =
+            std.Io.Clock.real.now(self.io).toMilliseconds() + duration_ms;
+        self.requestRender();
+    }
+
+    /// Shortcut for the common error case — `Save failed`, OOM,
+    /// permission denied, etc. Renders with a red ✗.
+    pub fn setStatusError(
+        self: *Core,
+        comptime fmt: []const u8,
+        args: anytype,
+        duration_ms: i64,
+    ) void {
+        self.setStatusLeveled(.err, fmt, args, duration_ms);
+    }
+
+    /// Static-string convenience for any level. Skips the bufPrint and
+    /// uses the literal slice directly — safe because the literal lives
+    /// for the lifetime of the program.
+    pub fn setStatusLiteralLeveled(
+        self: *Core,
+        level: protocol.StatusLevel,
+        msg: []const u8,
+        duration_ms: i64,
+    ) void {
+        self.status_message = msg;
+        self.status_message_level = level;
+        self.status_message_expires =
+            std.Io.Clock.real.now(self.io).toMilliseconds() + duration_ms;
+        self.requestRender();
+    }
+
+    /// Success-level static literal (most common case).
+    pub fn setStatusLiteral(self: *Core, msg: []const u8, duration_ms: i64) void {
+        self.setStatusLiteralLeveled(.success, msg, duration_ms);
     }
 
     fn formatAndSave(self: *Core) !void {
@@ -3733,6 +4189,7 @@ pub const Core = struct {
     }
 
     pub fn sendUpdate(self: *Core) !void {
+        @import("../services/thread_name.zig").markStep("send:enter");
         const now = std.Io.Clock.real.now(self.io).toMilliseconds();
         self.last_render_time = now;
         self.needs_render = false;
@@ -3836,8 +4293,10 @@ pub const Core = struct {
 
         self.syncStateToPane();
 
+        @import("../services/thread_name.zig").markStep("send:visible_lines");
         const visible_lines = try s.buffer.getVisibleLines(alloc, s.scroll_offset, visible_rows + 5);
 
+        @import("../services/thread_name.zig").markStep("send:terminal_slices");
         const terminal_input_slice = if (self.terminal_input.items.len > 0)
             try alloc.dupe(u8, self.terminal_input.items)
         else
@@ -3853,7 +4312,9 @@ pub const Core = struct {
         const command_palette_query_slice = if (self.mode == .command_palette) try alloc.dupe(u8, self.command_palette_input.items) else null;
         const go_to_line_input_slice = if (self.mode == .go_to_line) try alloc.dupe(u8, self.go_to_line_input.items) else null;
         const symbol_picker_query_slice = if (self.mode == .symbol_picker) try alloc.dupe(u8, self.symbol_picker_query.items) else null;
+        const workspace_symbol_query_slice = if (self.mode == .workspace_symbol_picker) try alloc.dupe(u8, self.workspace_symbol_query.items) else null;
 
+        @import("../services/thread_name.zig").markStep("send:logs");
         var logs_slice: ?[]const protocol.LogEntry = null;
         if (self.mode == .log_view) {
             if (logger_service.getGlobal()) |l| {
@@ -3871,6 +4332,7 @@ pub const Core = struct {
             }
         }
 
+        @import("../services/thread_name.zig").markStep("send:cmd_palette");
         var command_palette_results: ?[]const protocol.CommandEntry = null;
         if (self.mode == .command_palette) {
             const entries = try alloc.alloc(protocol.CommandEntry, self.command_palette_results.items.len);
@@ -3880,6 +4342,7 @@ pub const Core = struct {
             command_palette_results = entries;
         }
 
+        @import("../services/thread_name.zig").markStep("send:file_picker");
         var picker_entries: ?[]const protocol.DirEntry = null;
         var file_picker_cwd: ?[]const u8 = null;
         if (self.mode == .file_picker or self.mode == .terminal) {
@@ -3893,6 +4356,7 @@ pub const Core = struct {
             }
         }
 
+        @import("../services/thread_name.zig").markStep("send:buffer_infos");
         const buffer_infos = try alloc.alloc(protocol.BufferInfo, self.buffer_manager.buffers.items.len);
         for (self.buffer_manager.buffers.items, 0..) |buf, i| {
             buffer_infos[i] = .{
@@ -3903,6 +4367,7 @@ pub const Core = struct {
             };
         }
 
+        @import("../services/thread_name.zig").markStep("send:syntax_setup");
         var syntax_tokens: ?[]const protocol.SyntaxToken = null;
 
         var lang = SyntaxManager.Language.unknown;
@@ -3913,14 +4378,18 @@ pub const Core = struct {
         }
 
         if (lang != .unknown) {
+            // Snapshot under the tree lock — without this, reading
+            // `current_lang`/`current_resource_id`/`tree` races with
+            // the parse worker that swaps them in under the same lock.
+            const syn_state = self.syntax_manager.stateSnapshot();
             if (!self.scroll_in_progress) {
                 const active_buffer_id = self.buffer_manager.getActive().id;
-                const needs_reparse = (self.syntax_manager.current_lang != lang) or
-                    (self.syntax_manager.current_resource_id != active_buffer_id) or
-                    (self.syntax_manager.tree == null);
+                const needs_reparse = (syn_state.lang != lang) or
+                    (syn_state.resource_id != active_buffer_id) or
+                    (!syn_state.has_tree);
 
                 if (needs_reparse) {
-                    if (self.syntax_manager.current_lang != lang) {
+                    if (syn_state.lang != lang) {
                         self.syntax_manager.setLanguageEnum(lang) catch |err| {
                             log.warn("Failed to set syntax language to {}: {}", .{ lang, err });
                         };
@@ -3936,8 +4405,8 @@ pub const Core = struct {
                 }
             } else {
                 const active_buffer_id = self.buffer_manager.getActive().id;
-                if (self.syntax_manager.tree == null or self.syntax_manager.current_lang != lang) {
-                    if (self.syntax_manager.current_lang != lang) {
+                if (!syn_state.has_tree or syn_state.lang != lang) {
+                    if (syn_state.lang != lang) {
                         self.syntax_manager.setLanguageEnum(lang) catch |err| {
                             log.warn("Failed to set syntax language to {}: {}", .{ lang, err });
                         };
@@ -3959,6 +4428,7 @@ pub const Core = struct {
             } else false;
 
             if (use_lsp) {
+                @import("../services/thread_name.zig").markStep("send:lsp_tokens");
                 if (self.lsp_manager.copyVisibleTokens(alloc, s.file_path.?, s.scroll_offset, s.scroll_offset + visible_rows + 5)) |tokens| {
                     syntax_tokens = tokens;
                 } else |_| {
@@ -3969,15 +4439,18 @@ pub const Core = struct {
             if (!self.scroll_in_progress) {
                 if (syntax_tokens == null or syntax_tokens.?.len == 0) {
                     if (lang == .markdown) {
+                        @import("../services/thread_name.zig").markStep("send:highlight_md");
                         if (s.buffer.toString(alloc)) |content| {
                             syntax_tokens = self.syntax_manager.highlightMarkdown(alloc, content, s.scroll_offset, s.scroll_offset + visible_rows + 5) catch null;
                         } else |_| {}
                     } else {
+                        @import("../services/thread_name.zig").markStep("send:highlight_ts");
                         syntax_tokens = self.syntax_manager.highlight(alloc, s.scroll_offset, s.scroll_offset + visible_rows + 5) catch null;
                     }
                 }
 
                 if (lang != .markdown and lang != .unknown) {
+                    @import("../services/thread_name.zig").markStep("send:brackets");
                     if (s.buffer.toString(alloc)) |content| {
                         if (self.syntax_manager.findBrackets(alloc, content, s.scroll_offset, s.scroll_offset + visible_rows + 5)) |bracket_tokens| {
                             if (bracket_tokens.len > 0) {
@@ -3994,16 +4467,11 @@ pub const Core = struct {
                 }
 
                 const lsp_count = if (use_lsp and syntax_tokens != null) syntax_tokens.?.len else 0;
-                log.debug("sendUpdate: lang={s}, tree={s}, query={s}, tokens={}", .{
-                    @tagName(lang),
-                    if (self.syntax_manager.tree != null) "valid" else "NULL",
-                    if (self.syntax_manager.query != null) "valid" else "NULL",
-                    if (syntax_tokens) |t| t.len else 0,
-                });
                 _ = lsp_count;
             }
         }
 
+        @import("../services/thread_name.zig").markStep("send:symbol_picker");
         var symbol_picker_results: ?[]const protocol.SymbolEntry = null;
         if (self.mode == .symbol_picker) {
             const entries = try alloc.alloc(protocol.SymbolEntry, self.symbol_picker_results.items.len);
@@ -4013,6 +4481,23 @@ pub const Core = struct {
             symbol_picker_results = entries;
         }
 
+        @import("../services/thread_name.zig").markStep("send:workspace_symbols");
+        var workspace_symbol_results: ?[]const protocol.WorkspaceSymbolEntry = null;
+        if (self.mode == .workspace_symbol_picker) {
+            const entries = try alloc.alloc(protocol.WorkspaceSymbolEntry, self.workspace_symbol_results.items.len);
+            for (self.workspace_symbol_results.items, 0..) |sym, i| {
+                entries[i] = .{
+                    .name = try alloc.dupe(u8, sym.name),
+                    .kind = try alloc.dupe(u8, sym.kind),
+                    .file_path = try alloc.dupe(u8, sym.file_path),
+                    .line = sym.line,
+                    .col = sym.col,
+                };
+            }
+            workspace_symbol_results = entries;
+        }
+
+        @import("../services/thread_name.zig").markStep("send:completion");
         var completion_items: ?[]const protocol.CompletionEntry = null;
         if (self.completion_active and self.filtered_completion_items.items.len > 0) {
             const entries = try alloc.alloc(protocol.CompletionEntry, self.filtered_completion_items.items.len);
@@ -4027,12 +4512,30 @@ pub const Core = struct {
             completion_items = entries;
         }
 
+        @import("../services/thread_name.zig").markStep("send:hover");
         var hover_content: ?[]const u8 = null;
         if (self.hover_content) |h| hover_content = try alloc.dupe(u8, h);
+
+        var hover_document_slot: ?hover_doc_mod.HoverDocument = null;
+        if (self.hover_doc) |doc| {
+            hover_document_slot = doc.clone(alloc) catch null;
+        }
+
+        const hover_loading = blk: {
+            if (!self.hover_pending) break :blk false;
+            const t_now = std.Io.Clock.real.now(self.io).toMilliseconds();
+            break :blk (t_now - self.hover_request_sent_ms) >= self.hover_loading_grace_ms;
+        };
+
+        // Which-key: only visible when the user has explicitly asked
+        // for it (Space twice). Never time-triggered — the auto-popup
+        // hid the active editor line on small terminals.
+        const which_key_visible = self.leader_pending and self.leader_help_requested;
 
         var file_path_slice: ?[]const u8 = null;
         if (s.file_path) |p| file_path_slice = try alloc.dupe(u8, p);
 
+        @import("../services/thread_name.zig").markStep("send:panes");
         var pane_snapshots: []const protocol.PaneSnapshot = &.{};
         var split_enabled = false;
         var focused_pane_id: u32 = 0;
@@ -4077,8 +4580,9 @@ pub const Core = struct {
                     if (pane_lang != .unknown) {
                         if (!self.scroll_in_progress) {
                             const pane_buffer_id = pane_buffer.id;
-                            if (self.syntax_manager.current_lang != pane_lang or self.syntax_manager.current_resource_id != pane_buffer_id) {
-                                if (self.syntax_manager.current_lang != pane_lang) {
+                            const pane_syn = self.syntax_manager.stateSnapshot();
+                            if (pane_syn.lang != pane_lang or pane_syn.resource_id != pane_buffer_id) {
+                                if (pane_syn.lang != pane_lang) {
                                     self.syntax_manager.setLanguageEnum(pane_lang) catch |err| {
                                         log.warn("Failed to set pane syntax language to {}: {}", .{ pane_lang, err });
                                     };
@@ -4142,6 +4646,7 @@ pub const Core = struct {
             }
         }
 
+        @import("../services/thread_name.zig").markStep("send:snapshot_create");
         const snapshot = try alloc.create(protocol.RenderSnapshot);
         snapshot.* = .{
             .visible_lines = visible_lines,
@@ -4180,8 +4685,19 @@ pub const Core = struct {
             .command_palette_selected = self.command_palette_selected,
             .syntax_tokens = syntax_tokens,
             .hover_content = hover_content,
+            .hover_document = hover_document_slot,
+            .hover_anchor_row = self.hover_anchor_row,
+            .hover_anchor_col = self.hover_anchor_col,
+            .hover_scroll_offset = self.hover_scroll_offset,
+            .hover_sticky = self.hover_sticky,
+            .hover_loading = hover_loading,
+            .which_key_visible = which_key_visible,
             .go_to_line_input = go_to_line_input_slice,
             .symbol_picker_query = symbol_picker_query_slice,
+            .workspace_symbol_query = workspace_symbol_query_slice,
+            .workspace_symbol_results = workspace_symbol_results,
+            .workspace_symbol_selected = self.workspace_symbol_selected,
+            .workspace_symbol_pending = self.workspace_symbol_pending,
             .symbol_picker_results = symbol_picker_results,
             .symbol_picker_selected = self.symbol_picker_selected,
             .completion_active = self.completion_active,
@@ -4323,8 +4839,10 @@ pub const Core = struct {
                     break :blk null;
                 }
             },
+            .status_message_level = self.status_message_level,
         };
 
+        @import("../services/thread_name.zig").markStep("send:encode");
         var msg = protocol.Message{ .render_update = .{
             .snapshot_ptr = @intFromPtr(snapshot),
             .arena_ptr = @intFromPtr(arena),
@@ -4336,41 +4854,64 @@ pub const Core = struct {
         // Renders coalesce: only the freshest snapshot matters. The
         // `version` field (bumped above) is the slot identity so the
         // bus can tell when it's actually replacing an earlier frame.
+        @import("../services/thread_name.zig").markStep("send:bus_send");
         try self.ui_bus.sendCoalesced(.render, bytes, self.version);
+        @import("../services/thread_name.zig").markStep("send:done");
     }
 
-    fn checkHover(self: *Core) !bool {
-        const s = self.state();
-        const path = s.file_path orelse return false;
+    // ---- Hover helpers ---------------------------------------------------
 
-        // Route through the authoritative LSP language detector instead
-        // of a hard-coded extension list. Any language LSPManager can
-        // serve (zig, python, ts/tsx/jsx, js, rust, go, c/cpp/headers,
-        // java, ruby/rake, c#) is hover-eligible; languages without a
-        // running server fall through gracefully in the dispatcher.
-        if (LSPManager.getLangFromPath(path) == null) return false;
+    /// True if the popup is currently rendered (either the parsed
+    /// document or the raw fallback).
+    pub fn hoverVisible(self: *Core) bool {
+        return self.hover_doc != null or self.hover_content != null;
+    }
 
-        const node = self.syntax_manager.getNodeAt(s.cursor_row, s.cursor_col) orelse return false;
-        const type_str = self.syntax_manager.getNodeType(node);
+    /// Free both the raw payload and the parsed document, reset
+    /// scroll, and clear the in-flight flag.
+    pub fn dismissHover(self: *Core) void {
+        if (self.hover_content) |c| {
+            self.allocator.free(c);
+            self.hover_content = null;
+        }
+        if (self.hover_doc) |*doc| doc.deinit();
+        self.hover_doc = null;
+        self.hover_scroll_offset = 0;
+        self.hover_sticky = false;
+        self.hover_pending = false;
+    }
 
-        // Different grammars name identifier-ish nodes differently
-        // (`identifier`, `type_identifier`, `field_identifier`,
-        // `scoped_identifier`, `property_identifier`, …). Accept any
-        // node whose type contains "identifier", plus the small set of
-        // non-`identifier`-named hover targets (builtin/primitive types).
-        const is_hoverable =
-            std.mem.indexOf(u8, type_str, "identifier") != null or
-            std.mem.eql(u8, type_str, "builtin_type") or
-            std.mem.eql(u8, type_str, "primitive_type") or
-            std.mem.eql(u8, type_str, "type") or
-            std.mem.endsWith(u8, type_str, "_name");
+    /// Record where to anchor the popup for the next response. Set by
+    /// the hover-trigger paths (manual and auto) so the renderer can
+    /// pin the popup near the *symbol* even if the cursor drifts.
+    pub fn setHoverAnchor(self: *Core, row: usize, col: usize) void {
+        self.hover_anchor_row = row;
+        self.hover_anchor_col = col;
+    }
 
-        if (!is_hoverable) return false;
+    /// Mark the hover as "sticky" — survives any non-scroll key until
+    /// the user presses Esc.
+    pub fn setHoverSticky(self: *Core, sticky: bool) void {
+        self.hover_sticky = sticky;
+    }
 
-        try self.ensureLspDocument();
-        self.hover_pending = true;
-        try self.lsp_manager.requestHover(path, @intCast(s.cursor_row), @intCast(s.cursor_col));
-        return true;
+    /// True if `key` should advance / retreat the popup body scroll
+    /// while a sticky hover is open. Arrow keys, vim hjkl-style j/k,
+    /// PageUp/Down, and Ctrl+u/d all count.
+    fn tryHoverScroll(self: *Core, key: vaxis.Key) bool {
+        var consumed = true;
+        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+            self.hover_scroll_offset +|= 1;
+        } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+            self.hover_scroll_offset -|= 1;
+        } else if (key.matches(vaxis.Key.page_down, .{}) or key.matches('d', .{ .ctrl = true })) {
+            self.hover_scroll_offset +|= 5;
+        } else if (key.matches(vaxis.Key.page_up, .{}) or key.matches('u', .{ .ctrl = true })) {
+            self.hover_scroll_offset -|= 5;
+        } else {
+            consumed = false;
+        }
+        return consumed;
     }
 
     pub fn ensureLspDocument(self: *Core) !void {
@@ -4801,6 +5342,61 @@ pub const Core = struct {
         if (key.text) |text| {
             try self.symbol_picker_query.appendSlice(self.allocator, text);
             try self.updateSymbolSearch();
+            return true;
+        }
+        return false;
+    }
+
+    fn handleWorkspaceSymbolPickerInput(self: *Core, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true })) {
+            if (self.workspace_symbol_selected > 0) self.workspace_symbol_selected -= 1;
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
+            if (self.workspace_symbol_results.items.len > 0 and
+                self.workspace_symbol_selected + 1 < self.workspace_symbol_results.items.len)
+            {
+                self.workspace_symbol_selected += 1;
+            }
+            return true;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            if (self.workspace_symbol_selected < self.workspace_symbol_results.items.len) {
+                const sym = self.workspace_symbol_results.items[self.workspace_symbol_selected];
+                // Record where we came from so Space, can take the
+                // user straight back.
+                const s = self.state();
+                if (s.file_path) |path| {
+                    self.jump_list.recordJump(path, s.cursor_row, s.cursor_col) catch {};
+                }
+                _ = self.buffer_manager.openFile(sym.file_path) catch |err| {
+                    log.warn("Open file from workspace symbol failed: {}", .{err});
+                    self.mode = self.previous_mode;
+                    return true;
+                };
+                const new_state = self.state();
+                new_state.cursor_row = sym.line;
+                new_state.cursor_col = sym.col;
+                new_state.preferred_col = null;
+                // Centre the line so the symbol isn't pinned to the top edge.
+                const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
+                const half = visible_rows / 2;
+                new_state.scroll_offset = if (new_state.cursor_row >= half) new_state.cursor_row - half else 0;
+            }
+            self.mode = self.previous_mode;
+            self.workspace_symbol_query.clearRetainingCapacity();
+            return true;
+        }
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            if (self.workspace_symbol_query.items.len > 0) {
+                _ = self.workspace_symbol_query.pop();
+                try self.dispatchWorkspaceSymbolQuery();
+            }
+            return true;
+        }
+        if (key.text) |text| {
+            try self.workspace_symbol_query.appendSlice(self.allocator, text);
+            try self.dispatchWorkspaceSymbolQuery();
             return true;
         }
         return false;

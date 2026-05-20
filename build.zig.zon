@@ -1,6 +1,6 @@
 .{
     .name = .stem,
-    .version = "0.4.0",
+    .version = "0.5.0",
     .fingerprint = 0x20bf92e5730ad4ee, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

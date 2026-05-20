@@ -360,6 +360,11 @@ pub const View = struct {
             return;
         }
 
+        if (mode == .workspace_symbol_picker) {
+            try self.drawWorkspaceSymbolPicker(win, snapshot, frame_allocator);
+            return;
+        }
+
         if (mode == .global_search) {
             try self.drawGlobalSearch(win, snapshot, frame_allocator);
             return;
@@ -802,8 +807,10 @@ pub const View = struct {
 
         self.drawScrollbar(text_area, total_lines, text_area.height, snapshot.scroll_offset);
 
-        if (snapshot.hover_content) |content| {
-            try self.drawHoverPopup(text_area, content, snapshot.cursor_row, snapshot.cursor_col, snapshot.scroll_offset);
+        if (!snapshot.completion_active and
+            (snapshot.hover_document != null or snapshot.hover_content != null or snapshot.hover_loading))
+        {
+            try self.drawHoverPopup(text_area, snapshot);
         }
 
         if (snapshot.completion_active) {
@@ -814,6 +821,10 @@ pub const View = struct {
 
         if (mode == .visual_search) {
             try self.drawSearchInput(win, snapshot.search_input orelse "", frame_allocator);
+        }
+
+        if (snapshot.which_key_visible) {
+            try self.drawWhichKey(win);
         }
     }
 
@@ -858,8 +869,10 @@ pub const View = struct {
                 try self.drawPaneContent(pane_win, snapshot, pane, frame_allocator);
 
                 if (pane.is_focused) {
-                    if (snapshot.hover_content) |content| {
-                        try self.drawHoverPopup(pane_win.child(.{ .y_off = 1, .height = height -| 1 }), content, pane.cursor_row, pane.cursor_col, pane.scroll_offset);
+                    if (!snapshot.completion_active and
+                        (snapshot.hover_document != null or snapshot.hover_content != null or snapshot.hover_loading))
+                    {
+                        try self.drawHoverPopup(pane_win.child(.{ .y_off = 1, .height = height -| 1 }), snapshot);
                     }
                 }
             }
@@ -876,6 +889,10 @@ pub const View = struct {
             .height = status_height,
         });
         try self.status_bar.draw(status_area, snapshot, frame_allocator);
+
+        if (snapshot.which_key_visible) {
+            try self.drawWhichKey(win);
+        }
     }
 
     fn drawPaneContent(
@@ -1472,193 +1489,607 @@ pub const View = struct {
         });
     }
 
-    fn drawHoverPopup(self: *View, win: vaxis.Window, content: []const u8, cursor_row: usize, cursor_col: usize, scroll_offset: usize) !void {
-        if (content.len == 0) return;
+    // ---- Hover popup -----------------------------------------------------
+    //
+    // The hover popup renders a parsed `HoverDocument` (from
+    // `services/hover_doc.zig`). Layout, from top to bottom:
+    //
+    //   ┌──────────────────────────────────────┐
+    //   │  {title or "Hover"}   esc · scroll   │  ← header
+    //   ├──────────────────────────────────────┤
+    //   │  signature                           │  ← signature panel (code-styled)
+    //   ├──────────────────────────────────────┤
+    //   │  body sections (scrollable)          │
+    //   │  …                                   │
+    //   ├──────────────────────────────────────┤
+    //   │  Esc dismiss   j/k scroll            │  ← footer (sticky only)
+    //   └──────────────────────────────────────┘
+    //
+    // Width is viewport-relative: max(40, min(96, win.width * 0.55)).
+    // Position prefers below-and-right of the anchor (token start),
+    // falls back to above when there's no room, and slides
+    // horizontally to stay inside the window.
 
-        if (win.width < 10 or win.height < 5) {
+    /// One rendered row inside the popup body. Carries its own style
+    /// + indent so the renderer can blit it directly without any more
+    /// branching on section kind.
+    const HoverRow = struct {
+        text: []const u8,
+        style: vaxis.Cell.Style,
+        indent: u16 = 0,
+    };
+
+    const HoverStyle = struct {
+        border: vaxis.Cell.Style,
+        bg: vaxis.Cell.Style,
+        title: vaxis.Cell.Style,
+        chip: vaxis.Cell.Style,
+        signature: vaxis.Cell.Style,
+        code: vaxis.Cell.Style,
+        paragraph: vaxis.Cell.Style,
+        list_item: vaxis.Cell.Style,
+        divider: vaxis.Cell.Style,
+        hint: vaxis.Cell.Style,
+    };
+
+    fn hoverStyles() HoverStyle {
+        const bg_color = vaxis.Cell.Color{ .rgb = .{ 30, 30, 46 } };
+        return .{
+            .border = .{ .fg = .{ .rgb = .{ 108, 112, 134 } }, .bg = bg_color },
+            .bg = .{ .bg = bg_color },
+            .title = .{ .fg = .{ .rgb = .{ 245, 224, 220 } }, .bg = bg_color, .bold = true },
+            .chip = .{ .fg = .{ .rgb = .{ 137, 180, 250 } }, .bg = bg_color, .italic = true },
+            .signature = .{ .fg = .{ .rgb = .{ 166, 227, 161 } }, .bg = bg_color, .bold = true },
+            .code = .{ .fg = .{ .rgb = .{ 137, 180, 250 } }, .bg = bg_color },
+            .paragraph = .{ .fg = .{ .rgb = .{ 205, 214, 244 } }, .bg = bg_color },
+            .list_item = .{ .fg = .{ .rgb = .{ 203, 166, 247 } }, .bg = bg_color },
+            .divider = .{ .fg = .{ .rgb = .{ 69, 71, 90 } }, .bg = bg_color },
+            .hint = .{ .fg = .{ .rgb = .{ 108, 112, 134 } }, .bg = bg_color, .italic = true },
+        };
+    }
+
+    fn drawHoverPopup(self: *View, win: vaxis.Window, snapshot: *const protocol.RenderSnapshot) !void {
+        if (win.width < 14 or win.height < 6) {
             logDebug("drawHoverPopup: Window too small ({}x{})", .{ win.width, win.height });
             return;
         }
 
-        if (content.len > 50000) {
-            logWarn("drawHoverPopup: Content too large ({}), truncating", .{content.len});
-            return;
+        const styles = hoverStyles();
+
+        // Width: viewport-relative with sensible bounds so signatures
+        // breathe on wide screens but don't dominate narrow ones.
+        const desired = (@as(usize, win.width) * 55) / 100;
+        const width_usize = std.math.clamp(desired, @as(usize, 40), @as(usize, 96));
+        const width: u16 = @intCast(@min(width_usize, @as(usize, win.width -| 2)));
+        const inner_width: u16 = if (width > 4) width - 4 else 1;
+        const text_width: usize = @intCast(inner_width);
+
+        // Build a wrapped line list from the structured document.
+        // Each row carries its style so we can keep code blocks /
+        // paragraphs / list items visually distinct.
+        var body_rows = std.ArrayListUnmanaged(HoverRow).empty;
+        defer body_rows.deinit(self.allocator);
+
+        // Title text — prefer the parsed title, fall back to "Hover".
+        var header_title: []const u8 = "Hover";
+        var header_chip: ?[]const u8 = null;
+        var signature_text: ?[]const u8 = null;
+        var has_doc = false;
+
+        if (snapshot.hover_document) |doc| {
+            has_doc = true;
+            if (doc.title) |t| header_title = t;
+            if (doc.signature_language) |l| header_chip = l;
+            if (doc.signature) |sig| signature_text = sig;
+
+            for (doc.sections, 0..) |sec, i| {
+                if (i > 0) {
+                    try body_rows.append(self.allocator, .{ .text = "", .style = styles.bg });
+                }
+                switch (sec.kind) {
+                    .paragraph => try wrapRows(self.allocator, &body_rows, sec.text, styles.paragraph, text_width, 0),
+                    .code_block => {
+                        var line_it = std.mem.splitScalar(u8, sec.text, '\n');
+                        while (line_it.next()) |line| {
+                            try wrapRows(self.allocator, &body_rows, line, styles.code, text_width, 0);
+                        }
+                    },
+                    .list_item => try wrapRows(self.allocator, &body_rows, sec.text, styles.list_item, text_width, 2),
+                    .blank => try body_rows.append(self.allocator, .{ .text = "", .style = styles.bg }),
+                }
+            }
+        } else if (snapshot.hover_content) |raw| {
+            // Parse failed — show raw lines with paragraph styling so
+            // we at least display something readable.
+            var line_it = std.mem.splitScalar(u8, raw, '\n');
+            while (line_it.next()) |line| {
+                try wrapRows(self.allocator, &body_rows, line, styles.paragraph, text_width, 0);
+            }
         }
 
-        const screen_row = cursor_row -| scroll_offset;
-        const screen_col = cursor_col;
+        // Signature panel takes 1 line plus a 1-line divider below it.
+        const has_signature = signature_text != null;
+        const sig_lines: u16 = if (has_signature) 1 else 0;
+        const sig_divider: u16 = if (has_signature) 1 else 0;
 
-        const border_style: vaxis.Cell.Style = .{
-            .fg = .{ .rgb = .{ 108, 112, 134 } },
-            .bg = .{ .rgb = .{ 30, 30, 46 } },
-        };
-        const header_style: vaxis.Cell.Style = .{
-            .fg = .{ .rgb = .{ 180, 190, 254 } },
-            .bg = .{ .rgb = .{ 30, 30, 46 } },
-            .bold = true,
-        };
-        const code_style: vaxis.Cell.Style = .{
-            .fg = .{ .rgb = .{ 137, 180, 250 } },
-            .bg = .{ .rgb = .{ 30, 30, 46 } },
-        };
-        const doc_style: vaxis.Cell.Style = .{
-            .fg = .{ .rgb = .{ 205, 214, 244 } },
-            .bg = .{ .rgb = .{ 30, 30, 46 } },
-        };
-        const hint_style: vaxis.Cell.Style = .{
-            .fg = .{ .rgb = .{ 88, 91, 112 } },
-            .bg = .{ .rgb = .{ 30, 30, 46 } },
-        };
+        const header_lines: u16 = 1;
+        const header_divider: u16 = 1;
+        const footer_lines: u16 = if (snapshot.hover_sticky) 1 else 0;
+        const footer_divider: u16 = if (snapshot.hover_sticky) 1 else 0;
+        const top_border: u16 = 1;
+        const bottom_border: u16 = 1;
 
-        var wrapped_lines = std.ArrayList(vaxis.Segment).initCapacity(self.allocator, 32) catch return;
-        defer wrapped_lines.deinit(self.allocator);
+        const chrome_rows: u16 =
+            top_border + header_lines + header_divider + sig_lines + sig_divider +
+            footer_divider + footer_lines + bottom_border;
 
-        const max_width: u16 = 70;
-        const max_height: u16 = 15;
-        var content_width: u16 = 0;
+        // Apply scroll: scrolling drops rows off the top of the body.
+        const total_body_rows: u16 = @intCast(@min(body_rows.items.len, @as(usize, std.math.maxInt(u16))));
+        const scroll: u16 = @intCast(@min(snapshot.hover_scroll_offset, @as(usize, total_body_rows)));
 
-        var lines_iter = std.mem.splitScalar(u8, content, '\n');
-        var is_first_line = true;
-        while (lines_iter.next()) |line| {
-            var style = doc_style;
+        // Pick popup height: prefer the natural body size, bound by
+        // viewport height. Always reserve space for chrome — and
+        // reserve at least one body row when we're in the loading
+        // state so the "Loading…" message has somewhere to land.
+        const natural_body_rows = blk: {
+            const raw = total_body_rows -| scroll;
+            if (raw == 0 and snapshot.hover_loading) break :blk 1;
+            break :blk raw;
+        };
+        const max_height: u16 = @intCast(@min(@as(usize, win.height -| 2), @as(usize, 20)));
+        const body_capacity = if (max_height > chrome_rows) max_height - chrome_rows else 1;
+        const body_visible_rows = @min(natural_body_rows, body_capacity);
+        const height: u16 = chrome_rows + body_visible_rows;
 
-            if (is_first_line or std.mem.startsWith(u8, line, "fn ") or std.mem.startsWith(u8, line, "pub ") or
-                std.mem.startsWith(u8, line, "const ") or std.mem.startsWith(u8, line, "var ") or
-                std.mem.indexOf(u8, line, "->") != null or std.mem.indexOf(u8, line, ":") != null)
-            {
-                style = code_style;
+        // Placement. Anchor on the token (not the cursor) so the
+        // popup stays put even if the cursor drifts mid-identifier.
+        const anchor_screen_row: u16 = @intCast(@min(
+            snapshot.hover_anchor_row -| snapshot.scroll_offset,
+            @as(usize, std.math.maxInt(u16)),
+        ));
+        const anchor_screen_col: u16 = @intCast(@min(
+            snapshot.hover_anchor_col,
+            @as(usize, std.math.maxInt(u16)),
+        ));
+
+        const space_above: u16 = anchor_screen_row;
+        const space_below: u16 = win.height -| (anchor_screen_row + 1);
+
+        // Bias toward below-the-token (more natural reading flow),
+        // fall back to above when there's clearly more room there.
+        var box_y: u16 = 0;
+        if (space_below >= height + 1) {
+            box_y = anchor_screen_row + 1;
+        } else if (space_above >= height) {
+            box_y = anchor_screen_row -| height;
+        } else if (space_below >= 4) {
+            // Truncate body to fit below.
+            const fit_body = if (space_below > chrome_rows + 1) space_below - chrome_rows - 1 else 1;
+            const truncated_body = @min(body_visible_rows, fit_body);
+            box_y = anchor_screen_row + 1;
+            return self.renderHoverBox(
+                win,
+                box_x_for(win, width, anchor_screen_col),
+                box_y,
+                width,
+                chrome_rows + truncated_body,
+                truncated_body,
+                styles,
+                header_title,
+                header_chip,
+                signature_text,
+                body_rows.items[scroll..@min(body_rows.items.len, @as(usize, scroll) + truncated_body)],
+                snapshot,
+            );
+        } else if (space_above >= 4) {
+            const fit_body = if (space_above > chrome_rows) space_above - chrome_rows else 1;
+            const truncated_body = @min(body_visible_rows, fit_body);
+            box_y = anchor_screen_row -| (chrome_rows + truncated_body);
+            return self.renderHoverBox(
+                win,
+                box_x_for(win, width, anchor_screen_col),
+                box_y,
+                width,
+                chrome_rows + truncated_body,
+                truncated_body,
+                styles,
+                header_title,
+                header_chip,
+                signature_text,
+                body_rows.items[scroll..@min(body_rows.items.len, @as(usize, scroll) + truncated_body)],
+                snapshot,
+            );
+        } else {
+            // Last resort: pin to row 0.
+            box_y = 0;
+        }
+
+        const body_end_idx = @min(body_rows.items.len, @as(usize, scroll) + body_visible_rows);
+        try self.renderHoverBox(
+            win,
+            box_x_for(win, width, anchor_screen_col),
+            box_y,
+            width,
+            height,
+            body_visible_rows,
+            styles,
+            header_title,
+            header_chip,
+            signature_text,
+            body_rows.items[scroll..body_end_idx],
+            snapshot,
+        );
+    }
+
+    fn renderHoverBox(
+        self: *View,
+        win: vaxis.Window,
+        box_x: u16,
+        box_y: u16,
+        width: u16,
+        height: u16,
+        body_visible_rows: u16,
+        styles: HoverStyle,
+        title: []const u8,
+        chip: ?[]const u8,
+        signature: ?[]const u8,
+        body_rows: []const HoverRow,
+        snapshot: *const protocol.RenderSnapshot,
+    ) !void {
+        const inner_left = box_x + 2;
+        const inner_right_padding: u16 = 2;
+        const inner_width: u16 = if (width > 4) width - 4 else 1;
+
+        // Top border
+        _ = win.printSegment(.{ .text = "╭", .style = styles.border }, .{ .row_offset = box_y, .col_offset = box_x });
+        for (1..width - 1) |i| {
+            _ = win.printSegment(.{ .text = "─", .style = styles.border }, .{ .row_offset = box_y, .col_offset = box_x + @as(u16, @intCast(i)) });
+        }
+        _ = win.printSegment(.{ .text = "╮", .style = styles.border }, .{ .row_offset = box_y, .col_offset = box_x + width - 1 });
+
+        var row = box_y + 1;
+
+        // Header: title on the left, optional language chip + key hint
+        // on the right.
+        fillRow(win, box_x, row, width, styles.bg);
+        _ = win.printSegment(.{ .text = title, .style = styles.title }, .{ .row_offset = row, .col_offset = inner_left });
+        if (chip) |c| {
+            const chip_text_buf = try std.fmt.allocPrint(self.allocator, "{s}", .{c});
+            defer self.allocator.free(chip_text_buf);
+            if (chip_text_buf.len + title.len + 4 < inner_width) {
+                const chip_col = inner_left + @as(u16, @intCast(title.len)) + 2;
+                _ = win.printSegment(.{ .text = chip_text_buf, .style = styles.chip }, .{ .row_offset = row, .col_offset = chip_col });
             }
+        }
+        const hint = if (snapshot.hover_sticky) "esc · j/k" else "esc";
+        if (width > hint.len + 6) {
+            const hint_col = box_x + width - 1 - @as(u16, @intCast(hint.len)) - 1;
+            _ = win.printSegment(.{ .text = hint, .style = styles.hint }, .{ .row_offset = row, .col_offset = hint_col });
+        }
+        _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x });
+        _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
+        row += 1;
 
-            if (line.len == 0) {
-                try wrapped_lines.append(self.allocator, .{ .text = "", .style = style });
-                continue;
-            }
+        // Header divider
+        drawDivider(win, box_x, row, width, styles);
+        row += 1;
 
-            var remaining = line;
-            while (remaining.len > 0) {
-                var split_idx = remaining.len;
-                if (remaining.len > max_width - 4) {
-                    var space_idx: ?usize = null;
-                    var i: usize = @min(max_width - 4, remaining.len);
-                    while (i > 0) : (i -= 1) {
-                        if (remaining[i] == ' ') {
-                            space_idx = i;
-                            break;
-                        }
+        // Signature panel
+        if (signature) |sig| {
+            fillRow(win, box_x, row, width, styles.bg);
+            const truncated = truncateText(sig, inner_width);
+            _ = win.printSegment(.{ .text = truncated, .style = styles.signature }, .{ .row_offset = row, .col_offset = inner_left });
+            _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x });
+            _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
+            row += 1;
+            drawDivider(win, box_x, row, width, styles);
+            row += 1;
+        }
+
+        // Loading state takes precedence over an empty body.
+        if (snapshot.hover_loading and body_rows.len == 0) {
+            fillRow(win, box_x, row, width, styles.bg);
+            _ = win.printSegment(.{ .text = "Loading…", .style = styles.hint }, .{ .row_offset = row, .col_offset = inner_left });
+            _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x });
+            _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
+            row += 1;
+        } else {
+            for (0..body_visible_rows) |i| {
+                fillRow(win, box_x, row, width, styles.bg);
+                if (i < body_rows.len) {
+                    const r = body_rows[i];
+                    const truncated = truncateText(r.text, inner_width -| r.indent);
+                    const bullet_or_space: []const u8 = if (r.indent > 0 and !std.mem.eql(u8, truncated, "")) "•" else " ";
+                    if (r.indent > 0) {
+                        _ = win.printSegment(.{ .text = bullet_or_space, .style = r.style }, .{ .row_offset = row, .col_offset = inner_left });
+                        _ = win.printSegment(.{ .text = truncated, .style = r.style }, .{ .row_offset = row, .col_offset = inner_left + r.indent });
+                    } else {
+                        _ = win.printSegment(.{ .text = truncated, .style = r.style }, .{ .row_offset = row, .col_offset = inner_left });
                     }
-                    split_idx = space_idx orelse @min(max_width - 4, remaining.len);
                 }
+                _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x });
+                _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
+                row += 1;
+            }
+        }
 
-                const segment_text = remaining[0..split_idx];
-                try wrapped_lines.append(self.allocator, .{ .text = segment_text, .style = style });
-                content_width = @max(content_width, @as(u16, @intCast(segment_text.len)));
+        // Footer — only on sticky hover, where the user is actively
+        // reading and needs the scroll affordance.
+        if (snapshot.hover_sticky) {
+            drawDivider(win, box_x, row, width, styles);
+            row += 1;
+            fillRow(win, box_x, row, width, styles.bg);
+            const footer = "Esc dismiss   j/k or ↑/↓ scroll";
+            const truncated = truncateText(footer, inner_width);
+            _ = win.printSegment(.{ .text = truncated, .style = styles.hint }, .{ .row_offset = row, .col_offset = inner_left });
+            _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x });
+            _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
+            row += 1;
+        }
 
-                if (split_idx < remaining.len) {
-                    const next_start = if (remaining[split_idx] == ' ') split_idx + 1 else split_idx;
-                    if (next_start >= remaining.len) break;
-                    remaining = remaining[next_start..];
-                } else {
+        // Bottom border
+        _ = win.printSegment(.{ .text = "╰", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x });
+        for (1..width - 1) |i| {
+            _ = win.printSegment(.{ .text = "─", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + @as(u16, @intCast(i)) });
+        }
+        _ = win.printSegment(.{ .text = "╯", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
+
+        _ = inner_right_padding; // silence unused
+        _ = height; // silence unused
+    }
+
+    /// Append wrapped rows for `text` into `out`. Soft-wraps at
+    /// `wrap_width` (cell count) breaking at spaces when possible,
+    /// hard-breaking otherwise. `indent` cells of left padding go to
+    /// every wrapped continuation row.
+    fn wrapRows(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged(HoverRow),
+        text: []const u8,
+        style: vaxis.Cell.Style,
+        wrap_width: usize,
+        indent: u16,
+    ) !void {
+        if (text.len == 0) {
+            try out.append(allocator, .{ .text = text, .style = style, .indent = indent });
+            return;
+        }
+        const usable = if (wrap_width > indent) wrap_width - indent else 1;
+        var remaining = text;
+        while (remaining.len > 0) {
+            if (remaining.len <= usable) {
+                try out.append(allocator, .{ .text = remaining, .style = style, .indent = indent });
+                return;
+            }
+            // Walk back from the soft-wrap boundary to the last space
+            // so we don't split a word. Hard-break if there's no
+            // earlier space.
+            var split: usize = usable;
+            var found_space = false;
+            var i: usize = usable;
+            while (i > 0) : (i -= 1) {
+                if (remaining[i - 1] == ' ') {
+                    split = i - 1;
+                    found_space = true;
                     break;
                 }
             }
-            is_first_line = false;
+            if (!found_space) split = usable;
+            const chunk = remaining[0..split];
+            try out.append(allocator, .{ .text = chunk, .style = style, .indent = indent });
+            // Skip the space we broke at, if any.
+            const next_start = if (found_space) split + 1 else split;
+            if (next_start >= remaining.len) return;
+            remaining = remaining[next_start..];
         }
+    }
 
-        var display_lines_count: u16 = @min(@as(u16, @intCast(wrapped_lines.items.len)), max_height - 3);
-        const width: u16 = @max(20, @min(max_width, content_width + 4));
-        var height: u16 = display_lines_count + 2;
-
-        // Pick vertical position: prefer the side with more room. If the
-        // cursor is in the upper half, render below; otherwise above. Falls
-        // back to truncating when nothing fits.
-        const cursor_screen_row: u16 = @intCast(@min(screen_row, @as(usize, std.math.maxInt(u16))));
-        const space_above: u16 = cursor_screen_row;
-        const space_below: u16 = win.height -| (cursor_screen_row + 1);
-        const prefer_above = space_above > space_below;
-
-        var box_y: u16 = 0;
-        if (prefer_above and space_above >= height) {
-            box_y = cursor_screen_row - height;
-        } else if (!prefer_above and space_below >= height) {
-            box_y = cursor_screen_row + 1;
-        } else if (space_below >= 3) {
-            // Truncate to fit below.
-            display_lines_count = @min(display_lines_count, space_below - 2);
-            height = display_lines_count + 2;
-            box_y = cursor_screen_row + 1;
-        } else if (space_above >= 3) {
-            display_lines_count = @min(display_lines_count, space_above - 2);
-            height = display_lines_count + 2;
-            box_y = cursor_screen_row -| height;
-        } else {
-            return;
+    /// Fill an interior row (`box_x+1` through `box_x+width-2`) with
+    /// blanks in the popup background so syntax tokens behind the
+    /// popup don't bleed through.
+    fn fillRow(win: vaxis.Window, box_x: u16, row: u16, width: u16, bg_style: vaxis.Cell.Style) void {
+        if (width < 2) return;
+        var j: u16 = 1;
+        while (j < width - 1) : (j += 1) {
+            _ = win.printSegment(.{ .text = " ", .style = bg_style }, .{ .row_offset = row, .col_offset = box_x + j });
         }
+    }
 
-        // Horizontal: keep at cursor col when it fits, else slide left to
-        // keep the popup fully inside the window. Leaves a 1-col margin from
-        // the right edge so the box doesn't kiss the scrollbar.
+    /// One-line divider between header / signature / body / footer.
+    fn drawDivider(win: vaxis.Window, box_x: u16, row: u16, width: u16, styles: HoverStyle) void {
+        _ = win.printSegment(.{ .text = "├", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x });
+        for (1..width - 1) |i| {
+            _ = win.printSegment(.{ .text = "─", .style = styles.divider }, .{ .row_offset = row, .col_offset = box_x + @as(u16, @intCast(i)) });
+        }
+        _ = win.printSegment(.{ .text = "┤", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
+    }
+
+    /// Truncate `text` to at most `max` bytes — byte-accurate, with a
+    /// trailing `…` when truncated. Good enough for ASCII-heavy
+    /// signatures and the doc text we get from LSPs; non-ASCII gets a
+    /// conservative byte-budget that won't split a codepoint at the
+    /// expense of a few cells.
+    fn truncateText(text: []const u8, max: usize) []const u8 {
+        if (text.len <= max) return text;
+        if (max == 0) return "";
+        // Don't bother with a real width count — bytes are a close
+        // enough approximation for our hover content and the ellipsis
+        // makes truncation visible.
+        return text[0..@min(text.len, max)];
+    }
+
+    /// Compute the popup's `box_x` so it stays inside `win`. Prefers
+    /// the anchor column, slides left when the box would overflow,
+    /// always leaves a 1-cell right margin.
+    fn box_x_for(win: vaxis.Window, width: u16, anchor_col: u16) u16 {
         const margin: u16 = 1;
-        const max_box_x: u16 = if (win.width > width + margin) win.width - width - margin else 0;
-        const box_x: u16 = @intCast(@min(screen_col, @as(usize, max_box_x)));
+        const max_x: u16 = if (win.width > width + margin) win.width - width - margin else 0;
+        return @min(anchor_col, max_x);
+    }
 
-        _ = win.printSegment(.{ .text = "╭", .style = border_style }, .{ .row_offset = box_y, .col_offset = box_x });
-        for (1..width - 1) |i| {
-            _ = win.printSegment(.{ .text = "─", .style = border_style }, .{ .row_offset = box_y, .col_offset = box_x + @as(u16, @intCast(i)) });
-        }
-        _ = win.printSegment(.{ .text = "╮", .style = border_style }, .{ .row_offset = box_y, .col_offset = box_x + width - 1 });
+    // ---- Which-key popup -------------------------------------------------
+    //
+    // Renders a small grouped panel at the bottom of the window
+    // listing every leader-key binding. Driven entirely by the
+    // static catalogue in `ui/which_key.zig` so the popup never
+    // claims a binding that doesn't exist.
 
-        _ = win.printSegment(.{ .text = "│", .style = border_style }, .{ .row_offset = box_y + 1, .col_offset = box_x });
-        for (1..width - 1) |i| {
-            _ = win.printSegment(.{ .text = " ", .style = header_style }, .{ .row_offset = box_y + 1, .col_offset = box_x + @as(u16, @intCast(i)) });
-        }
-        _ = win.printSegment(.{ .text = " Hover", .style = header_style }, .{ .row_offset = box_y + 1, .col_offset = box_x + 1 });
-        // Right-aligned hint "esc to dismiss" if there's room.
-        const hint = "esc to dismiss ";
-        if (width > hint.len + 8) {
-            const hint_col = box_x + width - 1 - @as(u16, @intCast(hint.len));
-            _ = win.printSegment(.{
-                .text = hint,
-                .style = .{ .fg = .{ .rgb = .{ 108, 112, 134 } }, .bg = .{ .rgb = .{ 30, 30, 46 } }, .italic = true },
-            }, .{ .row_offset = box_y + 1, .col_offset = hint_col });
-        }
-        _ = win.printSegment(.{ .text = "│", .style = border_style }, .{ .row_offset = box_y + 1, .col_offset = box_x + width - 1 });
+    fn drawWhichKey(self: *View, win: vaxis.Window) !void {
+        _ = self;
+        const wk = @import("which_key.zig");
 
-        for (0..display_lines_count) |i| {
-            const row = box_y + 2 + @as(u16, @intCast(i));
-            _ = win.printSegment(.{ .text = "│", .style = border_style }, .{ .row_offset = row, .col_offset = box_x });
+        if (win.width < 30 or win.height < 8) return;
 
-            for (1..width - 1) |j| {
-                _ = win.printSegment(.{ .text = " ", .style = doc_style }, .{ .row_offset = row, .col_offset = box_x + @as(u16, @intCast(j)) });
+        // Group ordering picked so column heights balance: large
+        // groups paired with small ones rather than two big groups
+        // stacking on the same column.
+        const groups = [_]wk.Group{ .file, .splits, .edit, .misc, .lsp, .navigation };
+
+        // Count entries per group + compute the tallest column.
+        var per_group_counts: [groups.len]usize = .{0} ** groups.len;
+        for (wk.entries) |e| {
+            for (groups, 0..) |g, gi| {
+                if (e.group == g) per_group_counts[gi] += 1;
             }
+        }
+        var tallest: usize = 0;
+        for (per_group_counts) |c| tallest = @max(tallest, c);
 
-            if (i < wrapped_lines.items.len) {
-                const seg = wrapped_lines.items[i];
-                _ = win.printSegment(.{ .text = seg.text, .style = seg.style }, .{ .row_offset = row, .col_offset = box_x + 2 });
+        // Cap popup width so it never dominates the screen. On wide
+        // terminals: 3-column compact layout. On medium: 2 columns.
+        // On narrow: 1 column. The previous version stretched
+        // edge-to-edge and made small terminals unusable.
+        const max_popup_w: u16 = 70;
+        const popup_width: u16 = @min(max_popup_w, win.width -| 4);
+        const columns: u16 = if (popup_width >= 60) 3 else if (popup_width >= 40) 2 else 1;
+        const col_width: u16 = if (columns > 0) (popup_width - 4) / columns else popup_width;
+
+        const rows_per_col = (groups.len + columns - 1) / columns;
+        const popup_height: u16 = blk: {
+            // Each column section: 1 header + N entries + 1 separator,
+            // stacked vertically per column.
+            var section_rows: usize = 0;
+            var col: usize = 0;
+            while (col < columns) : (col += 1) {
+                var col_rows: usize = 0;
+                var sec: usize = 0;
+                while (sec < rows_per_col) : (sec += 1) {
+                    const idx = col * rows_per_col + sec;
+                    if (idx >= groups.len) break;
+                    col_rows += 1 + per_group_counts[idx] + 1; // header + entries + spacer
+                }
+                section_rows = @max(section_rows, col_rows);
             }
+            // +2 for top/bottom border, +1 for title row.
+            const natural = section_rows + 3;
+            // Cap at half the viewport so the popup never swallows
+            // the active line. The user explicitly opted in via
+            // Space-Space; they still want to see the editor under it.
+            const max_pop_h: usize = @min(@as(usize, win.height) / 2 + 4, 18);
+            break :blk @intCast(@min(@min(natural, max_pop_h), @as(usize, win.height) - 1));
+        };
 
-            _ = win.printSegment(.{ .text = "│", .style = border_style }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
+        const box_x: u16 = (win.width -| popup_width) / 2;
+        const box_y: u16 = win.height -| (popup_height + 1);
+
+        const styles = whichKeyStyles();
+
+        // Frame.
+        _ = win.printSegment(.{ .text = "╭", .style = styles.border }, .{ .row_offset = box_y, .col_offset = box_x });
+        for (1..popup_width - 1) |i| {
+            _ = win.printSegment(.{ .text = "─", .style = styles.border }, .{ .row_offset = box_y, .col_offset = box_x + @as(u16, @intCast(i)) });
+        }
+        _ = win.printSegment(.{ .text = "╮", .style = styles.border }, .{ .row_offset = box_y, .col_offset = box_x + popup_width - 1 });
+
+        // Title row.
+        fillRow(win, box_x, box_y + 1, popup_width, styles.bg);
+        _ = win.printSegment(.{ .text = " Space — leader", .style = styles.title }, .{ .row_offset = box_y + 1, .col_offset = box_x + 2 });
+        const hint = "esc cancel";
+        if (popup_width > hint.len + 6) {
+            const hint_col = box_x + popup_width - 1 - @as(u16, @intCast(hint.len)) - 1;
+            _ = win.printSegment(.{ .text = hint, .style = styles.hint }, .{ .row_offset = box_y + 1, .col_offset = hint_col });
+        }
+        _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = box_y + 1, .col_offset = box_x });
+        _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = box_y + 1, .col_offset = box_x + popup_width - 1 });
+
+        // Inner area starts at box_y + 2 (after frame + title).
+        const inner_top = box_y + 2;
+        const inner_bottom = box_y + popup_height - 1; // bottom border row
+
+        // Fill background for interior rows.
+        var iy: u16 = inner_top;
+        while (iy < inner_bottom) : (iy += 1) {
+            fillRow(win, box_x, iy, popup_width, styles.bg);
+            _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = iy, .col_offset = box_x });
+            _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = iy, .col_offset = box_x + popup_width - 1 });
         }
 
-        var extra_rows: u16 = 0;
-        if (wrapped_lines.items.len > display_lines_count) {
-            const more_text = try std.fmt.allocPrint(self.allocator, "↓ +{d} more", .{wrapped_lines.items.len - display_lines_count});
-            defer self.allocator.free(more_text);
-            const scroll_row = box_y + 2 + display_lines_count;
-            _ = win.printSegment(.{ .text = "│", .style = border_style }, .{ .row_offset = scroll_row, .col_offset = box_x });
-            for (1..width - 1) |j| {
-                _ = win.printSegment(.{ .text = " ", .style = hint_style }, .{ .row_offset = scroll_row, .col_offset = box_x + @as(u16, @intCast(j)) });
+        // Lay out each group inside its column.
+        var col_idx: usize = 0;
+        while (col_idx < columns) : (col_idx += 1) {
+            const col_left = box_x + 2 + @as(u16, @intCast(col_idx)) * col_width;
+            var row_in_col: u16 = inner_top;
+            var sec_idx: usize = 0;
+            while (sec_idx < rows_per_col) : (sec_idx += 1) {
+                const gi = col_idx * rows_per_col + sec_idx;
+                if (gi >= groups.len) break;
+                if (row_in_col >= inner_bottom) break;
+                const g = groups[gi];
+                _ = win.printSegment(.{ .text = g.title(), .style = styles.group_title }, .{
+                    .row_offset = row_in_col,
+                    .col_offset = col_left,
+                });
+                row_in_col += 1;
+                for (wk.entries) |e| {
+                    if (e.group != g) continue;
+                    if (row_in_col >= inner_bottom) break;
+                    // `e.key` is a static string literal in `which_key.zig`
+                    // — no lifetime concerns, vaxis can retain the
+                    // pointer for as long as it likes.
+                    _ = win.printSegment(.{ .text = e.key, .style = styles.key }, .{
+                        .row_offset = row_in_col,
+                        .col_offset = col_left + 1,
+                    });
+                    _ = win.printSegment(.{ .text = e.label, .style = styles.label }, .{
+                        .row_offset = row_in_col,
+                        .col_offset = col_left + 4,
+                    });
+                    row_in_col += 1;
+                }
+                // Spacer between sections.
+                row_in_col += 1;
             }
-            _ = win.printSegment(.{ .text = more_text, .style = hint_style }, .{ .row_offset = scroll_row, .col_offset = box_x + 2 });
-            _ = win.printSegment(.{ .text = "│", .style = border_style }, .{ .row_offset = scroll_row, .col_offset = box_x + width - 1 });
-            extra_rows = 1;
         }
 
-        const bottom_row = box_y + 2 + display_lines_count + extra_rows;
-        _ = win.printSegment(.{ .text = "╰", .style = border_style }, .{ .row_offset = bottom_row, .col_offset = box_x });
-        for (1..width - 1) |i| {
-            _ = win.printSegment(.{ .text = "─", .style = border_style }, .{ .row_offset = bottom_row, .col_offset = box_x + @as(u16, @intCast(i)) });
+        // Bottom border.
+        _ = win.printSegment(.{ .text = "╰", .style = styles.border }, .{ .row_offset = inner_bottom, .col_offset = box_x });
+        for (1..popup_width - 1) |i| {
+            _ = win.printSegment(.{ .text = "─", .style = styles.border }, .{ .row_offset = inner_bottom, .col_offset = box_x + @as(u16, @intCast(i)) });
         }
-        _ = win.printSegment(.{ .text = "╯", .style = border_style }, .{ .row_offset = bottom_row, .col_offset = box_x + width - 1 });
+        _ = win.printSegment(.{ .text = "╯", .style = styles.border }, .{ .row_offset = inner_bottom, .col_offset = box_x + popup_width - 1 });
+    }
+
+    const WhichKeyStyle = struct {
+        border: vaxis.Cell.Style,
+        bg: vaxis.Cell.Style,
+        title: vaxis.Cell.Style,
+        group_title: vaxis.Cell.Style,
+        key: vaxis.Cell.Style,
+        label: vaxis.Cell.Style,
+        hint: vaxis.Cell.Style,
+    };
+
+    fn whichKeyStyles() WhichKeyStyle {
+        const bg_color = vaxis.Cell.Color{ .rgb = .{ 30, 30, 46 } };
+        return .{
+            .border = .{ .fg = .{ .rgb = .{ 108, 112, 134 } }, .bg = bg_color },
+            .bg = .{ .bg = bg_color },
+            .title = .{ .fg = .{ .rgb = .{ 245, 224, 220 } }, .bg = bg_color, .bold = true },
+            .group_title = .{ .fg = .{ .rgb = .{ 137, 180, 250 } }, .bg = bg_color, .bold = true },
+            .key = .{ .fg = .{ .rgb = .{ 250, 179, 135 } }, .bg = bg_color, .bold = true },
+            .label = .{ .fg = .{ .rgb = .{ 205, 214, 244 } }, .bg = bg_color },
+            .hint = .{ .fg = .{ .rgb = .{ 108, 112, 134 } }, .bg = bg_color, .italic = true },
+        };
     }
 
     fn drawCompletionPopup(
@@ -2154,6 +2585,147 @@ pub const View = struct {
                 if (width > sym.name.len + kind_text.len + 6) {
                     const k_style = if (is_selected) selected_style else kind_style;
                     _ = win.printSegment(.{ .text = kind_text, .style = k_style }, .{ .row_offset = @intCast(row), .col_offset = @intCast(start_x + width - kind_text.len - 2) });
+                }
+            }
+        }
+    }
+
+    /// Project-wide LSP symbol search. Mirrors `drawSymbolPicker` but
+    /// adds a third column for the basename of the file each symbol
+    /// lives in, so the user can disambiguate when several symbols
+    /// share a name.
+    fn drawWorkspaceSymbolPicker(self: *View, win: vaxis.Window, snapshot: *const protocol.RenderSnapshot, allocator: std.mem.Allocator) !void {
+        _ = self;
+        _ = allocator;
+
+        const overlay_style: vaxis.Cell.Style = .{
+            .fg = .{ .index = 7 },
+            .bg = .{ .index = 0 },
+        };
+
+        for (0..win.height) |row| {
+            for (0..win.width) |col| {
+                _ = win.printSegment(.{ .text = " ", .style = overlay_style }, .{
+                    .row_offset = @intCast(row),
+                    .col_offset = @intCast(col),
+                });
+            }
+        }
+
+        const width: usize = @min(win.width -| 4, 90);
+        const height: usize = @min(win.height -| 4, 20);
+
+        const start_x: usize = (win.width - width) / 2;
+        const start_y: usize = (win.height - height) / 4;
+
+        const box_style: vaxis.Cell.Style = .{
+            .fg = .{ .index = 7 },
+            .bg = .{ .index = 0 },
+        };
+        const border_style: vaxis.Cell.Style = .{
+            .fg = .{ .index = 5 },
+            .bg = .{ .index = 0 },
+        };
+        const selected_style: vaxis.Cell.Style = .{
+            .fg = .{ .index = 0 },
+            .bg = .{ .index = 5 },
+            .bold = true,
+        };
+        const kind_style: vaxis.Cell.Style = .{
+            .fg = .{ .index = 8 },
+            .bg = .{ .index = 0 },
+        };
+        const file_style: vaxis.Cell.Style = .{
+            .fg = .{ .index = 6 },
+            .bg = .{ .index = 0 },
+            .italic = true,
+        };
+
+        for (0..width) |i| {
+            _ = win.printSegment(.{ .text = "─", .style = border_style }, .{ .row_offset = @intCast(start_y), .col_offset = @intCast(start_x + i) });
+            _ = win.printSegment(.{ .text = "─", .style = border_style }, .{ .row_offset = @intCast(start_y + height + 2), .col_offset = @intCast(start_x + i) });
+        }
+        for (0..height + 3) |i| {
+            _ = win.printSegment(.{ .text = "│", .style = border_style }, .{ .row_offset = @intCast(start_y + i), .col_offset = @intCast(start_x) });
+            _ = win.printSegment(.{ .text = "│", .style = border_style }, .{ .row_offset = @intCast(start_y + i), .col_offset = @intCast(start_x + width) });
+        }
+        _ = win.printSegment(.{ .text = "╭", .style = border_style }, .{ .row_offset = @intCast(start_y), .col_offset = @intCast(start_x) });
+        _ = win.printSegment(.{ .text = "╮", .style = border_style }, .{ .row_offset = @intCast(start_y), .col_offset = @intCast(start_x + width) });
+        _ = win.printSegment(.{ .text = "╰", .style = border_style }, .{ .row_offset = @intCast(start_y + height + 2), .col_offset = @intCast(start_x) });
+        _ = win.printSegment(.{ .text = "╯", .style = border_style }, .{ .row_offset = @intCast(start_y + height + 2), .col_offset = @intCast(start_x + width) });
+
+        const input_prefix = "› ";
+        _ = win.printSegment(.{ .text = input_prefix, .style = border_style }, .{ .row_offset = @intCast(start_y + 1), .col_offset = @intCast(start_x + 1) });
+
+        const query = snapshot.workspace_symbol_query orelse "";
+        _ = win.printSegment(.{ .text = query, .style = box_style }, .{ .row_offset = @intCast(start_y + 1), .col_offset = @intCast(start_x + 1 + input_prefix.len) });
+        _ = win.printSegment(.{ .text = " ", .style = .{ .reverse = true } }, .{ .row_offset = @intCast(start_y + 1), .col_offset = @intCast(start_x + 1 + input_prefix.len + query.len) });
+
+        // Status hint right-aligned in the input row.
+        const hint = if (snapshot.workspace_symbol_pending) "loading…" else "enter open · esc cancel";
+        if (width > hint.len + 4) {
+            const hint_col = start_x + width - hint.len - 1;
+            _ = win.printSegment(.{ .text = hint, .style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 0 }, .italic = true } }, .{
+                .row_offset = @intCast(start_y + 1),
+                .col_offset = @intCast(hint_col),
+            });
+        }
+
+        for (1..width) |i| {
+            _ = win.printSegment(.{ .text = "─", .style = border_style }, .{ .row_offset = @intCast(start_y + 2), .col_offset = @intCast(start_x + i) });
+        }
+
+        if (snapshot.workspace_symbol_results) |results| {
+            if (results.len == 0) {
+                const msg = if (snapshot.workspace_symbol_pending) "Searching…" else "No matches.";
+                _ = win.printSegment(.{ .text = msg, .style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 0 }, .italic = true } }, .{
+                    .row_offset = @intCast(start_y + 3),
+                    .col_offset = @intCast(start_x + 2),
+                });
+                return;
+            }
+
+            var start_index: usize = 0;
+            if (snapshot.workspace_symbol_selected >= height) {
+                start_index = snapshot.workspace_symbol_selected - height + 1;
+            }
+
+            const render_count = @min(height, results.len);
+
+            for (0..render_count) |i| {
+                const item_index = start_index + i;
+                if (item_index >= results.len) break;
+
+                const sym = results[item_index];
+
+                const row = start_y + 3 + i;
+                const is_selected = item_index == snapshot.workspace_symbol_selected;
+                const style = if (is_selected) selected_style else box_style;
+
+                for (1..width) |j| {
+                    _ = win.printSegment(.{ .text = " ", .style = style }, .{ .row_offset = @intCast(row), .col_offset = @intCast(start_x + j) });
+                }
+
+                _ = win.printSegment(.{ .text = sym.name, .style = style }, .{ .row_offset = @intCast(row), .col_offset = @intCast(start_x + 2) });
+
+                const k_style = if (is_selected) selected_style else kind_style;
+                const f_style = if (is_selected) selected_style else file_style;
+
+                // File basename in the middle / right of the row;
+                // kind label flushed right.
+                const basename = std.fs.path.basename(sym.file_path);
+                const kind_text = sym.kind;
+                const right_label_len = kind_text.len + 1; // trailing space
+                if (width > sym.name.len + basename.len + right_label_len + 8) {
+                    const basename_col = start_x + sym.name.len + 4;
+                    _ = win.printSegment(.{ .text = basename, .style = f_style }, .{
+                        .row_offset = @intCast(row),
+                        .col_offset = @intCast(basename_col),
+                    });
+                    _ = win.printSegment(.{ .text = kind_text, .style = k_style }, .{
+                        .row_offset = @intCast(row),
+                        .col_offset = @intCast(start_x + width - right_label_len - 1),
+                    });
                 }
             }
         }

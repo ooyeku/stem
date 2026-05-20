@@ -3,6 +3,7 @@ const log = std.log.scoped(.SyntaxManager);
 const ts = @import("tree_sitter.zig");
 const c = ts.c;
 const protocol = @import("../kernel/protocol.zig");
+const thread_name = @import("../services/thread_name.zig");
 
 const test_utils = @import("../test_utils.zig");
 const MemoryTestUtils = test_utils.MemoryTestUtils;
@@ -319,6 +320,7 @@ pub const SyntaxManager = struct {
     }
 
     fn parseWorkerMain(self: *SyntaxManager) void {
+        thread_name.set("stem-parse");
         log.debug("parse worker started", .{});
         defer log.debug("parse worker exited", .{});
 
@@ -372,6 +374,7 @@ pub const SyntaxManager = struct {
             if (lang_ptr == null) continue;
 
             const wp = self.worker_parser orelse continue;
+            thread_name.markStep("parse:set_language");
             if (!c.ts_parser_set_language(wp, lang_ptr.?)) continue;
 
             // Take a refcounted copy of the previous tree (cheap — tree-
@@ -379,7 +382,9 @@ pub const SyntaxManager = struct {
             // parser without holding the tree lock during the parse. The
             // copy must be language-compatible with the new parse: if the
             // user switched languages, skip the copy.
+            thread_name.markStep("parse:lock_for_copy");
             self.treeLock();
+            thread_name.markStep("parse:tree_copy");
             const prev_tree_copy: ?*c.TSTree = if (self.current_lang == job.lang and self.tree != null)
                 c.ts_tree_copy(self.tree.?)
             else
@@ -394,6 +399,7 @@ pub const SyntaxManager = struct {
             // copy is just a content hint; with them, edited regions get
             // proper reparse and the rest is reused.
             if (prev_tree_copy) |t| {
+                thread_name.markStep("parse:apply_edits");
                 for (apply_edits) |ed| {
                     var ts_edit = c.TSInputEdit{
                         .start_byte = @intCast(ed.start_byte),
@@ -412,24 +418,34 @@ pub const SyntaxManager = struct {
             // tree-sitter does an incremental reparse — only changed nodes
             // are rebuilt; everything else is reused. Order-of-magnitude
             // faster on 1-char edits in large files.
+            thread_name.markStep("parse:parse_string");
             const new_tree = c.ts_parser_parse_string(wp, prev_tree_copy, job.source.ptr, @intCast(job.source.len));
+            thread_name.markStep("parse:delete_prev_copy");
             if (prev_tree_copy) |t| c.ts_tree_delete(t);
             if (new_tree == null) continue;
 
             // Swap in. Discard if the user changed language during the parse.
+            thread_name.markStep("parse:lock_for_install");
             self.treeLock();
+            thread_name.markStep("parse:check_installed");
             const installed = self.current_lang == job.lang;
             if (installed) {
+                thread_name.markStep("parse:delete_old_tree");
                 if (self.tree) |old| c.ts_tree_delete(old);
+                thread_name.markStep("parse:assign_new_tree");
                 self.tree = new_tree;
                 if (job.resource_id) |id| self.current_resource_id = id;
                 // Tree changed → memoized highlight + bracket pass stale.
+                thread_name.markStep("parse:invalidate_hl_cache");
                 self.highlight_cache.invalidate(self.allocator);
+                thread_name.markStep("parse:invalidate_bracket_cache");
                 self.bracket_cache.invalidate(self.allocator);
             } else {
+                thread_name.markStep("parse:discard_new_tree");
                 c.ts_tree_delete(new_tree);
             }
             self.treeUnlock();
+            thread_name.markStep("parse:idle");
 
             // Signal core's tick handler that highlighting can be redrawn.
             if (installed) self.tree_updated.store(true, .release);
@@ -764,6 +780,82 @@ pub const SyntaxManager = struct {
         }
     }
 
+    /// Snapshot of the relevant node fields, extracted under the
+    /// tree lock so the caller never has to hold a live `TSNode`
+    /// reference across operations that could trigger a reparse —
+    /// such reparses delete the old tree on the worker thread and
+    /// would leave any held node pointing at freed memory.
+    pub const NodeSnapshot = struct {
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+        start_byte: u32,
+        end_byte: u32,
+        type_name: []const u8,
+        is_named: bool,
+    };
+
+    /// Extract a node descriptor at the given point. Safer
+    /// replacement for `getNodeAt`: returns a fully owned-by-value
+    /// snapshot rather than a `TSNode` whose validity depends on
+    /// the tree staying alive.
+    pub fn nodeAt(self: *SyntaxManager, line: usize, col: usize) ?NodeSnapshot {
+        self.treeLock();
+        defer self.treeUnlock();
+        const tree = self.tree orelse return null;
+        const root = c.ts_tree_root_node(tree);
+        const point = c.TSPoint{
+            .row = @intCast(line),
+            .column = @intCast(col),
+        };
+        const node = c.ts_node_descendant_for_point_range(root, point, point);
+        if (c.ts_node_is_null(node)) return null;
+        const sp = c.ts_node_start_point(node);
+        const ep = c.ts_node_end_point(node);
+        const type_str = c.ts_node_type(node);
+        return .{
+            .start_row = sp.row,
+            .start_col = sp.column,
+            .end_row = ep.row,
+            .end_col = ep.column,
+            .start_byte = c.ts_node_start_byte(node),
+            .end_byte = c.ts_node_end_byte(node),
+            .type_name = std.mem.span(type_str),
+            .is_named = c.ts_node_is_named(node),
+        };
+    }
+
+    /// State snapshot used by the render thread to decide whether
+    /// the syntax tree is current. Reads `current_lang`,
+    /// `current_resource_id`, and the truthiness of `tree` under
+    /// `tree_mutex`, returning a by-value tuple so callers don't
+    /// have to hold the lock to use the values. Without this, the
+    /// render thread races with the parse worker installing a new
+    /// tree (see `parseWorkerMain`) — the worker can free the old
+    /// tree and overwrite the pointer at the moment the render
+    /// thread is reading it, producing a torn read.
+    pub const StateSnapshot = struct {
+        lang: Language,
+        resource_id: u64,
+        has_tree: bool,
+    };
+
+    pub fn stateSnapshot(self: *SyntaxManager) StateSnapshot {
+        self.treeLock();
+        defer self.treeUnlock();
+        return .{
+            .lang = self.current_lang,
+            .resource_id = self.current_resource_id,
+            .has_tree = self.tree != null,
+        };
+    }
+
+    /// Legacy entry point — kept for tests and for callers that
+    /// hold the tree lock for the entire node lifetime. Returns
+    /// the raw `TSNode`; the caller MUST NOT let any other thread
+    /// (especially the parse worker) install a new tree while the
+    /// node is in use, or it will dereference freed memory.
     pub fn getNodeAt(self: *SyntaxManager, line: usize, col: usize) ?c.TSNode {
         self.treeLock();
         defer self.treeUnlock();

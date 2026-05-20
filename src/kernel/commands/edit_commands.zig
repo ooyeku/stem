@@ -3,6 +3,16 @@ const std = @import("std");
 const log = std.log.scoped(.EditCommands);
 
 pub const EditCommands = struct {
+    /// Count newlines in `text` to report "N lines" feedback for
+    /// clipboard / paste / line operations.
+    fn lineCountIn(text: []const u8) usize {
+        var count: usize = 1;
+        for (text) |c| {
+            if (c == '\n') count += 1;
+        }
+        return count;
+    }
+
     pub fn cmdEditUndo(core: anytype) anyerror!void {
         const s = core.state();
 
@@ -34,9 +44,14 @@ pub const EditCommands = struct {
 
             s.cursor_row = txn.cursor_before.row;
             s.cursor_col = txn.cursor_before.col;
+            s.preferred_col = null;
             s.modified = true;
 
+            core.setStatusLiteral("Undo", 1500);
             try core.sendLspDocChanged();
+            try core.sendUpdate();
+        } else {
+            core.setStatusLiteralLeveled(.info, "Nothing to undo", 1500);
             try core.sendUpdate();
         }
     }
@@ -67,27 +82,35 @@ pub const EditCommands = struct {
 
             s.cursor_row = txn.cursor_after.row;
             s.cursor_col = txn.cursor_after.col;
+            s.preferred_col = null;
             s.modified = true;
 
+            core.setStatusLiteral("Redo", 1500);
             try core.sendLspDocChanged();
+            try core.sendUpdate();
+        } else {
+            core.setStatusLiteralLeveled(.info, "Nothing to redo", 1500);
             try core.sendUpdate();
         }
     }
 
     pub fn cmdEditCopy(core: anytype) anyerror!void {
-        const text = try core.getSelectionText() orelse return;
+        const text = try core.getSelectionText() orelse {
+            core.setStatusLiteralLeveled(.warning, "Nothing selected to copy", 1500);
+            try core.sendUpdate();
+            return;
+        };
         defer core.allocator.free(text);
 
         core.clipboard.clearRetainingCapacity();
         try core.clipboard.appendSlice(core.allocator, text);
 
-        var line_count: usize = 1;
-        for (text) |c| {
-            if (c == '\n') line_count += 1;
+        const lines = lineCountIn(text);
+        if (lines == 1) {
+            core.setStatus("Copied {d} char{s}", .{ text.len, if (text.len == 1) "" else "s" }, 2000);
+        } else {
+            core.setStatus("Copied {d} lines ({d} chars)", .{ lines, text.len }, 2000);
         }
-
-        core.status_message = if (line_count == 1) "Copied 1 line" else if (line_count < 10) "Copied lines" else "Copied selection";
-        core.status_message_expires = std.Io.Clock.real.now(core.io).toMilliseconds() + 2000;
 
         if (core.mode == .visual or core.mode == .visual_search) {
             core.state().selection_anchor = null;
@@ -100,19 +123,22 @@ pub const EditCommands = struct {
     pub fn cmdEditCut(core: anytype) anyerror!void {
         const s = core.state();
 
-        const text = try core.getSelectionText() orelse return;
+        const text = try core.getSelectionText() orelse {
+            core.setStatusLiteralLeveled(.warning, "Nothing selected to cut", 1500);
+            try core.sendUpdate();
+            return;
+        };
         defer core.allocator.free(text);
 
         core.clipboard.clearRetainingCapacity();
         try core.clipboard.appendSlice(core.allocator, text);
 
-        var line_count: usize = 1;
-        for (text) |c| {
-            if (c == '\n') line_count += 1;
+        const lines = lineCountIn(text);
+        if (lines == 1) {
+            core.setStatus("Cut {d} char{s}", .{ text.len, if (text.len == 1) "" else "s" }, 2000);
+        } else {
+            core.setStatus("Cut {d} lines ({d} chars)", .{ lines, text.len }, 2000);
         }
-
-        core.status_message = if (line_count == 1) "Cut 1 line" else if (line_count < 10) "Cut lines" else "Cut selection";
-        core.status_message_expires = std.Io.Clock.real.now(core.io).toMilliseconds() + 2000;
 
         const anchor = s.selection_anchor orelse return;
         var start_row: usize = undefined;
@@ -146,9 +172,22 @@ pub const EditCommands = struct {
     }
 
     pub fn cmdEditPaste(core: anytype) anyerror!void {
-        if (core.clipboard.items.len == 0) return;
+        if (core.clipboard.items.len == 0) {
+            core.setStatusLiteralLeveled(.warning, "Clipboard is empty", 1500);
+            try core.sendUpdate();
+            return;
+        }
+
+        const len = core.clipboard.items.len;
+        const lines = lineCountIn(core.clipboard.items);
 
         try core.insertTextWithHistory(core.clipboard.items);
+
+        if (lines == 1) {
+            core.setStatus("Pasted {d} char{s}", .{ len, if (len == 1) "" else "s" }, 1500);
+        } else {
+            core.setStatus("Pasted {d} lines", .{lines}, 1500);
+        }
 
         try core.sendLspDocChanged();
         try core.sendUpdate();
@@ -161,6 +200,7 @@ pub const EditCommands = struct {
         if (s.cursor_row >= total and total > 0) {
             s.cursor_row = total - 1;
         }
+        core.setStatusLiteral("Deleted line", 1500);
         try core.sendLspDocChanged();
         try core.sendUpdate();
     }
@@ -168,6 +208,7 @@ pub const EditCommands = struct {
     pub fn cmdEditDuplicateLine(core: anytype) anyerror!void {
         const s = core.state();
         try s.duplicateLine(s.cursor_row);
+        core.setStatusLiteral("Duplicated line", 1500);
         try core.sendLspDocChanged();
         try core.sendUpdate();
     }
@@ -177,7 +218,11 @@ pub const EditCommands = struct {
         if (s.cursor_row > 0) {
             try s.swapAdjacentLines(s.cursor_row, s.cursor_row - 1);
             s.cursor_row -= 1;
+            core.setStatusLiteral("Moved line up", 1200);
             try core.sendLspDocChanged();
+            try core.sendUpdate();
+        } else {
+            core.setStatusLiteralLeveled(.info, "Already at top", 1200);
             try core.sendUpdate();
         }
     }
@@ -188,7 +233,11 @@ pub const EditCommands = struct {
         if (s.cursor_row + 1 < total_lines) {
             try s.swapAdjacentLines(s.cursor_row, s.cursor_row + 1);
             s.cursor_row += 1;
+            core.setStatusLiteral("Moved line down", 1200);
             try core.sendLspDocChanged();
+            try core.sendUpdate();
+        } else {
+            core.setStatusLiteralLeveled(.info, "Already at bottom", 1200);
             try core.sendUpdate();
         }
     }
@@ -196,6 +245,7 @@ pub const EditCommands = struct {
     pub fn cmdEditJoinLines(core: anytype) anyerror!void {
         const s = core.state();
         try s.joinLines(s.cursor_row);
+        core.setStatusLiteral("Joined line", 1200);
         try core.sendLspDocChanged();
         try core.sendUpdate();
     }
@@ -219,6 +269,7 @@ pub const EditCommands = struct {
 
         try core.insertTextWithHistory(text);
 
+        core.setStatusLiteral("Inserted timestamp", 1500);
         try core.sendLspDocChanged();
         try core.sendUpdate();
     }

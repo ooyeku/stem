@@ -3,6 +3,7 @@ const log = std.log.scoped(.LSPManager);
 const server_mod = @import("lsp/server.zig");
 const LSPServer = server_mod.LSPServer;
 const DocumentSymbol = LSPServer.DocumentSymbol;
+const WorkspaceSymbol = LSPServer.WorkspaceSymbol;
 const zls_embedded = @import("lsp/zls_embedded.zig");
 const protocol = @import("../kernel/protocol.zig");
 const Installer = @import("lsp/installer.zig").Installer;
@@ -132,6 +133,7 @@ pub const LSPManager = struct {
     const recovery_window_ms: i64 = 60_000;
 
     fn watchdogMain(self: *LSPManager) void {
+        @import("thread_name.zig").set("stem-lsp-wd");
         log.info("[LSP WATCHDOG] started", .{});
         defer log.info("[LSP WATCHDOG] exited", .{});
 
@@ -272,6 +274,7 @@ pub const LSPManager = struct {
     /// and `root` and frees them after the start completes (success or
     /// fail). Set as a thread entry point.
     fn runParallelStart(self: *LSPManager, lang_owned: []u8, root_owned: ?[]u8) void {
+        @import("thread_name.zig").set("stem-lsp-start");
         defer self.allocator.free(lang_owned);
         defer if (root_owned) |r| self.allocator.free(r);
         defer self.endStart(lang_owned);
@@ -1903,6 +1906,42 @@ pub const LSPManager = struct {
     pub fn freeDocumentSymbols(self: *LSPManager, symbols: []DocumentSymbol) void {
         for (symbols) |sym| {
             self.allocator.free(sym.name);
+            if (sym.container_name) |c| self.allocator.free(c);
+        }
+        self.allocator.free(symbols);
+    }
+
+    /// Send a `workspace/symbol` query to the server matching `lang`.
+    /// No-ops if there's no running server for that language — the
+    /// caller's picker just stays empty.
+    pub fn requestWorkspaceSymbol(self: *LSPManager, lang: []const u8, query: []const u8) !void {
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        const server = self.servers.get(lang) orelse return;
+        if (!server.is_initialized.load(.acquire)) return;
+        try server.requestWorkspaceSymbol(query);
+    }
+
+    pub fn popWorkspaceSymbolsResult(self: *LSPManager) ?[]WorkspaceSymbol {
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            server.workspace_symbols_mutex.lockUncancelable(self.io);
+            defer server.workspace_symbols_mutex.unlock(self.io);
+            if (server.workspace_symbols_result) |res| {
+                server.workspace_symbols_result = null;
+                return res;
+            }
+        }
+        return null;
+    }
+
+    pub fn freeWorkspaceSymbols(self: *LSPManager, symbols: []WorkspaceSymbol) void {
+        for (symbols) |sym| {
+            self.allocator.free(sym.name);
+            self.allocator.free(sym.file_path);
             if (sym.container_name) |c| self.allocator.free(c);
         }
         self.allocator.free(symbols);

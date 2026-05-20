@@ -220,6 +220,7 @@ pub fn searchWithPaths(
 }
 
 fn scanWorkerMain(w: anytype) void {
+    @import("thread_name.zig").set("stem-gsearch");
     for (w.rel_paths_slice) |rel_path| {
         searchFileByRelPath(w.allocator, w.io, w.root, rel_path, w.query, w.options, &w.local_matches) catch |err| {
             std.log.debug("GlobalSearch worker: skipped {s}: {}", .{ rel_path, err });

@@ -38,7 +38,180 @@ fn installShutdownSignals() !void {
     std.posix.sigaction(.HUP, &sa, null);
 }
 
+/// Pre-opened crash-log file descriptor. Opened at startup so the signal
+/// handler doesn't need to allocate or call `open` (which isn't strictly
+/// async-signal-safe). -1 when no log is available.
+var crash_log_fd: std.c.fd_t = -1;
+
+/// Dedicated stack for the signal handler. The fault that brought us
+/// here may have been a stack overflow — handling it on the same
+/// (exhausted) stack just deadlocks or crashes again. POSIX
+/// `sigaltstack` swaps to this buffer for the duration of the handler.
+var crash_altstack: [64 * 1024]u8 align(16) = undefined;
+
+extern "c" fn backtrace(buffer: [*]usize, size: c_int) c_int;
+extern "c" fn backtrace_symbols_fd(buffer: [*]const usize, size: c_int, fd: c_int) void;
+extern "c" fn pthread_setname_np(name: [*:0]const u8) c_int;
+extern "c" fn pthread_getname_np(thread: ?*anyopaque, name: [*]u8, len: usize) c_int;
+extern "c" fn pthread_self() ?*anyopaque;
+
+const thread_name = @import("services/thread_name.zig");
+const setThreadName = thread_name.set;
+
+/// Async-signal-safe crash handler. The rules say we shouldn't call
+/// most libc functions here, but a few are explicitly allowed
+/// (`write`, `raise`, `_exit`), and `backtrace`/`backtrace_symbols_fd`
+/// are widely treated as signal-safe in practice. Worst case we die a
+/// different way before the dump finishes; that's no worse than the
+/// silent SEGV the user is hitting today.
+fn handleCrashSignal(sig: std.c.SIG, info: *const std.c.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    const sig_name: []const u8 = switch (sig) {
+        std.posix.SIG.SEGV => "SIGSEGV",
+        std.posix.SIG.BUS => "SIGBUS",
+        std.posix.SIG.ILL => "SIGILL",
+        std.posix.SIG.FPE => "SIGFPE",
+        std.posix.SIG.ABRT => "SIGABRT",
+        else => "signal",
+    };
+
+    // Write to both the crash log and stderr (fd 2). The terminal
+    // tends to swallow stderr while vaxis is in alt-screen, but the
+    // moment we re-raise and die the alt-screen is dropped — leaving
+    // anything we wrote to stderr visible on the way out.
+    const stderr_fd: std.c.fd_t = 2;
+
+    // Try to pull the thread's name. If a worker set it via
+    // setThreadName, we get something readable like "stem-parse";
+    // otherwise we fall back to "<unnamed>". This is the single most
+    // useful piece of info when the closure was inlined into
+    // `entryFn` and the rest of the trace is one symbol.
+    var name_buf: [64]u8 = undefined;
+    var tname: []const u8 = "<unnamed>";
+    if (pthread_getname_np(pthread_self(), &name_buf, name_buf.len) == 0) {
+        const z = std.mem.indexOfScalar(u8, &name_buf, 0) orelse name_buf.len;
+        if (z > 0) tname = name_buf[0..z];
+    }
+
+    const hdr = "\n=== stem crash: ";
+    const sep = " on thread '";
+    const tail = "' ===\n";
+    if (crash_log_fd >= 0) {
+        _ = std.c.write(crash_log_fd, hdr.ptr, hdr.len);
+        _ = std.c.write(crash_log_fd, sig_name.ptr, sig_name.len);
+        _ = std.c.write(crash_log_fd, sep.ptr, sep.len);
+        _ = std.c.write(crash_log_fd, tname.ptr, tname.len);
+        _ = std.c.write(crash_log_fd, tail.ptr, tail.len);
+    }
+    _ = std.c.write(stderr_fd, hdr.ptr, hdr.len);
+    _ = std.c.write(stderr_fd, sig_name.ptr, sig_name.len);
+    _ = std.c.write(stderr_fd, sep.ptr, sep.len);
+    _ = std.c.write(stderr_fd, tname.ptr, tname.len);
+    _ = std.c.write(stderr_fd, tail.ptr, tail.len);
+
+    // Fault address from siginfo. NULL = null-deref, low values = a
+    // small offset from a NULL base pointer (struct field through a
+    // null *T), 0x7f… range = heap or stack (likely UAF), high
+    // canonical addresses = stack overflow / code corruption.
+    {
+        var addr_buf: [48]u8 = undefined;
+        const addr_val: usize = @intFromPtr(info.addr);
+        const addr_str = std.fmt.bufPrint(&addr_buf, "fault addr: 0x{x}\n", .{addr_val}) catch "fault addr: ?\n";
+        if (crash_log_fd >= 0) _ = std.c.write(crash_log_fd, addr_str.ptr, addr_str.len);
+        _ = std.c.write(stderr_fd, addr_str.ptr, addr_str.len);
+    }
+
+    // Most recently logged "step" marker. The parse worker (and any
+    // other worker that opts in) writes a static string here before
+    // each tree-sitter C call; on crash the last one tells us exactly
+    // which call was in flight.
+    const step = thread_name.last_step.load(.acquire);
+    if (step != null) {
+        const step_hdr = "last step: ";
+        const step_str = std.mem.span(@as([*:0]const u8, @ptrCast(step.?)));
+        if (crash_log_fd >= 0) {
+            _ = std.c.write(crash_log_fd, step_hdr.ptr, step_hdr.len);
+            _ = std.c.write(crash_log_fd, step_str.ptr, step_str.len);
+            _ = std.c.write(crash_log_fd, "\n", 1);
+        }
+        _ = std.c.write(stderr_fd, step_hdr.ptr, step_hdr.len);
+        _ = std.c.write(stderr_fd, step_str.ptr, step_str.len);
+        _ = std.c.write(stderr_fd, "\n", 1);
+    }
+
+    // POSIX backtrace into a small buffer of return addresses, then
+    // let libSystem symbolicate to the fd directly. Avoids any
+    // allocator / Zig debug-info round-trip from inside the handler.
+    var frames: [64]usize = undefined;
+    const n = backtrace(&frames, frames.len);
+    if (n > 0) {
+        if (crash_log_fd >= 0) backtrace_symbols_fd(&frames, n, crash_log_fd);
+        backtrace_symbols_fd(&frames, n, stderr_fd);
+    } else {
+        const msg = "(backtrace returned no frames)\n";
+        if (crash_log_fd >= 0) _ = std.c.write(crash_log_fd, msg.ptr, msg.len);
+        _ = std.c.write(stderr_fd, msg.ptr, msg.len);
+    }
+
+    // SA_RESETHAND already reset the handler to the default; raising
+    // the same signal now actually kills us with the usual coredump
+    // behaviour, so `zsh` still prints its normal "segmentation fault"
+    // line and external tools (lldb, Crash Reporter) see the right
+    // exit status.
+    _ = std.c.raise(sig);
+}
+
+fn installCrashHandler(logs_dir: []const u8) !void {
+    if (@import("builtin").os.tag == .windows) return;
+
+    // Open (or create) `crash.log` once at startup. Append-mode so
+    // multiple crashes in a row stack up. We hold the fd for the
+    // process lifetime; the signal handler writes to it without
+    // touching higher-level I/O.
+    var path_buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/crash.log", .{logs_dir}) catch return;
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
+    if (fd >= 0) crash_log_fd = fd;
+
+    // Drop a startup marker. Lets the user verify the handler is
+    // armed without having to crash on purpose. If THIS line doesn't
+    // appear in crash.log, the installer didn't run / the path is
+    // wrong / the directory isn't writable.
+    if (crash_log_fd >= 0) {
+        const banner = "\n--- stem launched, crash handler armed ---\n";
+        _ = std.c.write(crash_log_fd, banner.ptr, banner.len);
+    }
+
+    // Sigaltstack: install a dedicated buffer for the handler so a
+    // stack-overflow SEGV still has somewhere to run. Without this,
+    // the handler can't execute (the original stack is gone) and the
+    // process dies silently.
+    const stack: std.posix.stack_t = .{
+        .sp = &crash_altstack,
+        .size = crash_altstack.len,
+        .flags = 0,
+    };
+    _ = std.c.sigaltstack(&stack, null);
+
+    const sa: std.posix.Sigaction = .{
+        .handler = .{ .sigaction = handleCrashSignal },
+        .mask = std.posix.sigemptyset(),
+        // SIGINFO: handler receives (sig, siginfo_t*, ucontext_t*) so
+        //   we can read si_addr.
+        // ONSTACK: run on the dedicated alt stack we just installed.
+        // RESETHAND: after one delivery the handler is reset to the
+        //   default, so the `raise(sig)` below kills the process
+        //   with the original behaviour (coredump + zsh message).
+        .flags = std.posix.SA.SIGINFO | std.posix.SA.ONSTACK | std.posix.SA.RESETHAND,
+    };
+    std.posix.sigaction(.SEGV, &sa, null);
+    std.posix.sigaction(.BUS, &sa, null);
+    std.posix.sigaction(.ILL, &sa, null);
+    std.posix.sigaction(.FPE, &sa, null);
+    std.posix.sigaction(.ABRT, &sa, null);
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
+    setThreadName("stem-main");
     var gpa = std.heap.DebugAllocator(.{}).init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -62,6 +235,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     try logger.init(allocator, io, storage.logs_dir, log_level);
     defer logger.deinit();
+
+    // Install SIGSEGV / SIGBUS / etc. handlers. Best-effort: writes a
+    // backtrace to `~/.stem/logs/crash.log` and re-raises with the
+    // default handler so the OS still produces a coredump + zsh still
+    // reports the crash. Without this, segfaults vanish into thin air
+    // and we have no way to diagnose them.
+    installCrashHandler(storage.logs_dir) catch |err| {
+        std.log.warn("Failed to install crash handler: {}", .{err});
+    };
 
     // Vigil-backed telemetry. Initialized once; the MessageBus + plugin
     // manager + supervisor all write into the same rollup.
@@ -184,6 +366,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     const Runner = struct {
         fn run(ctx: *CoreContext) void {
+            setThreadName("stem-core");
             ctx.core.run(ctx.bus) catch |err| {
                 if (err != error.UserQuit) {
                     std.debug.print("Core crashed: {}\n", .{err});
@@ -198,6 +381,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         bus: *MessageBus,
         allocator: std.mem.Allocator,
         fn run(self: @This()) !void {
+            setThreadName("stem-input");
             // Monotonic counter for coalesced sends (resize): each event
             // gets a fresh identity so the bus knows the slot was reused.
             var resize_seq: u64 = 0;
@@ -250,6 +434,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         allocator: std.mem.Allocator,
         io: std.Io,
         fn run(self: @This()) !void {
+            setThreadName("stem-heartbeat");
             var tick_seq: u64 = 0;
             while (true) {
                 std.Io.sleep(self.io, .fromMilliseconds(100), .awake) catch break;
@@ -280,6 +465,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         allocator: std.mem.Allocator,
         io: std.Io,
         fn run(self: @This()) void {
+            setThreadName("stem-sigmon");
             while (true) {
                 std.Io.sleep(self.io, .fromMilliseconds(200), .awake) catch return;
                 if (shutdown_requested.load(.acquire)) {

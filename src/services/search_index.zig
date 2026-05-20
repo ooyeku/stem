@@ -183,6 +183,7 @@ pub const SearchIndex = struct {
 };
 
 fn indexerWorker(self: *SearchIndex, root_owned: []u8) void {
+    @import("thread_name.zig").set("stem-index");
     // The worker fully owns `root_owned`. On exit, hand it to the
     // index (via `applyPaths`) so future `notePathSaved` calls can
     // use it. If the swap fails or the index already had a root,
