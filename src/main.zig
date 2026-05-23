@@ -49,6 +49,19 @@ var crash_log_fd: std.c.fd_t = -1;
 /// `sigaltstack` swaps to this buffer for the duration of the handler.
 var crash_altstack: [64 * 1024]u8 align(16) = undefined;
 
+/// Saved terminal attributes from before vaxis took the tty into raw +
+/// alt-screen mode. The crash handler restores these so the user's
+/// shell isn't left with broken echo / raw mode after a crash. Set
+/// once in `installCrashHandler`; read read-only in the handler.
+var saved_termios: std.c.termios = undefined;
+var saved_termios_valid: bool = false;
+
+/// Path to the recovery directory (`~/.stem/recover/`). Static buffer
+/// + length so the signal handler can write the path without touching
+/// the allocator. Set once in `installCrashHandler`.
+var recover_dir_buf: [4096]u8 = undefined;
+var recover_dir_len: usize = 0;
+
 extern "c" fn backtrace(buffer: [*]usize, size: c_int) c_int;
 extern "c" fn backtrace_symbols_fd(buffer: [*]const usize, size: c_int, fd: c_int) void;
 extern "c" fn pthread_setname_np(name: [*:0]const u8) c_int;
@@ -152,6 +165,47 @@ fn handleCrashSignal(sig: std.c.SIG, info: *const std.c.siginfo_t, _: ?*anyopaqu
         _ = std.c.write(stderr_fd, msg.ptr, msg.len);
     }
 
+    // Point the user at any unsaved work that the autosave-backup
+    // worker (`Core.maybeAutosave`) has staged in ~/.stem/recover/.
+    // Without this hint, users assume a crash lost their edits and
+    // never discover the recovery picker (`buffer.restore_backups`).
+    if (recover_dir_len > 0) {
+        const hint_pre = "unsaved work may be recoverable from: ";
+        const hint_post = "\nrun `stem` and use `buffer.restore_backups` from the palette\n";
+        if (crash_log_fd >= 0) {
+            _ = std.c.write(crash_log_fd, hint_pre.ptr, hint_pre.len);
+            _ = std.c.write(crash_log_fd, &recover_dir_buf, recover_dir_len);
+            _ = std.c.write(crash_log_fd, hint_post.ptr, hint_post.len);
+        }
+        _ = std.c.write(stderr_fd, hint_pre.ptr, hint_pre.len);
+        _ = std.c.write(stderr_fd, &recover_dir_buf, recover_dir_len);
+        _ = std.c.write(stderr_fd, hint_post.ptr, hint_post.len);
+    }
+
+    // Restore terminal state before re-raising. Vaxis put the tty
+    // in raw + alt-screen + bracketed-paste + mouse-tracking mode;
+    // if the OS kills us without unwinding through `vaxis.Tty.deinit`
+    // (which is async-signal-unsafe to call here), the user lands in
+    // a broken shell with no echo and the cursor hidden. Issue the
+    // standard reset escapes directly to stdout (fd 1), then
+    // `tcsetattr` the saved termios back. All async-signal-safe:
+    // `write` and `tcsetattr` are both on POSIX's whitelist.
+    const stdout_fd: std.c.fd_t = 1;
+    const reset_seq =
+        "\x1b[?1049l" ++ // leave alt-screen, return to primary buffer
+        "\x1b[?25h" ++ //   show cursor
+        "\x1b[?1000l" ++ // disable X10 mouse tracking
+        "\x1b[?1002l" ++ // disable button-event mouse tracking
+        "\x1b[?1003l" ++ // disable any-event mouse tracking
+        "\x1b[?1006l" ++ // disable SGR mouse encoding
+        "\x1b[?2004l" ++ // disable bracketed paste
+        "\x1b[0m" ++ //    reset SGR attributes
+        "\r\n";
+    _ = std.c.write(stdout_fd, reset_seq.ptr, reset_seq.len);
+    if (saved_termios_valid) {
+        _ = std.c.tcsetattr(stdout_fd, .NOW, &saved_termios);
+    }
+
     // SA_RESETHAND already reset the handler to the default; raising
     // the same signal now actually kills us with the usual coredump
     // behaviour, so `zsh` still prints its normal "segmentation fault"
@@ -160,7 +214,7 @@ fn handleCrashSignal(sig: std.c.SIG, info: *const std.c.siginfo_t, _: ?*anyopaqu
     _ = std.c.raise(sig);
 }
 
-fn installCrashHandler(logs_dir: []const u8) !void {
+fn installCrashHandler(logs_dir: []const u8, recover_dir: []const u8) !void {
     if (@import("builtin").os.tag == .windows) return;
 
     // Open (or create) `crash.log` once at startup. Append-mode so
@@ -171,6 +225,27 @@ fn installCrashHandler(logs_dir: []const u8) !void {
     const path = std.fmt.bufPrintZ(&path_buf, "{s}/crash.log", .{logs_dir}) catch return;
     const fd = std.c.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
     if (fd >= 0) crash_log_fd = fd;
+
+    // Stash the recovery-dir path so the signal handler can point the
+    // user at it without doing string formatting (allocator + format
+    // calls aren't async-signal-safe).
+    if (recover_dir.len > 0 and recover_dir.len <= recover_dir_buf.len) {
+        @memcpy(recover_dir_buf[0..recover_dir.len], recover_dir);
+        recover_dir_len = recover_dir.len;
+    }
+
+    // Snapshot the pre-vaxis termios so the crash handler can put
+    // the user's shell back into cooked / echo / canonical mode if
+    // we die mid-render. Vaxis owns the tty during normal operation
+    // and restores it via its own deinit, but a SEGV bypasses that
+    // entirely — without this, the user lands in a non-responsive
+    // shell after a crash. Best-effort: if stdin isn't a tty (piped
+    // input), skip; the handler will just write reset escapes which
+    // is still better than nothing.
+    const stdin_fd: std.c.fd_t = 0;
+    if (std.c.tcgetattr(stdin_fd, &saved_termios) == 0) {
+        saved_termios_valid = true;
+    }
 
     // Drop a startup marker. Lets the user verify the handler is
     // armed without having to crash on purpose. If THIS line doesn't
@@ -241,7 +316,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // default handler so the OS still produces a coredump + zsh still
     // reports the crash. Without this, segfaults vanish into thin air
     // and we have no way to diagnose them.
-    installCrashHandler(storage.logs_dir) catch |err| {
+    // Recover dir is the sibling of logs_dir under ~/.stem/. Built
+    // once here so the crash handler doesn't have to derive it from
+    // a signal-handler context (no allocator, no fmt).
+    const recover_dir = blk: {
+        // strip trailing "logs" → "<config>/recover"
+        const parent = std.fs.path.dirname(storage.logs_dir) orelse break :blk "";
+        break :blk std.fs.path.join(allocator, &.{ parent, "recover" }) catch break :blk "";
+    };
+    defer if (recover_dir.len > 0) allocator.free(recover_dir);
+
+    installCrashHandler(storage.logs_dir, recover_dir) catch |err| {
         std.log.warn("Failed to install crash handler: {}", .{err});
     };
 

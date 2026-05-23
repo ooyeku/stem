@@ -69,9 +69,29 @@ pub const LSPManager = struct {
     restart_state: std.StringHashMapUnmanaged(RestartState) = .empty,
     restart_state_mutex: std.Io.Mutex = .init,
 
+    /// Per-file pending `textDocument/didChange` payloads. Coalesces a
+    /// burst of edits within `change_debounce_ms` into a single send.
+    /// Without this, fast typing fires one didChange per keystroke per
+    /// server — at 23 wired languages, a multi-file session can fan
+    /// out to >100 notifications/sec and overwhelm slow LSPs. The
+    /// trailing-edge model flushes once the user pauses (drained from
+    /// Core's tick handler via `flushPendingChanges`). On
+    /// `documentSaved` / `documentClosed` we flush or drop synchronously
+    /// so the server isn't left with stale-or-missing content.
+    pending_changes: std.StringHashMapUnmanaged(PendingChange) = .empty,
+    pending_changes_mutex: std.Io.Mutex = .init,
+    change_debounce_ms: i64 = 50,
+
     pub const RestartState = struct {
         attempts: u32 = 0,
         last_attempt_ms: i64 = 0,
+    };
+
+    pub const PendingChange = struct {
+        /// Owned by `pending_changes_mutex`; freed on flush or replace.
+        content: []u8,
+        version: i64,
+        queued_at: i64,
     };
 
     pub const ZigEnv = struct {
@@ -424,6 +444,20 @@ pub const LSPManager = struct {
         var rs_it = self.restart_state.keyIterator();
         while (rs_it.next()) |k| self.allocator.free(k.*);
         self.restart_state.deinit(self.allocator);
+
+        // Drop any debounced didChange payloads. The servers are
+        // about to die (or already are) — sending the final flush
+        // would be wasted work; just free.
+        {
+            self.pending_changes_mutex.lockUncancelable(self.io);
+            defer self.pending_changes_mutex.unlock(self.io);
+            var pc_it = self.pending_changes.iterator();
+            while (pc_it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.content);
+            }
+            self.pending_changes.deinit(self.allocator);
+        }
 
         // Drain in-progress parallel starts under a bounded wait.
         // With `global_shutdown` set and the children dead, each start
@@ -1670,23 +1704,120 @@ pub const LSPManager = struct {
     }
 
     pub fn documentChanged(self: *LSPManager, file_path: []const u8, content: []const u8, version: i64) !void {
-        // Hot path on every keystroke. Snapshot the server pointer under the
-        // lock, drop it, then do the (potentially large) didChange write
-        // without holding the manager lock.
-        self.manager_mutex.lockUncancelable(self.io);
-        const server_opt = self.getServerForFile(file_path);
-        self.manager_mutex.unlock(self.io);
-        const server = server_opt orelse return;
-        if (!server.server_running.load(.acquire)) return;
-        const uri = try pathToUri(self.allocator, self.io, file_path);
-        defer self.allocator.free(uri);
-        try server.sendDidChange(uri, version, content);
-        server.requestSemanticTokens(uri) catch |err| {
-            log.warn("Failed to request semantic tokens after change for {s}: {}", .{ file_path, err });
+        // Trailing-edge debounce: buffer the latest content for this
+        // file and let Core's tick handler flush via
+        // `flushPendingChanges` once the user pauses for
+        // `change_debounce_ms`. Avoids a per-keystroke didChange
+        // storm. The slot is latest-wins so a burst of N edits costs
+        // O(1) memory, one final send.
+        const now = std.Io.Clock.real.now(self.io).toMilliseconds();
+        const content_owned = try self.allocator.dupe(u8, content);
+        errdefer self.allocator.free(content_owned);
+
+        self.pending_changes_mutex.lockUncancelable(self.io);
+        defer self.pending_changes_mutex.unlock(self.io);
+
+        const gop = try self.pending_changes.getOrPut(self.allocator, file_path);
+        if (gop.found_existing) {
+            self.allocator.free(gop.value_ptr.content);
+        } else {
+            // Dupe the key so we own it; the caller's slice can vanish.
+            const key_owned = self.allocator.dupe(u8, file_path) catch |err| {
+                self.allocator.free(content_owned);
+                _ = self.pending_changes.remove(file_path);
+                return err;
+            };
+            gop.key_ptr.* = key_owned;
+        }
+        gop.value_ptr.* = .{
+            .content = content_owned,
+            .version = version,
+            .queued_at = now,
         };
     }
 
+    /// Drain pending didChange entries whose debounce window has
+    /// elapsed and send them to the corresponding LSP servers. Called
+    /// from Core's tick handler — keeps the hot keystroke path free of
+    /// network I/O and per-server JSON encoding work.
+    pub fn flushPendingChanges(self: *LSPManager) void {
+        const now = std.Io.Clock.real.now(self.io).toMilliseconds();
+        self.flushPendingChangesInternal(now, false);
+    }
+
+    /// Force-flush every pending change immediately, ignoring the
+    /// debounce window. Used by `documentSaved` so the server sees the
+    /// final edit before the save notification, and by shutdown paths
+    /// where we won't get another tick.
+    pub fn flushPendingChangesNow(self: *LSPManager) void {
+        const now = std.Io.Clock.real.now(self.io).toMilliseconds();
+        self.flushPendingChangesInternal(now, true);
+    }
+
+    fn flushPendingChangesInternal(self: *LSPManager, now_ms: i64, force: bool) void {
+        // Steal-then-send pattern: collect the entries that are ready
+        // under the pending_changes lock, then release it before any
+        // network I/O. Holding the lock across `sendDidChange` would
+        // serialize every other documentChanged call on the slow path.
+        var ready: std.ArrayListUnmanaged(struct {
+            path: []const u8,
+            content: []const u8,
+            version: i64,
+        }) = .empty;
+        defer ready.deinit(self.allocator);
+
+        {
+            self.pending_changes_mutex.lockUncancelable(self.io);
+            defer self.pending_changes_mutex.unlock(self.io);
+
+            var it = self.pending_changes.iterator();
+            var to_remove: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer to_remove.deinit(self.allocator);
+
+            while (it.next()) |entry| {
+                if (!force and now_ms - entry.value_ptr.queued_at < self.change_debounce_ms) continue;
+                ready.append(self.allocator, .{
+                    .path = entry.key_ptr.*,
+                    .content = entry.value_ptr.content,
+                    .version = entry.value_ptr.version,
+                }) catch {
+                    // OOM during steal — leave entry pending for next tick.
+                    return;
+                };
+                to_remove.append(self.allocator, entry.key_ptr.*) catch {};
+            }
+            for (to_remove.items) |key| _ = self.pending_changes.remove(key);
+        }
+
+        for (ready.items) |entry| {
+            defer self.allocator.free(entry.path);
+            defer self.allocator.free(entry.content);
+
+            self.manager_mutex.lockUncancelable(self.io);
+            const server_opt = self.getServerForFile(entry.path);
+            self.manager_mutex.unlock(self.io);
+            const server = server_opt orelse continue;
+            if (!server.server_running.load(.acquire)) continue;
+            const uri = pathToUri(self.allocator, self.io, entry.path) catch continue;
+            defer self.allocator.free(uri);
+
+            server.sendDidChange(uri, entry.version, entry.content) catch |err| {
+                log.warn("debounced sendDidChange failed for {s}: {}", .{ entry.path, err });
+                continue;
+            };
+            server.requestSemanticTokens(uri) catch |err| {
+                log.warn("Failed to request semantic tokens after change for {s}: {}", .{ entry.path, err });
+            };
+        }
+    }
+
     pub fn documentSaved(self: *LSPManager, file_path: []const u8) !void {
+        // Flush any debounced changes first so the server's view of
+        // the file matches what we're about to claim is saved. Without
+        // this, didSave can arrive before the last didChange and the
+        // server formats / lints stale content.
+        self.flushPendingChangesNow();
+
         self.manager_mutex.lockUncancelable(self.io);
         const server_opt = self.getServerForFile(file_path);
         self.manager_mutex.unlock(self.io);
@@ -1698,6 +1829,18 @@ pub const LSPManager = struct {
     }
 
     pub fn documentClosed(self: *LSPManager, file_path: []const u8) !void {
+        // Drop any pending change for this file — the server is
+        // about to be told the document is gone, no point pushing
+        // changes it'll discard anyway.
+        {
+            self.pending_changes_mutex.lockUncancelable(self.io);
+            defer self.pending_changes_mutex.unlock(self.io);
+            if (self.pending_changes.fetchRemove(file_path)) |kv| {
+                self.allocator.free(kv.key);
+                self.allocator.free(kv.value.content);
+            }
+        }
+
         const uri = try pathToUri(self.allocator, self.io, file_path);
         defer self.allocator.free(uri);
 

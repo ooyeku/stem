@@ -425,13 +425,19 @@ pub const SyntaxManager = struct {
             if (new_tree == null) continue;
 
             // Swap in. Discard if the user changed language during the parse.
+            // Steal the old tree pointer under the lock; do the actual
+            // `ts_tree_delete` (which can be tens of µs on a large tree
+            // and walks the entire node arena) outside the lock so a
+            // concurrent `highlight()` / `findBrackets()` / `nodeAt()`
+            // never blocks on it. Same reasoning for `new_tree` when
+            // we discard.
             thread_name.markStep("parse:lock_for_install");
             self.treeLock();
             thread_name.markStep("parse:check_installed");
             const installed = self.current_lang == job.lang;
+            var deferred_delete: ?*c.TSTree = null;
             if (installed) {
-                thread_name.markStep("parse:delete_old_tree");
-                if (self.tree) |old| c.ts_tree_delete(old);
+                deferred_delete = self.tree;
                 thread_name.markStep("parse:assign_new_tree");
                 self.tree = new_tree;
                 if (job.resource_id) |id| self.current_resource_id = id;
@@ -441,10 +447,14 @@ pub const SyntaxManager = struct {
                 thread_name.markStep("parse:invalidate_bracket_cache");
                 self.bracket_cache.invalidate(self.allocator);
             } else {
-                thread_name.markStep("parse:discard_new_tree");
-                c.ts_tree_delete(new_tree);
+                deferred_delete = new_tree;
             }
             self.treeUnlock();
+
+            if (deferred_delete) |t| {
+                thread_name.markStep("parse:delete_old_tree_unlocked");
+                c.ts_tree_delete(t);
+            }
             thread_name.markStep("parse:idle");
 
             // Signal core's tick handler that highlighting can be redrawn.
@@ -773,18 +783,25 @@ pub const SyntaxManager = struct {
         const new_tree = c.ts_parser_parse_string(self.parser, prev_tree_copy, source.ptr, @intCast(source.len));
         if (prev_tree_copy) |t| c.ts_tree_delete(t);
 
-        self.treeLock();
-        defer self.treeUnlock();
-        // Only commit if the language hasn't changed under us.
-        if (self.current_lang == lang) {
-            if (self.tree) |t| c.ts_tree_delete(t);
-            self.tree = new_tree;
-            if (resource_id) |id| self.current_resource_id = id;
-            self.highlight_cache.invalidate(self.allocator);
-            self.bracket_cache.invalidate(self.allocator);
-        } else if (new_tree) |t| {
-            c.ts_tree_delete(t);
+        // Same steal-and-delete-outside pattern as `parseWorkerMain`:
+        // hand `ts_tree_delete` the freed tree only after we've
+        // dropped `tree_mutex`, so concurrent readers aren't blocked
+        // by a multi-µs C-side teardown.
+        var deferred_delete: ?*c.TSTree = null;
+        {
+            self.treeLock();
+            defer self.treeUnlock();
+            if (self.current_lang == lang) {
+                deferred_delete = self.tree;
+                self.tree = new_tree;
+                if (resource_id) |id| self.current_resource_id = id;
+                self.highlight_cache.invalidate(self.allocator);
+                self.bracket_cache.invalidate(self.allocator);
+            } else {
+                deferred_delete = new_tree;
+            }
         }
+        if (deferred_delete) |t| c.ts_tree_delete(t);
     }
 
     /// Snapshot of the relevant node fields, extracted under the

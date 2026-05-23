@@ -189,33 +189,51 @@ pub const DecorationManager = struct {
     }
 
     pub fn removeByKind(self: *DecorationManager, kind: DecorationKind) void {
-        var i: usize = 0;
-        while (i < self.decorations.items.len) {
-            const dec = self.decorations.items[i];
+        // Single-pass compact. Previous form used `orderedRemove(i)` inside
+        // the loop — that's O(n) per removal, so for N decorations all of
+        // the same kind we paid O(n²). With this on the hot path of every
+        // search keystroke (search_match + search_current cleared then
+        // re-added by `addSearchMatches`) the quadratic blew up on large
+        // result sets. The write-pointer compact below is O(n) and order-
+        // preserving, matching the previous behaviour.
+        var write: usize = 0;
+        const items = self.decorations.items;
+        for (items) |dec| {
             if (dec.kind == kind) {
                 if (dec.tooltip) |t| self.allocator.free(t);
                 if (dec.source) |s| self.allocator.free(s);
-                _ = self.decorations.orderedRemove(i);
-            } else {
-                i += 1;
+                continue;
             }
+            self.decorations.items[write] = dec;
+            write += 1;
         }
+        self.decorations.shrinkRetainingCapacity(write);
     }
 
     pub fn removeBySource(self: *DecorationManager, source: []const u8) void {
-        var i: usize = 0;
-        while (i < self.decorations.items.len) {
-            const dec = self.decorations.items[i];
-            if (dec.source) |s| {
-                if (std.mem.eql(u8, s, source)) {
-                    if (dec.tooltip) |t| self.allocator.free(t);
-                    self.allocator.free(s);
-                    _ = self.decorations.orderedRemove(i);
-                    continue;
+        // Same O(n) compact as `removeByKind`. Fires on every search
+        // input keystroke (`updateSearchDecorations` removes the prior
+        // "search" set before adding the new one), every word-highlight
+        // refresh, and every multi-cursor refresh — so the quadratic
+        // form here was the dominant cost on large decoration counts.
+        var write: usize = 0;
+        const items = self.decorations.items;
+        for (items) |dec| {
+            const keep = blk: {
+                if (dec.source) |s| {
+                    if (std.mem.eql(u8, s, source)) {
+                        if (dec.tooltip) |t| self.allocator.free(t);
+                        self.allocator.free(s);
+                        break :blk false;
+                    }
                 }
-            }
-            i += 1;
+                break :blk true;
+            };
+            if (!keep) continue;
+            self.decorations.items[write] = dec;
+            write += 1;
         }
+        self.decorations.shrinkRetainingCapacity(write);
     }
 
     pub fn getForLine(self: *DecorationManager, line: usize, allocator: std.mem.Allocator) ![]DecorationSnapshot {

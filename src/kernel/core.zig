@@ -252,7 +252,14 @@ pub const Core = struct {
     definition_pending: bool = false,
     needs_render: bool = true,
     last_render_time: i64 = 0,
-    min_render_interval_ms: i64 = 3,
+    /// Minimum gap between two `sendUpdate` snapshots, in ms. Acts as
+    /// a soft frame-rate cap — a burst of state changes within this
+    /// window is coalesced into one snapshot rather than rebuilding
+    /// every time. 16 ms ≈ 60 FPS, which is faster than any user-
+    /// noticeable input feedback need (60 wpm typing is ~5 chars/sec
+    /// = 200 ms between events). Holds back wasted CPU during fast
+    /// scroll, LSP token bursts, and parse-worker tree updates.
+    min_render_interval_ms: i64 = 16,
     /// Last time we wrote the crash-recovery snapshot. The tick
     /// handler rewrites every 30 s of activity so a crash can lose
     /// at most that much cursor / scroll position state.
@@ -1395,7 +1402,9 @@ pub const Core = struct {
                         continue;
                     };
                     // best-effort: workspace tracking is auxiliary; buffer is still usable if this fails
-                    self.workspace_manager.registerBuffer(opened_buffer.id, path) catch {};
+                    self.workspace_manager.registerBuffer(opened_buffer.id, path) catch |err| {
+                        log.debug("workspace registerBuffer failed for {s}: {s}", .{ path, @errorName(err) });
+                    };
                 }
             }
             self.refreshSyntaxForCurrentBuffer();
@@ -1526,7 +1535,7 @@ pub const Core = struct {
                             };
                             // Manager-owned JSON encoder will frame and
                             // dispatch via the right process plugin.
-                            self.replyPluginRequest(reply) catch {};
+                            self.replyPluginRequest(reply) catch |err| log.debug("plugin reply send failed: {s}", .{@errorName(err)});
                         } else if (pm.message_type == .get_buffer_content) {
                             const active_buf = self.buffer_manager.getActive();
                             const content = active_buf.state.buffer.toString(self.allocator) catch "";
@@ -1537,7 +1546,7 @@ pub const Core = struct {
                                 .payload = .{ .buffer_content_response = .{ .id = active_buf.id, .content = content } },
                                 .correlation_id = pm.correlation_id,
                             };
-                            self.replyPluginRequest(reply) catch {};
+                            self.replyPluginRequest(reply) catch |err| log.debug("plugin reply send failed: {s}", .{@errorName(err)});
                         } else if (pm.message_type == .get_plugin_list) {
                             const reply = protocol.PluginMessage{
                                 .plugin_id = pm.plugin_id,
@@ -1545,19 +1554,19 @@ pub const Core = struct {
                                 .payload = .{ .plugin_list_data = "" }, // free-form; manager populates the JSON
                                 .correlation_id = pm.correlation_id,
                             };
-                            self.replyPluginRequest(reply) catch {};
+                            self.replyPluginRequest(reply) catch |err| log.debug("plugin reply send failed: {s}", .{@errorName(err)});
                         } else if (pm.message_type == .load_plugin) {
                             const target = pm.payload.plugin_load;
                             self.plugin_manager.loadPluginByName(target) catch |err| {
                                 log.warn("plugin '{s}' load failed: {s}", .{ target, @errorName(err) });
                             };
-                            self.sendUpdate() catch {};
+                            self.sendUpdate() catch |err| log.debug("sendUpdate after plugin msg failed: {s}", .{@errorName(err)});
                         } else if (pm.message_type == .unload_plugin) {
                             const target = pm.payload.plugin_unload;
                             self.plugin_manager.unloadPlugin(target) catch |err| {
                                 log.warn("plugin '{s}' unload failed: {s}", .{ target, @errorName(err) });
                             };
-                            self.sendUpdate() catch {};
+                            self.sendUpdate() catch |err| log.debug("sendUpdate after plugin msg failed: {s}", .{@errorName(err)});
                         } else if (pm.message_type == .show_notification) {
                             // Plugin notification — fold into the
                             // status bar with a 4-second TTL. Prefix
@@ -1577,7 +1586,7 @@ pub const Core = struct {
                             self.status_message = written;
                             self.status_message_expires =
                                 std.Io.Clock.real.now(self.io).toMilliseconds() + 4_000;
-                            self.sendUpdate() catch {};
+                            self.sendUpdate() catch |err| log.debug("sendUpdate after plugin msg failed: {s}", .{@errorName(err)});
                         }
                         // Other PluginMessage variants are unused —
                         // wasm plugins call host imports directly and
@@ -1605,6 +1614,12 @@ pub const Core = struct {
                         // file changed on disk under us — common when a
                         // formatter or git checkout rewrites the file.
                         self.maybeCheckExternalChange();
+
+                        // Drain any debounced LSP didChange payloads
+                        // whose debounce window has elapsed. Without
+                        // this drive, the trailing-edge debounce never
+                        // fires on a paused user.
+                        self.lsp_manager.flushPendingChanges();
 
                         // Refresh the word-under-cursor highlight. Only
                         // applies after `word_highlight_idle_ms` of
@@ -1989,8 +2004,15 @@ pub const Core = struct {
                             const now = std.Io.Clock.real.now(self.io).toMilliseconds();
                             const time_since_render = now - self.last_render_time;
                             if (time_since_render >= self.min_render_interval_ms) {
-                                self.needs_render = false;
-                                self.last_render_time = now;
+                                // Don't advance `last_render_time` or
+                                // clear `needs_render` here — sendUpdate
+                                // owns both fields. The bug we hit
+                                // before: this branch set
+                                // `last_render_time = now`, then
+                                // sendUpdate's own throttle saw
+                                // ~0 ms elapsed and bailed, so the
+                                // tree-update post-buffer-switch
+                                // render never actually painted.
                                 try self.sendUpdate();
                             }
                         }
@@ -3865,7 +3887,9 @@ pub const Core = struct {
                 // active-parameter index, `)` dismisses. Cheap fire-and-
                 // forget — the tick handler drains the response.
                 if (char == '(' or char == ',') {
-                    self.triggerSignatureHelp() catch {};
+                    self.triggerSignatureHelp() catch |err| {
+                        log.debug("triggerSignatureHelp failed: {s}", .{@errorName(err)});
+                    };
                 } else if (char == ')') {
                     self.dismissSignatureHelp();
                 }
@@ -4618,7 +4642,9 @@ pub const Core = struct {
                 log.debug("scan drain: addFileLazyBackground failed for '{s}': {}", .{ p, err });
                 continue;
             };
-            self.workspace_manager.registerBuffer(0, p) catch {};
+            self.workspace_manager.registerBuffer(0, p) catch |err| {
+                log.debug("scan drain: workspace registerBuffer failed for {s}: {s}", .{ p, @errorName(err) });
+            };
             added_any = true;
         }
 
@@ -4636,7 +4662,7 @@ pub const Core = struct {
 
         // A new batch of buffers is in the picker; ask the UI to redraw so
         // the file picker (and buffer list) reflect the change.
-        if (added_any) self.sendUpdate() catch {};
+        if (added_any) self.sendUpdate() catch |err| log.debug("sendUpdate after scan drain failed: {s}", .{@errorName(err)});
     }
 
     /// Block briefly waiting for any in-flight scan workers to exit. Called
@@ -4731,7 +4757,14 @@ pub const Core = struct {
             defer self.allocator.free(sidecar);
             var sf = std.Io.Dir.createFileAbsolute(self.io, sidecar, .{}) catch continue;
             defer sf.close(self.io);
-            sf.writeStreamingAll(self.io, path) catch {};
+            sf.writeStreamingAll(self.io, path) catch |err| {
+                // Failing to write the sidecar isn't fatal — the
+                // .bak still holds the content, just without the
+                // path-of-origin annotation the recovery picker
+                // surfaces. Log so we know if disk space / perm
+                // issues are silently eating it.
+                log.debug("autosave sidecar write failed for {s}: {s}", .{ sidecar, @errorName(err) });
+            };
         }
     }
 
@@ -5728,6 +5761,20 @@ pub const Core = struct {
     pub fn sendUpdate(self: *Core) !void {
         @import("../services/thread_name.zig").markStep("send:enter");
         const now = std.Io.Clock.real.now(self.io).toMilliseconds();
+
+        // Soft frame-rate cap. A snapshot built <16 ms ago is still
+        // in the bus (or just consumed); building another one now
+        // produces a frame the user can't perceive and the bus would
+        // coalesce anyway (see main.zig render_update drain). Mark
+        // need-to-render so the tick handler catches up and bail.
+        // Critical UX paths (mode change, file open) still feel
+        // instant because the previous render was, by definition,
+        // <16 ms old.
+        if (self.last_render_time > 0 and now - self.last_render_time < self.min_render_interval_ms) {
+            self.needs_render = true;
+            @import("../services/thread_name.zig").markStep("send:throttled");
+            return;
+        }
         self.last_render_time = now;
         self.needs_render = false;
 
@@ -5920,7 +5967,9 @@ pub const Core = struct {
                 self.last_inlay_request_ms = now_ms;
                 const start_line: u32 = @intCast(s.scroll_offset);
                 const end_line: u32 = @intCast(s.scroll_offset + visible_rows + 5);
-                self.lsp_manager.requestInlayHint(path, start_line, end_line) catch {};
+                self.lsp_manager.requestInlayHint(path, start_line, end_line) catch |err| {
+                    log.debug("requestInlayHint failed for {s}: {s}", .{ path, @errorName(err) });
+                };
             }
         }
 
@@ -5938,6 +5987,15 @@ pub const Core = struct {
         // pointer dereference.
         const is_large_active = self.activeBufferIsLarge();
         if (lang != .unknown and !is_large_active) {
+            // Materialize the active buffer's content exactly once for
+            // every consumer below (parse submit, markdown highlight,
+            // bracket finder). Previously each consumer called
+            // `s.buffer.toString` independently — 3-4x rope flatten on a
+            // 50k-line file per render frame. The arena owns this slice
+            // so we don't free it explicitly.
+            @import("../services/thread_name.zig").markStep("send:buffer_tostring");
+            const active_content_opt: ?[]const u8 = s.buffer.toString(alloc) catch null;
+
             // Snapshot under the tree lock — without this, reading
             // `current_lang`/`current_resource_id`/`tree` races with
             // the parse worker that swaps them in under the same lock.
@@ -5957,11 +6015,11 @@ pub const Core = struct {
                     // Async — render proceeds with whatever tree we
                     // currently have (possibly none), and re-fires
                     // once the worker installs the new tree.
-                    if (s.buffer.toString(alloc)) |content| {
+                    if (active_content_opt) |content| {
                         self.syntax_manager.submitParse(content, active_buffer_id) catch |err| {
                             log.debug("Syntax reparse submit failed for active buffer: {}", .{err});
                         };
-                    } else |_| {}
+                    }
                 }
             } else {
                 const active_buffer_id = self.buffer_manager.getActive().id;
@@ -5971,11 +6029,11 @@ pub const Core = struct {
                             log.warn("Failed to set syntax language to {}: {}", .{ lang, err });
                         };
                     }
-                    if (s.buffer.toString(alloc)) |content| {
+                    if (active_content_opt) |content| {
                         self.syntax_manager.submitParse(content, active_buffer_id) catch |err| {
                             log.debug("Syntax parse submit during scroll failed: {}", .{err});
                         };
-                    } else |_| {}
+                    }
                 }
             }
 
@@ -6007,9 +6065,9 @@ pub const Core = struct {
             if (syntax_tokens == null or syntax_tokens.?.len == 0) {
                 if (lang == .markdown) {
                     @import("../services/thread_name.zig").markStep("send:highlight_md");
-                    if (s.buffer.toString(alloc)) |content| {
+                    if (active_content_opt) |content| {
                         syntax_tokens = self.syntax_manager.highlightMarkdown(alloc, content, s.scroll_offset, s.scroll_offset + visible_rows + 5) catch null;
-                    } else |_| {}
+                    }
                 } else {
                     @import("../services/thread_name.zig").markStep("send:highlight_ts");
                     syntax_tokens = self.syntax_manager.highlight(alloc, s.scroll_offset, s.scroll_offset + visible_rows + 5) catch null;
@@ -6018,7 +6076,7 @@ pub const Core = struct {
 
             if (lang != .markdown and lang != .unknown) {
                 @import("../services/thread_name.zig").markStep("send:brackets");
-                if (s.buffer.toString(alloc)) |content| {
+                if (active_content_opt) |content| {
                     if (self.syntax_manager.findBrackets(alloc, content, s.scroll_offset, s.scroll_offset + visible_rows + 5)) |bracket_tokens| {
                         if (bracket_tokens.len > 0) {
                             const existing = syntax_tokens orelse &.{};
@@ -6030,7 +6088,7 @@ pub const Core = struct {
                             }
                         }
                     } else |_| {}
-                } else |_| {}
+                }
             }
         }
 
@@ -6142,6 +6200,11 @@ pub const Core = struct {
 
                     const pane_is_large = self.bufferIsLargeAt(b.pane.buffer_index);
                     if (pane_lang != .unknown and !pane_is_large) {
+                        // One toString per pane, shared by parse-submit
+                        // and markdown-highlight (same rationale as the
+                        // active-buffer block above).
+                        const pane_content_opt: ?[]const u8 = p_state.buffer.toString(alloc) catch null;
+
                         if (!self.scroll_in_progress) {
                             const pane_buffer_id = pane_buffer.id;
                             const pane_syn = self.syntax_manager.stateSnapshot();
@@ -6151,11 +6214,11 @@ pub const Core = struct {
                                         log.warn("Failed to set pane syntax language to {}: {}", .{ pane_lang, err });
                                     };
                                 }
-                                if (p_state.buffer.toString(alloc)) |content| {
+                                if (pane_content_opt) |content| {
                                     self.syntax_manager.submitParse(content, pane_buffer_id) catch |err| {
                                         log.debug("Pane syntax parse submit failed: {}", .{err});
                                     };
-                                } else |_| {}
+                                }
                             }
                         }
 
@@ -6173,9 +6236,9 @@ pub const Core = struct {
 
                         if (pane_tokens == null or pane_tokens.?.len == 0) {
                             if (pane_lang == .markdown) {
-                                if (p_state.buffer.toString(alloc)) |content| {
+                                if (pane_content_opt) |content| {
                                     pane_tokens = self.syntax_manager.highlightMarkdown(alloc, content, pane_scroll, pane_scroll + safe_pane_rows + 5) catch null;
-                                } else |_| {}
+                                }
                             } else {
                                 pane_tokens = self.syntax_manager.highlight(alloc, pane_scroll, pane_scroll + safe_pane_rows + 5) catch null;
                             }
@@ -6206,6 +6269,51 @@ pub const Core = struct {
                 }
                 pane_snapshots = panes;
             }
+        }
+
+        // Fetch + sort diagnostics once for the active buffer. The
+        // snapshot fields below need (a) a sorted protocol-shaped list
+        // and (b) error / warning counts. Previously each was a
+        // separate `getDiagnosticsForFile` call, each acquiring the
+        // diagnostics mutex and walking the per-URI map — 3x the work
+        // for no reason. Drains to one call here.
+        @import("../services/thread_name.zig").markStep("send:diagnostics");
+        var diagnostics_snap: ?[]const protocol.DiagnosticSnapshot = null;
+        var diagnostics_err_count: u32 = 0;
+        var diagnostics_warn_count: u32 = 0;
+        if (s.file_path) |dpath| {
+            if (self.lsp_manager.getDiagnosticsForFile(alloc, dpath)) |diags| {
+                if (diags.len > 0) {
+                    std.mem.sort(LSPManager.Diagnostic, diags, {}, struct {
+                        fn lt(_: void, a: LSPManager.Diagnostic, b: LSPManager.Diagnostic) bool {
+                            if (a.start_line != b.start_line) return a.start_line < b.start_line;
+                            return a.start_col < b.start_col;
+                        }
+                    }.lt);
+                    const out = try alloc.alloc(protocol.DiagnosticSnapshot, diags.len);
+                    for (diags, 0..) |d, i| {
+                        out[i] = .{
+                            .start_line = d.start_line,
+                            .start_col = d.start_col,
+                            .end_line = d.end_line,
+                            .end_col = d.end_col,
+                            .severity = switch (d.severity) {
+                                .err => .err,
+                                .warning => .warning,
+                                .info => .info,
+                                .hint => .hint,
+                            },
+                            .message = d.message,
+                        };
+                        switch (d.severity) {
+                            .err => diagnostics_err_count += 1,
+                            .warning => diagnostics_warn_count += 1,
+                            else => {},
+                        }
+                    }
+                    diagnostics_snap = out;
+                }
+            } else |_| {}
         }
 
         @import("../services/thread_name.zig").markStep("send:snapshot_create");
@@ -6379,56 +6487,9 @@ pub const Core = struct {
                 try alloc.dupe(protocol.DiffLineHighlight, self.diff_highlights.items)
             else
                 null,
-            .diagnostics = blk_d: {
-                const path = s.file_path orelse break :blk_d null;
-                const diags = self.lsp_manager.getDiagnosticsForFile(alloc, path) catch break :blk_d null;
-                // diags is owned by alloc (the snapshot arena), so it gets
-                // freed automatically when the arena is reset.
-                if (diags.len == 0) break :blk_d null;
-                std.mem.sort(LSPManager.Diagnostic, diags, {}, struct {
-                    fn lt(_: void, a: LSPManager.Diagnostic, b: LSPManager.Diagnostic) bool {
-                        if (a.start_line != b.start_line) return a.start_line < b.start_line;
-                        return a.start_col < b.start_col;
-                    }
-                }.lt);
-                const out = try alloc.alloc(protocol.DiagnosticSnapshot, diags.len);
-                for (diags, 0..) |d, i| {
-                    out[i] = .{
-                        .start_line = d.start_line,
-                        .start_col = d.start_col,
-                        .end_line = d.end_line,
-                        .end_col = d.end_col,
-                        .severity = switch (d.severity) {
-                            .err => .err,
-                            .warning => .warning,
-                            .info => .info,
-                            .hint => .hint,
-                        },
-                        .message = d.message,
-                    };
-                }
-                break :blk_d out;
-            },
-            .diagnostic_error_count = blk_e: {
-                const path = s.file_path orelse break :blk_e 0;
-                var c: u32 = 0;
-                if (self.lsp_manager.getDiagnosticsForFile(alloc, path)) |diags| {
-                    for (diags) |d| if (d.severity == .err) {
-                        c += 1;
-                    };
-                } else |_| {}
-                break :blk_e c;
-            },
-            .diagnostic_warning_count = blk_w: {
-                const path = s.file_path orelse break :blk_w 0;
-                var c: u32 = 0;
-                if (self.lsp_manager.getDiagnosticsForFile(alloc, path)) |diags| {
-                    for (diags) |d| if (d.severity == .warning) {
-                        c += 1;
-                    };
-                } else |_| {}
-                break :blk_w c;
-            },
+            .diagnostics = diagnostics_snap,
+            .diagnostic_error_count = diagnostics_err_count,
+            .diagnostic_warning_count = diagnostics_warn_count,
             .status_message = blk: {
                 const current_time = std.Io.Clock.real.now(self.io).toMilliseconds();
                 if (self.status_message != null and current_time < self.status_message_expires) {
@@ -6775,7 +6836,9 @@ pub const Core = struct {
                 buf.state.scroll_offset = buf_state.scroll_offset;
 
                 // best-effort: workspace tracking is auxiliary; buffer is still usable if this fails
-                self.workspace_manager.registerBuffer(buf.id, path) catch {};
+                self.workspace_manager.registerBuffer(buf.id, path) catch |err| {
+                    log.debug("workspace registerBuffer failed for {s}: {s}", .{ path, @errorName(err) });
+                };
             } else |_| {
                 log.info("Session: File no longer exists: '{s}'", .{path});
             }
@@ -6974,7 +7037,9 @@ pub const Core = struct {
                 // user straight back.
                 const s = self.state();
                 if (s.file_path) |path| {
-                    self.jump_list.recordJump(path, s.cursor_row, s.cursor_col) catch {};
+                    self.jump_list.recordJump(path, s.cursor_row, s.cursor_col) catch |err| {
+                        log.debug("recordJump failed for {s}: {s}", .{ path, @errorName(err) });
+                    };
                 }
                 _ = self.buffer_manager.openFile(sym.file_path) catch |err| {
                     log.warn("Open file from workspace symbol failed: {}", .{err});
@@ -7255,10 +7320,18 @@ pub const Core = struct {
         // Move to the next match.
         self.advanceReplaceCursor();
 
-        // If "Apply All", silently consume the remainder.
+        // If "Apply All", consume the remainder. Per-match failures
+        // get logged so the user knows when a replace skipped a file
+        // (e.g. read-only, vanished between scan and apply).
         if (self.global_search_replace_apply_all) {
             while (self.replaceWalkHasCurrent()) {
-                self.applyCurrentReplaceMatch() catch {};
+                self.applyCurrentReplaceMatch() catch |err| {
+                    log.warn("Apply-all: replace failed at file_idx={d} match_idx={d}: {s}", .{
+                        self.global_search_replace_file_idx,
+                        self.global_search_replace_match_idx,
+                        @errorName(err),
+                    });
+                };
                 self.advanceReplaceCursor();
             }
             try self.finishReplaceConfirm(true);
@@ -7531,7 +7604,9 @@ pub const Core = struct {
         // Record the current spot in the jump list before we leave, so
         // Space `,` can bring the user back.
         if (self.state().file_path) |cur_path| {
-            self.jump_list.recordJump(cur_path, self.state().cursor_row, self.state().cursor_col) catch {};
+            self.jump_list.recordJump(cur_path, self.state().cursor_row, self.state().cursor_col) catch |err| {
+                log.debug("recordJump failed for {s}: {s}", .{ cur_path, @errorName(err) });
+            };
         }
         try self.openFileAtLine(bm.file_path, bm.row);
         const s = self.state();
