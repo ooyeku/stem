@@ -53,13 +53,12 @@ pub const SyntaxManager = struct {
     /// breathed near the editor.
     highlight_cache: HighlightCache = .{},
 
-    /// Same idea as `highlight_cache`, but for `findBrackets`. Brackets
-    /// don't change unless the file content changes, so on an idle
-    /// frame we'd otherwise walk the entire file byte-by-byte each
-    /// render. The cache key is `(resource_id, content_len,
-    /// start_line, end_line)` — `content_len` stands in for "did the
-    /// buffer change?" cheaply and is exact enough for the cache to
-    /// stay correct.
+    /// Same idea as `highlight_cache`, but for `findBrackets`. The cache
+    /// stores brackets for the *entire* buffer, keyed on
+    /// `(resource_id, content_len)`. Visible-range windowing happens
+    /// at lookup time. Without whole-buffer caching, scrolling would
+    /// miss the cache every frame (visible range changes) and trigger
+    /// a full byte-walk per render — visibly laggy on large files.
     bracket_cache: BracketCache = .{},
 
     /// Pending edits queued by `recordEdit`. Drained on the next
@@ -90,8 +89,9 @@ pub const SyntaxManager = struct {
     pub const BracketCache = struct {
         resource_id: u64 = 0,
         content_len: usize = 0,
-        start_line: usize = 0,
-        end_line: usize = 0,
+        /// Whole-buffer bracket tokens, sorted by `(line, start_col)` via
+        /// the natural left-to-right walk that produces them. Lookups
+        /// binary-search by line to extract the visible window.
         tokens: std.ArrayListUnmanaged(protocol.SyntaxToken) = .empty,
         valid: bool = false,
 
@@ -1925,12 +1925,11 @@ pub const SyntaxManager = struct {
         start_line: usize,
         end_line: usize,
     ) ![]protocol.SyntaxToken {
-        // Cache lookup. `content_len` is the cheap "has the buffer
-        // changed?" check — exact enough since any edit changes the
-        // byte count by ±1 or more, and the few cases where two
-        // unrelated edits net to zero length delta are vanishingly
-        // rare. On cache hit we hand back a fresh copy so the caller
-        // can free it without touching our entry.
+        // Whole-buffer cache, windowed at lookup time. `content_len`
+        // stands in for "did the buffer change?" — any insertion or
+        // deletion shifts the byte count, so a match means the cached
+        // brackets are still byte-accurate. Visible-range scrolling
+        // hits the cache every frame; only an edit invalidates.
         //
         // Lock around the cache + current_resource_id reads: the parse
         // worker invalidates `bracket_cache` (frees tokens.items) under
@@ -1942,16 +1941,16 @@ pub const SyntaxManager = struct {
             defer self.treeUnlock();
             if (self.bracket_cache.valid and
                 self.bracket_cache.resource_id == self.current_resource_id and
-                self.bracket_cache.content_len == content.len and
-                self.bracket_cache.start_line == start_line and
-                self.bracket_cache.end_line == end_line)
+                self.bracket_cache.content_len == content.len)
             {
-                return try allocator.dupe(protocol.SyntaxToken, self.bracket_cache.tokens.items);
+                return try windowTokensByLine(allocator, self.bracket_cache.tokens.items, start_line, end_line);
             }
         }
 
-        var tokens = std.ArrayListUnmanaged(protocol.SyntaxToken).empty;
-        errdefer tokens.deinit(allocator);
+        // Cache miss: walk the entire buffer once, depth-track from line 0
+        // so every bracket in the cache carries its true nesting level.
+        var all_tokens = std.ArrayListUnmanaged(protocol.SyntaxToken).empty;
+        defer all_tokens.deinit(allocator);
 
         var paren_depth: u8 = 0;
         var brace_depth: u8 = 0;
@@ -1967,81 +1966,93 @@ pub const SyntaxManager = struct {
                 continue;
             }
 
-            if (line_num >= start_line and line_num < end_line) {
-                const bracket_type: ?struct { depth: *u8, is_opening: bool } = switch (byte) {
-                    '(' => .{ .depth = &paren_depth, .is_opening = true },
-                    ')' => .{ .depth = &paren_depth, .is_opening = false },
-                    '{' => .{ .depth = &brace_depth, .is_opening = true },
-                    '}' => .{ .depth = &brace_depth, .is_opening = false },
-                    '[' => .{ .depth = &bracket_depth, .is_opening = true },
-                    ']' => .{ .depth = &bracket_depth, .is_opening = false },
-                    else => null,
+            const bracket_type: ?struct { depth: *u8, is_opening: bool } = switch (byte) {
+                '(' => .{ .depth = &paren_depth, .is_opening = true },
+                ')' => .{ .depth = &paren_depth, .is_opening = false },
+                '{' => .{ .depth = &brace_depth, .is_opening = true },
+                '}' => .{ .depth = &brace_depth, .is_opening = false },
+                '[' => .{ .depth = &bracket_depth, .is_opening = true },
+                ']' => .{ .depth = &bracket_depth, .is_opening = false },
+                else => null,
+            };
+
+            if (bracket_type) |bt| {
+                const depth_level: u8 = if (bt.is_opening) blk: {
+                    bt.depth.* +|= 1;
+                    break :blk bt.depth.*;
+                } else blk: {
+                    const d = bt.depth.*;
+                    bt.depth.* -|= 1;
+                    break :blk d;
                 };
 
-                if (bracket_type) |bt| {
-                    const depth_level: u8 = if (bt.is_opening) blk: {
-                        bt.depth.* +|= 1;
-                        break :blk bt.depth.*;
-                    } else blk: {
-                        const d = bt.depth.*;
-                        bt.depth.* -|= 1;
-                        break :blk d;
-                    };
+                const normalized = ((depth_level -| 1) % 6) + 1;
+                const token_type: protocol.SyntaxToken.TokenType = switch (normalized) {
+                    1 => .bracket_1,
+                    2 => .bracket_2,
+                    3 => .bracket_3,
+                    4 => .bracket_4,
+                    5 => .bracket_5,
+                    else => .bracket_6,
+                };
 
-                    const normalized = ((depth_level -| 1) % 6) + 1;
-                    const token_type: protocol.SyntaxToken.TokenType = switch (normalized) {
-                        1 => .bracket_1,
-                        2 => .bracket_2,
-                        3 => .bracket_3,
-                        4 => .bracket_4,
-                        5 => .bracket_5,
-                        else => .bracket_6,
-                    };
-
-                    try tokens.append(allocator, .{
-                        .line = line_num,
-                        .start_col = col,
-                        .length = 1,
-                        .token_type = token_type,
-                    });
-                }
-            } else if (line_num < start_line) {
-                switch (byte) {
-                    '(' => paren_depth +|= 1,
-                    ')' => paren_depth -|= 1,
-                    '{' => brace_depth +|= 1,
-                    '}' => brace_depth -|= 1,
-                    '[' => bracket_depth +|= 1,
-                    ']' => bracket_depth -|= 1,
-                    else => {},
-                }
+                try all_tokens.append(allocator, .{
+                    .line = line_num,
+                    .start_col = col,
+                    .length = 1,
+                    .token_type = token_type,
+                });
             }
 
             col += 1;
         }
 
-        const result = try tokens.toOwnedSlice(allocator);
-
-        // Populate the cache with our own copy. The caller's `result`
-        // slice (which we return) is allocated from the per-frame
-        // arena, so we re-copy into our long-lived allocator.
-        // Lock around the write so the parse worker can't invalidate
-        // partway through and leave us with a half-populated cache
-        // whose pointers no longer match `valid`.
+        // Install in cache, then window for the caller. Lock around the
+        // write so the parse worker can't invalidate partway through and
+        // leave us with a half-populated cache whose pointers no longer
+        // match `valid`.
         self.treeLock();
         defer self.treeUnlock();
         self.bracket_cache.invalidate(self.allocator);
-        self.bracket_cache.tokens.appendSlice(self.allocator, result) catch {
-            // OOM while populating cache is fine — just skip the
-            // cache, the caller still gets a correct result.
-            return result;
+        self.bracket_cache.tokens.appendSlice(self.allocator, all_tokens.items) catch {
+            // OOM while populating cache: skip cache, still return the
+            // windowed result so this frame renders correctly.
+            return try windowTokensByLine(allocator, all_tokens.items, start_line, end_line);
         };
         self.bracket_cache.resource_id = self.current_resource_id;
         self.bracket_cache.content_len = content.len;
-        self.bracket_cache.start_line = start_line;
-        self.bracket_cache.end_line = end_line;
         self.bracket_cache.valid = true;
-        return result;
+        return try windowTokensByLine(allocator, self.bracket_cache.tokens.items, start_line, end_line);
+    }
+
+    /// Extract the subrange of `tokens` whose `line` falls in
+    /// `[start_line, end_line)`. Assumes `tokens` is sorted by line
+    /// (which the whole-buffer walk in `findBrackets` produces).
+    fn windowTokensByLine(
+        allocator: std.mem.Allocator,
+        tokens: []const protocol.SyntaxToken,
+        start_line: usize,
+        end_line: usize,
+    ) ![]protocol.SyntaxToken {
+        if (tokens.len == 0 or start_line >= end_line) return &.{};
+        const start_u32: u32 = @intCast(@min(start_line, std.math.maxInt(u32)));
+        const end_u32: u32 = @intCast(@min(end_line, std.math.maxInt(u32)));
+
+        // Binary search for the first token whose line >= start_u32.
+        var lo: usize = 0;
+        var hi: usize = tokens.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (tokens[mid].line < start_u32) lo = mid + 1 else hi = mid;
+        }
+        const first = lo;
+
+        // Walk forward until we pass end_u32.
+        var last = first;
+        while (last < tokens.len and tokens[last].line < end_u32) : (last += 1) {}
+
+        if (first == last) return &.{};
+        return try allocator.dupe(protocol.SyntaxToken, tokens[first..last]);
     }
 
     pub fn findCurrentScope(

@@ -6,9 +6,11 @@ const vigil = @import("vigil");
 const EditorState = @import("../core/state.zig").EditorState;
 const FileManager = @import("../core/file_manager.zig").FileManager;
 const auto_pair = @import("../core/auto_pair.zig");
+const unicode = @import("../core/unicode.zig");
 const Keys = @import("../config/keys.zig").Keys;
 const BufferManager = @import("buffer_manager.zig").BufferManager;
 const JumpList = @import("jump_list.zig").JumpList;
+const BookmarkStore = @import("bookmarks.zig").BookmarkStore;
 const protocol = @import("protocol.zig");
 const LSPManager = @import("../services/lsp_manager.zig").LSPManager;
 const LspServer = @import("../services/lsp/server.zig").LSPServer;
@@ -68,6 +70,11 @@ fn Wrap(comptime f: anytype) type {
     };
 }
 
+pub const MultiCursor = struct {
+    row: usize,
+    col: usize,
+};
+
 pub const Core = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -109,10 +116,76 @@ pub const Core = struct {
     /// One of `[` or `]` pressed, awaiting target key (e.g. `d` for
     /// diagnostic). null = no bracket-prefix pending.
     bracket_pending: ?u8 = null,
+    /// `m` pressed in select mode, awaiting bookmark slot (a-z). The
+    /// slot key then writes `(file, row, col)` into `bookmarks`. Any
+    /// other follow-up cancels.
+    bookmark_set_pending: bool = false,
+    /// `'` pressed in select mode, awaiting bookmark slot to jump to.
+    bookmark_jump_pending: bool = false,
+    bookmarks: BookmarkStore,
+    /// Text-object / surround chord progress. `s` in select mode
+    /// starts the chord:
+    ///   `s i <c>`  → select inside <c>
+    ///   `s a <c>`  → select around <c>
+    ///   `s d <c>`  → delete the surround pair <c> enclosing cursor
+    ///   `s r <old> <new>` → replace surround <old> with <new>
+    /// In visual mode, `S <c>` wraps the selection with <c>.
+    text_object_state: enum {
+        none,
+        s_seen,
+        inside_pending,
+        around_pending,
+        surround_delete_pending,
+        surround_replace_old_pending,
+        surround_replace_new_pending,
+        surround_add_pending,
+    } = .none,
+    /// First char captured in `s r <old> <new>`. Held between the two
+    /// follow-up keystrokes so the second key can complete the chord.
+    surround_replace_old: u8 = 0,
+
+    /// Secondary cursor positions for the active buffer. Empty means
+    /// single-cursor mode. Insert and backspace operations in insert
+    /// mode replicate at each secondary; line-altering operations and
+    /// Esc clear the list. See `addNextOccurrence` for the canonical
+    /// entry point.
+    multi_cursors: std.ArrayListUnmanaged(MultiCursor) = .empty,
+    /// Buffer id the multi_cursors list belongs to. Switching buffers
+    /// invalidates the cursors (positions reference a different file).
+    multi_cursor_buffer_id: u32 = 0,
+    /// The pattern used by `Ctrl+D` to find the next occurrence.
+    /// Re-derived each press: from the visual selection if any,
+    /// otherwise the word under the primary cursor.
+    multi_cursor_query: std.ArrayListUnmanaged(u8) = .empty,
+    /// Cache of the identifier currently echoed via `word_highlight`
+    /// decorations. Null = no highlight active. Owned by the manager
+    /// allocator; freed when replaced or cleared.
+    last_word_highlight: ?[]u8 = null,
+    /// Minimum idle (ms) before word-under-cursor highlights paint.
+    /// Mirrors VS Code's behaviour — wait until the cursor settles so
+    /// fast motion doesn't flash repaints.
+    word_highlight_idle_ms: i64 = 300,
     win_size: vaxis.Winsize = .{ .rows = 24, .cols = 80, .x_pixel = 0, .y_pixel = 0 },
     save_as_input: std.ArrayListUnmanaged(u8) = .empty,
     search_input: std.ArrayListUnmanaged(u8) = .empty,
     last_search_query: std.ArrayListUnmanaged(u8) = .empty,
+    /// `/` = forward, `?` = backward. Used by both incremental search
+    /// (live cursor jump while typing) and `n`/`N` step navigation.
+    search_direction: enum { forward, backward } = .forward,
+    /// Cursor position at the moment the search prompt opened. Esc
+    /// restores it so a cancelled search doesn't strand the cursor on
+    /// a partial-match preview.
+    search_origin_row: usize = 0,
+    search_origin_col: usize = 0,
+    /// Total matches in the whole buffer for the current query, and
+    /// the 1-based index of the active match. Both shown in the
+    /// status bar as `[i/N]`. Capped — see `max_buffer_search_matches`.
+    search_match_count: usize = 0,
+    search_match_index: usize = 0,
+    /// Pathology guard: stop counting matches past this so a buffer
+    /// pasted with thousands of repeated short strings doesn't lock
+    /// the editor on every keystroke during search.
+    max_buffer_search_matches: usize = 9999,
     lsp_manager: LSPManager,
     lsp_doc_version: i64 = 1,
     syntax_manager: SyntaxManager,
@@ -205,6 +278,29 @@ pub const Core = struct {
     /// True once at least one search has actually run, so the UI can show
     /// "No matches" instead of the initial "Type to search…" placeholder.
     global_search_ran: bool = false,
+
+    /// Replace-with-confirmation flow state. Triggered by Ctrl+R while
+    /// in global_search mode with a non-empty replace field. We snapshot
+    /// the query+replace strings at trigger time so subsequent edits to
+    /// the input fields don't disturb the walk.
+    global_search_replace_active: bool = false,
+    /// Set when the user pressed `A`; remaining matches in the walk
+    /// apply silently. Resets when the flow ends.
+    global_search_replace_apply_all: bool = false,
+    global_search_replace_query_snap: std.ArrayListUnmanaged(u8) = .empty,
+    global_search_replace_text_snap: std.ArrayListUnmanaged(u8) = .empty,
+    global_search_replace_file_idx: usize = 0,
+    global_search_replace_match_idx: usize = 0,
+    /// Stats reported when the flow ends.
+    global_search_replace_count: usize = 0,
+    global_search_replace_skipped: usize = 0,
+    /// Cumulative column shift on the currently-targeted line caused by
+    /// previously-applied replacements. Reset when the line changes.
+    global_search_replace_line_delta: i64 = 0,
+    /// (file_idx, line) of the last replacement, so we know when to
+    /// reset `line_delta`.
+    global_search_replace_last_file: usize = std.math.maxInt(usize),
+    global_search_replace_last_line: usize = 0,
     split_manager: ?SplitManager = null,
     leader_number_input: std.ArrayListUnmanaged(u8) = .empty,
     buffer_picker_number_input: std.ArrayListUnmanaged(u8) = .empty,
@@ -324,6 +420,7 @@ pub const Core = struct {
             .command_palette_results = .empty,
             .history_manager = HistoryManager.init(allocator, io),
             .jump_list = JumpList.init(allocator, io, 100),
+            .bookmarks = BookmarkStore.init(allocator),
             .decoration_manager = DecorationManager.init(allocator),
             .job_manager = JobManager.init(allocator, io),
             .workspace_manager = WorkspaceManager.init(allocator, io),
@@ -360,6 +457,10 @@ pub const Core = struct {
         self.save_as_input.deinit(self.allocator);
         self.search_input.deinit(self.allocator);
         self.last_search_query.deinit(self.allocator);
+        self.global_search_replace_query_snap.deinit(self.allocator);
+        self.global_search_replace_text_snap.deinit(self.allocator);
+        self.multi_cursors.deinit(self.allocator);
+        self.multi_cursor_query.deinit(self.allocator);
         self.lsp_manager.deinit();
         if (self.references_symbol_name) |name| self.allocator.free(name);
         if (self.references_source_file) |path| self.allocator.free(path);
@@ -407,6 +508,9 @@ pub const Core = struct {
 
         self.history_manager.deinit();
         self.jump_list.deinit();
+        self.bookmarks.deinit();
+        if (self.last_word_highlight) |w| self.allocator.free(w);
+        self.last_word_highlight = null;
         self.decoration_manager.deinit();
         self.job_manager.deinit();
         self.workspace_manager.deinit();
@@ -524,12 +628,102 @@ pub const Core = struct {
 
     fn insertCharWithHistory(self: *Core, char: u8) !void {
         const s = self.state();
-        const offset = s.getOffsetFromCursor();
-        self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
-        try s.insertChar(char);
+
+        // Single-cursor fast path.
+        if (self.multi_cursors.items.len == 0) {
+            const offset = s.getOffsetFromCursor();
+            self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+            try s.insertChar(char);
+            var char_buf: [1]u8 = .{char};
+            try self.history_manager.recordInsert(offset, &char_buf);
+            self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+            return;
+        }
+
+        // Multi-cursor: newline breaks the simple shift model — bail
+        // to single cursor before inserting so we don't desync.
+        if (char == '\n') {
+            self.clearMultiCursors();
+            const offset = s.getOffsetFromCursor();
+            self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+            try s.insertChar(char);
+            var char_buf: [1]u8 = .{char};
+            try self.history_manager.recordInsert(offset, &char_buf);
+            self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+            return;
+        }
+
+        try self.applyMultiCharInsert(char);
+    }
+
+    /// Apply a single (non-newline) char insert at the primary cursor
+    /// and each secondary cursor, then shift positions to keep the
+    /// secondaries pointing at the right column after the line
+    /// rewrites. Processed in descending byte-offset order so earlier
+    /// inserts don't invalidate later offsets.
+    fn applyMultiCharInsert(self: *Core, char: u8) !void {
+        const s = self.state();
+
+        // Build the full position list (primary + secondaries) and
+        // tag with byte offsets.
+        const PosOff = struct { row: usize, col: usize, off: usize, is_primary: bool };
+        var all = std.ArrayListUnmanaged(PosOff).empty;
+        defer all.deinit(self.allocator);
+        try all.append(self.allocator, .{
+            .row = s.cursor_row,
+            .col = s.cursor_col,
+            .off = s.getOffsetFromCursor(),
+            .is_primary = true,
+        });
+        for (self.multi_cursors.items) |mc| {
+            try all.append(self.allocator, .{
+                .row = mc.row,
+                .col = mc.col,
+                .off = s.getOffsetFor(mc.row, mc.col),
+                .is_primary = false,
+            });
+        }
+
+        // Descending offset order: safe insert loop.
+        std.sort.block(PosOff, all.items, {}, struct {
+            fn lt(_: void, a: PosOff, b: PosOff) bool {
+                return a.off > b.off;
+            }
+        }.lt);
+
         var char_buf: [1]u8 = .{char};
-        try self.history_manager.recordInsert(offset, &char_buf);
+        self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+        for (all.items) |po| {
+            try s.buffer.insert(po.off, &char_buf);
+            try self.history_manager.recordInsert(po.off, &char_buf);
+        }
+        s.markModified();
         self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+
+        // Compute each cursor's new column: self-advance by 1, plus +1
+        // for every OTHER cursor that sat at a lower col on the same row
+        // (those inserts pushed this cursor's content right).
+        for (all.items) |*po| {
+            var shift: usize = 1;
+            for (all.items) |q| {
+                if (q.off == po.off and q.is_primary == po.is_primary) continue;
+                if (q.row == po.row and q.col < po.col) shift += 1;
+            }
+            po.col += shift;
+        }
+
+        // Write back: primary into EditorState, secondaries into list.
+        self.multi_cursors.clearRetainingCapacity();
+        for (all.items) |po| {
+            if (po.is_primary) {
+                s.cursor_row = po.row;
+                s.cursor_col = po.col;
+                s.preferred_col = null;
+            } else {
+                self.multi_cursors.append(self.allocator, .{ .row = po.row, .col = po.col }) catch continue;
+            }
+        }
+        self.refreshMultiCursorDecorations();
     }
 
     pub fn insertTextWithHistory(self: *Core, text: []const u8) !void {
@@ -555,14 +749,84 @@ pub const Core = struct {
 
     fn backspaceCharWithHistory(self: *Core) !void {
         const s = self.state();
-        const offset = s.getOffsetFromCursor();
-        if (offset == 0) return;
-        const deleted_char = s.buffer.getCharAt(offset - 1) orelse return;
-        var char_buf: [1]u8 = .{deleted_char};
+
+        // Single-cursor fast path.
+        if (self.multi_cursors.items.len == 0) {
+            const offset = s.getOffsetFromCursor();
+            if (offset == 0) return;
+            const deleted_char = s.buffer.getCharAt(offset - 1) orelse return;
+            var char_buf: [1]u8 = .{deleted_char};
+            self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+            try self.history_manager.recordDelete(offset - 1, &char_buf);
+            try s.backspaceChar();
+            self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+            return;
+        }
+
+        // Multi-cursor backspace skips cursors at column 0 (line-join
+        // semantics would desync the secondaries). Apply in descending
+        // offset order so the deletes don't shift earlier offsets.
+        const PosOff = struct { row: usize, col: usize, off: usize, is_primary: bool };
+        var all = std.ArrayListUnmanaged(PosOff).empty;
+        defer all.deinit(self.allocator);
+        try all.append(self.allocator, .{
+            .row = s.cursor_row,
+            .col = s.cursor_col,
+            .off = s.getOffsetFromCursor(),
+            .is_primary = true,
+        });
+        for (self.multi_cursors.items) |mc| {
+            try all.append(self.allocator, .{
+                .row = mc.row,
+                .col = mc.col,
+                .off = s.getOffsetFor(mc.row, mc.col),
+                .is_primary = false,
+            });
+        }
+        std.sort.block(PosOff, all.items, {}, struct {
+            fn lt(_: void, a: PosOff, b: PosOff) bool {
+                return a.off > b.off;
+            }
+        }.lt);
+
         self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
-        try self.history_manager.recordDelete(offset - 1, &char_buf);
-        try s.backspaceChar();
+        var applied: usize = 0;
+        for (all.items) |*po| {
+            if (po.col == 0) continue; // skip line-join case
+            if (po.off == 0) continue;
+            const deleted = s.buffer.getCharAt(po.off - 1) orelse continue;
+            var char_buf: [1]u8 = .{deleted};
+            try self.history_manager.recordDelete(po.off - 1, &char_buf);
+            try s.buffer.delete(po.off - 1, 1);
+            applied += 1;
+        }
+        s.markModified();
         self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+
+        // Update positions: each retreats by 1 col, plus -1 for every
+        // other cursor that backspaced at a lower col on the same row.
+        for (all.items) |*po| {
+            if (po.col == 0) continue;
+            var shift: usize = 1;
+            for (all.items) |q| {
+                if (q.off == po.off and q.is_primary == po.is_primary) continue;
+                if (q.col == 0) continue;
+                if (q.row == po.row and q.col < po.col) shift += 1;
+            }
+            po.col -|= shift;
+        }
+
+        self.multi_cursors.clearRetainingCapacity();
+        for (all.items) |po| {
+            if (po.is_primary) {
+                s.cursor_row = po.row;
+                s.cursor_col = po.col;
+                s.preferred_col = null;
+            } else {
+                self.multi_cursors.append(self.allocator, .{ .row = po.row, .col = po.col }) catch continue;
+            }
+        }
+        self.refreshMultiCursorDecorations();
     }
 
     pub fn deleteRangeWithHistory(self: *Core, start_offset: usize, end_offset: usize) !void {
@@ -734,6 +998,43 @@ pub const Core = struct {
         _ = context;
         const self: *Core = @ptrCast(@alignCast(ctx));
         try self.openWorkspaceSymbolPicker();
+    }
+
+    fn cmdBookmarkList(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
+        _ = context;
+        const self: *Core = @ptrCast(@alignCast(ctx));
+        try self.openBookmarksBuffer();
+    }
+
+    fn cmdBookmarkClearAll(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
+        _ = context;
+        const self: *Core = @ptrCast(@alignCast(ctx));
+        self.bookmarks.clearAll();
+        self.bookmarks.save(self.io) catch |err| {
+            log.warn("Failed to persist bookmarks after clearAll: {}", .{err});
+        };
+        self.setStatusLiteralLeveled(.info, "Bookmarks cleared", 1500);
+        try self.sendUpdate();
+    }
+
+    fn cmdLspToggleFormatOnSave(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
+        _ = context;
+        const self: *Core = @ptrCast(@alignCast(ctx));
+        self.storage.config.editor.format_on_save = !self.storage.config.editor.format_on_save;
+        const tag: []const u8 = if (self.storage.config.editor.format_on_save) "ON" else "OFF";
+        self.setStatus("Format-on-save: {s}", .{tag}, 2000);
+        try self.sendUpdate();
+    }
+
+    /// Cheap precondition for format-on-save: do we even have an LSP
+    /// class for this file's language? If not, skip the formatter
+    /// request entirely so .txt and friends don't pay a 100 ms wait
+    /// on every save. We don't check the running server's formatting
+    /// capability — `formatAndSave` already times out gracefully if
+    /// the server doesn't reply, and falls through to plain save.
+    fn canLspFormat(self: *Core, path: []const u8) bool {
+        _ = self;
+        return LSPManager.getLangFromPath(path) != null;
     }
 
     /// Pretty-name the LSP symbol kind enum for the picker UI. Same
@@ -924,6 +1225,9 @@ pub const Core = struct {
         try R.register("nav.match_bracket", "Nav: Match Bracket", "Jump to matching (), {}, [], or <> (%)", Wrap(NavCommands.cmdNavMatchBracket).run, null);
         try R.register("search.find_in_buffer", "Search: Find in Buffer", "Search within current file", Wrap(NavCommands.cmdSearchFindInBuffer).run, null);
 
+        try R.register("bookmark.list", "Bookmark: List", "Open the [Bookmarks] buffer", cmdBookmarkList, null);
+        try R.register("bookmark.clear_all", "Bookmark: Clear All", "Remove every set bookmark for this project", cmdBookmarkClearAll, null);
+
         try R.register("lsp.format", "LSP: Format Document", "Format the entire file using zls", Wrap(LspCommands.cmdLspFormatDocument).run, null);
         try R.register("lsp.definition", "LSP: Go to Definition", "Jump to symbol definition", Wrap(LspCommands.cmdLspGoToDefinition).run, null);
         try R.register("lsp.diagnostics", "LSP: Show Diagnostics", "List all errors/warnings for current file", Wrap(LspCommands.cmdLspShowDiagnostics).run, null);
@@ -932,6 +1236,7 @@ pub const Core = struct {
         try R.register("lsp.hover", "LSP: Hover", "Trigger hover information for symbol under cursor", Wrap(LspCommands.cmdLspHover).run, null);
         try R.register("lsp.references", "LSP: Find References", "Find all references to symbol under cursor", Wrap(LspCommands.cmdLspFindReferences).run, null);
         try R.register("lsp.workspace_symbols", "LSP: Workspace Symbols", "Fuzzy find symbols across the workspace via LSP", cmdWorkspaceSymbols, null);
+        try R.register("lsp.toggle_format_on_save", "LSP: Toggle Format on Save", "Run the LSP formatter automatically before each save", cmdLspToggleFormatOnSave, null);
 
         try R.register("mode.insert", "Mode: Insert", "Switch to insert mode", Wrap(SystemCommands.cmdModeInsert).run, null);
         try R.register("mode.visual", "Mode: Visual", "Switch to visual mode", Wrap(SystemCommands.cmdModeVisual).run, null);
@@ -1037,6 +1342,15 @@ pub const Core = struct {
             self.search_index.startIndexing(cwd) catch |err| {
                 std.log.warn("Search index startup failed: {}", .{err});
             };
+            // Bind bookmarks to this project so set/get persists across
+            // restarts. Failure here is non-fatal — bookmarks just stay
+            // in-memory for the session.
+            if (self.homeDir()) |home| {
+                defer self.allocator.free(home);
+                self.bookmarks.attachProject(self.io, home, cwd) catch |err| {
+                    log.warn("Bookmark store attach failed: {}", .{err});
+                };
+            } else |_| {}
         } else |_| {}
 
         // Eagerly send `didOpen` for the active buffer so the LSP is aware
@@ -1199,6 +1513,12 @@ pub const Core = struct {
                         // file changed on disk under us — common when a
                         // formatter or git checkout rewrites the file.
                         self.maybeCheckExternalChange();
+
+                        // Refresh the word-under-cursor highlight. Only
+                        // applies after `word_highlight_idle_ms` of
+                        // cursor stillness, so fast scrolling doesn't
+                        // flash decorations across the viewport.
+                        self.maybeRefreshWordHighlight();
 
                         // Hover and which-key are both user-driven —
                         // the auto-hover idle timer used to fire
@@ -2018,12 +2338,115 @@ pub const Core = struct {
     }
 
     fn handleSelectInput(self: *Core, key: vaxis.Key) !bool {
+        // Esc clears all transient select-mode state — multi-cursors,
+        // pending chord prefixes, the nav repeat count — so the user
+        // can always bail back to a clean slate.
+        if (key.matches(vaxis.Key.escape, .{})) {
+            if (self.multi_cursors.items.len > 0) {
+                self.clearMultiCursors();
+            }
+            self.bracket_pending = null;
+            self.bookmark_set_pending = false;
+            self.bookmark_jump_pending = false;
+            self.text_object_state = .none;
+            self.nav_repeat_count = 0;
+            return true;
+        }
+
+        // Text-object chord: `s i <c>` selects inside, `s a <c>` selects
+        // around. Each follow-up advances the state machine; any
+        // non-matching key cancels.
+        switch (self.text_object_state) {
+            .none => {},
+            .s_seen => {
+                self.text_object_state = .none;
+                if (key.matches('i', .{})) {
+                    self.text_object_state = .inside_pending;
+                    return true;
+                }
+                if (key.matches('a', .{})) {
+                    self.text_object_state = .around_pending;
+                    return true;
+                }
+                if (key.matches('d', .{})) {
+                    self.text_object_state = .surround_delete_pending;
+                    return true;
+                }
+                if (key.matches('r', .{})) {
+                    self.text_object_state = .surround_replace_old_pending;
+                    return true;
+                }
+                // Cancel; fall through to normal handling.
+            },
+            .inside_pending, .around_pending => {
+                const around = self.text_object_state == .around_pending;
+                self.text_object_state = .none;
+                if (key.codepoint > 0 and key.codepoint < 0x80) {
+                    try self.selectTextObject(@intCast(key.codepoint), around);
+                    return true;
+                }
+                // Non-ASCII or modified key cancels the chord.
+            },
+            .surround_delete_pending => {
+                self.text_object_state = .none;
+                if (key.codepoint > 0 and key.codepoint < 0x80) {
+                    try self.deleteSurround(@intCast(key.codepoint));
+                    return true;
+                }
+            },
+            .surround_replace_old_pending => {
+                if (key.codepoint > 0 and key.codepoint < 0x80) {
+                    self.surround_replace_old = @intCast(key.codepoint);
+                    self.text_object_state = .surround_replace_new_pending;
+                    return true;
+                }
+                self.text_object_state = .none;
+            },
+            .surround_replace_new_pending => {
+                const old = self.surround_replace_old;
+                self.text_object_state = .none;
+                if (key.codepoint > 0 and key.codepoint < 0x80) {
+                    try self.replaceSurround(old, @intCast(key.codepoint));
+                    return true;
+                }
+            },
+            .surround_add_pending => {
+                // `S <c>` is a visual-mode chord; if we end up here in
+                // select mode (mode switched mid-chord), cancel safely.
+                self.text_object_state = .none;
+            },
+        }
+
+        // `m<a-z>` sets the bookmark slot, `'<a-z>` jumps to it. Both
+        // are one-shot chords; any non-matching follow-up cancels.
+        if (self.bookmark_set_pending) {
+            self.bookmark_set_pending = false;
+            if (key.codepoint >= 'a' and key.codepoint <= 'z' and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+                try self.setBookmark(@intCast(key.codepoint));
+                return true;
+            }
+            // Fall through — unknown follow-up dispatches normally.
+        }
+        if (self.bookmark_jump_pending) {
+            self.bookmark_jump_pending = false;
+            if (key.codepoint >= 'a' and key.codepoint <= 'z' and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+                try self.jumpToBookmark(@intCast(key.codepoint));
+                return true;
+            }
+            // Fall through — unknown follow-up dispatches normally.
+        }
+
         // `]d` / `[d` jump to next/previous diagnostic. The bracket prefix
         // is a one-shot — any non-matching follow-up cancels it.
         if (self.bracket_pending) |prefix| {
             self.bracket_pending = null;
             if (key.matches('d', .{})) {
                 try self.jumpToDiagnostic(prefix == ']');
+                return true;
+            }
+            // `]g` / `[g` — next/previous git diff hunk in this buffer.
+            if (key.matches('g', .{})) {
+                try self.jumpToHunk(prefix == ']');
                 return true;
             }
             // Tree-sitter AST motions:
@@ -2497,6 +2920,82 @@ pub const Core = struct {
             return true;
         }
 
+        // Bookmark chord triggers. `m` opens the set chord; `'` opens
+        // the jump chord. The follow-up letter resolves both.
+        if (key.matches('m', .{})) {
+            self.bookmark_set_pending = true;
+            self.setStatusLiteralLeveled(.info, "Set bookmark: a-z", 2000);
+            return true;
+        }
+        if (key.matches('\'', .{})) {
+            self.bookmark_jump_pending = true;
+            self.setStatusLiteralLeveled(.info, "Jump to bookmark: a-z", 2000);
+            return true;
+        }
+
+        // Text-object trigger. `s` starts the chord; `i <c>` / `a <c>`
+        // resolve it.
+        if (key.matches('s', .{})) {
+            self.text_object_state = .s_seen;
+            self.setStatusLiteralLeveled(.info, "Select: i<c>=inside, a<c>=around (w W p \" ' ` ( [ { <)", 2500);
+            return true;
+        }
+
+        // Multi-cursor: add next occurrence of the word under cursor
+        // (or current selection in visual mode) as a secondary cursor.
+        if (key.matches('d', .{ .ctrl = true })) {
+            try self.addNextOccurrence();
+            return true;
+        }
+
+        // Word motions: vim-style w/b/e for word boundaries (mixing
+        // identifier and punctuation runs), W/B for WORD boundaries
+        // (whitespace-separated). `e` lands on the last char of a word.
+        if (key.matches('w', .{})) {
+            const s = self.state();
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorNextWord();
+            return true;
+        }
+        if (key.matches('b', .{})) {
+            const s = self.state();
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorPrevWord();
+            return true;
+        }
+        if (key.matches('e', .{})) {
+            const s = self.state();
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorNextWordEnd();
+            return true;
+        }
+        if (key.matches('W', .{ .shift = true })) {
+            const s = self.state();
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorNextBigWord();
+            return true;
+        }
+        if (key.matches('B', .{ .shift = true })) {
+            const s = self.state();
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorPrevBigWord();
+            return true;
+        }
+
+        // Paragraph jumps: `}` next blank-line-separated block, `{` previous.
+        if (key.matches('}', .{ .shift = true })) {
+            const s = self.state();
+            var i: usize = 0;
+            while (i < count) : (i += 1) s.moveCursorNextParagraph();
+            return true;
+        }
+        if (key.matches('{', .{ .shift = true })) {
+            const s = self.state();
+            var i: usize = 0;
+            while (i < count) : (i += 1) s.moveCursorPrevParagraph();
+            return true;
+        }
+
         if (key.matches('%', .{ .shift = true })) {
             try NavCommands.cmdNavMatchBracket(self);
             return true;
@@ -2551,16 +3050,74 @@ pub const Core = struct {
         }
 
         if (key.matches('/', .{})) {
-            self.previous_mode = .select;
-            self.mode = .visual_search;
-            self.search_input.clearRetainingCapacity();
+            try self.enterIncrementalSearch(.select, .forward);
+            return true;
+        }
+        if (key.matches('?', .{ .shift = true })) {
+            try self.enterIncrementalSearch(.select, .backward);
             return true;
         }
 
         return false;
     }
 
+    fn enterIncrementalSearch(self: *Core, prev_mode: protocol.Mode, direction: enum { forward, backward }) !void {
+        self.previous_mode = prev_mode;
+        self.mode = .visual_search;
+        self.search_input.clearRetainingCapacity();
+        self.search_direction = if (direction == .forward) .forward else .backward;
+        const s = self.state();
+        self.search_origin_row = s.cursor_row;
+        self.search_origin_col = s.cursor_col;
+        self.search_match_count = 0;
+        self.search_match_index = 0;
+    }
+
     fn handleVisualInput(self: *Core, key: vaxis.Key) !bool {
+        // Text-object chord: in visual mode, `i <c>` / `a <c>` extend
+        // the selection to the inside/around of the named object.
+        // Matches vim's standard visual-mode bindings.
+        switch (self.text_object_state) {
+            .inside_pending, .around_pending => {
+                const around = self.text_object_state == .around_pending;
+                self.text_object_state = .none;
+                if (key.codepoint > 0 and key.codepoint < 0x80) {
+                    try self.selectTextObject(@intCast(key.codepoint), around);
+                    return true;
+                }
+            },
+            else => {},
+        }
+        if (key.matches('i', .{})) {
+            self.text_object_state = .inside_pending;
+            return true;
+        }
+        if (key.matches('a', .{})) {
+            self.text_object_state = .around_pending;
+            return true;
+        }
+
+        // Surround-add chord: `S <c>` wraps the current selection
+        // with the matching pair for <c>. Single delimiter (")` or
+        // bracket-style pair (( → ( … )).
+        if (self.text_object_state == .none and key.matches('S', .{ .shift = true })) {
+            self.text_object_state = .surround_add_pending;
+            return true;
+        }
+        // Multi-cursor: Ctrl+D in visual mode uses the selection as
+        // the seed query for next-occurrence search.
+        if (key.matches('d', .{ .ctrl = true })) {
+            try self.addNextOccurrence();
+            return true;
+        }
+        if (self.text_object_state == .surround_add_pending) {
+            self.text_object_state = .none;
+            if (key.codepoint > 0 and key.codepoint < 0x80) {
+                try self.addSurround(@intCast(key.codepoint));
+                return true;
+            }
+        }
+
         if (key.matches(vaxis.Key.delete, .{}) or key.matches(vaxis.Key.backspace, .{})) {
             const s = self.state();
 
@@ -2601,9 +3158,11 @@ pub const Core = struct {
         }
 
         if (key.matches('/', .{})) {
-            self.previous_mode = .visual;
-            self.mode = .visual_search;
-            self.search_input.clearRetainingCapacity();
+            try self.enterIncrementalSearch(.visual, .forward);
+            return true;
+        }
+        if (key.matches('?', .{ .shift = true })) {
+            try self.enterIncrementalSearch(.visual, .backward);
             return true;
         }
 
@@ -2689,6 +3248,43 @@ pub const Core = struct {
             return true;
         }
 
+        // Word + paragraph motions extend the selection.
+        if (key.matches('w', .{})) {
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorNextWord();
+            return true;
+        }
+        if (key.matches('b', .{})) {
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorPrevWord();
+            return true;
+        }
+        if (key.matches('e', .{})) {
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorNextWordEnd();
+            return true;
+        }
+        if (key.matches('W', .{ .shift = true })) {
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorNextBigWord();
+            return true;
+        }
+        if (key.matches('B', .{ .shift = true })) {
+            var i: usize = 0;
+            while (i < count) : (i += 1) try s.moveCursorPrevBigWord();
+            return true;
+        }
+        if (key.matches('}', .{ .shift = true })) {
+            var i: usize = 0;
+            while (i < count) : (i += 1) s.moveCursorNextParagraph();
+            return true;
+        }
+        if (key.matches('{', .{ .shift = true })) {
+            var i: usize = 0;
+            while (i < count) : (i += 1) s.moveCursorPrevParagraph();
+            return true;
+        }
+
         return false;
     }
 
@@ -2699,46 +3295,260 @@ pub const Core = struct {
                 self.last_search_query.appendSlice(self.allocator, self.search_input.items) catch |err| {
                     log.warn("Failed to persist last search query: {}", .{err});
                 };
-
-                const query = self.search_input.items;
-                const s = self.state();
-
-                const start_offset = s.getOffsetFromCursor();
-                if (try s.buffer.find(query, start_offset)) |found_offset| {
-                    s.updateCursorFromOffset(found_offset);
-
-                    self.mode = self.previous_mode;
-                    if (self.mode == .select) {
-                        s.selection_anchor = null;
-                    }
-                    self.search_input.clearRetainingCapacity();
-                } else {
-                    self.mode = self.previous_mode;
-                    self.search_input.clearRetainingCapacity();
+                // Cursor is already on the live-previewed match; just
+                // exit the prompt and keep it where it is.
+                self.mode = self.previous_mode;
+                if (self.mode == .select) {
+                    const s = self.state();
+                    s.selection_anchor = null;
                 }
-                return true;
+                self.search_input.clearRetainingCapacity();
             } else {
                 self.mode = self.previous_mode;
                 self.decoration_manager.removeBySource("search");
-                return true;
             }
+            return true;
         } else if (key.matches(vaxis.Key.escape, .{})) {
+            // Revert cursor to its pre-search location so a cancelled
+            // search doesn't leave the user stranded mid-preview.
+            const s = self.state();
+            s.cursor_row = self.search_origin_row;
+            s.cursor_col = self.search_origin_col;
+            s.preferred_col = null;
             self.mode = self.previous_mode;
             self.search_input.clearRetainingCapacity();
             self.decoration_manager.removeBySource("search");
+            self.search_match_count = 0;
+            self.search_match_index = 0;
             return true;
         } else if (key.matches(vaxis.Key.backspace, .{})) {
             if (self.search_input.items.len > 0) {
                 _ = self.search_input.pop();
                 try self.updateSearchDecorations();
+                self.jumpToIncrementalMatch();
                 return true;
             }
         } else if (key.text) |text| {
             try self.search_input.appendSlice(self.allocator, text);
             try self.updateSearchDecorations();
+            self.jumpToIncrementalMatch();
             return true;
         }
         return false;
+    }
+
+    /// Move the cursor to the closest match in `search_direction`
+    /// starting from `search_origin_*`. Called on every keystroke
+    /// during the search prompt so the user can preview where Enter
+    /// will land. Wraps at file boundaries.
+    fn jumpToIncrementalMatch(self: *Core) void {
+        const query = self.search_input.items;
+        if (query.len == 0) {
+            const s = self.state();
+            s.cursor_row = self.search_origin_row;
+            s.cursor_col = self.search_origin_col;
+            self.search_match_count = 0;
+            self.search_match_index = 0;
+            return;
+        }
+        const s = self.state();
+        const target = self.findMatchSmartCase(query, self.search_origin_row, self.search_origin_col, self.search_direction);
+        if (target) |pos| {
+            s.cursor_row = pos.row;
+            s.cursor_col = pos.col;
+            s.preferred_col = null;
+            self.recenterIfOffscreen();
+            self.updateSearchMatchCounters();
+        }
+    }
+
+    const MatchPos = struct { row: usize, col: usize };
+
+    /// Smart-case match scan across the whole buffer. Returns the
+    /// closest match in the requested direction, wrapping at file
+    /// boundaries. Walks per-line so the comparison can be
+    /// case-insensitive cheaply. Bounded by `max_buffer_search_matches`
+    /// indirectly via line iteration; for the common interactive case
+    /// this is well under a millisecond.
+    fn findMatchSmartCase(
+        self: *Core,
+        query: []const u8,
+        from_row: usize,
+        from_col: usize,
+        direction: @TypeOf(self.search_direction),
+    ) ?MatchPos {
+        const s = self.state();
+        const total_lines = s.buffer.lineCount();
+        if (total_lines == 0 or query.len == 0) return null;
+        const case_sensitive = querySensitive(query);
+
+        switch (direction) {
+            .forward => {
+                // Pass 1: scan from (from_row, from_col) to EOF.
+                var line_num = from_row;
+                while (line_num < total_lines) : (line_num += 1) {
+                    if (lineMatch(self, line_num, query, case_sensitive, if (line_num == from_row) from_col else 0, .forward)) |col| {
+                        return .{ .row = line_num, .col = col };
+                    }
+                }
+                // Pass 2: wrap from BOF to (from_row, from_col).
+                line_num = 0;
+                while (line_num <= from_row) : (line_num += 1) {
+                    const limit = if (line_num == from_row) from_col else std.math.maxInt(usize);
+                    if (lineMatchBounded(self, line_num, query, case_sensitive, 0, limit)) |col| {
+                        return .{ .row = line_num, .col = col };
+                    }
+                }
+            },
+            .backward => {
+                // Pass 1: scan from (from_row, from_col) backward to BOF.
+                var line_num: isize = @intCast(from_row);
+                while (line_num >= 0) : (line_num -= 1) {
+                    const ln: usize = @intCast(line_num);
+                    const limit: usize = if (ln == from_row) from_col else std.math.maxInt(usize);
+                    if (lineMatch(self, ln, query, case_sensitive, limit, .backward)) |col| {
+                        return .{ .row = ln, .col = col };
+                    }
+                }
+                // Pass 2: wrap from EOF back to (from_row, from_col).
+                line_num = @intCast(total_lines - 1);
+                while (line_num >= @as(isize, @intCast(from_row))) : (line_num -= 1) {
+                    const ln: usize = @intCast(line_num);
+                    const start_col: usize = if (ln == from_row) from_col + 1 else 0;
+                    if (lineMatchBounded(self, ln, query, case_sensitive, start_col, std.math.maxInt(usize))) |col| {
+                        return .{ .row = ln, .col = col };
+                    }
+                }
+            },
+        }
+        return null;
+    }
+
+    fn lineMatch(
+        self: *Core,
+        line_num: usize,
+        query: []const u8,
+        case_sensitive: bool,
+        from_col: usize,
+        dir: enum { forward, backward },
+    ) ?usize {
+        const s = self.state();
+        const line = s.getLineContent(line_num) catch return null;
+        defer self.allocator.free(line);
+        if (line.len < query.len) return null;
+        switch (dir) {
+            .forward => {
+                var col = from_col;
+                while (col + query.len <= line.len) : (col += 1) {
+                    const slice = line[col .. col + query.len];
+                    const eq = if (case_sensitive)
+                        std.mem.eql(u8, slice, query)
+                    else
+                        asciiEqlIgnoreCase(slice, query);
+                    if (eq) return col;
+                }
+            },
+            .backward => {
+                if (line.len < query.len) return null;
+                const upper = @min(from_col, line.len - query.len + 1);
+                var col: isize = @as(isize, @intCast(upper)) - 1;
+                while (col >= 0) : (col -= 1) {
+                    const uc: usize = @intCast(col);
+                    const slice = line[uc .. uc + query.len];
+                    const eq = if (case_sensitive)
+                        std.mem.eql(u8, slice, query)
+                    else
+                        asciiEqlIgnoreCase(slice, query);
+                    if (eq) return uc;
+                }
+            },
+        }
+        return null;
+    }
+
+    fn lineMatchBounded(
+        self: *Core,
+        line_num: usize,
+        query: []const u8,
+        case_sensitive: bool,
+        from_col: usize,
+        upper_col_exclusive: usize,
+    ) ?usize {
+        const s = self.state();
+        const line = s.getLineContent(line_num) catch return null;
+        defer self.allocator.free(line);
+        if (line.len < query.len) return null;
+        const upper = @min(upper_col_exclusive, line.len - query.len + 1);
+        var col = from_col;
+        var best: ?usize = null;
+        while (col < upper) : (col += 1) {
+            const slice = line[col .. col + query.len];
+            const eq = if (case_sensitive)
+                std.mem.eql(u8, slice, query)
+            else
+                asciiEqlIgnoreCase(slice, query);
+            if (eq) best = col;
+        }
+        return best;
+    }
+
+    /// Walk the buffer counting all matches and the index of the one
+    /// the cursor currently sits in. Bounded by
+    /// `max_buffer_search_matches`. Smart-case: if the query has any
+    /// uppercase byte, comparison is case-sensitive; otherwise it's
+    /// case-insensitive (mirrors ripgrep / Helix).
+    fn updateSearchMatchCounters(self: *Core) void {
+        const query = self.search_input.items;
+        if (query.len == 0) {
+            self.search_match_count = 0;
+            self.search_match_index = 0;
+            return;
+        }
+        const s = self.state();
+        const case_sensitive = querySensitive(query);
+
+        var total: usize = 0;
+        var idx: usize = 0;
+        const total_lines = s.buffer.lineCount();
+        var line_num: usize = 0;
+        while (line_num < total_lines and total < self.max_buffer_search_matches) : (line_num += 1) {
+            const line = s.getLineContent(line_num) catch continue;
+            defer self.allocator.free(line);
+            var col: usize = 0;
+            while (col + query.len <= line.len) {
+                const eq = if (case_sensitive)
+                    std.mem.eql(u8, line[col .. col + query.len], query)
+                else
+                    asciiEqlIgnoreCase(line[col .. col + query.len], query);
+                if (eq) {
+                    total += 1;
+                    if (line_num == s.cursor_row and col == s.cursor_col) {
+                        idx = total;
+                    }
+                    col += query.len;
+                    if (total >= self.max_buffer_search_matches) break;
+                } else {
+                    col += 1;
+                }
+            }
+        }
+        self.search_match_count = total;
+        self.search_match_index = idx;
+    }
+
+    fn querySensitive(q: []const u8) bool {
+        for (q) |b| {
+            if (b >= 'A' and b <= 'Z') return true;
+        }
+        return false;
+    }
+
+    fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| {
+            if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+        }
+        return true;
     }
 
     fn updateSearchDecorations(self: *Core) !void {
@@ -3751,9 +4561,114 @@ pub const Core = struct {
         const msg = if (buf.state.modified)
             std.fmt.bufPrint(&self.skip_status_buf, "WARNING: '{s}' changed on disk while you have unsaved edits", .{basename}) catch return
         else
-            std.fmt.bufPrint(&self.skip_status_buf, "'{s}' changed on disk \u{2014} :e! to reload", .{basename}) catch return;
+            std.fmt.bufPrint(&self.skip_status_buf, "'{s}' changed on disk \u{2014} run file.reload to refresh", .{basename}) catch return;
         self.status_message = msg;
         self.status_message_expires = now + 5_000;
+    }
+
+    /// Repaint the word-under-cursor highlight if the cursor has been
+    /// still for `word_highlight_idle_ms`. Idempotent — re-walking on
+    /// the same word is a no-op (we cache it). Clears immediately when
+    /// the cursor moves, so the highlight follows intent.
+    fn maybeRefreshWordHighlight(self: *Core) void {
+        // Skip during modal interactions where highlighting would be
+        // visual noise.
+        switch (self.mode) {
+            .select, .view => {},
+            else => {
+                self.clearWordHighlight();
+                return;
+            },
+        }
+
+        const now = std.Io.Clock.real.now(self.io).toMilliseconds();
+        const idle = now - self.last_cursor_move_time;
+
+        if (idle < self.word_highlight_idle_ms) {
+            // Cursor still moving — drop any stale highlight so we
+            // don't trail the cursor.
+            self.clearWordHighlight();
+            return;
+        }
+
+        const s = self.state();
+        const cur_line = s.getLineContent(s.cursor_row) catch return;
+        defer self.allocator.free(cur_line);
+
+        const range = unicode.wordRangeAt(cur_line, s.cursor_col) orelse {
+            self.clearWordHighlight();
+            return;
+        };
+        const word = cur_line[range.start..range.end];
+        // Don't bother with single-char "words" — too noisy.
+        if (word.len < 2) {
+            self.clearWordHighlight();
+            return;
+        }
+
+        // No change since last paint?
+        if (self.last_word_highlight) |prev| {
+            if (std.mem.eql(u8, prev, word)) return;
+        }
+
+        // New word — repaint.
+        self.applyWordHighlight(word);
+    }
+
+    fn clearWordHighlight(self: *Core) void {
+        if (self.last_word_highlight) |w| {
+            self.allocator.free(w);
+            self.last_word_highlight = null;
+            self.decoration_manager.removeBySource("word_highlight");
+        }
+    }
+
+    fn applyWordHighlight(self: *Core, word: []const u8) void {
+        // Replace cached word.
+        if (self.last_word_highlight) |w| self.allocator.free(w);
+        self.last_word_highlight = self.allocator.dupe(u8, word) catch return;
+        self.decoration_manager.removeBySource("word_highlight");
+
+        // Scan only the visible window — decorations outside it would
+        // be wasted work and could mark thousands of lines on big files.
+        const s = self.state();
+        const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
+        const start = s.scroll_offset;
+        const end = @min(s.scroll_offset + visible_rows + 5, s.buffer.lineCount());
+
+        var row: usize = start;
+        while (row < end) : (row += 1) {
+            const line = s.getLineContent(row) catch continue;
+            defer self.allocator.free(line);
+            var col: usize = 0;
+            while (col + word.len <= line.len) {
+                if (std.mem.eql(u8, line[col .. col + word.len], word)) {
+                    // Require word boundaries on both sides — don't
+                    // highlight `foo` inside `foobar`.
+                    const before_ok = col == 0 or !isWordByte(line[col - 1]);
+                    const after_ok = col + word.len == line.len or !isWordByte(line[col + word.len]);
+                    if (before_ok and after_ok) {
+                        _ = self.decoration_manager.add(
+                            Range.singleLine(row, col, col + word.len),
+                            .word_highlight,
+                            50,
+                            null,
+                            "word_highlight",
+                        ) catch {};
+                        col += word.len;
+                        continue;
+                    }
+                }
+                col += 1;
+            }
+        }
+        // Request a render so the highlight shows up without waiting
+        // for the next user input.
+        self.needs_render = true;
+    }
+
+    fn isWordByte(b: u8) bool {
+        return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or (b >= '0' and b <= '9') or b == '_' or b >= 0x80;
     }
 
     fn writeRecoveryFile(self: *Core, path: []const u8, content: []const u8) !void {
@@ -3844,11 +4759,20 @@ pub const Core = struct {
         if (s.file_path) |path| {
             const basename = std.fs.path.basename(path);
 
+            // Two paths: format-on-save runs the LSP formatter first
+            // (and bails to plain save if the LSP doesn't support
+            // formatting for this filetype). The .zig special case
+            // honours format-on-save unconditionally to preserve the
+            // historical behaviour where ZLS formats every save.
+            const is_zig = std.mem.endsWith(u8, path, ".zig");
+            const format_first = is_zig or
+                (self.storage.config.editor.format_on_save and self.canLspFormat(path));
+
             // Surface failures in the status bar instead of letting
             // them propagate silently — the user just hit save and
             // deserves to know it didn't take. We still bubble the
             // error up so callers can react.
-            if (std.mem.endsWith(u8, path, ".zig")) {
+            if (format_first) {
                 self.formatAndSave() catch |err| {
                     self.setStatusError("Save failed for {s}: {s}", .{ basename, @errorName(err) }, 3000);
                     return err;
@@ -4440,38 +5364,41 @@ pub const Core = struct {
                 }
             }
 
-            if (!self.scroll_in_progress) {
-                if (syntax_tokens == null or syntax_tokens.?.len == 0) {
-                    if (lang == .markdown) {
-                        @import("../services/thread_name.zig").markStep("send:highlight_md");
-                        if (s.buffer.toString(alloc)) |content| {
-                            syntax_tokens = self.syntax_manager.highlightMarkdown(alloc, content, s.scroll_offset, s.scroll_offset + visible_rows + 5) catch null;
-                        } else |_| {}
-                    } else {
-                        @import("../services/thread_name.zig").markStep("send:highlight_ts");
-                        syntax_tokens = self.syntax_manager.highlight(alloc, s.scroll_offset, s.scroll_offset + visible_rows + 5) catch null;
-                    }
-                }
-
-                if (lang != .markdown and lang != .unknown) {
-                    @import("../services/thread_name.zig").markStep("send:brackets");
+            // Highlights and bracket coloring always run, scroll or not.
+            // The previous `if (!scroll_in_progress)` guard left the visible
+            // region with only LSP tokens during scroll, which produced a
+            // flash of unhighlighted text whenever LSP wasn't ready (cold
+            // start, no LSP for the language, just-revealed lines). The
+            // tree-sitter highlight is bounded to the visible range and is
+            // microseconds; brackets are cached per buffer-version (see
+            // `findBrackets`) so scroll is cheap.
+            if (syntax_tokens == null or syntax_tokens.?.len == 0) {
+                if (lang == .markdown) {
+                    @import("../services/thread_name.zig").markStep("send:highlight_md");
                     if (s.buffer.toString(alloc)) |content| {
-                        if (self.syntax_manager.findBrackets(alloc, content, s.scroll_offset, s.scroll_offset + visible_rows + 5)) |bracket_tokens| {
-                            if (bracket_tokens.len > 0) {
-                                const existing = syntax_tokens orelse &.{};
-                                const merged = alloc.alloc(protocol.SyntaxToken, existing.len + bracket_tokens.len) catch null;
-                                if (merged) |m| {
-                                    @memcpy(m[0..existing.len], existing);
-                                    @memcpy(m[existing.len..], bracket_tokens);
-                                    syntax_tokens = m;
-                                }
-                            }
-                        } else |_| {}
+                        syntax_tokens = self.syntax_manager.highlightMarkdown(alloc, content, s.scroll_offset, s.scroll_offset + visible_rows + 5) catch null;
                     } else |_| {}
+                } else {
+                    @import("../services/thread_name.zig").markStep("send:highlight_ts");
+                    syntax_tokens = self.syntax_manager.highlight(alloc, s.scroll_offset, s.scroll_offset + visible_rows + 5) catch null;
                 }
+            }
 
-                const lsp_count = if (use_lsp and syntax_tokens != null) syntax_tokens.?.len else 0;
-                _ = lsp_count;
+            if (lang != .markdown and lang != .unknown) {
+                @import("../services/thread_name.zig").markStep("send:brackets");
+                if (s.buffer.toString(alloc)) |content| {
+                    if (self.syntax_manager.findBrackets(alloc, content, s.scroll_offset, s.scroll_offset + visible_rows + 5)) |bracket_tokens| {
+                        if (bracket_tokens.len > 0) {
+                            const existing = syntax_tokens orelse &.{};
+                            const merged = alloc.alloc(protocol.SyntaxToken, existing.len + bracket_tokens.len) catch null;
+                            if (merged) |m| {
+                                @memcpy(m[0..existing.len], existing);
+                                @memcpy(m[existing.len..], bracket_tokens);
+                                syntax_tokens = m;
+                            }
+                        }
+                    } else |_| {}
+                } else |_| {}
             }
         }
 
@@ -4611,15 +5538,13 @@ pub const Core = struct {
                             }
                         }
 
-                        if (!self.scroll_in_progress) {
-                            if (pane_tokens == null or pane_tokens.?.len == 0) {
-                                if (pane_lang == .markdown) {
-                                    if (p_state.buffer.toString(alloc)) |content| {
-                                        pane_tokens = self.syntax_manager.highlightMarkdown(alloc, content, pane_scroll, pane_scroll + safe_pane_rows + 5) catch null;
-                                    } else |_| {}
-                                } else {
-                                    pane_tokens = self.syntax_manager.highlight(alloc, pane_scroll, pane_scroll + safe_pane_rows + 5) catch null;
-                                }
+                        if (pane_tokens == null or pane_tokens.?.len == 0) {
+                            if (pane_lang == .markdown) {
+                                if (p_state.buffer.toString(alloc)) |content| {
+                                    pane_tokens = self.syntax_manager.highlightMarkdown(alloc, content, pane_scroll, pane_scroll + safe_pane_rows + 5) catch null;
+                                } else |_| {}
+                            } else {
+                                pane_tokens = self.syntax_manager.highlight(alloc, pane_scroll, pane_scroll + safe_pane_rows + 5) catch null;
                             }
                         }
                     }
@@ -4684,6 +5609,9 @@ pub const Core = struct {
                 null,
             .save_as_input = save_as_input_slice,
             .search_input = search_input_slice,
+            .search_direction_forward = (self.search_direction == .forward),
+            .search_match_count = self.search_match_count,
+            .search_match_index = self.search_match_index,
             .command_palette_query = command_palette_query_slice,
             .command_palette_results = command_palette_results,
             .command_palette_selected = self.command_palette_selected,
@@ -5465,6 +6393,37 @@ pub const Core = struct {
     }
 
     fn handleGlobalSearchInput(self: *Core, key: vaxis.Key) !bool {
+        // Replace-confirmation flow: intercept y/n/A/q before the
+        // normal input path so they don't get typed into the query
+        // buffer. Esc bails out cleanly.
+        if (self.global_search_replace_active) {
+            if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+                try self.finishReplaceConfirm(false);
+                return true;
+            }
+            if (key.matches('y', .{})) {
+                try self.replaceConfirmStep(.replace);
+                return true;
+            }
+            if (key.matches('n', .{})) {
+                try self.replaceConfirmStep(.skip);
+                return true;
+            }
+            if (key.matches('A', .{ .shift = true })) {
+                self.global_search_replace_apply_all = true;
+                try self.replaceConfirmStep(.replace);
+                return true;
+            }
+            // Swallow other keys so they don't accidentally edit fields.
+            return true;
+        }
+
+        // Ctrl+R from global_search starts the replace-confirmation walk.
+        if (key.matches('r', .{ .ctrl = true })) {
+            try self.startReplaceConfirm();
+            return true;
+        }
+
         if (key.matches(vaxis.Key.tab, .{})) {
             self.global_search_focus_replace = !self.global_search_focus_replace;
             return true;
@@ -5559,6 +6518,216 @@ pub const Core = struct {
         }
 
         return false;
+    }
+
+    const ReplaceStep = enum { replace, skip };
+
+    /// Begin the replace-with-confirmation walk over the current search
+    /// results. Snapshots query+replace so subsequent typing into the
+    /// fields can't disturb the walk. Pre-conditions: both fields
+    /// non-empty AND there's at least one result. Otherwise: status
+    /// message, do nothing.
+    fn startReplaceConfirm(self: *Core) !void {
+        if (self.global_search_query.items.len == 0) {
+            self.setStatusLiteralLeveled(.warning, "Empty search query", 2000);
+            return;
+        }
+        if (self.global_search_replace.items.len == 0) {
+            self.setStatusLiteralLeveled(.warning, "Empty replacement (Tab to focus replace field)", 2500);
+            return;
+        }
+        if (self.global_search_results.items.len == 0) {
+            self.setStatusLiteralLeveled(.warning, "No matches to replace", 2000);
+            return;
+        }
+
+        // Snapshot so concurrent edits to the input fields can't
+        // corrupt the walk (e.g. user typing in the replace field
+        // between confirmations).
+        self.global_search_replace_query_snap.clearRetainingCapacity();
+        self.global_search_replace_text_snap.clearRetainingCapacity();
+        try self.global_search_replace_query_snap.appendSlice(self.allocator, self.global_search_query.items);
+        try self.global_search_replace_text_snap.appendSlice(self.allocator, self.global_search_replace.items);
+
+        self.global_search_replace_active = true;
+        self.global_search_replace_apply_all = false;
+        self.global_search_replace_file_idx = 0;
+        self.global_search_replace_match_idx = 0;
+        self.global_search_replace_count = 0;
+        self.global_search_replace_skipped = 0;
+        self.global_search_replace_line_delta = 0;
+        self.global_search_replace_last_file = std.math.maxInt(usize);
+        self.global_search_replace_last_line = 0;
+
+        try self.showReplaceConfirmPrompt();
+    }
+
+    /// Advance the walk by one step (replace or skip). Triggers the
+    /// next prompt, or finishes the flow when there are no more matches.
+    fn replaceConfirmStep(self: *Core, step: ReplaceStep) !void {
+        // Apply (or skip) the current match.
+        if (step == .replace) {
+            self.applyCurrentReplaceMatch() catch |err| {
+                log.warn("Replace failed at file_idx={d} match_idx={d}: {}", .{
+                    self.global_search_replace_file_idx,
+                    self.global_search_replace_match_idx,
+                    err,
+                });
+            };
+        } else {
+            self.global_search_replace_skipped += 1;
+        }
+        // Move to the next match.
+        self.advanceReplaceCursor();
+
+        // If "Apply All", silently consume the remainder.
+        if (self.global_search_replace_apply_all) {
+            while (self.replaceWalkHasCurrent()) {
+                self.applyCurrentReplaceMatch() catch {};
+                self.advanceReplaceCursor();
+            }
+            try self.finishReplaceConfirm(true);
+            return;
+        }
+
+        if (!self.replaceWalkHasCurrent()) {
+            try self.finishReplaceConfirm(true);
+            return;
+        }
+        try self.showReplaceConfirmPrompt();
+    }
+
+    fn replaceWalkHasCurrent(self: *Core) bool {
+        return self.global_search_replace_file_idx < self.global_search_results.items.len;
+    }
+
+    fn advanceReplaceCursor(self: *Core) void {
+        if (self.global_search_replace_file_idx >= self.global_search_results.items.len) return;
+        const group = self.global_search_results.items[self.global_search_replace_file_idx];
+        if (self.global_search_replace_match_idx + 1 < group.matches.len) {
+            self.global_search_replace_match_idx += 1;
+        } else {
+            self.global_search_replace_file_idx += 1;
+            self.global_search_replace_match_idx = 0;
+        }
+    }
+
+    /// Open the active match's file, position the cursor on the match,
+    /// and surface the y/n/A/q prompt in the status bar.
+    fn showReplaceConfirmPrompt(self: *Core) !void {
+        const file_idx = self.global_search_replace_file_idx;
+        const group = self.global_search_results.items[file_idx];
+        const match = group.matches[self.global_search_replace_match_idx];
+
+        // Open the file and place the cursor at the (delta-adjusted)
+        // match column so the user sees what's about to be touched.
+        const full_path = std.Io.Dir.cwd().realPathFileAlloc(self.io, group.file_path, self.allocator) catch {
+            // File vanished mid-walk — skip it.
+            self.global_search_replace_file_idx += 1;
+            self.global_search_replace_match_idx = 0;
+            if (!self.replaceWalkHasCurrent()) {
+                try self.finishReplaceConfirm(true);
+                return;
+            }
+            try self.showReplaceConfirmPrompt();
+            return;
+        };
+        defer self.allocator.free(full_path);
+        try self.openFileAtLine(full_path, match.line_num);
+        const adjusted_col = self.adjustedMatchCol(file_idx, match);
+        const s = self.state();
+        s.cursor_col = adjusted_col;
+        self.recenterIfOffscreen();
+
+        const total = self.countTotalMatches();
+        const done = self.global_search_replace_count + self.global_search_replace_skipped + 1;
+        const msg = std.fmt.bufPrint(
+            &self.skip_status_buf,
+            "Replace? [y]es [n]o [A]ll [q]uit  ({d}/{d})",
+            .{ done, total },
+        ) catch return;
+        self.status_message = msg;
+        self.status_message_expires = std.math.maxInt(i64);
+        // Stay in global_search mode so our handler keeps seeing keys,
+        // but visually the user is now in the buffer.
+        self.mode = .global_search;
+        try self.sendUpdate();
+    }
+
+    fn countTotalMatches(self: *Core) usize {
+        var n: usize = 0;
+        for (self.global_search_results.items) |g| n += g.matches.len;
+        return n;
+    }
+
+    /// Translate the search result's original column to the current
+    /// column after prior replacements on the same line shifted text.
+    fn adjustedMatchCol(self: *Core, file_idx: usize, match: protocol.GlobalSearchMatch) usize {
+        if (file_idx == self.global_search_replace_last_file and match.line_num == self.global_search_replace_last_line) {
+            const c: i64 = @intCast(match.match_start);
+            const adj = c + self.global_search_replace_line_delta;
+            if (adj < 0) return 0;
+            return @intCast(adj);
+        }
+        return match.match_start;
+    }
+
+    fn applyCurrentReplaceMatch(self: *Core) !void {
+        const file_idx = self.global_search_replace_file_idx;
+        if (file_idx >= self.global_search_results.items.len) return;
+        const group = self.global_search_results.items[file_idx];
+        if (self.global_search_replace_match_idx >= group.matches.len) return;
+        const match = group.matches[self.global_search_replace_match_idx];
+
+        // Reset the line-delta counter when we move to a different line.
+        if (file_idx != self.global_search_replace_last_file or
+            match.line_num != self.global_search_replace_last_line)
+        {
+            self.global_search_replace_line_delta = 0;
+            self.global_search_replace_last_file = file_idx;
+            self.global_search_replace_last_line = match.line_num;
+        }
+
+        const full_path = try std.Io.Dir.cwd().realPathFileAlloc(self.io, group.file_path, self.allocator);
+        defer self.allocator.free(full_path);
+        try self.openFileAtLine(full_path, match.line_num);
+
+        const s = self.state();
+        const start_col = self.adjustedMatchCol(file_idx, match);
+        const query = self.global_search_replace_query_snap.items;
+        const replacement = self.global_search_replace_text_snap.items;
+        const start_off = s.getOffsetFor(match.line_num, start_col);
+        const end_off = start_off + query.len;
+        try s.deleteRange(start_off, end_off);
+        s.cursor_row = match.line_num;
+        s.cursor_col = start_col;
+        try s.insertTextAtCursor(replacement);
+
+        const delta: i64 = @as(i64, @intCast(replacement.len)) - @as(i64, @intCast(query.len));
+        self.global_search_replace_line_delta += delta;
+        self.global_search_replace_count += 1;
+    }
+
+    fn finishReplaceConfirm(self: *Core, completed: bool) !void {
+        const replaced = self.global_search_replace_count;
+        const skipped = self.global_search_replace_skipped;
+        self.global_search_replace_active = false;
+        self.global_search_replace_apply_all = false;
+        self.global_search_replace_query_snap.clearRetainingCapacity();
+        self.global_search_replace_text_snap.clearRetainingCapacity();
+        // Return to select mode in whichever buffer we ended up on so
+        // the user can immediately review/save.
+        self.mode = .select;
+
+        const tag = if (completed) "Replace done" else "Replace cancelled";
+        const msg = std.fmt.bufPrint(
+            &self.skip_status_buf,
+            "{s}: {d} replaced, {d} skipped",
+            .{ tag, replaced, skipped },
+        ) catch return;
+        self.status_message = msg;
+        self.status_message_expires = std.Io.Clock.real.now(self.io).toMilliseconds() + 4000;
+        try self.sendUpdate();
     }
 
     fn performGlobalSearch(self: *Core) !void {
@@ -5657,6 +6826,582 @@ pub const Core = struct {
         const half = visible_rows / 2;
         s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
 
+        try self.sendUpdate();
+    }
+
+    fn setBookmark(self: *Core, slot: u8) !void {
+        const s = self.state();
+        const path = s.file_path orelse {
+            self.setStatusLiteralLeveled(.warning, "Cannot bookmark unsaved buffer", 2000);
+            return;
+        };
+        const now = std.Io.Clock.real.now(self.io).toMilliseconds();
+        try self.bookmarks.set(slot, path, s.cursor_row, s.cursor_col, now);
+        self.bookmarks.save(self.io) catch |err| {
+            log.warn("Failed to persist bookmark: {}", .{err});
+        };
+        const msg = std.fmt.bufPrint(&self.skip_status_buf, "Bookmark '{c}' set at line {d}", .{ slot, s.cursor_row + 1 }) catch return;
+        self.status_message = msg;
+        self.status_message_expires = now + 2000;
+        try self.sendUpdate();
+    }
+
+    fn jumpToBookmark(self: *Core, slot: u8) !void {
+        const bm = self.bookmarks.get(slot) orelse {
+            const msg = std.fmt.bufPrint(&self.skip_status_buf, "Bookmark '{c}' not set", .{slot}) catch return;
+            self.status_message = msg;
+            self.status_message_expires = std.Io.Clock.real.now(self.io).toMilliseconds() + 1500;
+            return;
+        };
+        // Record the current spot in the jump list before we leave, so
+        // Space `,` can bring the user back.
+        if (self.state().file_path) |cur_path| {
+            self.jump_list.recordJump(cur_path, self.state().cursor_row, self.state().cursor_col) catch {};
+        }
+        try self.openFileAtLine(bm.file_path, bm.row);
+        const s = self.state();
+        s.cursor_col = bm.col;
+        s.preferred_col = null;
+        self.recenterIfOffscreen();
+        try self.sendUpdate();
+    }
+
+    fn openBookmarksBuffer(self: *Core) !void {
+        const name = "[Bookmarks]";
+
+        var content = std.ArrayListUnmanaged(u8).empty;
+        defer content.deinit(self.allocator);
+
+        try content.appendSlice(self.allocator, "# Bookmarks\n\n");
+        if (self.bookmarks.count() == 0) {
+            try content.appendSlice(self.allocator, "(none set \u{2014} use `mx` in select mode to set, `'x` to jump)\n");
+        } else {
+            try content.appendSlice(self.allocator, "Slot  Line   File\n");
+            try content.appendSlice(self.allocator, "----  -----  --------------------------------\n");
+            for (self.bookmarks.slots, 0..) |slot, i| {
+                if (slot) |bm| {
+                    const slot_char: u8 = @intCast('a' + i);
+                    const row_str = try std.fmt.allocPrint(self.allocator, " {c}    {d: >5}  {s}\n", .{ slot_char, bm.row + 1, bm.file_path });
+                    defer self.allocator.free(row_str);
+                    try content.appendSlice(self.allocator, row_str);
+                }
+            }
+            try content.appendSlice(self.allocator, "\nUse `'<slot>` from any buffer to jump.\n");
+        }
+        try self.buffer_manager.openVirtual(name, content.items);
+        self.refreshSyntaxForCurrentBuffer();
+        try self.sendUpdate();
+    }
+
+    /// Apply a text-object selection: turn the named object (word,
+    /// paragraph, quote-delimited string, bracket pair, …) into a
+    /// visual selection rooted at the cursor. `around` includes the
+    /// delimiters; `!around` excludes them. Quietly does nothing if
+    /// the object isn't found.
+    fn selectTextObject(self: *Core, ch: u8, around: bool) !void {
+        const s = self.state();
+        const range = self.findTextObject(ch, around) orelse {
+            self.setStatusLiteralLeveled(.warning, "Text object not found", 1200);
+            return;
+        };
+        s.selection_anchor = .{ .row = range.start_row, .col = range.start_col };
+        s.cursor_row = range.end_row;
+        s.cursor_col = range.end_col;
+        self.mode = .visual;
+        try self.sendUpdate();
+    }
+
+    const TextRange = struct {
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    };
+
+    fn findTextObject(self: *Core, ch: u8, around: bool) ?TextRange {
+        switch (ch) {
+            'w' => return self.textObjectWord(around, false),
+            'W' => return self.textObjectWord(around, true),
+            'p' => return self.textObjectParagraph(around),
+            '"', '\'', '`' => return self.textObjectQuote(ch, around),
+            '(', ')', 'b' => return self.textObjectBracket('(', ')', around),
+            '[', ']' => return self.textObjectBracket('[', ']', around),
+            '{', '}', 'B' => return self.textObjectBracket('{', '}', around),
+            '<', '>' => return self.textObjectBracket('<', '>', around),
+            else => return null,
+        }
+    }
+
+    fn textObjectWord(self: *Core, around: bool, big: bool) ?TextRange {
+        const s = self.state();
+        const line = s.getLineContent(s.cursor_row) catch return null;
+        defer self.allocator.free(line);
+        if (s.cursor_col >= line.len) return null;
+
+        const inWord = struct {
+            fn f(b: u8, is_big: bool) bool {
+                return if (is_big) isNonSpaceByte(b) else isWordByte(b);
+            }
+        }.f;
+        if (!inWord(line[s.cursor_col], big)) return null;
+
+        var start = s.cursor_col;
+        while (start > 0 and inWord(line[start - 1], big)) : (start -= 1) {}
+        var end = s.cursor_col;
+        while (end < line.len and inWord(line[end], big)) : (end += 1) {}
+
+        if (around) {
+            // Include trailing whitespace; if none, include leading.
+            const trailing_end = end;
+            var with_trail = end;
+            while (with_trail < line.len and (line[with_trail] == ' ' or line[with_trail] == '\t')) : (with_trail += 1) {}
+            if (with_trail > trailing_end) {
+                end = with_trail;
+            } else {
+                while (start > 0 and (line[start - 1] == ' ' or line[start - 1] == '\t')) : (start -= 1) {}
+            }
+        }
+        return .{
+            .start_row = s.cursor_row,
+            .start_col = start,
+            .end_row = s.cursor_row,
+            .end_col = end,
+        };
+    }
+
+    fn isNonSpaceByte(b: u8) bool {
+        return b != ' ' and b != '\t' and b != '\n' and b != '\r';
+    }
+
+    fn textObjectParagraph(self: *Core, around: bool) ?TextRange {
+        const s = self.state();
+        const total = s.buffer.lineCount();
+        if (total == 0) return null;
+
+        // Walk back to the first non-blank line (or top of buffer).
+        var start = s.cursor_row;
+        while (start > 0 and !self.isLineBlank(start - 1)) : (start -= 1) {}
+        var end = s.cursor_row;
+        while (end + 1 < total and !self.isLineBlank(end + 1)) : (end += 1) {}
+        // `around`: include the trailing blank line(s).
+        if (around) {
+            while (end + 1 < total and self.isLineBlank(end + 1)) : (end += 1) {}
+        }
+        const end_line = s.getLineContent(end) catch return null;
+        defer self.allocator.free(end_line);
+        return .{
+            .start_row = start,
+            .start_col = 0,
+            .end_row = end,
+            .end_col = end_line.len,
+        };
+    }
+
+    fn isLineBlank(self: *Core, row: usize) bool {
+        const s = self.state();
+        const line = s.getLineContent(row) catch return true;
+        defer self.allocator.free(line);
+        for (line) |b| {
+            if (b != ' ' and b != '\t' and b != '\r') return false;
+        }
+        return true;
+    }
+
+    fn textObjectQuote(self: *Core, q: u8, around: bool) ?TextRange {
+        // Quoted-string objects are line-local — multi-line strings
+        // are rare in source and the AST query path covers them better.
+        const s = self.state();
+        const line = s.getLineContent(s.cursor_row) catch return null;
+        defer self.allocator.free(line);
+
+        // Find the pair of quotes on this line that brackets the cursor.
+        // Handle simple `\q` escapes.
+        var opens = std.ArrayListUnmanaged(usize).empty;
+        defer opens.deinit(self.allocator);
+        var positions = std.ArrayListUnmanaged(usize).empty;
+        defer positions.deinit(self.allocator);
+        var i: usize = 0;
+        while (i < line.len) : (i += 1) {
+            if (line[i] == '\\' and i + 1 < line.len) {
+                i += 1;
+                continue;
+            }
+            if (line[i] == q) positions.append(self.allocator, i) catch return null;
+        }
+        if (positions.items.len < 2) return null;
+
+        // Pair them up sequentially: (0,1), (2,3), …
+        var p: usize = 0;
+        while (p + 1 < positions.items.len) : (p += 2) {
+            const a = positions.items[p];
+            const b = positions.items[p + 1];
+            if (s.cursor_col >= a and s.cursor_col <= b) {
+                if (around) {
+                    return .{ .start_row = s.cursor_row, .start_col = a, .end_row = s.cursor_row, .end_col = b + 1 };
+                } else {
+                    return .{ .start_row = s.cursor_row, .start_col = a + 1, .end_row = s.cursor_row, .end_col = b };
+                }
+            }
+        }
+        return null;
+    }
+
+    fn textObjectBracket(self: *Core, open: u8, close: u8, around: bool) ?TextRange {
+        // Walk outward from the cursor to find the enclosing pair. We
+        // count depth across line breaks so multi-line braces work.
+        const s = self.state();
+        const total = s.buffer.lineCount();
+        if (total == 0) return null;
+
+        // Find opener: walk backward from cursor, tracking depth.
+        var depth: i32 = 0;
+        var op_row: ?usize = null;
+        var op_col: usize = 0;
+        var row: isize = @intCast(s.cursor_row);
+        var start_col: isize = @as(isize, @intCast(s.cursor_col)) - 1;
+        scan_back: while (row >= 0) {
+            const line = s.getLineContent(@intCast(row)) catch break;
+            defer self.allocator.free(line);
+            const c_start: isize = if (row == @as(isize, @intCast(s.cursor_row))) start_col else @as(isize, @intCast(line.len)) - 1;
+            var c = c_start;
+            while (c >= 0) : (c -= 1) {
+                const b = line[@intCast(c)];
+                if (b == close) depth += 1;
+                if (b == open) {
+                    if (depth == 0) {
+                        op_row = @intCast(row);
+                        op_col = @intCast(c);
+                        break :scan_back;
+                    }
+                    depth -= 1;
+                }
+            }
+            row -= 1;
+            start_col = -1;
+        }
+        if (op_row == null) return null;
+
+        // Find closer: walk forward from cursor, tracking depth.
+        depth = 0;
+        var cl_row: ?usize = null;
+        var cl_col: usize = 0;
+        row = @intCast(s.cursor_row);
+        var fwd_start: isize = @intCast(s.cursor_col);
+        scan_fwd: while (row < @as(isize, @intCast(total))) {
+            const line = s.getLineContent(@intCast(row)) catch break;
+            defer self.allocator.free(line);
+            var c: isize = if (row == @as(isize, @intCast(s.cursor_row))) fwd_start else 0;
+            while (c < @as(isize, @intCast(line.len))) : (c += 1) {
+                const b = line[@intCast(c)];
+                if (b == open) depth += 1;
+                if (b == close) {
+                    if (depth == 0) {
+                        cl_row = @intCast(row);
+                        cl_col = @intCast(c);
+                        break :scan_fwd;
+                    }
+                    depth -= 1;
+                }
+            }
+            row += 1;
+            fwd_start = 0;
+        }
+        if (cl_row == null) return null;
+
+        if (around) {
+            return .{ .start_row = op_row.?, .start_col = op_col, .end_row = cl_row.?, .end_col = cl_col + 1 };
+        }
+        // inside: skip the opener and the closer
+        return .{ .start_row = op_row.?, .start_col = op_col + 1, .end_row = cl_row.?, .end_col = cl_col };
+    }
+
+    /// Ctrl+D — find the next occurrence of the current selection (or
+    /// the word under the cursor if no selection) and add a secondary
+    /// cursor there. The primary cursor moves to the new match so the
+    /// user immediately sees where they landed. Wraps at file end.
+    /// Cleared by Esc or any line-altering command.
+    fn addNextOccurrence(self: *Core) !void {
+        const s = self.state();
+        const buf_id = self.buffer_manager.getActive().id;
+        // Buffer switched out from under us — drop stale cursors.
+        if (self.multi_cursors.items.len > 0 and self.multi_cursor_buffer_id != buf_id) {
+            self.clearMultiCursors();
+        }
+
+        // Seed: selection text (visual mode) or word under cursor.
+        if (self.multi_cursors.items.len == 0) {
+            self.multi_cursor_buffer_id = buf_id;
+            self.multi_cursor_query.clearRetainingCapacity();
+
+            if (self.mode == .visual and s.selection_anchor != null) {
+                const sel = self.normalizedSelection() orelse return;
+                const text = try self.copyRangeText(sel);
+                defer self.allocator.free(text);
+                try self.multi_cursor_query.appendSlice(self.allocator, text);
+                // The selection itself becomes the "primary cursor" anchor;
+                // we don't add it as a secondary since it's already the
+                // primary site.
+                s.selection_anchor = null;
+                self.mode = .select;
+                // Place the primary cursor at the START of the selection
+                // for predictable next-search origin.
+                s.cursor_row = sel.start_row;
+                s.cursor_col = sel.start_col;
+            } else {
+                const line = s.getLineContent(s.cursor_row) catch return;
+                defer self.allocator.free(line);
+                const wr = unicode.wordRangeAt(line, s.cursor_col) orelse {
+                    self.setStatusLiteralLeveled(.warning, "Place cursor on a word", 1500);
+                    return;
+                };
+                try self.multi_cursor_query.appendSlice(self.allocator, line[wr.start..wr.end]);
+                s.cursor_col = wr.start;
+            }
+        }
+
+        const query = self.multi_cursor_query.items;
+        if (query.len == 0) return;
+
+        // Find next occurrence after the current primary cursor.
+        const search_from_off = s.getOffsetFor(s.cursor_row, s.cursor_col) + query.len;
+        const found = (s.buffer.find(query, search_from_off) catch null) orelse
+            (s.buffer.find(query, 0) catch null) orelse {
+            self.setStatusLiteralLeveled(.info, "No more matches", 1200);
+            return;
+        };
+
+        // Bank the primary as a secondary, then move primary to the new match.
+        try self.multi_cursors.append(self.allocator, .{
+            .row = s.cursor_row,
+            .col = s.cursor_col,
+        });
+        s.updateCursorFromOffset(found);
+        s.preferred_col = null;
+        self.recenterIfOffscreen();
+        self.refreshMultiCursorDecorations();
+        const msg = std.fmt.bufPrint(&self.skip_status_buf, "{d} cursors active", .{self.multi_cursors.items.len + 1}) catch return;
+        self.status_message = msg;
+        self.status_message_expires = std.Io.Clock.real.now(self.io).toMilliseconds() + 1500;
+        try self.sendUpdate();
+    }
+
+    fn clearMultiCursors(self: *Core) void {
+        self.multi_cursors.clearRetainingCapacity();
+        self.multi_cursor_query.clearRetainingCapacity();
+        self.decoration_manager.removeBySource("multi_cursor");
+    }
+
+    fn refreshMultiCursorDecorations(self: *Core) void {
+        self.decoration_manager.removeBySource("multi_cursor");
+        const query_len = self.multi_cursor_query.items.len;
+        for (self.multi_cursors.items) |mc| {
+            _ = self.decoration_manager.add(
+                Range.singleLine(mc.row, mc.col, mc.col + query_len),
+                .word_highlight,
+                80,
+                null,
+                "multi_cursor",
+            ) catch continue;
+        }
+    }
+
+    const NormalizedSelection = struct {
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    };
+
+    fn normalizedSelection(self: *Core) ?NormalizedSelection {
+        const s = self.state();
+        const anchor = s.selection_anchor orelse return null;
+        var start_row = anchor.row;
+        var start_col = anchor.col;
+        var end_row = s.cursor_row;
+        var end_col = s.cursor_col;
+        if (start_row > end_row or (start_row == end_row and start_col > end_col)) {
+            std.mem.swap(usize, &start_row, &end_row);
+            std.mem.swap(usize, &start_col, &end_col);
+        }
+        return .{
+            .start_row = start_row,
+            .start_col = start_col,
+            .end_row = end_row,
+            .end_col = end_col,
+        };
+    }
+
+    fn copyRangeText(self: *Core, sel: NormalizedSelection) ![]u8 {
+        const s = self.state();
+        const start_off = s.getOffsetFor(sel.start_row, sel.start_col);
+        const end_off = s.getOffsetFor(sel.end_row, sel.end_col);
+        if (end_off <= start_off) return self.allocator.dupe(u8, "");
+        const len = end_off - start_off;
+        var out = try self.allocator.alloc(u8, len);
+        var idx: usize = 0;
+        while (idx < len) : (idx += 1) {
+            out[idx] = s.buffer.getCharAt(start_off + idx) orelse 0;
+        }
+        return out;
+    }
+
+    fn surroundPair(ch: u8) struct { open: u8, close: u8 } {
+        return switch (ch) {
+            '(', ')', 'b' => .{ .open = '(', .close = ')' },
+            '[', ']' => .{ .open = '[', .close = ']' },
+            '{', '}', 'B' => .{ .open = '{', .close = '}' },
+            '<', '>' => .{ .open = '<', .close = '>' },
+            // Quotes: open and close are the same byte.
+            '"' => .{ .open = '"', .close = '"' },
+            '\'' => .{ .open = '\'', .close = '\'' },
+            '`' => .{ .open = '`', .close = '`' },
+            else => .{ .open = ch, .close = ch },
+        };
+    }
+
+    /// `S <c>` in visual mode: wrap the active selection with the pair
+    /// for `<c>`. Single-byte delimiters (`"`, `'`) get the same byte
+    /// on both sides; brackets get matched pairs. Cursor lands after
+    /// the closer.
+    fn addSurround(self: *Core, ch: u8) !void {
+        const s = self.state();
+        const anchor = s.selection_anchor orelse {
+            self.setStatusLiteralLeveled(.warning, "No selection to surround", 1500);
+            return;
+        };
+
+        // Normalize so (start, end) is in document order.
+        var start_row = anchor.row;
+        var start_col = anchor.col;
+        var end_row = s.cursor_row;
+        var end_col = s.cursor_col;
+        if (start_row > end_row or (start_row == end_row and start_col > end_col)) {
+            std.mem.swap(usize, &start_row, &end_row);
+            std.mem.swap(usize, &start_col, &end_col);
+        }
+
+        const pair = surroundPair(ch);
+        const end_off = s.getOffsetFor(end_row, end_col);
+        const close_str = [_]u8{pair.close};
+        try s.buffer.insert(end_off, &close_str);
+        const start_off = s.getOffsetFor(start_row, start_col);
+        const open_str = [_]u8{pair.open};
+        try s.buffer.insert(start_off, &open_str);
+        s.modified = true;
+
+        // Drop the selection; place cursor just after the closer.
+        s.selection_anchor = null;
+        self.mode = .select;
+        try self.sendUpdate();
+    }
+
+    /// `s d <c>` in select mode: delete the enclosing pair `<c>`
+    /// (e.g. the parens around the cursor). Leaves contents intact.
+    fn deleteSurround(self: *Core, ch: u8) !void {
+        const s = self.state();
+        const pair = surroundPair(ch);
+        const range = if (pair.open == pair.close)
+            self.textObjectQuote(pair.open, true)
+        else
+            self.textObjectBracket(pair.open, pair.close, true);
+        const r = range orelse {
+            self.setStatusLiteralLeveled(.warning, "No matching surround pair", 1500);
+            return;
+        };
+
+        // Delete closer FIRST (later in buffer) so the opener's offset
+        // remains valid for the second delete.
+        const close_off = s.getOffsetFor(r.end_row, r.end_col);
+        try s.buffer.delete(close_off - 1, 1);
+        const open_off = s.getOffsetFor(r.start_row, r.start_col);
+        try s.buffer.delete(open_off, 1);
+        s.modified = true;
+        try self.sendUpdate();
+    }
+
+    /// `s r <old> <new>` in select mode: swap the surrounding `<old>`
+    /// pair for `<new>`. Same lookup as deleteSurround, then re-emit.
+    fn replaceSurround(self: *Core, old_ch: u8, new_ch: u8) !void {
+        const s = self.state();
+        const old_pair = surroundPair(old_ch);
+        const new_pair = surroundPair(new_ch);
+        const range = if (old_pair.open == old_pair.close)
+            self.textObjectQuote(old_pair.open, true)
+        else
+            self.textObjectBracket(old_pair.open, old_pair.close, true);
+        const r = range orelse {
+            self.setStatusLiteralLeveled(.warning, "No matching surround pair", 1500);
+            return;
+        };
+
+        // Replace closer FIRST so the opener offset survives.
+        const close_off = s.getOffsetFor(r.end_row, r.end_col);
+        try s.buffer.delete(close_off - 1, 1);
+        const new_close = [_]u8{new_pair.close};
+        try s.buffer.insert(close_off - 1, &new_close);
+        const open_off = s.getOffsetFor(r.start_row, r.start_col);
+        try s.buffer.delete(open_off, 1);
+        const new_open = [_]u8{new_pair.open};
+        try s.buffer.insert(open_off, &new_open);
+        s.modified = true;
+        try self.sendUpdate();
+    }
+
+    /// `]g` / `[g` — move the cursor to the start of the next or previous
+    /// git diff hunk. Adjacent changed/added/deleted lines form one hunk;
+    /// the cursor lands on the hunk's first line. Wraps at file boundaries.
+    fn jumpToHunk(self: *Core, forward: bool) !void {
+        if (self.diff_highlights.items.len == 0) {
+            self.setStatusLiteralLeveled(.info, "No git hunks in this buffer", 1500);
+            return;
+        }
+        const s = self.state();
+
+        // Build the sorted list of hunk start lines. A hunk start is any
+        // diff line whose immediately-previous line is not itself a diff
+        // line. Sorted on insert by `addDiffDecorations`, so a single pass
+        // is enough.
+        var lines = std.ArrayListUnmanaged(usize).empty;
+        defer lines.deinit(self.allocator);
+        for (self.diff_highlights.items) |h| try lines.append(self.allocator, h.line);
+        std.sort.block(usize, lines.items, {}, std.sort.asc(usize));
+
+        var hunk_starts = std.ArrayListUnmanaged(usize).empty;
+        defer hunk_starts.deinit(self.allocator);
+        var prev_line: ?usize = null;
+        for (lines.items) |line| {
+            if (prev_line) |pl| {
+                if (line != pl + 1) try hunk_starts.append(self.allocator, line);
+            } else {
+                try hunk_starts.append(self.allocator, line);
+            }
+            prev_line = line;
+        }
+        if (hunk_starts.items.len == 0) return;
+
+        const cur = s.cursor_row;
+        var target: ?usize = null;
+        if (forward) {
+            for (hunk_starts.items) |h| {
+                if (h > cur) {
+                    target = h;
+                    break;
+                }
+            }
+            if (target == null) target = hunk_starts.items[0]; // wrap
+        } else {
+            var i = hunk_starts.items.len;
+            while (i > 0) : (i -= 1) {
+                if (hunk_starts.items[i - 1] < cur) {
+                    target = hunk_starts.items[i - 1];
+                    break;
+                }
+            }
+            if (target == null) target = hunk_starts.items[hunk_starts.items.len - 1]; // wrap
+        }
+        s.cursor_row = target.?;
+        s.cursor_col = 0;
+        self.recenterIfOffscreen();
         try self.sendUpdate();
     }
 

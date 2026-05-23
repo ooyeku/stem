@@ -242,6 +242,10 @@ pub const EditorConfig = struct {
     mouse_enabled: bool = true,
     auto_pairs: bool = true,
     cursor_line: bool = true,
+    /// When true and an LSP for the file's language has formatting
+    /// support, the buffer is formatted in-place before each save.
+    /// Toggle at runtime with `lsp.toggle_format_on_save`.
+    format_on_save: bool = false,
 
     pub fn writeConfig(self: EditorConfig, writer: anytype, indent: usize) !void {
         try writer.writeAll("{\n");
@@ -258,7 +262,9 @@ pub const EditorConfig = struct {
         try printIndent(writer, indent + 4);
         try writer.print("\"auto_pairs\": {},\n", .{self.auto_pairs});
         try printIndent(writer, indent + 4);
-        try writer.print("\"cursor_line\": {}\n", .{self.cursor_line});
+        try writer.print("\"cursor_line\": {},\n", .{self.cursor_line});
+        try printIndent(writer, indent + 4);
+        try writer.print("\"format_on_save\": {}\n", .{self.format_on_save});
         try printIndent(writer, indent);
         try writer.writeAll("}");
     }

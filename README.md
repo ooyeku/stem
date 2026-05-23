@@ -68,15 +68,23 @@ To build and install system-wide from source:
 - Multi-buffer workflow with a tab bar
 - Horizontal and vertical split panes
 - Transactional undo/redo with cursor restoration
+- Multi-cursor editing (Sublime-style `Ctrl+D` add-next-occurrence)
+- Vim-style text objects (`w` `W` `p` `"` `(` `[` `{` …) for select inside / around
+- Surround commands: wrap selection, change or delete a pair
+- Named bookmarks (`m<a-z>` set, `'<a-z>` jump) persisted per project
+- Incremental in-buffer search with `/` and `?`, smart-case, live match count
+- Project-wide search (`Space /`) with per-match replace confirmation
 - Fuzzy file picker, buffer picker, and command palette
-- Project-wide search (`Space /`) with replace
 - Tree-sitter syntax highlighting for 29 languages
 - LSP integration for 23 external language servers plus embedded ZLS
-  for Zig
+  for Zig (with optional format-on-save)
+- Word-under-cursor highlight after a short idle
 - Integrated terminal mode
 - Manifest-driven plugin system with wasm and exec runtimes
 - Auto-completion, hover docs, go-to-definition, references,
   diagnostics, and document symbols (via LSP)
+- Jump to next/previous diagnostic (`]d`/`[d`), git hunk (`]g`/`[g`),
+  AST sibling (`]s`/`[s`), function (`]m`/`[m`)
 - Session restore with crash-recovery snapshots
 - Background workspace file index for instant `Find` queries
 - CLI search tools (`stem --find`, `--vfind`, `--scope`)
@@ -158,9 +166,70 @@ editing; everything else is reachable through the palette.
 |-----|--------|
 | `h` `j` `k` `l` | Move left/down/up/right |
 | Arrow keys | Move left/down/up/right |
+| `w` `b` `e` | Next / previous / end of word |
+| `W` `B` | Next / previous WORD (whitespace-separated) |
+| `{` `}` | Previous / next paragraph |
 | `Home` / `End` | Start / end of line |
 | `PageUp` / `PageDown` | Scroll one page |
+| `%` | Jump to matching bracket |
+| `[N] motion` | Repeat motion N times (`5j`, `3w`) |
 | `[` / `]` | Previous / next buffer (Cmd+Shift on macOS) |
+| `]d` / `[d` | Next / previous diagnostic |
+| `]g` / `[g` | Next / previous git hunk |
+| `]s` / `[s` | Next / previous AST sibling |
+| `]m` / `[m` | Next / previous function-like node |
+
+### Search (Select / Visual)
+
+| Key | Action |
+|-----|--------|
+| `/` | Incremental forward search with live preview + `[i/N]` count |
+| `?` | Incremental backward search |
+| `n` / `N` | Next / previous match after closing the prompt |
+| `Esc` | Cancel search; cursor returns to its starting position |
+
+Search uses smart case: any uppercase character in the query makes
+the search case-sensitive; otherwise it's case-insensitive.
+
+### Bookmarks
+
+| Key | Action |
+|-----|--------|
+| `m<a-z>` | Set bookmark `<x>` at the cursor |
+| `'<a-z>` | Jump to bookmark `<x>` (works across files) |
+
+Bookmarks persist per project under `~/.stem/cache/bookmarks/`.
+The `bookmark.list` command opens a `[Bookmarks]` overview;
+`bookmark.clear_all` removes them.
+
+### Text objects (Select / Visual)
+
+In **select mode**:
+- `s i <c>` — select INSIDE `<c>`
+- `s a <c>` — select AROUND `<c>`
+
+In **visual mode**, drop the `s` prefix: `i <c>` / `a <c>`.
+
+`<c>` is one of: `w` word, `W` WORD, `p` paragraph, `"` `'` `` ` ``
+string literals, `(` `[` `{` `<` matching pairs (use either bracket).
+
+### Surround
+
+| Chord | Action |
+|-------|--------|
+| `S <c>` (visual) | Wrap the active selection with `<c>` |
+| `s d <c>` (select) | Delete the surround pair `<c>` enclosing the cursor |
+| `s r <old> <new>` (select) | Replace surround `<old>` with `<new>` |
+
+### Multi-cursor
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+D` | Add the next occurrence of the word / selection as a secondary cursor |
+| `Esc` (select mode) | Clear all secondary cursors |
+
+Typing and backspace replicate at every cursor. Newlines and
+line-altering operations collapse back to the primary cursor.
 
 ### Save / open / quit
 
@@ -201,6 +270,30 @@ On macOS use `Cmd`, on Linux/Windows use `Ctrl`:
 | `Space D` | Git diff (via bundled git plugin) |
 | `Space Esc` | Cancel the leader |
 
+### Project-wide search & replace
+
+`Space /` opens the global search panel. Type into the query field;
+results populate live across the workspace.
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Toggle focus between query and replace fields |
+| `Enter` | Open the highlighted match |
+| `↑` / `↓` | Walk through matches |
+| `Ctrl+R` | Start replace-with-confirmation walk |
+
+Inside the replace walk:
+
+| Key | Action |
+|-----|--------|
+| `y` | Apply replacement at this match, advance |
+| `n` | Skip this match, advance |
+| `A` | Apply this match and every remaining match silently |
+| `q` / `Esc` | Cancel; summary shown in the status bar |
+
+Replacements happen in open buffers (not directly on disk), so you can
+undo per-file with `Space u` and only commit by saving.
+
 ### Split navigation
 
 | Key | Action |
@@ -237,19 +330,23 @@ Or edit `~/.stem/config.json` directly:
     "tab_size": 4,
     "insert_spaces": true,
     "line_numbers": "relative",
-    "wrap_lines": false,
-    "highlight_current_line": true
+    "wrap": false,
+    "cursor_line": true,
+    "auto_pairs": true,
+    "format_on_save": false
   },
   "ui": {
-    "show_status_bar": true,
-    "show_tab_bar": true,
-    "theme": "default"
+    "show_status_bar": true
   },
   "logging": {
     "level": "info"
   }
 }
 ```
+
+Enable format-on-save at runtime via the command palette
+(`Space a` → `lsp.toggle_format_on_save`) or persist it with
+`stem config set editor.format_on_save true`.
 
 ## Platform support
 

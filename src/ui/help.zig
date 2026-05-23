@@ -48,13 +48,69 @@ pub const help_text = cli_help_text ++
     \\- `[N] + Motion`     : Repeat motion (e.g. `5j` = 5 down)
     \\- `Page Up/Down`     : Scroll by page
     \\- `%`                : Jump to matching bracket (( ) { } [ ] < >)
+    \\- `w` / `b` / `e`    : Next / previous / end of word
+    \\- `W` / `B`          : Next / previous WORD (whitespace-separated)
+    \\- `{` / `}`          : Previous / next paragraph (blank-line-separated)
     \\
     \\## Search
     \\
-    \\- `/` (Select Mode): Jump to text (Normal Search).
-    \\- `/` (Visual Mode): Extend selection to text (Visual Search).
-    \\- `n`              : Go to next match.
-    \\- `N` (Shift+n)    : Go to previous match.
+    \\- `/` (Select / Visual): Incremental forward search with live
+    \\                         match preview. `[i/N]` shows position
+    \\                         in the prompt header. Smart case: any
+    \\                         uppercase in the query → case-sensitive.
+    \\- `?` (Select / Visual): Same, but backward.
+    \\- `Enter`              : Accept the current match.
+    \\- `Esc`                : Cancel; cursor returns to its origin.
+    \\- `n` / `N`            : Next / previous match after closing the prompt.
+    \\
+    \\## Diagnostics & Hunks
+    \\
+    \\- `]d` / `[d`: Jump to next / previous diagnostic in the buffer.
+    \\- `]g` / `[g`: Jump to next / previous git diff hunk.
+    \\- `]s` / `[s`: Jump to next / previous AST sibling.
+    \\- `]m` / `[m`: Jump to next / previous function-like node.
+    \\
+    \\## Bookmarks
+    \\
+    \\- `m<a-z>`   : Set bookmark slot `<x>` at the cursor.
+    \\- `'<a-z>`   : Jump to bookmark `<x>` (works across files).
+    \\- Bookmarks persist per-project under `~/.stem/cache/bookmarks/`.
+    \\- Command: `bookmark.list` opens a `[Bookmarks]` buffer; `bookmark.clear_all` removes them all.
+    \\
+    \\## Word-Under-Cursor Highlight
+    \\
+    \\After ~300ms of cursor stillness on an identifier, every visible
+    \\occurrence of that identifier is faintly highlighted. Moving the
+    \\cursor clears the highlight immediately. No configuration needed.
+    \\
+    \\## Text Objects (Select / Visual Mode)
+    \\
+    \\Text objects let you select a syntactic chunk in one chord rather
+    \\than walking edge-to-edge with motions.
+    \\
+    \\- Select mode: `s i <c>` selects INSIDE `<c>`, `s a <c>` selects AROUND `<c>`.
+    \\- Visual mode: `i <c>` and `a <c>` (no `s` prefix needed).
+    \\
+    \\Objects: `w` word, `W` WORD, `p` paragraph, `"` `'` `` ` `` quotes,
+    \\`(` `[` `{` `<` matching pairs (use either bracket character).
+    \\
+    \\## Surround
+    \\
+    \\- Visual mode: `S <c>` wraps the active selection with `<c>`.
+    \\- Select mode: `s d <c>` deletes the surround pair `<c>` around the cursor.
+    \\- Select mode: `s r <old> <new>` replaces the surround.
+    \\
+    \\Supported chars: `( [ { <` (matching pairs) and `" ' \``.
+    \\
+    \\## Multi-Cursor
+    \\
+    \\- `Ctrl+D` adds the next occurrence of the word under the cursor
+    \\  (or the active visual selection) as a secondary cursor. Repeat
+    \\  to add more.
+    \\- Typing in insert mode replicates at every cursor; backspace
+    \\  too. Newlines and structural commands fall back to the primary
+    \\  cursor.
+    \\- `Esc` in select mode clears all secondary cursors.
     \\
     \\## Commands (Leader Key: Space)
     \\
@@ -95,11 +151,11 @@ pub const help_text = cli_help_text ++
     \\
     \\## Structural (tree-sitter) Motions
     \\
-    \\- `]s` / `[s`: Jump to next / previous AST sibling
-    \\- `]m` / `[m`: Jump to next / previous function or method
-    \\- `]d` / `[d`: Jump to next / previous diagnostic
     \\- `V`         (normal): Select the AST node under the cursor
     \\- `+` / `-`   (visual): Expand to parent / shrink to first child
+    \\
+    \\See "Diagnostics & Hunks" above for `]d`/`[d`, `]g`/`[g`,
+    \\`]s`/`[s`, `]m`/`[m`.
     \\
     \\## Copy & Paste
     \\
@@ -220,12 +276,17 @@ pub const help_text = cli_help_text ++
     \\- edit.insert_datetime: Insert timestamp
     \\
     \\### LSP (Zig Files)
-    \\- lsp.format      : Format document
-    \\- lsp.definition  : Go to definition
-    \\- lsp.references  : Find references
-    \\- lsp.hover       : Show hover info
-    \\- lsp.diagnostics : Show errors/warnings
-    \\- lsp.restart     : Restart ZLS
+    \\- lsp.format               : Format document
+    \\- lsp.definition           : Go to definition
+    \\- lsp.references           : Find references
+    \\- lsp.hover                : Show hover info
+    \\- lsp.diagnostics          : Show errors/warnings
+    \\- lsp.restart              : Restart ZLS
+    \\- lsp.toggle_format_on_save: Toggle automatic format on every save
+    \\
+    \\### Bookmarks
+    \\- bookmark.list      : Open the [Bookmarks] buffer
+    \\- bookmark.clear_all : Remove every bookmark for this project
     \\
     \\### Split/Pane
     \\- split.vertical  : Split top/bottom
@@ -257,11 +318,15 @@ pub const help_text = cli_help_text ++
     \\- `stem config set <key> <v>` : Update a setting
     \\
     \\### Available Settings
-    \\- `editor.tab_width`   : Tab width (default: 4)
-    \\- `editor.line_numbers`: Show line numbers
-    \\- `editor.word_wrap`   : Enable word wrapping
-    \\- `ui.show_whitespace` : Show invisible characters
-    \\- `logging.level`      : Log level (debug/info/warn/err)
+    \\- `editor.tab_size`       : Tab width (default: 4)
+    \\- `editor.insert_spaces`  : Insert spaces instead of tabs
+    \\- `editor.line_numbers`   : absolute / relative / none
+    \\- `editor.wrap`           : Enable word wrapping
+    \\- `editor.auto_pairs`     : Auto-close brackets and quotes
+    \\- `editor.cursor_line`    : Highlight the cursor's line
+    \\- `editor.format_on_save` : Run LSP formatter before each save
+    \\- `ui.show_status_bar`    : Render the status bar
+    \\- `logging.level`         : Log level (debug/info/warn/err)
     \\
     \\Logs are written to `~/.stem/logs/stem.log`
     \\

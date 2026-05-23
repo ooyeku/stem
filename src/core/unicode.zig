@@ -148,6 +148,105 @@ fn prevCodePoint(text: []const u8, end_byte_offset: usize) ?struct { start: usiz
     return .{ .start = i, .class = info.class };
 }
 
+/// Returns the byte offset of the END of the current word, or the end of
+/// the next word if the cursor is between words. Vim's `e` semantics.
+pub fn nextWordEnd(text: []const u8, current_byte_offset: usize) !?usize {
+    if (current_byte_offset >= text.len) return null;
+
+    var i = current_byte_offset;
+    // Advance one position so a cursor sitting on the last char of a word
+    // doesn't just stay put.
+    const here = classifyAt(text, i);
+    if (here.len > 0) i += here.len;
+
+    // Skip any whitespace to land inside the next non-space run.
+    while (i < text.len) {
+        const c = classifyAt(text, i);
+        if (c.class != .space) break;
+        i += c.len;
+    }
+    if (i >= text.len) return null;
+    const run_class = classifyAt(text, i).class;
+    // Walk to the last byte of this run.
+    var last_end = i;
+    while (i < text.len) {
+        const c = classifyAt(text, i);
+        if (c.class != run_class) break;
+        i += c.len;
+        last_end = i;
+    }
+    // Vim's `e` lands ON the last char, not after. Step back one code point.
+    if (last_end > current_byte_offset) {
+        if (prevCodePoint(text, last_end)) |p| return p.start;
+    }
+    return null;
+}
+
+/// WORD (vim's capital-W) variant: words are runs of non-whitespace.
+/// Punctuation is part of the WORD it lives in.
+pub fn nextBigWord(text: []const u8, current_byte_offset: usize) !?usize {
+    if (current_byte_offset >= text.len) return null;
+    var i = current_byte_offset;
+    // Skip current non-space run.
+    while (i < text.len) {
+        const c = classifyAt(text, i);
+        if (c.class == .space) break;
+        i += c.len;
+    }
+    // Skip whitespace to land at start of next WORD.
+    while (i < text.len) {
+        const c = classifyAt(text, i);
+        if (c.class != .space) break;
+        i += c.len;
+    }
+    if (i == current_byte_offset) return null;
+    return i;
+}
+
+/// Returns the byte range `[start, end)` of the word-class run containing
+/// `byte_offset`, or null if the cursor isn't on a word character (e.g.
+/// it's on whitespace or punctuation). "Word" means an identifier-ish
+/// run: letters, digits, underscores, etc. — matches the classifier used
+/// by `nextWord`/`prevWord`.
+pub fn wordRangeAt(text: []const u8, byte_offset: usize) ?struct { start: usize, end: usize } {
+    if (byte_offset >= text.len) return null;
+    const here = classifyAt(text, byte_offset);
+    if (here.class != .word) return null;
+
+    // Walk backward to find the start.
+    var start = byte_offset;
+    while (start > 0) {
+        const p = prevCodePoint(text, start) orelse break;
+        if (p.class != .word) break;
+        start = p.start;
+    }
+    // Walk forward to find the end.
+    var end = byte_offset;
+    while (end < text.len) {
+        const c = classifyAt(text, end);
+        if (c.class != .word) break;
+        end += c.len;
+    }
+    return .{ .start = start, .end = end };
+}
+
+pub fn prevBigWord(text: []const u8, current_byte_offset: usize) !?usize {
+    if (current_byte_offset == 0) return null;
+    var i = current_byte_offset;
+    var prev = prevCodePoint(text, i) orelse return null;
+    // Skip whitespace.
+    while (prev.class == .space) {
+        i = prev.start;
+        prev = prevCodePoint(text, i) orelse return 0;
+    }
+    // Walk back through the non-space run.
+    while (prev.class != .space) {
+        i = prev.start;
+        prev = prevCodePoint(text, i) orelse return 0;
+    }
+    return i;
+}
+
 pub fn graphemeWidth(text: []const u8) i3 {
     if (text.len == 0) return 0;
     const w = vaxis.gwidth.gwidth(text, .unicode);

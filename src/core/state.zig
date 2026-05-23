@@ -687,6 +687,106 @@ pub const EditorState = struct {
         }
     }
 
+    /// Vim-style `e`: jump to the last char of the current/next word.
+    pub fn moveCursorNextWordEnd(self: *EditorState) !void {
+        self.preferred_col = null;
+        const line_content = try self.getLineContent(self.cursor_row);
+        defer self.allocator.free(line_content);
+
+        if (try unicode.nextWordEnd(line_content, self.cursor_col)) |new_col| {
+            self.cursor_col = new_col;
+        } else {
+            const line_count = self.buffer.lineCount();
+            if (line_count > 0 and self.cursor_row + 1 < line_count) {
+                self.cursor_row += 1;
+                const next_line = try self.getLineContent(self.cursor_row);
+                defer self.allocator.free(next_line);
+                if (try unicode.nextWordEnd(next_line, 0)) |c| {
+                    self.cursor_col = c;
+                } else {
+                    self.cursor_col = 0;
+                }
+            }
+        }
+    }
+
+    /// Vim-style WORD motion (W): whitespace-separated.
+    pub fn moveCursorNextBigWord(self: *EditorState) !void {
+        self.preferred_col = null;
+        const line_content = try self.getLineContent(self.cursor_row);
+        defer self.allocator.free(line_content);
+
+        if (try unicode.nextBigWord(line_content, self.cursor_col)) |new_col| {
+            self.cursor_col = new_col;
+        } else {
+            const line_count = self.buffer.lineCount();
+            if (line_count > 0 and self.cursor_row + 1 < line_count) {
+                self.cursor_row += 1;
+                self.cursor_col = 0;
+            }
+        }
+    }
+
+    pub fn moveCursorPrevBigWord(self: *EditorState) !void {
+        self.preferred_col = null;
+        const line_content = try self.getLineContent(self.cursor_row);
+        defer self.allocator.free(line_content);
+
+        if (try unicode.prevBigWord(line_content, self.cursor_col)) |new_col| {
+            self.cursor_col = new_col;
+        } else {
+            if (self.cursor_row > 0) {
+                self.cursor_row -= 1;
+                self.cursor_col = self.getLineLength(self.cursor_row);
+            }
+        }
+    }
+
+    /// Vim-style `}`: jump to the start of the next paragraph (first
+    /// blank line after, then the line after that). Falls back to EOF.
+    pub fn moveCursorNextParagraph(self: *EditorState) void {
+        self.preferred_col = null;
+        const total = self.buffer.lineCount();
+        if (total == 0) return;
+        var row = self.cursor_row + 1;
+        // Skip the current non-blank block.
+        while (row < total) : (row += 1) {
+            if (self.isLineBlank(row)) break;
+        }
+        // Skip blank lines to land on the next non-blank line, or EOF.
+        while (row < total) : (row += 1) {
+            if (!self.isLineBlank(row)) break;
+        }
+        if (row >= total) row = total - 1;
+        self.cursor_row = row;
+        self.cursor_col = 0;
+    }
+
+    /// Vim-style `{`: jump to the start of the previous paragraph.
+    pub fn moveCursorPrevParagraph(self: *EditorState) void {
+        self.preferred_col = null;
+        if (self.cursor_row == 0) {
+            self.cursor_col = 0;
+            return;
+        }
+        var row: usize = self.cursor_row - 1;
+        // Skip blank lines immediately above.
+        while (row > 0 and self.isLineBlank(row)) : (row -= 1) {}
+        // Skip the non-blank block above to find its top.
+        while (row > 0 and !self.isLineBlank(row - 1)) : (row -= 1) {}
+        self.cursor_row = row;
+        self.cursor_col = 0;
+    }
+
+    fn isLineBlank(self: *EditorState, row: usize) bool {
+        const line = self.getLineContent(row) catch return true;
+        defer self.allocator.free(line);
+        for (line) |b| {
+            if (b != ' ' and b != '\t' and b != '\r') return false;
+        }
+        return true;
+    }
+
     pub fn getLineDisplayWidth(self: *EditorState, row: usize) !i32 {
         const line_content = try self.getLineContent(row);
         defer self.allocator.free(line_content);

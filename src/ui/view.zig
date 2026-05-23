@@ -820,7 +820,14 @@ pub const View = struct {
         }
 
         if (mode == .visual_search) {
-            try self.drawSearchInput(win, snapshot.search_input orelse "", frame_allocator);
+            try self.drawSearchInput(
+                win,
+                snapshot.search_input orelse "",
+                snapshot.search_direction_forward,
+                snapshot.search_match_count,
+                snapshot.search_match_index,
+                frame_allocator,
+            );
         }
 
         if (snapshot.which_key_visible) {
@@ -2242,11 +2249,18 @@ pub const View = struct {
         _ = win.printSegment(.{ .text = "╯", .style = border_style }, .{ .row_offset = bottom_row, .col_offset = box_x + max_width - 1 });
     }
 
-    fn drawSearchInput(self: *View, win: vaxis.Window, input: []const u8, allocator: std.mem.Allocator) !void {
+    fn drawSearchInput(
+        self: *View,
+        win: vaxis.Window,
+        input: []const u8,
+        forward: bool,
+        match_count: usize,
+        match_index: usize,
+        allocator: std.mem.Allocator,
+    ) !void {
         _ = self;
-        _ = allocator;
 
-        const box_width: u16 = 40;
+        const box_width: u16 = 48;
         const box_height: u16 = 3;
         const box_x = (win.width - box_width) / 2;
         const box_y = win.height - box_height - 2;
@@ -2272,11 +2286,32 @@ pub const View = struct {
             }
         }
 
-        const title = " Search: ";
-        _ = win.printSegment(.{ .text = title, .style = box_style }, .{
+        // Title: " /search " or " ?search " on the left; "  [i/N]" on
+        // the right of the title row so the count is visible alongside
+        // the prompt while you type.
+        const prefix = if (forward) " / Search:" else " ? Search:";
+        _ = win.printSegment(.{ .text = prefix, .style = box_style }, .{
             .row_offset = box_y,
             .col_offset = box_x + 1,
         });
+        if (match_count > 0) {
+            const count_text = try std.fmt.allocPrint(allocator, "[{d}/{d}] ", .{ match_index, match_count });
+            defer allocator.free(count_text);
+            const count_len: u16 = @intCast(@min(count_text.len, @as(usize, box_width - 2)));
+            const count_col = box_x + box_width - count_len - 1;
+            _ = win.printSegment(.{ .text = count_text, .style = box_style }, .{
+                .row_offset = box_y,
+                .col_offset = count_col,
+            });
+        } else if (input.len > 0) {
+            const text = " [no matches] ";
+            const text_len: u16 = @intCast(text.len);
+            const col = box_x + box_width - text_len - 1;
+            _ = win.printSegment(.{ .text = text, .style = box_style }, .{
+                .row_offset = box_y,
+                .col_offset = col,
+            });
+        }
 
         const input_row = box_y + 1;
         const input_col = box_x + 2;

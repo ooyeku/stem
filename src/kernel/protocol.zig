@@ -323,6 +323,14 @@ pub const RenderSnapshot = struct {
     buffer_picker_number_input: ?[]const u8 = null,
     save_as_input: ?[]const u8,
     search_input: ?[]const u8,
+    /// `/` (forward) or `?` (backward), shown in the search prompt
+    /// title so the user knows which direction n/N will step.
+    search_direction_forward: bool = true,
+    /// Total matches in the current buffer for the live search query
+    /// and the 1-based index of the active one (cursor sits on it
+    /// during incremental search). 0 / 0 = unknown or no matches.
+    search_match_count: usize = 0,
+    search_match_index: usize = 0,
 
     syntax_tokens: ?[]const SyntaxToken = null,
 
