@@ -108,6 +108,10 @@ pub const BufferInfo = struct {
     name: []const u8,
     modified: bool,
     is_active: bool,
+    /// True when the buffer crossed the configured large-file
+    /// thresholds at load time. Tabs render a `[L]` badge so the user
+    /// knows tree-sitter / LSP / brackets are intentionally off.
+    is_large: bool = false,
 };
 
 pub const LogEntry = struct {
@@ -118,6 +122,18 @@ pub const LogEntry = struct {
 };
 
 pub const DiagnosticSeverity = enum(u8) { err, warning, info, hint };
+
+/// Single inlay hint as the renderer sees it. Position is buffer-
+/// local (0-based line/col); label is the flattened text, kind is
+/// 1 = type, 2 = parameter, null = unspecified.
+pub const InlayHintSnapshot = struct {
+    line: u32,
+    col: u32,
+    label: []const u8,
+    kind: ?u8 = null,
+    padding_left: bool = false,
+    padding_right: bool = false,
+};
 
 /// Snapshot of an LSP diagnostic for the currently visible buffer. Positions
 /// are buffer-local (0-based line/col, same convention as cursor_row/col).
@@ -258,6 +274,13 @@ pub const EditorConfigSnapshot = struct {
     wrap: bool = false,
     show_status_bar: bool = true,
     cursor_line: bool = true,
+    /// Mirrors `EditorConfig.inline_diagnostics`. When true the view
+    /// renders every line's worst diagnostic at end-of-line, not just
+    /// the cursor's line.
+    inline_diagnostics: bool = true,
+    /// Mirrors `EditorConfig.inlay_hints`. When true the view paints
+    /// LSP inlay hints as dim virtual text inline.
+    inlay_hints: bool = false,
 
     pub const LineNumbersMode = enum { absolute, relative, none };
 };
@@ -380,6 +403,21 @@ pub const RenderSnapshot = struct {
     completion_active: bool = false,
     completion_items: ?[]const CompletionEntry = null,
     completion_selected: usize = 0,
+
+    /// LSP signature-help popup contents. Non-null only when the
+    /// signature_help slot in Core holds a parsed response (i.e. the
+    /// user just typed `(` or `,` and the server replied). The
+    /// renderer drops a one-line overlay above the cursor.
+    signature_help_label: ?[]const u8 = null,
+    signature_help_active_parameter: u32 = 0,
+    /// Slices into `signature_help_label` are *not* duped — the
+    /// renderer only needs the param-label list to compute where to
+    /// bold/underline. Param labels are owned by the snapshot arena.
+    signature_help_parameters: ?[]const []const u8 = null,
+
+    /// Inlay hints for the current viewport — point, label, kind.
+    /// Owned by the snapshot arena (cloned in `clone`).
+    inlay_hints: ?[]const InlayHintSnapshot = null,
 
     split_enabled: bool = false,
     panes: []const PaneSnapshot = &.{},

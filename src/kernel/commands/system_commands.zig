@@ -21,6 +21,9 @@ pub const SystemCommands = struct {
     }
     pub fn cmdModeSelect(core: anytype) anyerror!void {
         core.mode = .select;
+        // Signature-help is Insert-mode only; clear when we leave.
+        // Idempotent — safe to call when no popup is showing.
+        core.dismissSignatureHelp();
         try core.sendUpdate();
     }
     pub fn cmdShowHelp(core: anytype) anyerror!void {

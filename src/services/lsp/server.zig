@@ -16,6 +16,9 @@ pub const RequestKind = enum {
     completion,
     document_symbols,
     workspace_symbols,
+    code_action,
+    signature_help,
+    inlay_hint,
 };
 
 /// LSP position encoding. Defaults to utf16 (the LSP-spec default) unless the
@@ -181,6 +184,31 @@ pub const LSPServer = struct {
     workspace_symbols_result: ?[]WorkspaceSymbol = null,
     workspace_symbols_mutex: std.Io.Mutex = .init,
 
+    /// `textDocument/codeAction` last-response slot. The set of
+    /// returned actions is small (typically 1–10) and short-lived
+    /// (one user request → one apply or dismiss), so a single-slot
+    /// last-response model is fine.
+    code_action_result: ?[]CodeAction = null,
+    code_action_mutex: std.Io.Mutex = .init,
+
+    /// `textDocument/signatureHelp` last-response slot. Polled by
+    /// Insert-mode tick after a `(` / `,` triggers a request.
+    signature_help_result: ?SignatureHelp = null,
+    signature_help_mutex: std.Io.Mutex = .init,
+
+    /// `textDocument/inlayHint` results, keyed by URI. Unlike the
+    /// other request kinds the response is per-file and cached for
+    /// the lifetime of the visible window — the renderer reads from
+    /// this map every frame the LSP hint flag is on. Caller cancels
+    /// by sending a new request for the same URI (replaces the
+    /// previous list).
+    inlay_hints: std.StringHashMapUnmanaged([]InlayHint) = .empty,
+    inlay_hints_mutex: std.Io.Mutex = .init,
+    /// Tracks which URI a pending inlay-hint request was for so the
+    /// response handler knows which slot to fill. Mirrors
+    /// `pending_semantic_requests`.
+    pending_inlay_requests: std.AutoHashMapUnmanaged(i64, []u8) = .empty,
+
     file_tokens: std.StringHashMapUnmanaged(FileTokens) = .empty,
     file_tokens_mutex: std.Io.Mutex = .init,
 
@@ -318,6 +346,57 @@ pub const LSPServer = struct {
         };
     };
 
+    /// `textDocument/codeAction` result. We store a minimal subset:
+    /// the human-readable title (shown in the picker) and the raw
+    /// JSON of the `edit` and `command` fields so apply-time logic
+    /// can re-parse without forcing every server's CodeAction shape
+    /// through a single typed schema. Memory: every field is owned
+    /// and freed in `freeCodeActions`.
+    pub const CodeAction = struct {
+        title: []const u8,
+        /// Optional `kind` string (e.g. "quickfix", "refactor.extract").
+        /// Used only for grouping/labeling; null when the action is a
+        /// raw `Command` (no `kind` field).
+        kind: ?[]const u8 = null,
+        /// Serialized JSON of the `WorkspaceEdit` returned by the
+        /// server, or null if this action is purely a `Command`.
+        edit_json: ?[]const u8 = null,
+        /// Serialized JSON of the `Command` field, or null if the
+        /// action only carries an `edit`.
+        command_json: ?[]const u8 = null,
+    };
+
+    /// `textDocument/signatureHelp` result. We collapse the LSP shape
+    /// (signatures[], activeSignature, activeParameter) to a single
+    /// active-signature view — most servers return one and the popup
+    /// only renders the active one anyway. `parameters` is the list
+    /// of param-label strings extracted from the active signature.
+    pub const SignatureHelp = struct {
+        /// Full signature label, e.g. "foo(x: int, y: int) -> int".
+        label: []const u8,
+        /// Param labels, in order. Used by the renderer to bold/underline
+        /// the active one.
+        parameters: [][]const u8,
+        /// 0-based index of the parameter currently being typed.
+        /// Out-of-range means "no parameter highlighted".
+        active_parameter: u32 = 0,
+    };
+
+    /// `textDocument/inlayHint` result. We flatten the label to a
+    /// single string — multi-part labels (LabelPart[]) are joined
+    /// with empty separators because we don't render hover/edit
+    /// targets per part.
+    pub const InlayHint = struct {
+        line: u32,
+        col: u32,
+        label: []const u8,
+        /// 1 = type, 2 = parameter. `null` means the server didn't
+        /// specify; renderer treats unset as "other" / default style.
+        kind: ?u8 = null,
+        padding_left: bool = false,
+        padding_right: bool = false,
+    };
+
     const SemanticTokenType = enum(u32) {
         namespace = 0,
         type = 1,
@@ -450,10 +529,47 @@ pub const LSPServer = struct {
         }
         self.workspace_symbols_mutex.unlock(self.io);
 
+        self.code_action_mutex.lockUncancelable(self.io);
+        if (self.code_action_result) |acts| {
+            for (acts) |a| freeCodeActionInner(self.allocator, a);
+            self.allocator.free(acts);
+        }
+        self.code_action_mutex.unlock(self.io);
+
+        self.signature_help_mutex.lockUncancelable(self.io);
+        if (self.signature_help_result) |sh| freeSignatureHelpInner(self.allocator, sh);
+        self.signature_help_mutex.unlock(self.io);
+
+        self.inlay_hints_mutex.lockUncancelable(self.io);
+        var inlay_it = self.inlay_hints.iterator();
+        while (inlay_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            for (entry.value_ptr.*) |h| self.allocator.free(h.label);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.inlay_hints.deinit(self.allocator);
+        var inlay_pend_it = self.pending_inlay_requests.valueIterator();
+        while (inlay_pend_it.next()) |uri_ptr| self.allocator.free(uri_ptr.*);
+        self.pending_inlay_requests.deinit(self.allocator);
+        self.inlay_hints_mutex.unlock(self.io);
+
         self.to_server.deinit();
         self.from_server.deinit();
 
         self.allocator.destroy(self);
+    }
+
+    fn freeCodeActionInner(allocator: std.mem.Allocator, a: CodeAction) void {
+        allocator.free(a.title);
+        if (a.kind) |k| allocator.free(k);
+        if (a.edit_json) |e| allocator.free(e);
+        if (a.command_json) |c| allocator.free(c);
+    }
+
+    fn freeSignatureHelpInner(allocator: std.mem.Allocator, sh: SignatureHelp) void {
+        allocator.free(sh.label);
+        for (sh.parameters) |p| allocator.free(p);
+        allocator.free(sh.parameters);
     }
 
     pub fn stop(self: *LSPServer) void {
@@ -854,6 +970,28 @@ pub const LSPServer = struct {
                     .workspace_symbols => if (result) |r| {
                         self.handleWorkspaceSymbolsResult(r) catch |err| log.warn("[LSP] workspace symbols handler: {}", .{err});
                     },
+                    .code_action => if (result) |r| {
+                        self.handleCodeActionResult(r) catch |err| log.warn("[LSP] code action handler: {}", .{err});
+                    },
+                    .signature_help => if (result) |r| {
+                        self.handleSignatureHelpResult(r) catch |err| log.warn("[LSP] signature help handler: {}", .{err});
+                    },
+                    .inlay_hint => {
+                        const uri_owned = blk: {
+                            self.inlay_hints_mutex.lockUncancelable(self.io);
+                            defer self.inlay_hints_mutex.unlock(self.io);
+                            if (self.pending_inlay_requests.fetchRemove(id)) |kv| {
+                                break :blk kv.value;
+                            }
+                            break :blk null;
+                        };
+                        if (uri_owned) |uri| {
+                            defer self.allocator.free(uri);
+                            if (result) |r| {
+                                self.handleInlayHintResult(r, uri) catch |err| log.warn("[LSP] inlay hint handler: {}", .{err});
+                            }
+                        }
+                    },
                 }
                 return;
             }
@@ -1225,6 +1363,29 @@ pub const LSPServer = struct {
         try self.sendRequestWithId(id, "textDocument/formatting", params.written());
     }
 
+    /// Range version of `requestFormatting` — `textDocument/rangeFormatting`.
+    /// The response shape is identical (`TextEdit[]`) so it reuses the same
+    /// `.format` pending kind and result slot.
+    pub fn requestRangeFormatting(self: *LSPServer, uri: []const u8, start_line: u32, start_col: u32, end_line: u32, end_col: u32) !void {
+        var params: std.Io.Writer.Allocating = .init(self.allocator);
+        defer params.deinit();
+        const w = &params.writer;
+        try w.writeAll("{\"textDocument\":{\"uri\":\"");
+        try w.writeAll(uri);
+        try w.writeAll("\"},\"range\":{\"start\":{\"line\":");
+        try w.print("{d}", .{start_line});
+        try w.writeAll(",\"character\":");
+        try w.print("{d}", .{start_col});
+        try w.writeAll("},\"end\":{\"line\":");
+        try w.print("{d}", .{end_line});
+        try w.writeAll(",\"character\":");
+        try w.print("{d}", .{end_col});
+        try w.writeAll("}},\"options\":{\"tabSize\":4,\"insertSpaces\":true}}");
+        const id = self.nextRequestId();
+        try self.setPending(.format, id);
+        try self.sendRequestWithId(id, "textDocument/rangeFormatting", params.written());
+    }
+
     pub fn requestDefinition(self: *LSPServer, uri: []const u8, line: u32, col: u32) !void {
         var params: std.Io.Writer.Allocating = .init(self.allocator);
         defer params.deinit();
@@ -1298,6 +1459,72 @@ pub const LSPServer = struct {
         const id = self.nextRequestId();
         try self.setPending(.workspace_symbols, id);
         try self.sendRequestWithId(id, "workspace/symbol", params.written());
+    }
+
+    /// `textDocument/codeAction`. We always ask for the full set
+    /// (no `context.only` filter) because filtering is a server-
+    /// side optimization; the picker is the final filter.
+    pub fn requestCodeAction(self: *LSPServer, uri: []const u8, start_line: u32, start_col: u32, end_line: u32, end_col: u32) !void {
+        var params: std.Io.Writer.Allocating = .init(self.allocator);
+        defer params.deinit();
+        const w = &params.writer;
+        try w.writeAll("{\"textDocument\":{\"uri\":\"");
+        try w.writeAll(uri);
+        try w.writeAll("\"},\"range\":{\"start\":{\"line\":");
+        try w.print("{d}", .{start_line});
+        try w.writeAll(",\"character\":");
+        try w.print("{d}", .{start_col});
+        try w.writeAll("},\"end\":{\"line\":");
+        try w.print("{d}", .{end_line});
+        try w.writeAll(",\"character\":");
+        try w.print("{d}", .{end_col});
+        try w.writeAll("}},\"context\":{\"diagnostics\":[]}}");
+        const id = self.nextRequestId();
+        try self.setPending(.code_action, id);
+        try self.sendRequestWithId(id, "textDocument/codeAction", params.written());
+    }
+
+    pub fn requestSignatureHelp(self: *LSPServer, uri: []const u8, line: u32, col: u32) !void {
+        var params: std.Io.Writer.Allocating = .init(self.allocator);
+        defer params.deinit();
+        const w = &params.writer;
+        try w.writeAll("{\"textDocument\":{\"uri\":\"");
+        try w.writeAll(uri);
+        try w.writeAll("\"},\"position\":{\"line\":");
+        try w.print("{d}", .{line});
+        try w.writeAll(",\"character\":");
+        try w.print("{d}", .{col});
+        try w.writeAll("}}");
+        const id = self.nextRequestId();
+        try self.setPending(.signature_help, id);
+        try self.sendRequestWithId(id, "textDocument/signatureHelp", params.written());
+    }
+
+    /// `textDocument/inlayHint`. Unlike the other requests this one
+    /// carries the URI through the pending map (similar to semantic
+    /// tokens) so the response handler can route hints to the right
+    /// file's slot.
+    pub fn requestInlayHint(self: *LSPServer, uri: []const u8, start_line: u32, end_line: u32) !void {
+        var params: std.Io.Writer.Allocating = .init(self.allocator);
+        defer params.deinit();
+        const w = &params.writer;
+        try w.writeAll("{\"textDocument\":{\"uri\":\"");
+        try w.writeAll(uri);
+        try w.writeAll("\"},\"range\":{\"start\":{\"line\":");
+        try w.print("{d}", .{start_line});
+        try w.writeAll(",\"character\":0},\"end\":{\"line\":");
+        try w.print("{d}", .{end_line});
+        try w.writeAll(",\"character\":0}}}");
+        const id = self.nextRequestId();
+        try self.setPending(.inlay_hint, id);
+
+        const uri_dup = try self.allocator.dupe(u8, uri);
+        errdefer self.allocator.free(uri_dup);
+        self.inlay_hints_mutex.lockUncancelable(self.io);
+        try self.pending_inlay_requests.put(self.allocator, id, uri_dup);
+        self.inlay_hints_mutex.unlock(self.io);
+
+        try self.sendRequestWithId(id, "textDocument/inlayHint", params.written());
     }
 
     pub fn handleSemanticTokensResult(self: *LSPServer, result: std.json.Value, uri: []const u8) !void {
@@ -2022,6 +2249,214 @@ pub const LSPServer = struct {
         }
         self.workspace_symbols_result = owned;
         self.workspace_symbols_mutex.unlock(self.io);
+    }
+
+    /// Parse `(Command | CodeAction)[]`. Both shapes share `title`,
+    /// so we read that uniformly and stash the raw JSON for whichever
+    /// of `edit` / `command` is present. Apply-time code re-parses
+    /// just the field it needs.
+    fn handleCodeActionResult(self: *LSPServer, result: std.json.Value) !void {
+        var owned: std.ArrayListUnmanaged(CodeAction) = .empty;
+        errdefer {
+            for (owned.items) |a| freeCodeActionInner(self.allocator, a);
+            owned.deinit(self.allocator);
+        }
+        if (result == .array) {
+            for (result.array.items) |item| {
+                if (item != .object) continue;
+                const title_val = item.object.get("title") orelse continue;
+                if (title_val != .string) continue;
+                const title = try self.allocator.dupe(u8, title_val.string);
+                errdefer self.allocator.free(title);
+
+                var kind: ?[]const u8 = null;
+                errdefer if (kind) |k| self.allocator.free(k);
+                if (item.object.get("kind")) |kv| {
+                    if (kv == .string) kind = try self.allocator.dupe(u8, kv.string);
+                }
+
+                // Re-serialize the `edit` / `command` sub-objects so
+                // the apply path can re-parse them without us having
+                // to round-trip the entire LSP `WorkspaceEdit` schema
+                // through Zig types. The JSON arenas in this scope
+                // own the original strings; we copy out.
+                var edit_json: ?[]const u8 = null;
+                errdefer if (edit_json) |e| self.allocator.free(e);
+                if (item.object.get("edit")) |ev| {
+                    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+                    defer aw.deinit();
+                    try std.json.Stringify.value(ev, .{}, &aw.writer);
+                    edit_json = try self.allocator.dupe(u8, aw.written());
+                }
+
+                var command_json: ?[]const u8 = null;
+                errdefer if (command_json) |c| self.allocator.free(c);
+                if (item.object.get("command")) |cv| {
+                    var aw: std.Io.Writer.Allocating = .init(self.allocator);
+                    defer aw.deinit();
+                    try std.json.Stringify.value(cv, .{}, &aw.writer);
+                    command_json = try self.allocator.dupe(u8, aw.written());
+                }
+
+                try owned.append(self.allocator, .{
+                    .title = title,
+                    .kind = kind,
+                    .edit_json = edit_json,
+                    .command_json = command_json,
+                });
+            }
+        }
+
+        const slice = try owned.toOwnedSlice(self.allocator);
+        self.code_action_mutex.lockUncancelable(self.io);
+        if (self.code_action_result) |old| {
+            for (old) |a| freeCodeActionInner(self.allocator, a);
+            self.allocator.free(old);
+        }
+        self.code_action_result = slice;
+        self.code_action_mutex.unlock(self.io);
+    }
+
+    /// Parse `SignatureHelp`. We flatten to the active signature
+    /// only (most servers return one anyway) and extract param
+    /// labels as plain strings — multi-part labels with offset
+    /// ranges are slice'd through `signature.label[start..end]`.
+    fn handleSignatureHelpResult(self: *LSPServer, result: std.json.Value) !void {
+        if (result == .null) {
+            self.signature_help_mutex.lockUncancelable(self.io);
+            if (self.signature_help_result) |old| freeSignatureHelpInner(self.allocator, old);
+            self.signature_help_result = null;
+            self.signature_help_mutex.unlock(self.io);
+            return;
+        }
+        if (result != .object) return;
+        const signatures = result.object.get("signatures") orelse return;
+        if (signatures != .array or signatures.array.items.len == 0) return;
+
+        var active_sig: usize = 0;
+        if (result.object.get("activeSignature")) |as| {
+            if (as == .integer and as.integer >= 0 and @as(usize, @intCast(as.integer)) < signatures.array.items.len) {
+                active_sig = @intCast(as.integer);
+            }
+        }
+        var active_param: u32 = 0;
+        if (result.object.get("activeParameter")) |ap| {
+            if (ap == .integer and ap.integer >= 0) active_param = @intCast(ap.integer);
+        }
+
+        const sig = signatures.array.items[active_sig];
+        if (sig != .object) return;
+        const label_val = sig.object.get("label") orelse return;
+        if (label_val != .string) return;
+        const label = try self.allocator.dupe(u8, label_val.string);
+        errdefer self.allocator.free(label);
+
+        var params_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (params_list.items) |p| self.allocator.free(p);
+            params_list.deinit(self.allocator);
+        }
+        if (sig.object.get("parameters")) |params| {
+            if (params == .array) {
+                for (params.array.items) |p| {
+                    if (p != .object) continue;
+                    const pl = p.object.get("label") orelse continue;
+                    // `label` can be either a string or `[start, end]`. Handle both.
+                    if (pl == .string) {
+                        const dup = try self.allocator.dupe(u8, pl.string);
+                        try params_list.append(self.allocator, dup);
+                    } else if (pl == .array and pl.array.items.len == 2 and
+                        pl.array.items[0] == .integer and pl.array.items[1] == .integer)
+                    {
+                        const p_start: usize = @intCast(@max(0, pl.array.items[0].integer));
+                        const p_end: usize = @intCast(@max(0, pl.array.items[1].integer));
+                        if (p_end <= label.len and p_start <= p_end) {
+                            const dup = try self.allocator.dupe(u8, label[p_start..p_end]);
+                            try params_list.append(self.allocator, dup);
+                        }
+                    }
+                }
+            }
+        }
+        const params_slice = try params_list.toOwnedSlice(self.allocator);
+
+        self.signature_help_mutex.lockUncancelable(self.io);
+        if (self.signature_help_result) |old| freeSignatureHelpInner(self.allocator, old);
+        self.signature_help_result = .{
+            .label = label,
+            .parameters = params_slice,
+            .active_parameter = active_param,
+        };
+        self.signature_help_mutex.unlock(self.io);
+    }
+
+    /// Parse `InlayHint[]`. Multi-part labels get joined with the
+    /// natural concatenation (no separators) because we don't render
+    /// individual parts.
+    fn handleInlayHintResult(self: *LSPServer, result: std.json.Value, uri: []const u8) !void {
+        var owned: std.ArrayListUnmanaged(InlayHint) = .empty;
+        errdefer {
+            for (owned.items) |h| self.allocator.free(h.label);
+            owned.deinit(self.allocator);
+        }
+        if (result == .array) {
+            for (result.array.items) |item| {
+                if (item != .object) continue;
+                const pos = item.object.get("position") orelse continue;
+                if (pos != .object) continue;
+                const line_val = pos.object.get("line") orelse continue;
+                const char_val = pos.object.get("character") orelse continue;
+                if (line_val != .integer or char_val != .integer) continue;
+
+                const lbl_val = item.object.get("label") orelse continue;
+                var label_buf: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer label_buf.deinit(self.allocator);
+                if (lbl_val == .string) {
+                    try label_buf.appendSlice(self.allocator, lbl_val.string);
+                } else if (lbl_val == .array) {
+                    for (lbl_val.array.items) |part| {
+                        if (part == .object) {
+                            if (part.object.get("value")) |v| if (v == .string) try label_buf.appendSlice(self.allocator, v.string);
+                        }
+                    }
+                } else continue;
+                const label_owned = try label_buf.toOwnedSlice(self.allocator);
+
+                var kind: ?u8 = null;
+                if (item.object.get("kind")) |kv| {
+                    if (kv == .integer) kind = @intCast(@as(i64, kv.integer) & 0xFF);
+                }
+                var pl = false;
+                var pr = false;
+                if (item.object.get("paddingLeft")) |v| if (v == .bool) {
+                    pl = v.bool;
+                };
+                if (item.object.get("paddingRight")) |v| if (v == .bool) {
+                    pr = v.bool;
+                };
+
+                try owned.append(self.allocator, .{
+                    .line = @intCast(line_val.integer),
+                    .col = @intCast(char_val.integer),
+                    .label = label_owned,
+                    .kind = kind,
+                    .padding_left = pl,
+                    .padding_right = pr,
+                });
+            }
+        }
+        const slice = try owned.toOwnedSlice(self.allocator);
+
+        self.inlay_hints_mutex.lockUncancelable(self.io);
+        defer self.inlay_hints_mutex.unlock(self.io);
+        const gop = try self.inlay_hints.getOrPut(self.allocator, uri);
+        if (gop.found_existing) {
+            for (gop.value_ptr.*) |h| self.allocator.free(h.label);
+            self.allocator.free(gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = try self.allocator.dupe(u8, uri);
+        }
+        gop.value_ptr.* = slice;
     }
 
     pub fn handleDiagnostics(self: *LSPServer, root: std.json.Value) !void {

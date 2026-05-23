@@ -123,6 +123,30 @@ pub const Core = struct {
     /// `'` pressed in select mode, awaiting bookmark slot to jump to.
     bookmark_jump_pending: bool = false,
     bookmarks: BookmarkStore,
+
+    /// Pending code-action list after `lsp.code_action` fired and
+    /// the LSP returned a non-empty list. While set, the next
+    /// digit `1..9`/`0` keypress applies the corresponding action;
+    /// Esc cancels. Owned by `self.allocator` via `freeCodeActions`.
+    code_action_pending: ?[]LspServer.CodeAction = null,
+
+    /// `textDocument/signatureHelp` last response. Populated when
+    /// `(` or `,` is typed in Insert mode and the LSP responded;
+    /// cleared on Esc, mode change, or another `(` triggering a
+    /// fresh request. Renders as a single-line popup above the
+    /// cursor.
+    signature_help: ?LspServer.SignatureHelp = null,
+    /// True between firing a signatureHelp request and either the
+    /// response arriving or the user dismissing. Polled by the
+    /// tick handler to drain the result without busy-waiting on
+    /// the Insert input path.
+    signature_help_pending: bool = false,
+
+    /// Wall-clock ms of last `textDocument/inlayHint` request.
+    /// Used to throttle: re-fire only when 500 ms have passed
+    /// since the previous fire, which keeps inlay updates timely
+    /// enough on scroll/edit without spamming the LSP.
+    last_inlay_request_ms: i64 = 0,
     /// Text-object / surround chord progress. `s` in select mode
     /// starts the chord:
     ///   `s i <c>`  → select inside <c>
@@ -431,6 +455,15 @@ pub const Core = struct {
 
         core.plugin_manager = PluginManager.init(allocator, io, environ_block, ui_bus, core.command_registry);
         core.search_index = SearchIndex.init(allocator, io, environ_block);
+
+        // Push the user's configured thresholds into the buffer manager
+        // so the first `openFile` honours them. Live config changes call
+        // `setLargeFileThresholds` again from the config-change handler.
+        core.buffer_manager.setLargeFileThresholds(
+            storage.config.editor.large_file_threshold_bytes,
+            storage.config.editor.large_file_threshold_lines,
+            storage.config.editor.large_file_hard_limit_bytes,
+        );
         return core;
     }
 
@@ -461,6 +494,14 @@ pub const Core = struct {
         self.global_search_replace_text_snap.deinit(self.allocator);
         self.multi_cursors.deinit(self.allocator);
         self.multi_cursor_query.deinit(self.allocator);
+        if (self.code_action_pending) |list| {
+            self.lsp_manager.freeCodeActions(list);
+            self.code_action_pending = null;
+        }
+        if (self.signature_help) |sh| {
+            self.lsp_manager.freeSignatureHelp(sh);
+            self.signature_help = null;
+        }
         self.lsp_manager.deinit();
         if (self.references_symbol_name) |name| self.allocator.free(name);
         if (self.references_source_file) |path| self.allocator.free(path);
@@ -529,6 +570,29 @@ pub const Core = struct {
             }
         }
         return &self.buffer_manager.getActive().state;
+    }
+
+    /// Whether the active buffer is in "large-file mode" — bypasses
+    /// tree-sitter highlighting, bracket rainbow, LSP requests, and
+    /// auto-pair so multi-MB files stay responsive. Computed once at
+    /// open in `BufferManager.openFile`, sticky for the buffer's life.
+    /// Lookup is two pointer dereferences; fine to call per-frame.
+    pub fn activeBufferIsLarge(self: *Core) bool {
+        if (self.split_manager) |*sm| {
+            const pane = sm.getFocusedPane();
+            if (pane.buffer_index < self.buffer_manager.buffers.items.len) {
+                return self.buffer_manager.buffers.items[pane.buffer_index].is_large;
+            }
+        }
+        return self.buffer_manager.getActive().is_large;
+    }
+
+    /// Whether the buffer at `index` is in large-file mode. Used by
+    /// pane-render code in `sendUpdate` so each split can be gated
+    /// independently of the focused one.
+    pub fn bufferIsLargeAt(self: *Core, index: usize) bool {
+        if (index >= self.buffer_manager.buffers.items.len) return false;
+        return self.buffer_manager.buffers.items[index].is_large;
     }
 
     pub fn ensureSplitManager(self: *Core) !void {
@@ -1026,6 +1090,24 @@ pub const Core = struct {
         try self.sendUpdate();
     }
 
+    fn cmdEditorToggleInlineDiagnostics(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
+        _ = context;
+        const self: *Core = @ptrCast(@alignCast(ctx));
+        self.storage.config.editor.inline_diagnostics = !self.storage.config.editor.inline_diagnostics;
+        const tag: []const u8 = if (self.storage.config.editor.inline_diagnostics) "ON" else "OFF";
+        self.setStatus("Inline diagnostics: {s}", .{tag}, 2000);
+        try self.sendUpdate();
+    }
+
+    fn cmdEditorToggleInlayHints(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
+        _ = context;
+        const self: *Core = @ptrCast(@alignCast(ctx));
+        self.storage.config.editor.inlay_hints = !self.storage.config.editor.inlay_hints;
+        const tag: []const u8 = if (self.storage.config.editor.inlay_hints) "ON" else "OFF";
+        self.setStatus("Inlay hints: {s}", .{tag}, 2000);
+        try self.sendUpdate();
+    }
+
     /// Cheap precondition for format-on-save: do we even have an LSP
     /// class for this file's language? If not, skip the formatter
     /// request entirely so .txt and friends don't pay a 100 ms wait
@@ -1203,6 +1285,7 @@ pub const Core = struct {
         try R.register("buffer.close", "Buffer: Close", "Close the active buffer", Wrap(BufferCommands.cmdBufferClose).run, null);
         try R.register("buffer.close_others", "Buffer: Close Others", "Close all buffers except active", Wrap(BufferCommands.cmdBufferCloseOthers).run, null);
         try R.register("buffer.new_scratch", "Buffer: New Scratch", "Create a new scratch buffer (not saved to disk)", Wrap(BufferCommands.cmdBufferNewScratch).run, null);
+        try R.register("buffer.restore_backups", "Buffer: Restore Backups", "List auto-save backups in ~/.stem/recover/", cmdBufferRestoreBackups, null);
 
         try R.register("edit.delete_line", "Edit: Delete Line", "Remove the current line", Wrap(EditCommands.cmdEditDeleteLine).run, null);
         try R.register("edit.duplicate_line", "Edit: Duplicate Line", "Copy current line and insert below", Wrap(EditCommands.cmdEditDuplicateLine).run, null);
@@ -1229,6 +1312,8 @@ pub const Core = struct {
         try R.register("bookmark.clear_all", "Bookmark: Clear All", "Remove every set bookmark for this project", cmdBookmarkClearAll, null);
 
         try R.register("lsp.format", "LSP: Format Document", "Format the entire file using zls", Wrap(LspCommands.cmdLspFormatDocument).run, null);
+        try R.register("lsp.format_selection", "LSP: Format Selection", "Format the visual selection (or current line) via textDocument/rangeFormatting", cmdLspFormatSelection, null);
+        try R.register("lsp.code_action", "LSP: Code Actions", "Show available code actions at the cursor (Space .)", cmdLspCodeAction, null);
         try R.register("lsp.definition", "LSP: Go to Definition", "Jump to symbol definition", Wrap(LspCommands.cmdLspGoToDefinition).run, null);
         try R.register("lsp.diagnostics", "LSP: Show Diagnostics", "List all errors/warnings for current file", Wrap(LspCommands.cmdLspShowDiagnostics).run, null);
         try R.register("lsp.restart", "LSP: Restart Server", "Force restart the embedded zls instance", Wrap(LspCommands.cmdLspRestartServer).run, null);
@@ -1237,6 +1322,8 @@ pub const Core = struct {
         try R.register("lsp.references", "LSP: Find References", "Find all references to symbol under cursor", Wrap(LspCommands.cmdLspFindReferences).run, null);
         try R.register("lsp.workspace_symbols", "LSP: Workspace Symbols", "Fuzzy find symbols across the workspace via LSP", cmdWorkspaceSymbols, null);
         try R.register("lsp.toggle_format_on_save", "LSP: Toggle Format on Save", "Run the LSP formatter automatically before each save", cmdLspToggleFormatOnSave, null);
+        try R.register("editor.toggle_inline_diagnostics", "Editor: Toggle Inline Diagnostics", "Show diagnostic messages inline at end-of-line on every affected line (\"error lens\")", cmdEditorToggleInlineDiagnostics, null);
+        try R.register("editor.toggle_inlay_hints", "Editor: Toggle Inlay Hints", "Render LSP inlay hints (type annotations, param names) as dim virtual text", cmdEditorToggleInlayHints, null);
 
         try R.register("mode.insert", "Mode: Insert", "Switch to insert mode", Wrap(SystemCommands.cmdModeInsert).run, null);
         try R.register("mode.visual", "Mode: Visual", "Switch to visual mode", Wrap(SystemCommands.cmdModeVisual).run, null);
@@ -1359,6 +1446,11 @@ pub const Core = struct {
         // `start_server` from prespawn finishes — by the time the user
         // hovers/completes, the doc is already known to the server.
         self.eagerlyOpenActiveBuffer();
+
+        // Surface any orphaned auto-save backups from a previous crash
+        // before the first render so the user notices the toast right
+        // away (vs. discovering it deep in a command-palette walk).
+        self.surfaceOrphanBackups();
 
         try self.sendUpdate();
         while (true) {
@@ -1646,11 +1738,15 @@ pub const Core = struct {
                                     };
                                     const new_state = self.state();
                                     if (new_state.file_path) |path| {
-                                        const content = new_state.buffer.toString(self.allocator) catch continue;
-                                        defer self.allocator.free(content);
-                                        self.lsp_manager.documentOpened(path, content) catch |err| {
-                                            log.warn("LSP document sync failed for '{s}': {}", .{ path, err });
-                                        };
+                                        // Don't push large buffers to LSP — see
+                                        // `ensureLspDocument` for the same gate.
+                                        if (!self.activeBufferIsLarge()) {
+                                            const content = new_state.buffer.toString(self.allocator) catch continue;
+                                            defer self.allocator.free(content);
+                                            self.lsp_manager.documentOpened(path, content) catch |err| {
+                                                log.warn("LSP document sync failed for '{s}': {}", .{ path, err });
+                                            };
+                                        }
                                     }
                                 }
 
@@ -1844,6 +1940,20 @@ pub const Core = struct {
                                     }
                                     try self.updateCompletionFilter();
                                 }
+                                self.requestRender();
+                            }
+                        }
+
+                        // Drain signature help responses. Replaces any
+                        // current popup; if the server returned a null
+                        // (no signature here, e.g. after `)`), the pop
+                        // returns null and we keep showing the previous
+                        // one until the user dismisses.
+                        if (self.signature_help_pending) {
+                            if (self.lsp_manager.popSignatureHelpResult()) |sh| {
+                                self.signature_help_pending = false;
+                                if (self.signature_help) |old| self.lsp_manager.freeSignatureHelp(old);
+                                self.signature_help = sh;
                                 self.requestRender();
                             }
                         }
@@ -2436,6 +2546,31 @@ pub const Core = struct {
             // Fall through — unknown follow-up dispatches normally.
         }
 
+        // Code-action picker: a digit picks an action; anything else
+        // (Esc, letter, navigation) dismisses the pending list.
+        if (self.code_action_pending) |list| {
+            if (key.codepoint >= '1' and key.codepoint <= '9' and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
+                const idx: usize = @intCast(key.codepoint - '1');
+                if (idx < list.len) {
+                    const chosen = list[idx];
+                    // Take ownership: clear the slot so the apply
+                    // callback can't see a half-freed list if it
+                    // re-enters the dispatcher.
+                    self.code_action_pending = null;
+                    defer self.lsp_manager.freeCodeActions(list);
+                    self.applyCodeAction(chosen) catch |err| {
+                        self.setStatus("Code action apply failed: {}", .{err}, 3000);
+                    };
+                    return true;
+                }
+            }
+            // Any other key (Esc, letter, etc.) cancels the chord.
+            self.lsp_manager.freeCodeActions(list);
+            self.code_action_pending = null;
+            self.setStatusLiteralLeveled(.info, "Code actions: cancelled", 1000);
+            // Fall through — let the key do its normal job.
+        }
+
         // `]d` / `[d` jump to next/previous diagnostic. The bracket prefix
         // is a one-shot — any non-matching follow-up cancels it.
         if (self.bracket_pending) |prefix| {
@@ -2636,6 +2771,8 @@ pub const Core = struct {
                 Keys.action_lsp_diagnostics => try LspCommands.cmdLspShowDiagnostics(self),
                 Keys.action_document_symbols => try cmdDocumentSymbols(self, null),
                 Keys.action_workspace_symbols => try cmdWorkspaceSymbols(self, null),
+                Keys.action_code_action => try cmdLspCodeAction(self, null),
+                Keys.action_format_selection => try cmdLspFormatSelection(self, null),
 
                 Keys.action_jump_back => try cmdJumpBack(self, null),
                 Keys.action_jump_forward => try cmdJumpForward(self, null),
@@ -2707,11 +2844,14 @@ pub const Core = struct {
                     self.leader_pending = false;
                 },
 
-                // `Space ?` → reveal the which-key popup. Toggles, so a
-                // second `?` hides it again without leaving the chord.
-                // Picked `?` because every other leader binding is
-                // `Space <letter>`, and `?` matches the convention used
-                // by which-key.nvim / LazyVim / Spacemacs.
+                // `Space ;` → reveal the which-key popup. Toggles, so
+                // a second `;` hides it again without leaving the
+                // chord. Picked `;` after `?` proved ambiguous: many
+                // terminals deliver `Shift+/` as codepoint `'/'` with
+                // a shift modifier, which fell through to
+                // `action_global_search` ('/') in this switch. `;` is
+                // unshifted, on the right home row, and unused
+                // anywhere else in the leader chord.
                 Keys.action_which_key => {
                     self.leader_help_requested = !self.leader_help_requested;
                 },
@@ -2744,7 +2884,7 @@ pub const Core = struct {
             // Toast the hint so the user knows the chord is open and
             // there's a way to see all the bindings without trial
             // and error. Short enough to never get in the way.
-            self.setStatusLiteralLeveled(.info, "Space again for command help", 1500);
+            self.setStatusLiteralLeveled(.info, "Space ; for command help", 1500);
             return true;
         }
 
@@ -3659,7 +3799,10 @@ pub const Core = struct {
             s.moveCursorToLineEnd();
         } else if (key.matches(vaxis.Key.backspace, .{})) {
             const config = auto_pair.AutoPairConfig{
-                .enabled = self.storage.config.editor.auto_pairs,
+                // Disable auto-pairs in large-file mode so backspace stays
+                // a pure 1-char delete (and we don't scan around the cursor
+                // for matching brackets on every keystroke in a huge file).
+                .enabled = self.storage.config.editor.auto_pairs and !self.activeBufferIsLarge(),
                 .smart_deletion = true,
             };
 
@@ -3696,7 +3839,7 @@ pub const Core = struct {
                 const char = text[0];
 
                 const config = auto_pair.AutoPairConfig{
-                    .enabled = self.storage.config.editor.auto_pairs,
+                    .enabled = self.storage.config.editor.auto_pairs and !self.activeBufferIsLarge(),
                     .wrap_selection = true,
                     .smart_deletion = true,
                     .context_aware = false,
@@ -3718,6 +3861,15 @@ pub const Core = struct {
                     try self.triggerCompletion();
                 }
 
+                // Signature help: `(` opens, `,` re-fires to update the
+                // active-parameter index, `)` dismisses. Cheap fire-and-
+                // forget — the tick handler drains the response.
+                if (char == '(' or char == ',') {
+                    self.triggerSignatureHelp() catch {};
+                } else if (char == ')') {
+                    self.dismissSignatureHelp();
+                }
+
                 try self.updateCompletionFilter();
                 self.markLspDirty();
             }
@@ -3725,7 +3877,29 @@ pub const Core = struct {
         return true;
     }
 
+    fn triggerSignatureHelp(self: *Core) !void {
+        if (self.activeBufferIsLarge()) return;
+        const s = self.state();
+        const path = s.file_path orelse return;
+        if (LSPManager.getLangFromPath(path) == null) return;
+        try self.ensureLspDocument();
+        self.lsp_manager.requestSignatureHelp(path, @intCast(s.cursor_row), @intCast(s.cursor_col)) catch |err| {
+            log.debug("signatureHelp request failed: {}", .{err});
+            return;
+        };
+        self.signature_help_pending = true;
+    }
+
+    pub fn dismissSignatureHelp(self: *Core) void {
+        if (self.signature_help) |sh| self.lsp_manager.freeSignatureHelp(sh);
+        self.signature_help = null;
+        self.signature_help_pending = false;
+    }
+
     fn triggerCompletion(self: *Core) !void {
+        // Skip in large-file mode — neither the LSP nor the user wants
+        // us shoving multi-MB content into the server every keystroke.
+        if (self.activeBufferIsLarge()) return;
         const s = self.state();
         const path = s.file_path orelse return;
 
@@ -3848,6 +4022,10 @@ pub const Core = struct {
     }
 
     pub fn sendLspDocChanged(self: *Core) !void {
+        // Large-file mode: skip LSP didChange and tree-sitter reparse
+        // entirely. Both would be expensive per-keystroke and the buffer
+        // is rendering as plain text anyway.
+        if (self.activeBufferIsLarge()) return;
         const s = self.state();
         if (s.file_path) |path| {
             // Was Zig-only; any language we have an LSP for needs
@@ -3951,6 +4129,8 @@ pub const Core = struct {
                 Keys.action_lsp_references => try LspCommands.cmdLspFindReferences(self),
                 Keys.action_lsp_hover => try LspCommands.cmdLspHover(self),
                 Keys.action_lsp_diagnostics => try LspCommands.cmdLspShowDiagnostics(self),
+                Keys.action_code_action => try cmdLspCodeAction(self, null),
+                Keys.action_format_selection => try cmdLspFormatSelection(self, null),
 
                 Keys.action_jump_back => try cmdJumpBack(self, null),
                 Keys.action_jump_forward => try cmdJumpForward(self, null),
@@ -3959,11 +4139,14 @@ pub const Core = struct {
                     self.leader_pending = false;
                 },
 
-                // `Space ?` → reveal the which-key popup. Toggles, so a
-                // second `?` hides it again without leaving the chord.
-                // Picked `?` because every other leader binding is
-                // `Space <letter>`, and `?` matches the convention used
-                // by which-key.nvim / LazyVim / Spacemacs.
+                // `Space ;` → reveal the which-key popup. Toggles, so
+                // a second `;` hides it again without leaving the
+                // chord. Picked `;` after `?` proved ambiguous: many
+                // terminals deliver `Shift+/` as codepoint `'/'` with
+                // a shift modifier, which fell through to
+                // `action_global_search` ('/') in this switch. `;` is
+                // unshifted, on the right home row, and unused
+                // anywhere else in the leader chord.
                 Keys.action_which_key => {
                     self.leader_help_requested = !self.leader_help_requested;
                 },
@@ -3979,7 +4162,7 @@ pub const Core = struct {
         if (key.matches(Keys.leader, .{})) {
             self.leader_pending = true;
             self.leader_help_requested = false;
-            self.setStatusLiteralLeveled(.info, "Space again for command help", 1500);
+            self.setStatusLiteralLeveled(.info, "Space ; for command help", 1500);
             return true;
         }
 
@@ -4137,8 +4320,12 @@ pub const Core = struct {
                 try self.workspace_manager.registerBuffer(opened_buffer.id, file_path);
 
                 const lang = SyntaxManager.Language.fromFilename(file_path);
+                const opened_is_large = opened_buffer.is_large;
+                if (opened_is_large) {
+                    self.setStatusLeveled(.warning, "Opened {s} in large-file mode — LSP, syntax, brackets disabled", .{opened_buffer.name}, 3000);
+                }
 
-                if (lang == .zig or lang == .python or lang == .javascript or lang == .typescript or lang == .go or lang == .rust) {
+                if (!opened_is_large and (lang == .zig or lang == .python or lang == .javascript or lang == .typescript or lang == .go or lang == .rust)) {
                     var project_root_owned: ?[]const u8 = null;
                     defer if (project_root_owned) |p| self.allocator.free(p);
 
@@ -4168,7 +4355,7 @@ pub const Core = struct {
                     self.lsp_doc_version = 1;
                 }
 
-                if (lang != .unknown) {
+                if (lang != .unknown and !opened_is_large) {
                     self.syntax_manager.setLanguageEnum(lang) catch |err| {
                         log.warn("Syntax manager language set failed for {}: {}", .{ lang, err });
                     };
@@ -4276,20 +4463,24 @@ pub const Core = struct {
 
                 // Save-as: spin up the LSP for the new file's language if
                 // there is one. Was a hand-rolled 5-language ladder; now
-                // delegates to the canonical detector.
-                if (LSPManager.getLangFromPath(full_path)) |lang_id| {
-                    const project_root = try self.findProjectRoot(full_path);
-                    defer if (project_root) |p| self.allocator.free(p);
+                // delegates to the canonical detector. Skipped when the
+                // buffer is in large-file mode (same reason as everywhere
+                // else: no point indexing a 5 MB log).
+                if (!self.activeBufferIsLarge()) {
+                    if (LSPManager.getLangFromPath(full_path)) |lang_id| {
+                        const project_root = try self.findProjectRoot(full_path);
+                        defer if (project_root) |p| self.allocator.free(p);
 
-                    const root = if (project_root) |p| p else self.file_manager.cwd;
-                    try self.lsp_manager.startServer(lang_id, root);
+                        const root = if (project_root) |p| p else self.file_manager.cwd;
+                        try self.lsp_manager.startServer(lang_id, root);
 
-                    const content = try self.state().buffer.toString(self.allocator);
-                    defer self.allocator.free(content);
-                    self.lsp_manager.documentOpened(full_path, content) catch |err| {
-                        log.warn("LSP document sync failed in save-as '{s}': {}", .{ full_path, err });
-                    };
-                    self.lsp_doc_version = 1;
+                        const content = try self.state().buffer.toString(self.allocator);
+                        defer self.allocator.free(content);
+                        self.lsp_manager.documentOpened(full_path, content) catch |err| {
+                            log.warn("LSP document sync failed in save-as '{s}': {}", .{ full_path, err });
+                        };
+                        self.lsp_doc_version = 1;
+                    }
                 }
 
                 self.mode = .select;
@@ -4487,8 +4678,17 @@ pub const Core = struct {
     }
 
     fn maybeAutosave(self: *Core) void {
+        // Respect `editor.auto_save_backup` — users can opt out if they
+        // dislike the periodic disk writes (eg. on battery / network FS).
+        if (!self.storage.config.editor.auto_save_backup) return;
+
         const now = std.Io.Clock.real.now(self.io).toMilliseconds();
-        if (now - self.last_autosave_ms < self.autosave_interval_ms) return;
+        // Honor `editor.auto_save_interval_seconds` over the hardcoded
+        // default; falls back to `autosave_interval_ms` if the configured
+        // value is zero (would otherwise mean "every tick" — bad idea).
+        const cfg_interval_s: i64 = @intCast(self.storage.config.editor.auto_save_interval_seconds);
+        const interval_ms: i64 = if (cfg_interval_s > 0) cfg_interval_s * 1000 else self.autosave_interval_ms;
+        if (now - self.last_autosave_ms < interval_ms) return;
         self.last_autosave_ms = now;
 
         const home_dir = self.homeDir() catch return;
@@ -4533,6 +4733,113 @@ pub const Core = struct {
             defer sf.close(self.io);
             sf.writeStreamingAll(self.io, path) catch {};
         }
+    }
+
+    /// Count backups in `~/.stem/recover/` (left over from a previous
+    /// crash) and post a status hint. Cheap — opens the dir, walks
+    /// `.bak` entries, never reads the payloads.
+    fn surfaceOrphanBackups(self: *Core) void {
+        const home_dir = self.homeDir() catch return;
+        defer self.allocator.free(home_dir);
+        const recover_dir = std.fs.path.join(self.allocator, &.{ home_dir, ".stem", "recover" }) catch return;
+        defer self.allocator.free(recover_dir);
+
+        var dir = std.Io.Dir.openDirAbsolute(self.io, recover_dir, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+        var iter = dir.iterate();
+        var count: usize = 0;
+        while (iter.next(self.io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".bak")) continue;
+            count += 1;
+        }
+        if (count == 0) return;
+        self.setStatusLeveled(.warning, "{d} recovery backup(s) found — run `buffer.restore_backups` to view", .{count}, 6000);
+    }
+
+    /// Open a virtual buffer listing every `.bak` in
+    /// `~/.stem/recover/`, with its original path (from the sibling
+    /// `.path` file) and an mtime. The user can open the original
+    /// via the file picker and reconcile; deleting the backup is a
+    /// follow-up command. Read-only buffer; this is a recovery
+    /// surface, not an editor.
+    fn cmdBufferRestoreBackups(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
+        _ = context;
+        const self: *Core = @ptrCast(@alignCast(ctx));
+
+        const home_dir = self.homeDir() catch |err| {
+            self.setStatusLeveled(.err, "Cannot resolve $HOME: {}", .{err}, 3000);
+            return;
+        };
+        defer self.allocator.free(home_dir);
+
+        const recover_dir = try std.fs.path.join(self.allocator, &.{ home_dir, ".stem", "recover" });
+        defer self.allocator.free(recover_dir);
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+
+        try w.print("Recovery backups in {s}\n", .{recover_dir});
+        try w.writeAll("(Each `.bak` is an autosave of a buffer that was dirty when stem last ran.\n");
+        try w.writeAll(" To restore: open the original file, then paste from the backup, or use\n");
+        try w.writeAll(" `cat <backup>` from a shell. Backups are deleted on next clean exit.)\n\n");
+
+        var dir = std.Io.Dir.openDirAbsolute(self.io, recover_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => {
+                try w.writeAll("(no backup directory yet — nothing to recover)\n");
+                try self.buffer_manager.openVirtual("[Recovery Backups]", aw.written());
+                try self.sendUpdate();
+                return;
+            },
+            else => return err,
+        };
+        defer dir.close(self.io);
+
+        var any = false;
+        var iter = dir.iterate();
+        while (try iter.next(self.io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".bak")) continue;
+            any = true;
+
+            // Resolve the original path from the sidecar.
+            const bak_path = try std.fs.path.join(self.allocator, &.{ recover_dir, entry.name });
+            defer self.allocator.free(bak_path);
+            const sidecar = try std.fmt.allocPrint(self.allocator, "{s}.path", .{bak_path});
+            defer self.allocator.free(sidecar);
+
+            var original: ?[]u8 = null;
+            defer if (original) |o| self.allocator.free(o);
+            if (std.Io.Dir.openFileAbsolute(self.io, sidecar, .{})) |sf| {
+                defer sf.close(self.io);
+                const len = sf.length(self.io) catch 0;
+                if (len > 0 and len < 4096) {
+                    const buf = self.allocator.alloc(u8, @intCast(len)) catch null;
+                    if (buf) |b| {
+                        const n = sf.readPositionalAll(self.io, b, 0) catch 0;
+                        original = b[0..n];
+                    }
+                }
+            } else |_| {}
+
+            const bak_file = std.Io.Dir.openFileAbsolute(self.io, bak_path, .{}) catch continue;
+            defer bak_file.close(self.io);
+            const bak_stat = bak_file.stat(self.io) catch continue;
+            const bak_size = bak_file.length(self.io) catch 0;
+
+            const orig = original orelse "(unknown — .path sidecar missing)";
+            try w.print("  {s}\n    backup: {s} ({d} bytes, mtime_ns={d})\n\n", .{
+                orig,
+                bak_path,
+                bak_size,
+                bak_stat.mtime.toNanoseconds(),
+            });
+        }
+        if (!any) try w.writeAll("(no backups present)\n");
+
+        try self.buffer_manager.openVirtual("[Recovery Backups]", aw.written());
+        try self.sendUpdate();
     }
 
     /// Stat the active buffer's file; if its mtime moved forward since we
@@ -4696,6 +5003,10 @@ pub const Core = struct {
     }
 
     fn eagerlyOpenActiveBuffer(self: *Core) void {
+        // Don't ship large buffers to the LSP — semantic tokens,
+        // diagnostics, and completion would be computed but never
+        // rendered (large-file mode draws plain text).
+        if (self.activeBufferIsLarge()) return;
         const s = self.state();
         const path = s.file_path orelse return;
         _ = LSPManager.getLangFromPath(path) orelse return;
@@ -4872,7 +5183,22 @@ pub const Core = struct {
 
         try self.ensureLspDocument();
         try self.lsp_manager.requestFormatting(path);
+        _ = try self.waitAndApplyFormatEdits();
+        try s.saveFile();
 
+        self.lsp_manager.documentSaved(path) catch |err| {
+            log.warn("LSP save notification failed for '{s}': {}", .{ path, err });
+        };
+    }
+
+    /// Drain the LSP `format` result slot for up to ~100 ms and apply
+    /// the edits to the active buffer in reverse-position order.
+    /// Returns whether any edits actually landed. Shared by full-doc
+    /// formatting (`formatAndSave`) and range formatting
+    /// (`cmdLspFormatSelection`); the response shape is identical so
+    /// one path handles both.
+    fn waitAndApplyFormatEdits(self: *Core) !bool {
+        const s = self.state();
         var attempts: usize = 0;
         while (attempts < 10) : (attempts += 1) {
             if (self.lsp_manager.popFormatResult()) |edits| {
@@ -4914,19 +5240,302 @@ pub const Core = struct {
 
                     try s.buffer.insert(start_off, edit.new_text);
                 }
-
-                break;
+                return edits.len > 0;
             }
-
             // best-effort: sleep cancellation is fine, loop will check condition again
             std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
         }
+        return false;
+    }
 
-        try s.saveFile();
-
-        self.lsp_manager.documentSaved(path) catch |err| {
-            log.warn("LSP save notification failed for '{s}': {}", .{ path, err });
+    /// `lsp.format_selection`. Sends `textDocument/rangeFormatting`
+    /// for the current visual selection (or, if not in visual mode,
+    /// the current line). Falls back to whole-document format if the
+    /// server doesn't support range formatting — easier than parsing
+    /// `capabilities.documentRangeFormattingProvider` from initialize.
+    fn cmdLspFormatSelection(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
+        _ = context;
+        const self: *Core = @ptrCast(@alignCast(ctx));
+        if (self.activeBufferIsLarge()) {
+            self.setStatusLiteralLeveled(.warning, "Format selection: skipped (large-file mode)", 2000);
+            return;
+        }
+        const s = self.state();
+        const path = s.file_path orelse {
+            self.setStatusLiteralLeveled(.warning, "Format selection: buffer has no file path", 2000);
+            return;
         };
+
+        // Resolve the range: visual selection if present, else the
+        // cursor's line. Tracking the in-flight mode here (vs. just
+        // reading `selection_anchor`) keeps "no selection" working
+        // outside Visual mode without surprising the user.
+        var start_line: u32 = @intCast(s.cursor_row);
+        var start_col: u32 = 0;
+        var end_line: u32 = @intCast(s.cursor_row + 1);
+        var end_col: u32 = 0;
+        if (s.selection_anchor) |a| {
+            const a_row: u32 = @intCast(a.row);
+            const c_row: u32 = @intCast(s.cursor_row);
+            const a_col: u32 = @intCast(a.col);
+            const c_col: u32 = @intCast(s.cursor_col);
+            if (a_row < c_row or (a_row == c_row and a_col <= c_col)) {
+                start_line = a_row;
+                start_col = a_col;
+                end_line = c_row;
+                end_col = c_col;
+            } else {
+                start_line = c_row;
+                start_col = c_col;
+                end_line = a_row;
+                end_col = a_col;
+            }
+            // Empty range (anchor at cursor) — fall through to line-based
+            // range below.
+            if (start_line == end_line and start_col == end_col) {
+                start_col = 0;
+                end_line = start_line + 1;
+                end_col = 0;
+            }
+        }
+
+        try self.ensureLspDocument();
+        self.lsp_manager.requestRangeFormatting(path, start_line, start_col, end_line, end_col) catch |err| switch (err) {
+            error.ServerNotReady, error.ServerNotRunning, error.UnsupportedLanguage => {
+                self.setStatusLiteralLeveled(.warning, "Format selection: LSP not ready, falling back to full document", 2000);
+                try self.lsp_manager.requestFormatting(path);
+            },
+            else => return err,
+        };
+        const applied = try self.waitAndApplyFormatEdits();
+        if (applied) {
+            self.setStatusLiteralLeveled(.success, "Format selection: applied", 1500);
+        } else {
+            self.setStatusLiteralLeveled(.info, "Format selection: no changes", 1500);
+        }
+        try self.sendUpdate();
+    }
+
+    /// `lsp.code_action` — Space `.`. Asks the LSP for available
+    /// actions at the cursor (or visual selection), waits briefly,
+    /// then either applies the single action automatically or
+    /// stashes the list and prompts for a digit to pick one.
+    fn cmdLspCodeAction(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
+        _ = context;
+        const self: *Core = @ptrCast(@alignCast(ctx));
+        if (self.activeBufferIsLarge()) {
+            self.setStatusLiteralLeveled(.warning, "Code actions: skipped (large-file mode)", 2000);
+            return;
+        }
+        const s = self.state();
+        const path = s.file_path orelse {
+            self.setStatusLiteralLeveled(.warning, "Code actions: buffer has no file path", 2000);
+            return;
+        };
+
+        // Resolve range — visual selection or cursor's char.
+        var start_line: u32 = @intCast(s.cursor_row);
+        var start_col: u32 = @intCast(s.cursor_col);
+        var end_line: u32 = @intCast(s.cursor_row);
+        var end_col: u32 = @intCast(s.cursor_col);
+        if (s.selection_anchor) |a| {
+            const a_row: u32 = @intCast(a.row);
+            const a_col: u32 = @intCast(a.col);
+            if (a_row < start_line or (a_row == start_line and a_col < start_col)) {
+                start_line = a_row;
+                start_col = a_col;
+            } else {
+                end_line = a_row;
+                end_col = a_col;
+            }
+        }
+
+        try self.ensureLspDocument();
+        self.lsp_manager.requestCodeAction(path, start_line, start_col, end_line, end_col) catch |err| {
+            self.setStatus("Code actions: request failed: {}", .{err}, 2000);
+            return;
+        };
+
+        // Wait briefly for the response. Up to ~300 ms — code-action
+        // round trips are typically much faster on small files; we
+        // bail out cleanly if the LSP is slow.
+        var attempts: usize = 0;
+        var actions: ?[]LspServer.CodeAction = null;
+        while (attempts < 30) : (attempts += 1) {
+            if (self.lsp_manager.popCodeActionResult()) |list| {
+                actions = list;
+                break;
+            }
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+        }
+
+        const list = actions orelse {
+            self.setStatusLiteralLeveled(.info, "Code actions: no response", 2000);
+            return;
+        };
+        if (list.len == 0) {
+            self.lsp_manager.freeCodeActions(list);
+            self.setStatusLiteralLeveled(.info, "Code actions: none available", 2000);
+            return;
+        }
+
+        if (list.len == 1) {
+            // Single action — just apply.
+            defer self.lsp_manager.freeCodeActions(list);
+            try self.applyCodeAction(list[0]);
+            return;
+        }
+
+        // Multiple — stash and prompt. Cap to 9 so a digit selects.
+        const visible = @min(list.len, 9);
+        if (self.code_action_pending) |old| self.lsp_manager.freeCodeActions(old);
+        self.code_action_pending = list;
+
+        var preview: std.ArrayListUnmanaged(u8) = .empty;
+        defer preview.deinit(self.allocator);
+        try preview.appendSlice(self.allocator, "Code actions: ");
+        for (list[0..visible], 0..) |a, i| {
+            if (i > 0) try preview.appendSlice(self.allocator, "  ");
+            const entry = try std.fmt.allocPrint(self.allocator, "[{d}] {s}", .{ i + 1, a.title });
+            defer self.allocator.free(entry);
+            try preview.appendSlice(self.allocator, entry);
+        }
+        if (list.len > visible) try preview.appendSlice(self.allocator, "  …");
+        self.setStatus("{s}", .{preview.items}, 8000);
+        try self.sendUpdate();
+    }
+
+    /// Apply one `CodeAction`. Handles the two shapes we care about:
+    /// `WorkspaceEdit.changes` (per-URI TextEdit lists) and
+    /// `WorkspaceEdit.documentChanges` (the newer form). Pure
+    /// `Command` actions are not executed yet — they require
+    /// `workspace/executeCommand` which most servers gate behind a
+    /// capability we don't advertise.
+    fn applyCodeAction(self: *Core, action: LspServer.CodeAction) !void {
+        const edit_json = action.edit_json orelse {
+            self.setStatus("Code action '{s}': command-only actions not yet supported", .{action.title}, 3000);
+            return;
+        };
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, edit_json, .{}) catch |err| {
+            self.setStatus("Code action: failed to parse edit JSON: {}", .{err}, 3000);
+            return;
+        };
+        defer parsed.deinit();
+
+        const we = parsed.value;
+        if (we != .object) return;
+
+        var applied: usize = 0;
+        if (we.object.get("changes")) |changes| {
+            if (changes == .object) {
+                var it = changes.object.iterator();
+                while (it.next()) |entry| {
+                    const uri = entry.key_ptr.*;
+                    if (entry.value_ptr.* != .array) continue;
+                    applied += try self.applyTextEditsForUri(uri, entry.value_ptr.array.items);
+                }
+            }
+        } else if (we.object.get("documentChanges")) |dc| {
+            if (dc == .array) {
+                for (dc.array.items) |op| {
+                    if (op != .object) continue;
+                    // Only `TextDocumentEdit` shape (has `textDocument` + `edits`).
+                    // `CreateFile` / `RenameFile` / `DeleteFile` have `kind` — skip.
+                    if (op.object.get("kind")) |k| {
+                        if (k == .string) continue;
+                    }
+                    const td = op.object.get("textDocument") orelse continue;
+                    if (td != .object) continue;
+                    const uri_val = td.object.get("uri") orelse continue;
+                    if (uri_val != .string) continue;
+                    const edits = op.object.get("edits") orelse continue;
+                    if (edits != .array) continue;
+                    applied += try self.applyTextEditsForUri(uri_val.string, edits.array.items);
+                }
+            }
+        }
+
+        self.setStatus("Code action '{s}': {d} edit(s) applied", .{ action.title, applied }, 2500);
+        try self.sendUpdate();
+    }
+
+    /// Apply a list of `TextEdit` JSON objects to whichever open
+    /// buffer matches `uri`. Edits within a single file are sorted
+    /// and applied in reverse so earlier offsets stay valid. Returns
+    /// the number of edits applied (0 if no buffer matches).
+    fn applyTextEditsForUri(self: *Core, uri: []const u8, edits_json: []const std.json.Value) !usize {
+        // Strip the `file://` prefix to get a local path. LSP URIs
+        // are always `file://` for textDocument operations on local
+        // disks — anything else (e.g. `untitled:`) we skip.
+        const file_prefix = "file://";
+        if (!std.mem.startsWith(u8, uri, file_prefix)) return 0;
+        const path = uri[file_prefix.len..];
+
+        // Find the buffer.
+        var target: ?*@TypeOf(self.buffer_manager.buffers.items[0]) = null;
+        for (self.buffer_manager.buffers.items) |*buf| {
+            if (buf.file_path) |fp| {
+                if (std.mem.eql(u8, fp, path)) {
+                    target = buf;
+                    break;
+                }
+            }
+        }
+        const buf = target orelse return 0;
+
+        // Parse edits into a sortable list.
+        const Edit = struct {
+            start_line: u32,
+            start_col: u32,
+            end_line: u32,
+            end_col: u32,
+            new_text: []const u8,
+        };
+        var list: std.ArrayListUnmanaged(Edit) = .empty;
+        defer list.deinit(self.allocator);
+        for (edits_json) |e| {
+            if (e != .object) continue;
+            const range = e.object.get("range") orelse continue;
+            if (range != .object) continue;
+            const start = range.object.get("start") orelse continue;
+            const end = range.object.get("end") orelse continue;
+            if (start != .object or end != .object) continue;
+            const sl = start.object.get("line") orelse continue;
+            const sc = start.object.get("character") orelse continue;
+            const el = end.object.get("line") orelse continue;
+            const ec = end.object.get("character") orelse continue;
+            if (sl != .integer or sc != .integer or el != .integer or ec != .integer) continue;
+            const nt = e.object.get("newText") orelse continue;
+            if (nt != .string) continue;
+            try list.append(self.allocator, .{
+                .start_line = @intCast(sl.integer),
+                .start_col = @intCast(sc.integer),
+                .end_line = @intCast(el.integer),
+                .end_col = @intCast(ec.integer),
+                .new_text = nt.string,
+            });
+        }
+
+        std.mem.sort(Edit, list.items, {}, struct {
+            fn lt(_: void, a: Edit, b: Edit) bool {
+                if (a.start_line != b.start_line) return a.start_line < b.start_line;
+                return a.start_col < b.start_col;
+            }
+        }.lt);
+
+        var i: usize = list.items.len;
+        while (i > 0) {
+            i -= 1;
+            const edit = list.items[i];
+            const start_off = buf.state.getOffsetFor(edit.start_line, edit.start_col);
+            const end_off = buf.state.getOffsetFor(edit.end_line, edit.end_col);
+            if (end_off > start_off) {
+                try buf.state.buffer.delete(start_off, end_off - start_off);
+            }
+            try buf.state.buffer.insert(start_off, edit.new_text);
+        }
+        buf.state.modified = true;
+        return list.items.len;
     }
 
     /// Wasm host-hook implementations. These run on whichever thread
@@ -5292,11 +5901,28 @@ pub const Core = struct {
                 .name = try alloc.dupe(u8, buf.name),
                 .modified = buf.state.modified,
                 .is_active = i == self.buffer_manager.active_index,
+                .is_large = buf.is_large,
             };
         }
 
         @import("../services/thread_name.zig").markStep("send:syntax_setup");
         var syntax_tokens: ?[]const protocol.SyntaxToken = null;
+
+        // Inlay hints: throttled refresh request. The LSP returns
+        // the entire file's hints, so we don't re-fire per-scroll
+        // — once every 500 ms is enough to track edits and buffer
+        // switches without flooding the server.
+        if (self.storage.config.editor.inlay_hints and !self.activeBufferIsLarge()) blk_inlay: {
+            const path = s.file_path orelse break :blk_inlay;
+            if (LSPManager.getLangFromPath(path) == null) break :blk_inlay;
+            const now_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+            if (now_ms - self.last_inlay_request_ms >= 500) {
+                self.last_inlay_request_ms = now_ms;
+                const start_line: u32 = @intCast(s.scroll_offset);
+                const end_line: u32 = @intCast(s.scroll_offset + visible_rows + 5);
+                self.lsp_manager.requestInlayHint(path, start_line, end_line) catch {};
+            }
+        }
 
         var lang = SyntaxManager.Language.unknown;
         if (s.file_path) |path| {
@@ -5305,7 +5931,13 @@ pub const Core = struct {
             lang = SyntaxManager.Language.fromFilename(self.buffer_manager.getActive().name);
         }
 
-        if (lang != .unknown) {
+        // Large-file mode short-circuit: skip tree-sitter, brackets, LSP
+        // tokens entirely. The buffer renders as plain text so editing a
+        // 5 MB log stays responsive. `is_large` is set once at open and
+        // sticky for the buffer's lifetime, so this branch is a single
+        // pointer dereference.
+        const is_large_active = self.activeBufferIsLarge();
+        if (lang != .unknown and !is_large_active) {
             // Snapshot under the tree lock — without this, reading
             // `current_lang`/`current_resource_id`/`tree` races with
             // the parse worker that swaps them in under the same lock.
@@ -5508,7 +6140,8 @@ pub const Core = struct {
                         pane_lang = SyntaxManager.Language.fromFilename(pane_buffer.name);
                     }
 
-                    if (pane_lang != .unknown) {
+                    const pane_is_large = self.bufferIsLargeAt(b.pane.buffer_index);
+                    if (pane_lang != .unknown and !pane_is_large) {
                         if (!self.scroll_in_progress) {
                             const pane_buffer_id = pane_buffer.id;
                             const pane_syn = self.syntax_manager.stateSnapshot();
@@ -5635,6 +6268,38 @@ pub const Core = struct {
             .completion_active = self.completion_active,
             .completion_items = completion_items,
             .completion_selected = self.completion_selected,
+            .signature_help_label = if (self.signature_help) |sh| try alloc.dupe(u8, sh.label) else null,
+            .signature_help_active_parameter = if (self.signature_help) |sh| sh.active_parameter else 0,
+            .signature_help_parameters = if (self.signature_help) |sh| blk: {
+                const out = try alloc.alloc([]const u8, sh.parameters.len);
+                for (sh.parameters, 0..) |p, i| out[i] = try alloc.dupe(u8, p);
+                break :blk out;
+            } else null,
+            .inlay_hints = blk_ih: {
+                if (!self.storage.config.editor.inlay_hints) break :blk_ih null;
+                if (self.activeBufferIsLarge()) break :blk_ih null;
+                const path = s.file_path orelse break :blk_ih null;
+                const hints = self.lsp_manager.copyInlayHints(alloc, path) catch break :blk_ih null;
+                if (hints.len == 0) break :blk_ih null;
+                // Filter to the visible range — there's no point
+                // shipping hints the renderer will discard.
+                var out: std.ArrayListUnmanaged(protocol.InlayHintSnapshot) = .empty;
+                errdefer out.deinit(alloc);
+                const first: u32 = @intCast(s.scroll_offset);
+                const last: u32 = @intCast(s.scroll_offset + visible_rows + 5);
+                for (hints) |h| {
+                    if (h.line < first or h.line >= last) continue;
+                    try out.append(alloc, .{
+                        .line = h.line,
+                        .col = h.col,
+                        .label = h.label,
+                        .kind = h.kind,
+                        .padding_left = h.padding_left,
+                        .padding_right = h.padding_right,
+                    });
+                }
+                break :blk_ih try out.toOwnedSlice(alloc);
+            },
             .split_enabled = split_enabled,
             .panes = pane_snapshots,
             .focused_pane_id = focused_pane_id,
@@ -5654,6 +6319,8 @@ pub const Core = struct {
                 .wrap = self.storage.config.editor.wrap,
                 .show_status_bar = self.storage.config.ui.show_status_bar,
                 .cursor_line = self.storage.config.editor.cursor_line,
+                .inline_diagnostics = self.storage.config.editor.inline_diagnostics,
+                .inlay_hints = self.storage.config.editor.inlay_hints,
             },
             .global_search_query = if (self.global_search_query.items.len > 0)
                 try alloc.dupe(u8, self.global_search_query.items)
@@ -5847,6 +6514,11 @@ pub const Core = struct {
     }
 
     pub fn ensureLspDocument(self: *Core) !void {
+        // Large-file mode never sends documents to the LSP — the
+        // semantic tokens, diagnostics, and completion that the server
+        // would compute aren't going to be rendered anyway, and the
+        // server would have to index the whole thing.
+        if (self.activeBufferIsLarge()) return;
         const s = self.state();
         const path = s.file_path orelse return;
         const lang = LSPManager.getLangFromPath(path) orelse return;
@@ -5884,6 +6556,9 @@ pub const Core = struct {
             log.warn("Failed to load lazy content: {}", .{err});
             return;
         };
+
+        // Skip the parse + LSP open entirely in large-file mode.
+        if (active_buf.is_large) return;
 
         const s = self.state();
         if (s.file_path) |path| {

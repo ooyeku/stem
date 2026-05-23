@@ -148,6 +148,34 @@ pub const help_text = cli_help_text ++
     \\- `Space + l`: Find References (List/Lookup)
     \\- `Space + h`: Show Hover Info
     \\- `Space + d`: Show Diagnostics
+    \\- `Space + m`: Rename symbol
+    \\- `Space + o` / `Space + O`: Document / workspace symbols
+    \\- `Space + C`: Code actions — picker prompts for 1–9 to apply
+    \\- `Space + F`: Format selection (visual range or current line)
+    \\- Signature help: auto-popup above the cursor in Insert mode
+    \\  when you type `(` or `,`. Dismissed by `)`, Esc, or mode change.
+    \\- Inlay hints: opt-in via `editor.toggle_inlay_hints`.
+    \\  Renders type / param-name hints as dim inline virtual text.
+    \\- Inline diagnostics: on by default. Toggle with
+    \\  `editor.toggle_inline_diagnostics`. When off, only the
+    \\  cursor's line shows its diagnostic at end-of-line.
+    \\
+    \\## Large-File Mode
+    \\
+    \\Files past `editor.large_file_threshold_bytes` (default 5 MB)
+    \\or `editor.large_file_threshold_lines` (default 50k) open with
+    \\tree-sitter, brackets, LSP, and auto-pair disabled. The status
+    \\bar shows `[LARGE]`. Files past `large_file_hard_limit_bytes`
+    \\(default 100 MB) are rejected at open. Re-open after editing
+    \\config to re-classify.
+    \\
+    \\## Auto-Save Backups
+    \\
+    \\Every 30 s (configurable: `editor.auto_save_interval_seconds`)
+    \\stem snapshots every dirty buffer to `~/.stem/recover/<hash>.bak`.
+    \\On startup, surviving backups produce a status toast; run
+    \\`buffer.restore_backups` to view them. Disable with
+    \\`editor.auto_save_backup = false`.
     \\
     \\## Structural (tree-sitter) Motions
     \\

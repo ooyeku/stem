@@ -126,6 +126,24 @@ pub const StatusBar = struct {
                 left_offset += u16Sat(file_indicator.len);
             }
 
+            // Large-file mode badge — tells the user why tree-sitter,
+            // brackets, and LSP feedback are silent. Rendered before the
+            // path so it's the first thing the eye lands on.
+            const active_is_large: bool = blk: {
+                if (snapshot.active_buffer_index < snapshot.buffers.len) {
+                    break :blk snapshot.buffers[snapshot.active_buffer_index].is_large;
+                }
+                break :blk false;
+            };
+            if (active_is_large) {
+                const large_badge = "[LARGE] ";
+                _ = win.printSegment(.{
+                    .text = large_badge,
+                    .style = .{ .fg = .{ .index = 11 }, .bold = true }, // bright yellow
+                }, .{ .col_offset = left_offset });
+                left_offset += u16Sat(large_badge.len);
+            }
+
             const full_path = snapshot.file_path orelse "[untitled]";
             const max_path_width: usize = @min(full_path.len, @as(usize, win.width / 2));
             const display_path = if (full_path.len > max_path_width)

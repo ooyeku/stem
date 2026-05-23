@@ -18,6 +18,16 @@ pub const Buffer = struct {
     /// watcher: if the on-disk mtime is newer than this, somebody else
     /// modified the file behind our back. 0 means "not yet stat'd."
     last_disk_mtime_ns: i96 = 0,
+    /// "Large-file mode" flag — set at open time when the buffer's
+    /// byte size or line count exceeds the configured thresholds. Once
+    /// true, callers MUST treat it as sticky for the lifetime of the
+    /// buffer: tree-sitter, brackets, LSP and auto-pair are all
+    /// skipped. Editing a 5 MB log shouldn't choke the editor.
+    is_large: bool = false,
+    /// True if the user asked to force-load (e.g. by re-trying past
+    /// the soft threshold). Lets the status bar distinguish "auto-
+    /// degraded" from "user-overrode".
+    large_overridden: bool = false,
 
     pub fn deinit(self: *Buffer, allocator: std.mem.Allocator) void {
         self.state.deinit();
@@ -28,6 +38,39 @@ pub const Buffer = struct {
     }
 };
 
+/// Decision result from `classifyContent`. Carries the human-readable
+/// reason so the toast on open can explain why the buffer degraded.
+pub const LargeFileDecision = struct {
+    is_large: bool,
+    /// 0 = "below threshold". Otherwise the offending count
+    /// (bytes or lines) so callers can format a message.
+    triggered_by_bytes: usize = 0,
+    triggered_by_lines: usize = 0,
+};
+
+/// Decide whether content should open in large-file mode given the
+/// configured thresholds. Lines are counted by scanning '\n' — cheap
+/// even at 100MB because it's a single linear pass.
+pub fn classifyContent(content: []const u8, threshold_bytes: usize, threshold_lines: usize) LargeFileDecision {
+    if (content.len > threshold_bytes) {
+        return .{ .is_large = true, .triggered_by_bytes = content.len };
+    }
+    // Skip the line count if even 1 byte per line would already be under
+    // the limit — cheap short-circuit on the common small-file path.
+    if (content.len < threshold_lines) return .{ .is_large = false };
+
+    var lines: usize = 1;
+    for (content) |b| {
+        if (b == '\n') {
+            lines += 1;
+            if (lines > threshold_lines) {
+                return .{ .is_large = true, .triggered_by_lines = lines };
+            }
+        }
+    }
+    return .{ .is_large = false };
+}
+
 pub const BufferManager = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -37,6 +80,13 @@ pub const BufferManager = struct {
     untitled_counter: u32,
     picker_selected: usize,
     picker_scroll_offset: usize,
+    /// Thresholds copied from `EditorConfig` at construction. Mutable so
+    /// `setLargeFileThresholds` can refresh them when the user edits
+    /// `~/.stem/config.json`. Defaults match the schema defaults — kept
+    /// in sync there.
+    large_file_threshold_bytes: usize = 5 * 1024 * 1024,
+    large_file_threshold_lines: usize = 50_000,
+    large_file_hard_limit_bytes: usize = 100 * 1024 * 1024,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) BufferManager {
         var mgr = BufferManager{
@@ -53,6 +103,18 @@ pub const BufferManager = struct {
         _ = mgr.createUntitled() catch null;
 
         return mgr;
+    }
+
+    /// Refresh the size thresholds used by `openFile` /
+    /// `loadBufferContent`. Called by `Core` whenever the config is
+    /// re-read so the next file open honours the new value.
+    pub fn setLargeFileThresholds(self: *BufferManager, threshold_bytes: u32, threshold_lines: u32, hard_limit_bytes: u32) void {
+        self.large_file_threshold_bytes = threshold_bytes;
+        self.large_file_threshold_lines = threshold_lines;
+        // A hard limit smaller than the soft threshold would be a
+        // nonsensical configuration — clamp to keep the invariant
+        // (soft ≤ hard) so we never reject a file we'd otherwise allow.
+        self.large_file_hard_limit_bytes = @max(hard_limit_bytes, threshold_bytes);
     }
 
     pub fn deinit(self: *BufferManager) void {
@@ -93,7 +155,7 @@ pub const BufferManager = struct {
         const file = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
         defer file.close(self.io);
         const size = try file.length(self.io);
-        if (size > 10 * 1024 * 1024) return error.FileTooLarge;
+        if (size > self.large_file_hard_limit_bytes) return error.FileTooLarge;
         const content = try self.allocator.alloc(u8, @intCast(size));
         defer self.allocator.free(content);
         // Capture actual bytes read; never trust that we got `size` back.
@@ -101,6 +163,8 @@ pub const BufferManager = struct {
         // otherwise leave trailing uninitialized bytes in `content`.
         const read_n = try file.readPositionalAll(self.io, content, 0);
         const content_slice = content[0..read_n];
+
+        const decision = classifyContent(content_slice, self.large_file_threshold_bytes, self.large_file_threshold_lines);
 
         const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
         errdefer self.allocator.free(name);
@@ -118,6 +182,7 @@ pub const BufferManager = struct {
             .state = state,
             .name = name,
             .file_path = file_path,
+            .is_large = decision.is_large,
         };
 
         try self.buffers.append(self.allocator, buffer);
@@ -201,10 +266,12 @@ pub const BufferManager = struct {
         const file = try std.Io.Dir.openFileAbsolute(self.io, path, .{});
         defer file.close(self.io);
         const size = try file.length(self.io);
-        if (size > 10 * 1024 * 1024) return error.FileTooLarge;
+        if (size > self.large_file_hard_limit_bytes) return error.FileTooLarge;
         const content = try self.allocator.alloc(u8, @intCast(size));
         defer self.allocator.free(content);
         const read_n = try file.readPositionalAll(self.io, content, 0);
+
+        const decision = classifyContent(content[0..read_n], self.large_file_threshold_bytes, self.large_file_threshold_lines);
 
         buffer.state.deinit();
         buffer.state = try EditorState.init(self.allocator, self.io, content[0..read_n]);
@@ -218,6 +285,7 @@ pub const BufferManager = struct {
             buffer.last_disk_mtime_ns = st.mtime.toNanoseconds();
         } else |_| {}
 
+        buffer.is_large = decision.is_large;
         buffer.not_loaded = false;
     }
 

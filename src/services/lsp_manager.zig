@@ -1792,6 +1792,150 @@ pub const LSPManager = struct {
         try self.dispatchRequest(file_path, .formatting, 0, 0);
     }
 
+    /// Send `textDocument/rangeFormatting`. Unlike `requestFormatting`
+    /// this doesn't go through the supervisor's deferred queue — range
+    /// formatting is always synchronous user intent ("format this
+    /// selection now"), so we either send it immediately or fail. The
+    /// response shares the format slot, so `popFormatResult` picks it
+    /// up like a full-document format.
+    pub fn requestRangeFormatting(self: *LSPManager, file_path: []const u8, start_line: u32, start_col: u32, end_line: u32, end_col: u32) !void {
+        const lang = getLangFromPath(file_path) orelse return error.UnsupportedLanguage;
+
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+
+        const server = self.servers.get(lang) orelse return error.ServerNotRunning;
+        if (!server.is_initialized.load(.acquire) or !server.server_running.load(.acquire)) {
+            return error.ServerNotReady;
+        }
+        const uri = try pathToUri(self.allocator, self.io, file_path);
+        defer self.allocator.free(uri);
+        try server.requestRangeFormatting(uri, start_line, start_col, end_line, end_col);
+    }
+
+    /// Send `textDocument/codeAction` for the given range. Same
+    /// synchronous fast-path-or-fail model as range formatting —
+    /// code actions are always user intent and need an immediate
+    /// answer (or a clean error so the caller can fall back).
+    pub fn requestCodeAction(self: *LSPManager, file_path: []const u8, start_line: u32, start_col: u32, end_line: u32, end_col: u32) !void {
+        const lang = getLangFromPath(file_path) orelse return error.UnsupportedLanguage;
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        const server = self.servers.get(lang) orelse return error.ServerNotRunning;
+        if (!server.is_initialized.load(.acquire) or !server.server_running.load(.acquire)) {
+            return error.ServerNotReady;
+        }
+        const uri = try pathToUri(self.allocator, self.io, file_path);
+        defer self.allocator.free(uri);
+        try server.requestCodeAction(uri, start_line, start_col, end_line, end_col);
+    }
+
+    pub fn popCodeActionResult(self: *LSPManager) ?[]LSPServer.CodeAction {
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            server.code_action_mutex.lockUncancelable(self.io);
+            defer server.code_action_mutex.unlock(self.io);
+            if (server.code_action_result) |res| {
+                server.code_action_result = null;
+                return res;
+            }
+        }
+        return null;
+    }
+
+    pub fn freeCodeActions(self: *LSPManager, actions: []LSPServer.CodeAction) void {
+        for (actions) |a| {
+            self.allocator.free(a.title);
+            if (a.kind) |k| self.allocator.free(k);
+            if (a.edit_json) |e| self.allocator.free(e);
+            if (a.command_json) |c| self.allocator.free(c);
+        }
+        self.allocator.free(actions);
+    }
+
+    pub fn requestSignatureHelp(self: *LSPManager, file_path: []const u8, line: u32, col: u32) !void {
+        const lang = getLangFromPath(file_path) orelse return error.UnsupportedLanguage;
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        const server = self.servers.get(lang) orelse return error.ServerNotRunning;
+        if (!server.is_initialized.load(.acquire) or !server.server_running.load(.acquire)) {
+            return error.ServerNotReady;
+        }
+        const uri = try pathToUri(self.allocator, self.io, file_path);
+        defer self.allocator.free(uri);
+        try server.requestSignatureHelp(uri, line, col);
+    }
+
+    pub fn popSignatureHelpResult(self: *LSPManager) ?LSPServer.SignatureHelp {
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        var it = self.servers.valueIterator();
+        while (it.next()) |server_ptr| {
+            const server = server_ptr.*;
+            server.signature_help_mutex.lockUncancelable(self.io);
+            defer server.signature_help_mutex.unlock(self.io);
+            if (server.signature_help_result) |res| {
+                server.signature_help_result = null;
+                return res;
+            }
+        }
+        return null;
+    }
+
+    pub fn freeSignatureHelp(self: *LSPManager, sh: LSPServer.SignatureHelp) void {
+        self.allocator.free(sh.label);
+        for (sh.parameters) |p| self.allocator.free(p);
+        self.allocator.free(sh.parameters);
+    }
+
+    pub fn requestInlayHint(self: *LSPManager, file_path: []const u8, start_line: u32, end_line: u32) !void {
+        const lang = getLangFromPath(file_path) orelse return error.UnsupportedLanguage;
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        const server = self.servers.get(lang) orelse return error.ServerNotRunning;
+        if (!server.is_initialized.load(.acquire) or !server.server_running.load(.acquire)) {
+            return error.ServerNotReady;
+        }
+        const uri = try pathToUri(self.allocator, self.io, file_path);
+        defer self.allocator.free(uri);
+        try server.requestInlayHint(uri, start_line, end_line);
+    }
+
+    /// Copy the most-recent inlay hints for `file_path` into the
+    /// caller's allocator. Returns an empty slice if no hints have
+    /// arrived yet — the caller checks `len == 0` to decide whether
+    /// to render anything.
+    pub fn copyInlayHints(self: *LSPManager, allocator: std.mem.Allocator, file_path: []const u8) ![]LSPServer.InlayHint {
+        const lang = getLangFromPath(file_path) orelse return &.{};
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        const server = self.servers.get(lang) orelse return &.{};
+
+        const uri = try pathToUri(self.allocator, self.io, file_path);
+        defer self.allocator.free(uri);
+
+        server.inlay_hints_mutex.lockUncancelable(self.io);
+        defer server.inlay_hints_mutex.unlock(self.io);
+        const hints = server.inlay_hints.get(uri) orelse return &.{};
+
+        const out = try allocator.alloc(LSPServer.InlayHint, hints.len);
+        errdefer allocator.free(out);
+        for (hints, 0..) |h, i| {
+            out[i] = .{
+                .line = h.line,
+                .col = h.col,
+                .label = try allocator.dupe(u8, h.label),
+                .kind = h.kind,
+                .padding_left = h.padding_left,
+                .padding_right = h.padding_right,
+            };
+        }
+        return out;
+    }
+
     pub fn popFormatResult(self: *LSPManager) ?[]const TextEdit {
         self.manager_mutex.lockUncancelable(self.io);
         defer self.manager_mutex.unlock(self.io);

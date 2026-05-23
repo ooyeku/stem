@@ -78,6 +78,9 @@ To build and install system-wide from source:
 - Tree-sitter syntax highlighting for 29 languages
 - LSP integration for 23 external language servers plus embedded ZLS
   for Zig (with optional format-on-save)
+- LSP code actions (`Space C`), range format (`Space F`), signature
+  help (auto-popup in Insert mode), and inlay hints (opt-in)
+- Inline diagnostics ("error lens") rendered at end-of-line
 - Word-under-cursor highlight after a short idle
 - Integrated terminal mode
 - Manifest-driven plugin system with wasm and exec runtimes
@@ -86,6 +89,11 @@ To build and install system-wide from source:
 - Jump to next/previous diagnostic (`]d`/`[d`), git hunk (`]g`/`[g`),
   AST sibling (`]s`/`[s`), function (`]m`/`[m`)
 - Session restore with crash-recovery snapshots
+- Periodic auto-save backups of dirty buffers in `~/.stem/recover/`,
+  surfaced at startup if any survived a crash
+- **Large-file mode**: files past 5 MB / 50k lines auto-degrade —
+  tree-sitter, brackets, LSP, and auto-pair disabled so a multi-MB
+  log stays responsive. `[LARGE]` badge in the status bar
 - Background workspace file index for instant `Find` queries
 - CLI search tools (`stem --find`, `--vfind`, `--scope`)
 
@@ -265,6 +273,9 @@ On macOS use `Cmd`, on Linux/Windows use `Ctrl`:
 | `Space d` | LSP diagnostics |
 | `Space m` | LSP rename |
 | `Space o` | Document symbols |
+| `Space O` | Workspace symbols |
+| `Space C` | LSP code actions (pick `1-9` to apply, any other key cancels) |
+| `Space F` | LSP format selection (visual range or current line) |
 | `Space ,` / `Space .` | Jump back / forward |
 | `Space j` | Background jobs list |
 | `Space D` | Git diff (via bundled git plugin) |
@@ -333,7 +344,14 @@ Or edit `~/.stem/config.json` directly:
     "wrap": false,
     "cursor_line": true,
     "auto_pairs": true,
-    "format_on_save": false
+    "format_on_save": false,
+    "inline_diagnostics": true,
+    "inlay_hints": false,
+    "auto_save_backup": true,
+    "auto_save_interval_seconds": 30,
+    "large_file_threshold_bytes": 5242880,
+    "large_file_threshold_lines": 50000,
+    "large_file_hard_limit_bytes": 104857600
   },
   "ui": {
     "show_status_bar": true
@@ -344,9 +362,35 @@ Or edit `~/.stem/config.json` directly:
 }
 ```
 
-Enable format-on-save at runtime via the command palette
-(`Space a` → `lsp.toggle_format_on_save`) or persist it with
-`stem config set editor.format_on_save true`.
+Runtime toggles (via the command palette `Space a`, or `stem config set ...`):
+
+| Setting | Command palette | Effect |
+|---------|-----------------|--------|
+| `editor.format_on_save` | `lsp.toggle_format_on_save` | Run LSP formatter before each save |
+| `editor.inline_diagnostics` | `editor.toggle_inline_diagnostics` | "Error lens" — diagnostic message after every affected line, not just the cursor's |
+| `editor.inlay_hints` | `editor.toggle_inlay_hints` | LSP type / param-name hints rendered as dim virtual text |
+
+### Large-file mode
+
+When a buffer exceeds `large_file_threshold_bytes` (default 5 MB)
+or `large_file_threshold_lines` (default 50 000), Stem opens it in
+**large-file mode**: tree-sitter syntax highlighting, bracket
+rainbow, LSP requests, and bracket auto-pair are disabled for
+that buffer. The status bar shows a yellow `[LARGE]` badge so the
+quiet behaviour isn't mysterious. Files past
+`large_file_hard_limit_bytes` (default 100 MB) are rejected at
+open time. All three thresholds are per-buffer at open and sticky
+for the buffer's life — re-open after `stem config set ...` to
+re-classify.
+
+### Auto-save backups
+
+While stem is running, every `auto_save_interval_seconds` (default
+30 s) it writes a snapshot of every dirty buffer to
+`~/.stem/recover/<hash>.bak` with a `.path` sidecar recording the
+original filename. On the next startup, if any backups survived,
+the status bar prompts you to run `buffer.restore_backups` to
+view them. Disable with `stem config set editor.auto_save_backup false`.
 
 ## Platform support
 

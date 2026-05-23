@@ -615,7 +615,56 @@ pub const View = struct {
             var char_idx: usize = 0;
             var current_col: usize = 0;
 
+            // Inlay hints for this line, scanned once and held as a
+            // small array. Most lines have 0–3 hints so this is cheap
+            // even at O(hints * lines).
+            const inlay_style: vaxis.Cell.Style = .{ .fg = .{ .rgb = .{ 128, 128, 140 } }, .italic = true };
+            var line_inlay_count: usize = 0;
+            const inlay_pool = snapshot.inlay_hints orelse &[_]protocol.InlayHintSnapshot{};
+            // Counting first lets us allocate the small temp slice
+            // exactly. Skip the alloc/sort if no hints apply.
+            for (inlay_pool) |h| {
+                if (h.line == file_line_idx) line_inlay_count += 1;
+            }
+            const line_inlays = if (line_inlay_count > 0) blk: {
+                var arr = try frame_allocator.alloc(protocol.InlayHintSnapshot, line_inlay_count);
+                var w: usize = 0;
+                for (inlay_pool) |h| {
+                    if (h.line == file_line_idx) {
+                        arr[w] = h;
+                        w += 1;
+                    }
+                }
+                std.mem.sort(protocol.InlayHintSnapshot, arr, {}, struct {
+                    fn lt(_: void, a: protocol.InlayHintSnapshot, b: protocol.InlayHintSnapshot) bool {
+                        return a.col < b.col;
+                    }
+                }.lt);
+                break :blk arr;
+            } else &[_]protocol.InlayHintSnapshot{};
+            var next_inlay: usize = 0;
+
             while (byte_idx < line.len) {
+                // Emit any inlay hints that anchor at this byte.
+                while (next_inlay < line_inlays.len and line_inlays[next_inlay].col == byte_idx) {
+                    const h = line_inlays[next_inlay];
+                    next_inlay += 1;
+                    if (h.padding_left) {
+                        _ = text_win.printSegment(.{ .text = " ", .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
+                        current_col += 1;
+                    }
+                    const room = if (current_col < text_width) text_width - current_col else 0;
+                    const fit_len = @min(h.label.len, room);
+                    if (fit_len > 0) {
+                        _ = text_win.printSegment(.{ .text = h.label[0..fit_len], .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
+                        current_col += fit_len;
+                    }
+                    if (h.padding_right and current_col < text_width) {
+                        _ = text_win.printSegment(.{ .text = " ", .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
+                        current_col += 1;
+                    }
+                }
+
                 const len = std.unicode.utf8ByteSequenceLength(line[byte_idx]) catch 1;
 
                 if (byte_idx + len > line.len) {
@@ -711,11 +760,34 @@ pub const View = struct {
                 }
             }
 
-            // Inline virtual-text diagnostic at end-of-line, but only for the
-            // line under the cursor — otherwise the whole screen turns into
-            // a wall of red.
+            // Trailing inlay hints (anchored at or past end-of-line).
+            // Same emission code as the inline path, just drained
+            // after the byte loop.
+            while (next_inlay < line_inlays.len) : (next_inlay += 1) {
+                const h = line_inlays[next_inlay];
+                if (h.padding_left and current_col < text_width) {
+                    _ = text_win.printSegment(.{ .text = " ", .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
+                    current_col += 1;
+                }
+                const room = if (current_col < text_width) text_width - current_col else 0;
+                const fit_len = @min(h.label.len, room);
+                if (fit_len > 0) {
+                    _ = text_win.printSegment(.{ .text = h.label[0..fit_len], .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
+                    current_col += fit_len;
+                }
+                if (h.padding_right and current_col < text_width) {
+                    _ = text_win.printSegment(.{ .text = " ", .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
+                    current_col += 1;
+                }
+            }
+
+            // Inline virtual-text diagnostic at end-of-line. With
+            // `inline_diagnostics` enabled (the "error lens" mode), every
+            // line that carries a diagnostic shows its highest-severity
+            // message; without it, only the cursor's line does.
             if (top_diag) |d| {
-                if (file_line_idx == snapshot.cursor_row) {
+                const show_inline = snapshot.editor_config.inline_diagnostics or file_line_idx == snapshot.cursor_row;
+                if (show_inline) {
                     const msg_color: vaxis.Cell.Color = switch (d.severity) {
                         .err => .{ .rgb = .{ 224, 108, 117 } },
                         .warning => .{ .rgb = .{ 229, 192, 123 } },
@@ -817,6 +889,21 @@ pub const View = struct {
             if (snapshot.completion_items) |items| {
                 try self.drawCompletionPopup(text_area, items, snapshot.completion_selected, snapshot.cursor_row, snapshot.cursor_col, snapshot.scroll_offset);
             }
+        }
+
+        // Signature help popup. Insert-mode only — Core clears it on
+        // mode change. Renders one-line above the cursor with the
+        // active parameter underlined.
+        if (snapshot.signature_help_label) |label| {
+            try self.drawSignatureHelp(
+                text_area,
+                label,
+                snapshot.signature_help_parameters orelse &.{},
+                snapshot.signature_help_active_parameter,
+                snapshot.cursor_row,
+                snapshot.cursor_col,
+                snapshot.scroll_offset,
+            );
         }
 
         if (mode == .visual_search) {
@@ -2097,6 +2184,94 @@ pub const View = struct {
             .label = .{ .fg = .{ .rgb = .{ 205, 214, 244 } }, .bg = bg_color },
             .hint = .{ .fg = .{ .rgb = .{ 108, 112, 134 } }, .bg = bg_color, .italic = true },
         };
+    }
+
+    /// One-line popup above the cursor showing the active LSP
+    /// signature. The active parameter (when in range) is rendered
+    /// in bold + underline so the user sees which argument they're
+    /// typing. Falls back to plain label rendering if the parameter
+    /// label can't be located inside the signature.
+    fn drawSignatureHelp(
+        self: *View,
+        win: vaxis.Window,
+        label: []const u8,
+        params: []const []const u8,
+        active_param: u32,
+        cursor_row: usize,
+        cursor_col: usize,
+        scroll_offset: usize,
+    ) !void {
+        _ = self;
+        if (label.len == 0) return;
+        if (win.width < 10 or win.height < 3) return;
+
+        // Trim multi-line labels — most servers keep it to one line,
+        // but Rust analyzer occasionally returns wrapped text.
+        var display = label;
+        if (std.mem.indexOfScalar(u8, display, '\n')) |nl| display = display[0..nl];
+
+        const max_width: u16 = @min(@as(u16, @intCast(display.len + 4)), @as(u16, @intCast(@as(usize, win.width) -| 2)));
+        const screen_row: u16 = @intCast(cursor_row -| scroll_offset);
+        // Prefer the row above the cursor; fall back below if there's no room.
+        var box_y: u16 = if (screen_row >= 1) screen_row - 1 else screen_row + 1;
+        if (box_y >= win.height) box_y = win.height - 1;
+        var box_x: u16 = @intCast(@min(cursor_col, @as(usize, win.width) -| @as(usize, max_width)));
+        _ = &box_x;
+
+        const bg: vaxis.Cell.Color = .{ .index = 0 };
+        const fg: vaxis.Cell.Color = .{ .index = 7 };
+        // vaxis Cell.Style doesn't expose underline as a free field
+        // here; bold alone is enough to mark the active parameter
+        // without the rendering becoming noisy.
+        const active_style: vaxis.Cell.Style = .{ .fg = fg, .bg = bg, .bold = true };
+        const base_style: vaxis.Cell.Style = .{ .fg = fg, .bg = bg };
+
+        // Wipe the background.
+        var clear_buf: [128]u8 = undefined;
+        const clear_n = @min(@as(usize, max_width), clear_buf.len);
+        @memset(clear_buf[0..clear_n], ' ');
+        _ = win.printSegment(.{ .text = clear_buf[0..clear_n], .style = base_style }, .{ .row_offset = box_y, .col_offset = box_x });
+
+        // Find the active parameter's byte range in the label so we
+        // can style just that span. If the param label appears
+        // multiple times, take the first hit — which matches what
+        // LSP servers intend in practice.
+        var active_start: ?usize = null;
+        var active_end: usize = 0;
+        if (active_param < params.len) {
+            const want = params[active_param];
+            if (want.len > 0) {
+                if (std.mem.indexOf(u8, display, want)) |off| {
+                    active_start = off;
+                    active_end = off + want.len;
+                }
+            }
+        }
+
+        const fits = @min(display.len, @as(usize, max_width) -| 2);
+        const truncated = display[0..fits];
+        if (active_start) |st| {
+            const en = @min(active_end, fits);
+            const pre = truncated[0..@min(st, fits)];
+            const mid = if (en > st and st < fits) truncated[st..en] else "";
+            const post = if (en < fits) truncated[en..fits] else "";
+            _ = win.printSegment(.{ .text = " ", .style = base_style }, .{ .row_offset = box_y, .col_offset = box_x });
+            var col: u16 = box_x + 1;
+            if (pre.len > 0) {
+                _ = win.printSegment(.{ .text = pre, .style = base_style }, .{ .row_offset = box_y, .col_offset = col });
+                col += @intCast(pre.len);
+            }
+            if (mid.len > 0) {
+                _ = win.printSegment(.{ .text = mid, .style = active_style }, .{ .row_offset = box_y, .col_offset = col });
+                col += @intCast(mid.len);
+            }
+            if (post.len > 0) {
+                _ = win.printSegment(.{ .text = post, .style = base_style }, .{ .row_offset = box_y, .col_offset = col });
+            }
+        } else {
+            _ = win.printSegment(.{ .text = " ", .style = base_style }, .{ .row_offset = box_y, .col_offset = box_x });
+            _ = win.printSegment(.{ .text = truncated, .style = base_style }, .{ .row_offset = box_y, .col_offset = box_x + 1 });
+        }
     }
 
     fn drawCompletionPopup(

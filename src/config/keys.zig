@@ -27,10 +27,11 @@ pub const Keys = struct {
     pub const action_palette = 'a';
     pub const action_help = 'w';
     pub const action_jobs = 'j';
-    /// Toggle the which-key popup. Replaces the earlier "Double Space"
-    /// trigger so the chord follows the same `<leader> <letter>` shape
-    /// as every other binding.
-    pub const action_which_key = '?';
+    /// Toggle the which-key popup. `;` is unshifted, on the right
+    /// home row, and unused anywhere else in the leader chord — no
+    /// terminal shift-dance ambiguity (which `?` had with backward
+    /// incremental search) and no other binding to fall through to.
+    pub const action_which_key = ';';
 
     pub const action_buffer = 'b';
     pub const action_next = 'n';
@@ -54,6 +55,14 @@ pub const Keys = struct {
     pub const action_lsp_diagnostics = 'd';
     pub const action_document_symbols = 'o';
     pub const action_workspace_symbols = 'O';
+    /// Space `C` opens the LSP code-action picker. Capital C because
+    /// `c` is copy. `Space .` would feel more natural but is already
+    /// jump-forward.
+    pub const action_code_action = 'C';
+    /// Space `F` formats the visual selection (or current line) via
+    /// `textDocument/rangeFormatting`. Lower-case `f` is the file
+    /// picker.
+    pub const action_format_selection = 'F';
 
     pub const action_jump_back = ',';
     pub const action_jump_forward = '.';

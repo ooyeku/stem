@@ -247,6 +247,40 @@ pub const EditorConfig = struct {
     /// Toggle at runtime with `lsp.toggle_format_on_save`.
     format_on_save: bool = false,
 
+    /// Files larger than this many bytes OR `large_file_threshold_lines`
+    /// lines flip into "large-file mode": tree-sitter highlighting,
+    /// bracket rainbow, LSP requests, and bracket auto-pair are all
+    /// disabled for that buffer. Designed so editing a 5MB log or a
+    /// minified bundle stays responsive instead of locking up on every
+    /// keystroke. 5 MB default.
+    large_file_threshold_bytes: u32 = 5 * 1024 * 1024,
+    large_file_threshold_lines: u32 = 50_000,
+    /// Files larger than this are rejected outright at open time. The
+    /// editor would still work, but a 1 GB buffer pinned in memory
+    /// would dominate the process — make the user opt in by editing
+    /// the file with a different tool first. 100 MB default.
+    large_file_hard_limit_bytes: u32 = 100 * 1024 * 1024,
+
+    /// When true, every line that carries a diagnostic also renders
+    /// the diagnostic message inline at end-of-line in the severity
+    /// colour ("error lens"). When false, only the gutter sign shows.
+    inline_diagnostics: bool = true,
+
+    /// When true, send `textDocument/inlayHint` for the visible range
+    /// and render returned hints (type annotations, param names) as
+    /// dim virtual text. Off by default — language servers vary in
+    /// quality and the extra requests aren't free.
+    inlay_hints: bool = false,
+
+    /// When true, every `auto_save_interval_seconds` the editor
+    /// writes a snapshot of every dirty buffer to
+    /// `~/.stem/cache/backup/<buffer-id>.snap`. On startup, surviving
+    /// snapshots whose source file is older than the snapshot are
+    /// offered for recovery. Independent of save-on-edit; this is
+    /// just a crash safety net.
+    auto_save_backup: bool = true,
+    auto_save_interval_seconds: u32 = 30,
+
     pub fn writeConfig(self: EditorConfig, writer: anytype, indent: usize) !void {
         try writer.writeAll("{\n");
         try printIndent(writer, indent + 4);
@@ -264,7 +298,21 @@ pub const EditorConfig = struct {
         try printIndent(writer, indent + 4);
         try writer.print("\"cursor_line\": {},\n", .{self.cursor_line});
         try printIndent(writer, indent + 4);
-        try writer.print("\"format_on_save\": {}\n", .{self.format_on_save});
+        try writer.print("\"format_on_save\": {},\n", .{self.format_on_save});
+        try printIndent(writer, indent + 4);
+        try writer.print("\"large_file_threshold_bytes\": {d},\n", .{self.large_file_threshold_bytes});
+        try printIndent(writer, indent + 4);
+        try writer.print("\"large_file_threshold_lines\": {d},\n", .{self.large_file_threshold_lines});
+        try printIndent(writer, indent + 4);
+        try writer.print("\"large_file_hard_limit_bytes\": {d},\n", .{self.large_file_hard_limit_bytes});
+        try printIndent(writer, indent + 4);
+        try writer.print("\"inline_diagnostics\": {},\n", .{self.inline_diagnostics});
+        try printIndent(writer, indent + 4);
+        try writer.print("\"inlay_hints\": {},\n", .{self.inlay_hints});
+        try printIndent(writer, indent + 4);
+        try writer.print("\"auto_save_backup\": {},\n", .{self.auto_save_backup});
+        try printIndent(writer, indent + 4);
+        try writer.print("\"auto_save_interval_seconds\": {d}\n", .{self.auto_save_interval_seconds});
         try printIndent(writer, indent);
         try writer.writeAll("}");
     }

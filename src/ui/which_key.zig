@@ -78,7 +78,7 @@ pub const entries = [_]Entry{
     .{ .key = "w", .label = "Help view", .group = .misc },
     .{ .key = "j", .label = "Jobs list", .group = .misc },
     .{ .key = "D", .label = "Git diff", .group = .misc },
-    .{ .key = "?", .label = "Toggle this help", .group = .misc },
+    .{ .key = ";", .label = "Toggle this help", .group = .misc },
 };
 
 /// Format a key codepoint as a stable string. Retained for callers
@@ -124,7 +124,7 @@ comptime {
         .{ .k = "w", .code = Keys.action_help },
         .{ .k = "j", .code = Keys.action_jobs },
         .{ .k = "D", .code = Keys.action_git_diff },
-        .{ .k = "?", .code = Keys.action_which_key },
+        .{ .k = ";", .code = Keys.action_which_key },
     };
     for (expected) |e| {
         if (e.k.len != 1 or e.k[0] != @as(u8, @intCast(e.code))) {
