@@ -30,26 +30,41 @@ cd stem
 zig build run
 ```
 
-To build and install system-wide from source:
+To build and install:
+
+**macOS / Linux** (bash, zsh, sh):
 
 ```bash
-./install.sh                  # builds ReleaseFast and installs
+./install.sh                  # build ReleaseFast, install, refresh plugins
 ./install.sh --prefix ~/.local
 ```
 
-### Uninstall
+**Windows** (PowerShell 5.1+, no admin needed):
 
-macOS / Linux:
+```powershell
+.\install.ps1                          # install into %LOCALAPPDATA%\Programs\stem
+.\install.ps1 -Prefix C:\tools\stem    # custom prefix
+.\install.ps1 -NoPath                  # skip the user-PATH update
+```
+
+If PowerShell blocks the script with an execution-policy error,
+launch it as `powershell -ExecutionPolicy Bypass -File .\install.ps1`.
+
+Both installers compile from source (`zig build -Doptimize=ReleaseFast`),
+copy the binary, install bundled wasm plugins to the system prefix and
+refresh the per-user plugin dir at `~/.stem/plugins/`
+(`%USERPROFILE%\.stem\plugins\` on Windows), and add the bin dir to PATH
+when it isn't already there.
+
+### Uninstall
 
 ```bash
 ./uninstall.sh             # remove the binary and bundled plugins
 ./uninstall.sh --purge     # also remove ~/.stem (config, logs, LSP cache)
 ```
 
-Windows:
-
 ```powershell
-.\uninstall.ps1            # remove the binary, plugins, and PATH entry
+.\uninstall.ps1            # remove binary, plugins, and PATH entry
 .\uninstall.ps1 -Purge     # also remove %APPDATA%\stem + %LOCALAPPDATA%\stem
 ```
 

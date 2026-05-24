@@ -276,7 +276,9 @@ src/
 └── fuzz/                  # Fuzz targets
 bundled/plugins/           # Wasm artifacts shipped with the binary
 docs/                      # This guide and related docs
-scripts/                   # Install scripts and shell completions
+install.sh, uninstall.sh   # Source-build install / uninstall (POSIX)
+install.ps1, uninstall.ps1 # Same on Windows (PowerShell 5.1+)
+scripts/completions/       # bash / fish / zsh completions
 ```
 
 ### User data

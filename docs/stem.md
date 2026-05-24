@@ -1085,7 +1085,9 @@ stem/
 │       └── uri_fuzz.zig
 ├── bundled/plugins/
 ├── docs/
-├── scripts/
+├── scripts/completions/   (bash, fish, zsh)
+├── install.sh, uninstall.sh      (POSIX)
+├── install.ps1, uninstall.ps1    (Windows)
 ├── build.zig
 └── build.zig.zon
 ```
