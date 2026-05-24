@@ -51,6 +51,7 @@ pub const Keys = struct {
     pub const action_help = 'h'; // help view (was: hover; hover moved to Space l h)
     pub const action_jobs = 'j';
     pub const action_close = 'k'; // close pane/buffer
+    pub const action_bookmarks = 'm'; // open the bookmarks list (Space m); direct `mx` / `'x` chords still work
     pub const action_next = 'n'; // next buffer
     pub const action_prev = 'p'; // previous buffer
     pub const action_quit = 'q';
@@ -64,9 +65,15 @@ pub const Keys = struct {
     pub const action_jump_back = ',';
     pub const action_jump_forward = '.';
 
-    /// Command palette. `:` is the vim convention; `Space a` used
-    /// to do this but is now `action_code_action`.
-    pub const action_palette = ':';
+    /// Command palette — fuzzy "find any command" prompt.
+    /// - `f` is the primary binding: unshifted, on the home row,
+    ///   mnemonic for "find" / "fuzzy". Works on every terminal,
+    ///   including the ones that mishandle `Shift+;`.
+    /// - `:` stays as a vim-style alias for terminals where it
+    ///   resolves cleanly (it's broken on Ghostty's shift-key
+    ///   delivery, which is why `f` is now primary).
+    pub const action_palette = 'f';
+    pub const action_palette_alt = ':';
     pub const action_global_search = '/';
 
     // ────────────────────────────────────────────────────────────

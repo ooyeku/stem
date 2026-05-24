@@ -72,10 +72,15 @@ pub const help_text = cli_help_text ++
     \\
     \\## Bookmarks
     \\
-    \\- `m<a-z>`   : Set bookmark slot `<x>` at the cursor.
+    \\26 named slots (a-z), per project, persisted across sessions.
+    \\
+    \\- `m<a-z>`   : Set bookmark `<x>` at the cursor — must be in a real
+    \\               file buffer (not in the [Bookmarks] view itself).
+    \\               Example: `ma` sets slot `a`. A toast confirms.
     \\- `'<a-z>`   : Jump to bookmark `<x>` (works across files).
-    \\- Bookmarks persist per-project under `~/.stem/cache/bookmarks/`.
-    \\- Commands: `bookmark.list` opens `[Bookmarks]`; `bookmark.clear_all` removes them all.
+    \\- `Space m`  : Open the [Bookmarks] list.
+    \\- Storage: `~/.stem/cache/bookmarks/`.
+    \\- Palette: `bookmark.list`, `bookmark.clear_all`.
     \\
     \\## Word-Under-Cursor Highlight
     \\
@@ -132,7 +137,7 @@ pub const help_text = cli_help_text ++
     \\
     \\### Top-level — navigation
     \\
-    \\- `Space :`  : Command palette
+    \\- `Space f`  : Command palette (find any command). Vim alias: `Space :`
     \\- `Space /`  : Project-wide search
     \\- `Space ,`  : Jump back
     \\- `Space .`  : Jump forward
@@ -266,7 +271,7 @@ pub const help_text = cli_help_text ++
     \\## Zig Build Commands
     \\
     \\Stem auto-detects your Zig workspace (build.zig). Use the
-    \\command palette (`Space :`) and type "zig" or "build":
+    \\command palette (`Space f`) and type "zig" or "build":
     \\
     \\- `Zig: Build`            : Run `zig build`
     \\- `Zig: Test`             : Run `zig build test`
@@ -289,7 +294,8 @@ pub const help_text = cli_help_text ++
     \\
     \\## Command Palette Reference
     \\
-    \\Press `Space :` to open. Type to filter; Enter to run.
+    \\Press `Space f` to open (or `Space :` if your terminal handles it).
+    \\Type to filter; Enter to run.
     \\Highlights of commonly-used commands:
     \\
     \\### File / buffer
@@ -367,7 +373,7 @@ pub const help_text = cli_help_text ++
     \\
     \\## Tips
     \\
-    \\- Use `Space :` to quickly access any command.
+    \\- Use `Space f` to fuzzy-find any command. (`Space :` works too on terminals that handle Shift+; cleanly.)
     \\- Use `Space e` (or `Cmd/Ctrl+O`) to open files via the tree explorer.
     \\- `Space ;` (or `Space ?`) toggles which-key — discover bindings on the fly.
     \\- In any chord (`Space l`, `Space g`, ...) which-key shows the sub-bindings.

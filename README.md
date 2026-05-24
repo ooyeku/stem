@@ -155,7 +155,7 @@ stem --version             # version info
 ## Key bindings
 
 Stem leans on a Space leader and a discoverable command palette
-(`Space :`) for most actions. The bindings below cover everyday
+(`Space f`) for most actions. The bindings below cover everyday
 editing; everything else is reachable through the palette.
 
 Press `Space ;` (or `Space ?`) at any time to pop up the which-key
@@ -267,7 +267,7 @@ The highest-frequency actions live as a single key after Space.
 | `Space k` | Close current pane / buffer |
 | `Space n` / `Space p` | Next / previous buffer |
 | `Space [1-9]` | Quick switch to buffer N |
-| `Space :` | Command palette (vim convention) |
+| `Space f` | Command palette (find any command) — `Space :` alias works on terminals that handle Shift+; cleanly |
 | `Space /` | Project-wide search & replace |
 | `Space ,` / `Space .` | Jump back / forward |
 | `Space z` | Center cursor in viewport |
@@ -525,9 +525,8 @@ plugins are supported.
 | `git` | wasm | Status / diff / staged-diff plus a live branch indicator |
 | `plugin_manager` | wasm | Plugin dashboard and reload commands |
 
-See the [Plugin Development Guide](docs/plugin-design.md) to write
-your own and [Plugin Architecture](docs/plugin-architecture.md) for
-host internals.
+See [docs/plugins.md](docs/plugins.md) for the full author guide
+and host internals.
 
 ## Troubleshooting
 
@@ -554,8 +553,7 @@ access.
 ## Documentation
 
 - [Developer Guide](docs/dev-guide.md) — architecture and module map
-- [Plugin Design](docs/plugin-design.md) — writing plugins
-- [Plugin Architecture](docs/plugin-architecture.md) — host internals
+- [Plugins](docs/plugins.md) — author guide + host internals
 - [stem.md](docs/stem.md) — long-form reference
 
 ## License

@@ -76,7 +76,7 @@ const top_only = [_]Entry{
     .{ .key = "n", .label = "Next buffer", .group = .file },
     .{ .key = "p", .label = "Previous buffer", .group = .file },
 
-    .{ .key = ":", .label = "Command palette", .group = .navigation },
+    .{ .key = "f", .label = "Command palette (find)", .group = .navigation },
     .{ .key = "/", .label = "Project search", .group = .navigation },
     .{ .key = ",", .label = "Jump back", .group = .navigation },
     .{ .key = ".", .label = "Jump forward", .group = .navigation },
@@ -94,6 +94,7 @@ const top_only = [_]Entry{
 
     .{ .key = "h", .label = "Help view", .group = .misc },
     .{ .key = "j", .label = "Jobs list", .group = .misc },
+    .{ .key = "m", .label = "Bookmarks list (set with mx in a file)", .group = .misc },
     .{ .key = ";", .label = "Toggle this help", .group = .misc },
 };
 
@@ -221,7 +222,7 @@ comptime {
         .{ .k = "q", .code = Keys.action_quit },
         .{ .k = "n", .code = Keys.action_next },
         .{ .k = "p", .code = Keys.action_prev },
-        .{ .k = ":", .code = Keys.action_palette },
+        .{ .k = "f", .code = Keys.action_palette },
         .{ .k = "/", .code = Keys.action_global_search },
         .{ .k = ",", .code = Keys.action_jump_back },
         .{ .k = ".", .code = Keys.action_jump_forward },
@@ -236,6 +237,7 @@ comptime {
         .{ .k = "|", .code = Keys.action_split_vertical },
         .{ .k = "h", .code = Keys.action_help },
         .{ .k = "j", .code = Keys.action_jobs },
+        .{ .k = "m", .code = Keys.action_bookmarks },
         .{ .k = ";", .code = Keys.action_which_key },
     };
     for (expected) |e| {

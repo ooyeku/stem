@@ -2838,7 +2838,7 @@ pub const Core = struct {
                     try self.openVirtualBuffer("[HELP]", Help.help_text);
                     self.leader_pending = false;
                 },
-                Keys.action_palette => {
+                Keys.action_palette, Keys.action_palette_alt => {
                     self.previous_mode = self.mode;
                     self.mode = .command_palette;
                     self.command_palette_input.clearRetainingCapacity();
@@ -2855,7 +2855,23 @@ pub const Core = struct {
                 Keys.action_paste => try EditCommands.cmdEditPaste(self),
 
                 Keys.action_code_action => try cmdLspCodeAction(self, null),
-                Keys.action_center_view => try NavCommands.cmdNavCenterView(self),
+                Keys.action_center_view => {
+                    // Center view edits scroll_offset on the buffer
+                    // state. In split mode the pane has its *own*
+                    // scroll_offset that masks the buffer's; sync
+                    // before/after so the scroll is actually visible.
+                    self.syncStateToPane();
+                    try NavCommands.cmdNavCenterView(self);
+                    self.syncPaneToState();
+                },
+                Keys.action_bookmarks => {
+                    // Opens the [Bookmarks] view from the leader so
+                    // users following the `Space <letter>` convention
+                    // can reach bookmarks without remembering the
+                    // direct `m<a-z>` chord. Direct chord still works.
+                    try self.openBookmarksBuffer();
+                    self.leader_pending = false;
+                },
 
                 Keys.action_jump_back => try cmdJumpBack(self, null),
                 Keys.action_jump_forward => try cmdJumpForward(self, null),
@@ -4184,7 +4200,7 @@ pub const Core = struct {
                     try self.openVirtualBuffer("[HELP]", Help.help_text);
                     self.leader_pending = false;
                 },
-                Keys.action_palette => {
+                Keys.action_palette, Keys.action_palette_alt => {
                     self.previous_mode = self.mode;
                     self.mode = .command_palette;
                     self.command_palette_input.clearRetainingCapacity();
@@ -4201,7 +4217,15 @@ pub const Core = struct {
                 Keys.action_paste => try EditCommands.cmdEditPaste(self),
 
                 Keys.action_code_action => try cmdLspCodeAction(self, null),
-                Keys.action_center_view => try NavCommands.cmdNavCenterView(self),
+                Keys.action_center_view => {
+                    self.syncStateToPane();
+                    try NavCommands.cmdNavCenterView(self);
+                    self.syncPaneToState();
+                },
+                Keys.action_bookmarks => {
+                    try self.openBookmarksBuffer();
+                    self.leader_pending = false;
+                },
 
                 Keys.action_jump_back => try cmdJumpBack(self, null),
                 Keys.action_jump_forward => try cmdJumpForward(self, null),
@@ -4660,6 +4684,17 @@ pub const Core = struct {
         } else {
             _ = self.buffer_manager.closeActive();
         }
+
+        // Pull the successor buffer's content if it's still lazy.
+        // Without this the user sees an empty buffer after closing
+        // a virtual buffer (or anything else) on top of a buffer
+        // that was opened via `Space e` / "open directory" /
+        // session restore — all of which mark new buffers
+        // `not_loaded = true` and rely on the first switch to
+        // call `loadBufferContent`. Every other buffer-switch
+        // site goes through `refreshSyntaxForCurrentBuffer`; this
+        // one was missed when the close helper was extracted.
+        self.refreshSyntaxForCurrentBuffer();
 
         // If the just-closed buffer had an opened_from snapshot and
         // the successor active buffer is the one we were on when we
@@ -8275,9 +8310,37 @@ pub const Core = struct {
         var content = std.ArrayListUnmanaged(u8).empty;
         defer content.deinit(self.allocator);
 
-        try content.appendSlice(self.allocator, "# Bookmarks\n\n");
+        try content.appendSlice(self.allocator,
+            \\# Bookmarks
+            \\
+            \\## How to use
+            \\
+            \\Bookmarks are 26 named slots (a-z) per project. They
+            \\persist across stem sessions.
+            \\
+            \\### To SET a bookmark
+            \\  1. Close this [Bookmarks] buffer (`Space k`) — bookmarks
+            \\     can only be set in real file-backed buffers, not in
+            \\     this virtual view.
+            \\  2. In your code, place the cursor where you want the
+            \\     bookmark.
+            \\  3. Press `m` then a letter (a-z). Example: `ma` sets
+            \\     bookmark `a` at the current line. A toast confirms.
+            \\
+            \\### To JUMP to a bookmark
+            \\  Press `'` (apostrophe) then the letter, from anywhere.
+            \\  Example: `'a` jumps to bookmark `a`.
+            \\
+            \\### Other
+            \\  - `Space m` re-opens this list any time.
+            \\  - Palette `bookmark.clear_all` wipes every slot for
+            \\    this project.
+            \\
+            \\## Current slots
+            \\
+        );
         if (self.bookmarks.count() == 0) {
-            try content.appendSlice(self.allocator, "(none set \u{2014} use `mx` in select mode to set, `'x` to jump)\n");
+            try content.appendSlice(self.allocator, "(none set yet)\n");
         } else {
             try content.appendSlice(self.allocator, "Slot  Line   File\n");
             try content.appendSlice(self.allocator, "----  -----  --------------------------------\n");
@@ -8289,7 +8352,6 @@ pub const Core = struct {
                     try content.appendSlice(self.allocator, row_str);
                 }
             }
-            try content.appendSlice(self.allocator, "\nUse `'<slot>` from any buffer to jump.\n");
         }
         try self.buffer_manager.openVirtual(name, content.items);
         self.refreshSyntaxForCurrentBuffer();

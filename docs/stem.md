@@ -375,6 +375,33 @@ Zig project detection: walks up the tree looking for `build.zig`,
 attaches each buffer to its detected workspace, and feeds the
 workspace root to the LSP on buffer switch.
 
+### Bookmarks — [`bookmarks.zig`](../src/kernel/bookmarks.zig)
+
+26-slot per-project mark store keyed by `a–z`. `m<x>` from Select
+mode writes `(file, row, col)` to slot `x`; `'<x>` jumps. Slots
+persist under `~/.stem/cache/bookmarks/<project-hash>.json`. The
+`[Bookmarks]` virtual buffer (palette `bookmark.list`) shows every
+set slot; `bookmark.clear_all` wipes the project.
+
+### Jump list — [`jump_list.zig`](../src/kernel/jump_list.zig)
+
+100-entry bounded back/forward history. Every cross-buffer
+navigation (buffer picker, `Cmd+[/]`, file explorer, virtual buffer
+open, bracket match `%`, LSP go-to-definition, symbol pickers,
+references / diagnostics pickers) records the cursor before moving.
+`Space ,` / `Space .` walk it; `Ctrl+O` / `Ctrl+I` are vim-style
+aliases. Buffer entries that share `(file, row, col)` with the
+existing tip collapse so repeated motion doesn't pollute history.
+
+### File explorer — [`file_explorer.zig`](../src/kernel/file_explorer.zig)
+
+Tree-shaped modal file opener rooted at the workspace cwd. Flat
+visible-row list rebuilt on expand/collapse; persistent
+`expanded: StringHashMap` set lets the tree remember its shape
+across re-opens within a session. Reachable via `Space e`, the
+universal `Cmd+O`, or the palette `file.open` — all three are
+aliases for the same entry point.
+
 ### Build integration — [`build_jobs.zig`](../src/kernel/build_jobs.zig)
 
 Runs `zig build`, `zig build test`, etc., parses compiler
@@ -465,31 +492,62 @@ pub const RenderSnapshot = struct {
     file_path: ?[]const u8,
     terminal_output: ?[]const u8,
 
-    // LSP & syntax
+    // Syntax + LSP overlays
     syntax_tokens: ?[]const SyntaxToken,
-    hover_content: ?[]const u8,
+    hover_document: ?HoverDocument,
+    hover_anchor_row: usize,
+    hover_anchor_col: usize,
+    signature_help_label: ?[]const u8,
+    signature_help_parameters: ?[]const Range,
+    signature_help_active_parameter: ?u32,
+    inlay_hints: ?[]const InlayHintSnapshot,
+    diagnostics: ?[]const DiagnosticSnapshot,
+    diagnostic_error_count: u32,
+    diagnostic_warning_count: u32,
+
+    // Completion
     completion_active: bool,
     completion_items: ?[]const CompletionEntry,
 
-    // Pickers
-    file_picker_entries: ?[]const FileEntry,
-    buffer_picker_entries: ?[]const BufferInfo,
-    command_palette_results: ?[]const Command,
+    // Pickers (mode-specific payloads)
+    file_picker_entries: ?[]const DirEntry,
+    file_explorer_entries: ?[]const ExplorerEntry,
+    buffer_picker_selected: usize,
+    command_palette_results: ?[]const CommandEntry,
+    symbol_picker_results: ?[]const SymbolEntry,
+    workspace_symbol_results: ?[]const WorkspaceSymbolEntry,
+    references_entries: ?[]const ReferenceEntry,
+    diagnostics_entries: ?[]const DiagnosticPickerEntry,
+    global_search_results: ?[]const GlobalSearchFileGroup,
+
+    // Which-key
+    which_key_visible: bool,
 
     // Split layout
     split_enabled: bool,
     panes: []const PaneSnapshot,
     focused_pane_id: u32,
+
+    // Misc
+    git_branch: ?[]const u8,
+    active_job_count: u32,
+    status_message: ?[]const u8,
+    status_message_level: StatusLevel,
 };
 ```
 
 ### Frame pacing
 
-- Minimum 3 ms between renders, dynamically bumped to ~16 ms during
-  scroll
-- `needs_render` coalesces redundant updates
-- Single allocation / deallocation per render cycle (arena)
-- `O(visible_lines)` extraction from the piece table
+- 60 Hz cap: `sendUpdate` throttles itself when the previous render
+  was less than ~16 ms ago, setting `needs_render = true` so the
+  tick handler can fire the deferred render once the gate elapses.
+- `needs_render` coalesces redundant updates between input bursts
+  and tick wake-ups.
+- Single allocation / deallocation per render cycle (arena pool).
+- `O(visible_lines)` extraction from the piece table.
+- `buffer.toString()` is memoised per-frame in the hot path so the
+  syntax + brackets + LSP work for one frame all share one
+  reconstruction.
 
 ---
 
@@ -504,14 +562,19 @@ cursor rendering keyed to the current mode, and defensive guards
 against malformed snapshots (zero-size windows, oversized line
 counts, mid-codepoint slices).
 
-### Popups
+### Popups & pickers
 
 | Popup | Function | Notes |
 |---|---|---|
-| Hover | `drawHoverPopup` | Text wrapping, max height, anchored near cursor |
+| Hover | `drawHoverPopup` | Markdown-rendered, anchored near cursor, idle-auto or sticky (`Space l h`) |
+| Signature help | `drawSignatureHelp` | One-line popup above the cursor; active parameter bolded |
+| Inlay hints | inline in `draw` | Dim italic virtual text at LSP-specified positions |
 | Completion | `drawCompletionPopup` | Scrollable list with kind icons |
+| Which-key | `drawWhichKey` | Top-level expands every chord; capped at ~80% viewport |
 | Command palette | `drawCommandPalette` | Fuzzy input + filtered results |
-| File / buffer picker | `drawFilePicker` | Directory-tree navigation |
+| File explorer | `drawFileExplorer` | Tree-shaped modal, j/k navigate, h/l expand/collapse |
+| References / diagnostics picker | `drawReferencesPicker` / `drawDiagnosticsPicker` | Shared `drawModalList` chrome; Esc restores the trigger position |
+| Buffer picker | `drawBufferPicker` | Modified marker + number prefix shortcuts |
 
 ### Status bar — [`status_bar.zig`](../src/ui/status_bar.zig)
 
@@ -589,14 +652,22 @@ Wired features:
 | Feature | LSP method | Stem integration |
 |---|---|---|
 | Auto-completion | `textDocument/completion` | Popup with filtered results |
-| Hover docs | `textDocument/hover` | Popup at cursor after idle delay |
+| Hover docs | `textDocument/hover` | Popup at cursor after idle delay; `Space l h` for sticky |
+| Signature help | `textDocument/signatureHelp` | Auto-fires in Insert mode on `(` / `,`; active-param highlighted |
 | Semantic tokens | `textDocument/semanticTokens/full` | Highlighting overlay |
-| Formatting | `textDocument/formatting` | On-demand |
-| Go to definition | `textDocument/definition` | Jump |
-| Find references | `textDocument/references` | List in pane |
-| Document symbols | `textDocument/documentSymbol` | Symbol picker |
-| Diagnostics | `textDocument/publishDiagnostics` | Inline markers + gutter |
-| Rename | `textDocument/rename` | Cross-file rename |
+| Inlay hints | `textDocument/inlayHint` | Virtual italic text for visible range; toggle `Space l i` |
+| Formatting (doc) | `textDocument/formatting` | `Space l f`; auto-runs on save when `editor.format_on_save = true` |
+| Formatting (range) | `textDocument/rangeFormatting` | `Space l F`; falls back to whole-doc when unsupported |
+| Code actions | `textDocument/codeAction` | `Space a` / `Space l a`; digit picker if multiple actions |
+| Go to definition | `textDocument/definition` | `Space l d` — records a jump first |
+| Find references | `textDocument/references` | `Space l r` opens the references picker |
+| Document symbols | `textDocument/documentSymbol` | `Space l s` symbol picker |
+| Workspace symbols | `workspace/symbol` | `Space l S` workspace picker |
+| Diagnostics (publish) | `textDocument/publishDiagnostics` | Gutter signs, error-lens inline text, picker via `Space l D` |
+| Rename | `textDocument/rename` | `Space l R` cross-file rename |
+
+`textDocument/didChange` is sent on a 50 ms trailing-edge debounce so
+fast typing collapses into a single notification per server.
 
 ---
 
@@ -656,9 +727,8 @@ Tree-sitter `.scm` files live under
 Stem has a manifest-driven plugin system. Plugins live in
 `~/.stem/plugins/<name>/`, declare commands and permissions in
 `plugin.json`, and run through either the `wasm` or `exec` runtime.
-See the [Plugin Architecture](plugin-architecture.md) doc for the
-host-side internals and [Plugin Design](plugin-design.md) for the
-authoring guide.
+See [plugins.md](plugins.md) for the full author guide and host
+internals.
 
 ### Architecture
 
@@ -762,20 +832,49 @@ backed by an actor pipeline.
 
 | Mode | Entry | Description |
 |---|---|---|
-| `select` | default | Navigation, selection, leader commands |
-| `insert` | `i` | Text input |
-| `visual` | `v` | Visual selection |
-| `visual_search` | `/` | Search with highlighting |
+| `select` | default | Navigation, selection, leader chord dispatch |
+| `insert` | `i` | Text input; auto-pair, signature help on `(` / `,` |
+| `visual` | `v` | Visual selection (text objects via `i <c>` / `a <c>`) |
+| `visual_search` | `/` (forward), `?` (backward) | Incremental in-buffer search with live highlights |
 | `terminal` | `t` | Integrated terminal |
-| `file_picker` | `Space f` | Fuzzy file picker |
+| `file_explorer` | `Space e` | Tree-shaped modal file opener — *single canonical entry point* |
+| `file_picker` | palette `file.open` only | Legacy directory-listing picker (kept reachable from the palette) |
 | `buffer_picker` | `Space b` | Buffer switcher |
-| `command_palette` | `Space a` | Fuzzy command search |
+| `command_palette` | `Space f` (or `Space :` on terminals that handle Shift+; cleanly) | Fuzzy command search |
+| `references_picker` | `Space l r` | LSP references; Enter jumps + records, Esc restores trigger |
+| `diagnostics_picker` | `Space l D` | LSP diagnostics; same picker UX |
+| `symbol_picker` | `Space l s` | Document symbols |
+| `workspace_symbol_picker` | `Space l S` | Workspace-wide symbol search |
 | `go_to_line` | palette | Line number input |
 | `save_as_mode` | palette | Save with new name |
-| `symbol_picker` | `Space o` | Document symbols |
-| `log_view` | `:logs` | Runtime log viewer |
-| `global_search` | `Space /` | Project-wide search and replace |
-| `view` | `Space w` | Help / docs view |
+| `log_view` | palette `system.logs` | Runtime log viewer |
+| `global_search` | `Space /` | Project-wide search + replace-with-confirmation walk |
+| `view` | `Space h` | Help / docs view |
+
+### Leader chord groups
+
+The Space leader supports four chord prefixes; the next key picks
+the sub-action. The which-key popup expands every chord inline at
+the top level so the sub-bindings are discoverable without entering
+the chord.
+
+| Chord | Family | Sample bindings |
+|---|---|---|
+| `Space l` | LSP | `d` definition · `r` references · `h` hover · `a` code actions · `f` / `F` format buffer / selection · `D` diagnostics · `s` / `S` doc / workspace symbols · `R` rename · `t` toggle inline diagnostics · `i` toggle inlay hints · `=` toggle format-on-save |
+| `Space g` | Git | `d` diff |
+| `Space w` | Window / splits | `-` horizontal · `\|` vertical · `h/j/k/l` focus · `q` close pane |
+| `Space t` | Editor toggles | `d` inline diagnostics · `i` inlay hints · `=` format-on-save |
+
+### Jump-list navigation
+
+`Space ,` / `Space .` (and the vim aliases `Ctrl+O` / `Ctrl+I`) walk the
+back/forward jump list. Every cross-buffer navigation (`Space b`,
+`Space e`, `Cmd+[/]`, picker open, bracket match `%`, symbol picker,
+LSP go-to-definition, virtual-buffer open) records the cursor before
+moving, so the user can always get back. The references and
+diagnostics pickers additionally stash the trigger location into the
+virtual buffer's `opened_from` field so `Esc` returns the cursor
+exactly to where the picker was opened from.
 
 For the full key map see the
 [README](../README.md#key-bindings).
@@ -795,6 +894,25 @@ file is used to restore state. Each save is atomic (write to
 `.tmp`, fsync, rename) so a crash mid-write can never produce a
 zero-byte session file.
 
+### Auto-save buffer backups
+
+Independent of the session file, every dirty buffer is snapshotted
+to `~/.stem/recover/<hash>.bak` (with a `.path` sidecar listing the
+source path) every `editor.auto_save_interval_seconds` (default 30).
+On startup the recovery scanner surfaces backups whose source is
+older than the snapshot; `buffer.restore_backups` (palette) opens
+the `[Recovery Backups]` index for selective restore. Disable
+entirely with `editor.auto_save_backup = false`.
+
+### Crash dump
+
+The Zig panic handler installed in `main.zig` writes
+`~/.stem/crash/<timestamp>.txt` with the stack trace, recent log
+tail, open buffer list (with dirty flags), and version info before
+re-raising. Combined with the auto-save backups above this means an
+unexpected exit doesn't lose work and is debuggable from the
+artefact alone.
+
 ---
 
 ## Configuration
@@ -809,7 +927,17 @@ zero-byte session file.
         "insert_spaces": true,
         "line_numbers": "relative",
         "wrap": false,
-        "mouse_enabled": true
+        "mouse_enabled": true,
+        "auto_pairs": true,
+        "cursor_line": true,
+        "format_on_save": false,
+        "inline_diagnostics": true,
+        "inlay_hints": false,
+        "auto_save_backup": true,
+        "auto_save_interval_seconds": 30,
+        "large_file_threshold_bytes": 5242880,
+        "large_file_threshold_lines": 50000,
+        "large_file_hard_limit_bytes": 104857600
     },
     "ui": {
         "show_status_bar": true
@@ -819,6 +947,19 @@ zero-byte session file.
     }
 }
 ```
+
+Editor knobs:
+
+| Key | Default | Effect |
+|---|---|---|
+| `format_on_save` | `false` | Run LSP `textDocument/formatting` before each save |
+| `inline_diagnostics` | `true` | Error-lens at end-of-line on every affected line |
+| `inlay_hints` | `false` | Render LSP inlay hints as dim italic virtual text |
+| `auto_save_backup` | `true` | Periodic `.bak` snapshots under `~/.stem/recover/` |
+| `auto_save_interval_seconds` | `30` | Cadence for the auto-save sweep |
+| `large_file_threshold_bytes` | `5242880` (5 MB) | Soft threshold — past this, tree-sitter / brackets / LSP / auto-pair are disabled for the buffer; `[LARGE]` badge in status bar |
+| `large_file_threshold_lines` | `50000` | Soft threshold by line count |
+| `large_file_hard_limit_bytes` | `104857600` (100 MB) | Hard limit — buffers larger than this are rejected at open |
 
 Logging levels: `debug`, `info`, `warn`, `err`.
 
@@ -855,15 +996,25 @@ stem/
 │   │   ├── core.zig
 │   │   ├── protocol.zig
 │   │   ├── command.zig
-│   │   ├── commands/
+│   │   ├── commands/                 # buffer/edit/file/git/lsp/nav/split/system/build/plugin
+│   │   ├── arena_pool.zig
+│   │   ├── bookmarks.zig
 │   │   ├── buffer_manager.zig
+│   │   ├── decorations.zig
+│   │   ├── file_explorer.zig
+│   │   ├── filetype.zig
 │   │   ├── history.zig
+│   │   ├── jobs.zig
+│   │   ├── jump_list.zig
+│   │   ├── message_bus.zig
+│   │   ├── platform.zig
+│   │   ├── request_reply.zig
+│   │   ├── safe.zig
 │   │   ├── session.zig
 │   │   ├── split_manager.zig
+│   │   ├── terminal_proc.zig
 │   │   ├── workspace.zig
 │   │   ├── build_jobs.zig
-│   │   ├── jobs.zig
-│   │   ├── decorations.zig
 │   │   └── vfs.zig
 │   ├── core/
 │   │   ├── piece_table.zig
@@ -877,6 +1028,8 @@ stem/
 │   │   ├── tab_bar.zig
 │   │   ├── file_picker.zig
 │   │   ├── buffer_picker.zig
+│   │   ├── which_key.zig
+│   │   ├── width.zig
 │   │   ├── help.zig
 │   │   ├── help_view.zig
 │   │   ├── log_view.zig
@@ -888,9 +1041,11 @@ stem/
 │   │   ├── lsp_manager.zig
 │   │   ├── global_search.zig
 │   │   ├── search_index.zig
+│   │   ├── hover_doc.zig
 │   │   ├── logger.zig
 │   │   ├── telemetry.zig
 │   │   ├── terminal.zig
+│   │   ├── thread_name.zig
 │   │   └── lsp/
 │   │       ├── external.zig
 │   │       ├── installer.zig
@@ -902,6 +1057,7 @@ stem/
 │   │   ├── manifest.zig
 │   │   ├── process_loader.zig
 │   │   ├── jsonrpc.zig
+│   │   ├── inspect.zig
 │   │   └── wasm/
 │   │       ├── interpreter.zig
 │   │       └── loader.zig

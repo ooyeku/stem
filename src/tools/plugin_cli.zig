@@ -52,7 +52,15 @@ fn runInspect(ctx: Context) !void {
         try plugin_inspect.writeReport(ctx.allocator, ctx.io, ctx.environ_block, null, ctx.out);
         return;
     }
-    try plugin_inspect.writeOne(ctx.allocator, ctx.io, root, ctx.sub_args[0], null, ctx.out);
+    const arg = ctx.sub_args[0];
+    // `writeOne` joins `(root, name)` internally, so we have to pass
+    // a name that's also the directory's basename. Resolve manifest
+    // name → on-disk directory, then hand `writeOne` the basename of
+    // the resolved path.
+    const resolved = try resolveInstalledPluginDir(ctx.allocator, ctx.io, root, arg);
+    defer ctx.allocator.free(resolved);
+    const basename = std.fs.path.basename(resolved);
+    try plugin_inspect.writeOne(ctx.allocator, ctx.io, root, basename, null, ctx.out);
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +103,62 @@ fn readManifest(allocator: std.mem.Allocator, io: std.Io, plugin_dir: []const u8
     defer allocator.free(bytes);
     _ = try file.readPositionalAll(io, bytes, 0);
     return manifest_mod.parse(allocator, bytes);
+}
+
+/// Walk `~/.stem/plugins/*` and return the directory whose
+/// `plugin.json` declares the given `name`. Caller owns the
+/// returned slice. Returns null when no manifest matches — the
+/// directory itself may simply not exist, or no plugin claims
+/// that name.
+fn lookupInstalledPluginDir(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    name: []const u8,
+) !?[]u8 {
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const candidate = try std.fs.path.join(allocator, &.{ root, entry.name });
+        var m = readManifest(allocator, io, candidate) catch {
+            allocator.free(candidate);
+            continue;
+        };
+        const matches = std.mem.eql(u8, m.name, name);
+        m.deinit();
+        if (matches) return candidate;
+        allocator.free(candidate);
+    }
+    return null;
+}
+
+/// Resolve a plugin reference (typically the manifest name shown by
+/// `plugin list`) to its installed directory. Prefers a manifest-
+/// name match; falls back to a literal `root/arg` join when no
+/// manifest declares that name (so existing scripts that pass the
+/// directory name still work). Caller owns the returned slice.
+fn resolveInstalledPluginDir(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    arg: []const u8,
+) ![]u8 {
+    if (try lookupInstalledPluginDir(allocator, io, root, arg)) |found| return found;
+    return std.fs.path.join(allocator, &.{ root, arg });
+}
+
+/// Heuristic for "this looks like a filesystem path, not a bare
+/// installed-plugin name." Used by `runTest` to decide whether to
+/// resolve the arg against `~/.stem/plugins` or treat it as a
+/// cwd-relative path.
+fn looksLikePath(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (std.fs.path.isAbsolute(s)) return true;
+    if (s[0] == '.' or s[0] == '~') return true;
+    return std.mem.indexOfAny(u8, s, "/\\") != null;
 }
 
 // ---------------------------------------------------------------------------
@@ -197,7 +261,11 @@ fn runInfo(ctx: Context) !void {
     const name = ctx.sub_args[0];
     const root = try pluginsRoot(ctx.allocator, ctx.environ_block);
     defer ctx.allocator.free(root);
-    const plugin_dir = try std.fs.path.join(ctx.allocator, &.{ root, name });
+    // Resolve the manifest-name → directory mapping. Without this,
+    // any plugin whose install directory differs from its manifest
+    // `name` field (e.g. `git-wasm/` declares `"name": "git"`) is
+    // unreachable from `info` even though `list` displays it.
+    const plugin_dir = try resolveInstalledPluginDir(ctx.allocator, ctx.io, root, name);
     defer ctx.allocator.free(plugin_dir);
 
     var m = readManifest(ctx.allocator, ctx.io, plugin_dir) catch |err| {
@@ -419,10 +487,28 @@ const TestHarness = struct {
 
 fn runTest(ctx: Context) !void {
     if (ctx.sub_args.len == 0) {
-        try ctx.err.print("usage: stem plugin test <plugin-dir>\n", .{});
+        try ctx.err.print("usage: stem plugin test <installed-name-or-path>\n", .{});
         return;
     }
-    const dir_arg = ctx.sub_args[0];
+    const raw_arg = ctx.sub_args[0];
+
+    // If the arg looks like a filesystem path (contains a
+    // separator, starts with `.` / `~`, or is absolute), keep the
+    // legacy "treat as cwd-relative dir" semantics. Otherwise try
+    // resolving it as an installed plugin name first — that's
+    // what `plugin list` showed and is the obvious thing for a
+    // user to type.
+    const dir_arg_owned: []u8 = blk: {
+        if (looksLikePath(raw_arg)) break :blk try ctx.allocator.dupe(u8, raw_arg);
+        const root = pluginsRoot(ctx.allocator, ctx.environ_block) catch break :blk try ctx.allocator.dupe(u8, raw_arg);
+        defer ctx.allocator.free(root);
+        if (lookupInstalledPluginDir(ctx.allocator, ctx.io, root, raw_arg) catch null) |found| {
+            break :blk found;
+        }
+        break :blk try ctx.allocator.dupe(u8, raw_arg);
+    };
+    defer ctx.allocator.free(dir_arg_owned);
+    const dir_arg: []const u8 = dir_arg_owned;
 
     // Resolve relative-path diagnostics early so the user gets a
     // useful error showing exactly what stem looked for.
