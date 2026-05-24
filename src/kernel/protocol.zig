@@ -11,6 +11,11 @@ pub const Mode = enum {
     view,
     terminal,
     file_picker,
+    /// Tree-shaped, modal sidebar of the current working
+    /// directory. Open via `Space e`. Navigate with j/k or arrows;
+    /// h/l (or Left/Right) collapse/expand directories; Enter on
+    /// a file opens it and dismisses the explorer. Esc dismisses.
+    file_explorer,
     buffer_picker,
     save_as_mode,
     command_palette,
@@ -19,11 +24,62 @@ pub const Mode = enum {
     workspace_symbol_picker,
     log_view,
     global_search,
+    /// LSP textDocument/references results, rendered as a modal
+    /// list. j/k navigates entries; Enter opens the file at the
+    /// match (recording a jump); Esc dismisses and returns the
+    /// cursor to the trigger position. Replaces the earlier
+    /// "open a flat text buffer" UX so users no longer have to
+    /// hunt back through buffer history after closing it.
+    references_picker,
+    /// Same shape for LSP diagnostics — j/k navigates the buffer's
+    /// errors / warnings; Enter jumps to the diagnostic; Esc
+    /// returns to the trigger position.
+    diagnostics_picker,
 };
 
 pub const DirEntry = struct {
     name: []const u8,
     is_dir: bool,
+};
+
+/// One row in the file-explorer's flattened visible tree. The
+/// builder walks the cwd once per render and emits an
+/// `ExplorerEntry` per visible row (directories collapse their
+/// children when not expanded), so the renderer is a straight
+/// list iteration — no tree traversal at draw time.
+pub const ExplorerEntry = struct {
+    /// Display name (basename only, not the full path).
+    name: []const u8,
+    /// Full path from the explorer root, so opening / expanding
+    /// doesn't have to reconstruct it.
+    path: []const u8,
+    /// 0 = direct child of the root.
+    depth: u16,
+    is_dir: bool,
+    /// Only meaningful when `is_dir` is true.
+    is_expanded: bool,
+};
+
+/// One entry in the references picker. Snapshot-only (the per-frame
+/// arena owns the strings); the underlying buffered list in Core
+/// keeps the durable copies.
+pub const ReferenceEntry = struct {
+    /// Absolute path used to open the file when the user picks it.
+    full_path: []const u8,
+    /// Basename for display in the picker.
+    display_path: []const u8,
+    /// 0-based line / col of the reference inside the target file.
+    line: u32,
+    col: u32,
+    /// Trimmed source-line preview (or "(unable to read)").
+    snippet: []const u8,
+};
+
+pub const DiagnosticPickerEntry = struct {
+    line: u32,
+    col: u32,
+    severity: DiagnosticSeverity,
+    message: []const u8,
 };
 
 pub const RenderParams = struct {
@@ -342,6 +398,17 @@ pub const RenderSnapshot = struct {
     file_picker_cwd: ?[]const u8,
     file_picker_entries: ?[]const DirEntry,
     file_picker_selected: usize,
+
+    /// File-explorer state. Each entry already carries its depth
+    /// and is_dir / is_expanded flags so the view doesn't have to
+    /// walk the tree. The list is the visible flattening of the
+    /// expanded tree, top-to-bottom; `file_explorer_selected` is
+    /// an index into it.
+    file_explorer_cwd: ?[]const u8 = null,
+    file_explorer_entries: ?[]const ExplorerEntry = null,
+    file_explorer_selected: usize = 0,
+    file_explorer_scroll_offset: usize = 0,
+
     buffer_picker_scroll_offset: usize,
     buffer_picker_number_input: ?[]const u8 = null,
     save_as_input: ?[]const u8,
@@ -384,6 +451,11 @@ pub const RenderSnapshot = struct {
     /// the Space leader has been held idle for a short delay. `null`
     /// when the popup isn't currently visible.
     which_key_visible: bool = false,
+    /// When the user has entered a chord prefix (`l` / `g` / `w` /
+    /// `t`), this is the prefix byte so the popup can show that
+    /// chord's sub-bindings instead of the top-level catalogue.
+    /// null when no chord is pending.
+    leader_chord: ?u8 = null,
 
     command_palette_query: ?[]const u8 = null,
     command_palette_results: ?[]const CommandEntry = null,
@@ -446,6 +518,21 @@ pub const RenderSnapshot = struct {
     /// True once a search has actually run since the panel was opened. Used
     /// to distinguish the empty initial state from "0 matches".
     global_search_ran: bool = false,
+
+    /// References picker payload — present when mode ==
+    /// .references_picker. Each entry is a flattened LSP location
+    /// with its file basename, line/col, and a short source-line
+    /// preview. `selected` is an index into the slice.
+    references_entries: ?[]const ReferenceEntry = null,
+    references_selected: usize = 0,
+    references_scroll_offset: usize = 0,
+    references_symbol: ?[]const u8 = null,
+
+    /// Diagnostics picker payload — same shape for mode ==
+    /// .diagnostics_picker. Filtered to the active buffer.
+    diagnostics_entries: ?[]const DiagnosticPickerEntry = null,
+    diagnostics_picker_selected: usize = 0,
+    diagnostics_picker_scroll_offset: usize = 0,
 
     diff_highlight_lines: ?[]const DiffLineHighlight = null,
     /// Diagnostics for the currently visible buffer, sorted by line.

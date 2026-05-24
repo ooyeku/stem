@@ -29,6 +29,20 @@ pub const Buffer = struct {
     /// degraded" from "user-overrode".
     large_overridden: bool = false,
 
+    /// Where this buffer was opened *from*. Populated by
+    /// `openVirtualBuffer` so closing a [References] / [Help] /
+    /// [Diagnostics] / [Bookmarks] / [Git Diff] etc. buffer can
+    /// jump the caller back to the trigger location instead of
+    /// dropping them wherever the next-active buffer last sat.
+    /// `null` for buffers opened directly from disk or scratch.
+    opened_from: ?OpenedFrom = null,
+
+    pub const OpenedFrom = struct {
+        buffer_id: u32,
+        row: usize,
+        col: usize,
+    };
+
     pub fn deinit(self: *Buffer, allocator: std.mem.Allocator) void {
         self.state.deinit();
         allocator.free(self.name);
@@ -392,6 +406,16 @@ pub const BufferManager = struct {
         if (index < self.buffers.items.len) {
             self.active_index = index;
         }
+    }
+
+    /// Look up a buffer's current index by its stable `id`.
+    /// Returns null when the id no longer matches any buffer
+    /// (e.g. it was closed since the caller cached it).
+    pub fn indexOfId(self: *const BufferManager, id: u32) ?usize {
+        for (self.buffers.items, 0..) |buf, i| {
+            if (buf.id == id) return i;
+        }
+        return null;
     }
 
     pub fn nextBuffer(self: *BufferManager) void {

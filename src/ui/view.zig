@@ -328,6 +328,38 @@ pub const View = struct {
             return;
         }
 
+        if (mode == .file_explorer) {
+            try drawFileExplorer(
+                win,
+                snapshot.file_explorer_cwd orelse ".",
+                snapshot.file_explorer_entries orelse &.{},
+                snapshot.file_explorer_selected,
+                snapshot.file_explorer_scroll_offset,
+            );
+            return;
+        }
+
+        if (mode == .references_picker) {
+            try drawReferencesPicker(
+                win,
+                snapshot.references_symbol,
+                snapshot.references_entries orelse &.{},
+                snapshot.references_selected,
+                snapshot.references_scroll_offset,
+            );
+            return;
+        }
+
+        if (mode == .diagnostics_picker) {
+            try drawDiagnosticsPicker(
+                win,
+                snapshot.diagnostics_entries orelse &.{},
+                snapshot.diagnostics_picker_selected,
+                snapshot.diagnostics_picker_scroll_offset,
+            );
+            return;
+        }
+
         if (mode == .buffer_picker) {
             try BufferPicker.draw(
                 win,
@@ -918,7 +950,7 @@ pub const View = struct {
         }
 
         if (snapshot.which_key_visible) {
-            try self.drawWhichKey(win);
+            try self.drawWhichKey(win, snapshot.leader_chord);
         }
     }
 
@@ -985,7 +1017,7 @@ pub const View = struct {
         try self.status_bar.draw(status_area, snapshot, frame_allocator);
 
         if (snapshot.which_key_visible) {
-            try self.drawWhichKey(win);
+            try self.drawWhichKey(win, snapshot.leader_chord);
         }
     }
 
@@ -1978,6 +2010,324 @@ pub const View = struct {
         }
     }
 
+    /// Modal tree-shaped file explorer overlay. Renders centered on
+    /// the screen with a border, a title row showing the root path,
+    /// a footer row with key hints, and a scrolling list of entries
+    /// in the middle. Directories show a `▸`/`▾` glyph; depth is
+    /// communicated by two spaces of indent per level.
+    fn drawFileExplorer(
+        win: vaxis.Window,
+        cwd: []const u8,
+        entries: []const protocol.ExplorerEntry,
+        selected: usize,
+        scroll_offset: usize,
+    ) !void {
+        if (win.width < 30 or win.height < 6) return;
+
+        // Modal box: 80% width, 80% height, centered.
+        const box_width: u16 = @min(@as(u16, 100), (win.width * 4) / 5);
+        const box_height: u16 = @min(@as(u16, 30), (win.height * 4) / 5);
+        const box_x: u16 = (win.width -| box_width) / 2;
+        const box_y: u16 = (win.height -| box_height) / 2;
+
+        const bg: vaxis.Cell.Style = theme.styles.panel.background;
+        const border: vaxis.Cell.Style = theme.styles.panel.background;
+        const title_style: vaxis.Cell.Style = theme.styles.panel.title;
+        const dir_style: vaxis.Cell.Style = .{
+            .fg = .{ .rgb = theme.colors.syntax.namespace },
+            .bg = bg.bg,
+            .bold = true,
+        };
+        const file_style: vaxis.Cell.Style = bg;
+        const selected_style: vaxis.Cell.Style = .{
+            .fg = .{ .index = theme.colors.palette.bright_white },
+            .bg = .{ .index = theme.colors.palette.blue },
+            .bold = true,
+        };
+        const hint_style: vaxis.Cell.Style = .{
+            .fg = .{ .rgb = theme.colors.syntax.comment },
+            .bg = bg.bg,
+            .italic = true,
+        };
+
+        // Top border + title.
+        _ = win.printSegment(.{ .text = "╭", .style = border }, .{ .row_offset = box_y, .col_offset = box_x });
+        for (1..box_width - 1) |i| {
+            _ = win.printSegment(.{ .text = "─", .style = border }, .{ .row_offset = box_y, .col_offset = box_x + @as(u16, @intCast(i)) });
+        }
+        _ = win.printSegment(.{ .text = "╮", .style = border }, .{ .row_offset = box_y, .col_offset = box_x + box_width - 1 });
+
+        // Title row: " 📁 Files — <cwd> "
+        fillRow(win, box_x, box_y + 1, box_width, bg);
+        _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = box_y + 1, .col_offset = box_x });
+        _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = box_y + 1, .col_offset = box_x + box_width - 1 });
+        const title_prefix = " Files — ";
+        _ = win.printSegment(.{ .text = title_prefix, .style = title_style }, .{ .row_offset = box_y + 1, .col_offset = box_x + 1 });
+        const max_cwd_len: usize = if (box_width > title_prefix.len + 4) box_width - title_prefix.len - 4 else 0;
+        const cwd_trim = if (cwd.len > max_cwd_len and max_cwd_len > 3) cwd[cwd.len - max_cwd_len + 1 ..] else cwd;
+        _ = win.printSegment(.{ .text = cwd_trim, .style = title_style }, .{ .row_offset = box_y + 1, .col_offset = box_x + 1 + @as(u16, @intCast(title_prefix.len)) });
+
+        // Body rows.
+        const list_top: u16 = box_y + 2;
+        const list_bottom: u16 = box_y + box_height - 2; // leave room for footer
+        const list_rows: usize = @intCast(list_bottom - list_top);
+
+        // Auto-scroll: keep selected in [scroll_offset, scroll_offset + list_rows)
+        var effective_scroll = scroll_offset;
+        if (selected < effective_scroll) effective_scroll = selected;
+        if (selected >= effective_scroll + list_rows) {
+            effective_scroll = if (selected + 1 > list_rows) selected + 1 - list_rows else 0;
+        }
+
+        var row: u16 = list_top;
+        var i: usize = effective_scroll;
+        while (i < entries.len and row < list_bottom) : ({
+            i += 1;
+            row += 1;
+        }) {
+            const e = entries[i];
+            // Background fill.
+            fillRow(win, box_x, row, box_width, bg);
+            _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = row, .col_offset = box_x });
+            _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = row, .col_offset = box_x + box_width - 1 });
+
+            const is_sel = i == selected;
+            const style_for_text = if (is_sel) selected_style else if (e.is_dir) dir_style else file_style;
+            const glyph: []const u8 = if (e.is_dir) (if (e.is_expanded) "▾ " else "▸ ") else "  ";
+
+            // Selection highlight spans the whole interior row.
+            if (is_sel) {
+                var col: u16 = box_x + 1;
+                while (col < box_x + box_width - 1) : (col += 1) {
+                    _ = win.printSegment(.{ .text = " ", .style = selected_style }, .{ .row_offset = row, .col_offset = col });
+                }
+            }
+
+            const indent_cols: u16 = @as(u16, @intCast(e.depth)) * 2;
+            const base_col = box_x + 2 + indent_cols;
+            if (base_col + 2 < box_x + box_width - 1) {
+                _ = win.printSegment(.{ .text = glyph, .style = style_for_text }, .{ .row_offset = row, .col_offset = base_col });
+                _ = win.printSegment(.{ .text = e.name, .style = style_for_text }, .{ .row_offset = row, .col_offset = base_col + 2 });
+            }
+        }
+        // Pad remaining empty rows so the border closes cleanly.
+        while (row < list_bottom) : (row += 1) {
+            fillRow(win, box_x, row, box_width, bg);
+            _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = row, .col_offset = box_x });
+            _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = row, .col_offset = box_x + box_width - 1 });
+        }
+
+        // Footer with key hints.
+        fillRow(win, box_x, list_bottom, box_width, bg);
+        _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = list_bottom, .col_offset = box_x });
+        _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = list_bottom, .col_offset = box_x + box_width - 1 });
+        const hint = " j/k move · h/l collapse/expand · ⏎ open · H hidden · esc close ";
+        const hint_col = box_x + 1;
+        if (hint.len < box_width - 2) {
+            _ = win.printSegment(.{ .text = hint, .style = hint_style }, .{ .row_offset = list_bottom, .col_offset = hint_col });
+        }
+
+        // Bottom border.
+        _ = win.printSegment(.{ .text = "╰", .style = border }, .{ .row_offset = box_y + box_height - 1, .col_offset = box_x });
+        for (1..box_width - 1) |bx| {
+            _ = win.printSegment(.{ .text = "─", .style = border }, .{ .row_offset = box_y + box_height - 1, .col_offset = box_x + @as(u16, @intCast(bx)) });
+        }
+        _ = win.printSegment(.{ .text = "╯", .style = border }, .{ .row_offset = box_y + box_height - 1, .col_offset = box_x + box_width - 1 });
+    }
+
+    /// Generic modal-list renderer used by the references and
+    /// diagnostics pickers. Centered box, header line, scrolling
+    /// row list, footer with key hints. Each row is rendered by
+    /// the caller's `rowText` closure so the two pickers can
+    /// format their entries differently (a reference shows
+    /// `[file] Ln 42: snippet`, a diagnostic shows
+    /// `E Ln 42:5  unused variable`).
+    fn drawModalList(
+        win: vaxis.Window,
+        title: []const u8,
+        footer_hint: []const u8,
+        row_count: usize,
+        selected: usize,
+        scroll_offset: usize,
+        ctx: anytype,
+    ) !void {
+        if (win.width < 30 or win.height < 6) return;
+
+        const box_width: u16 = @min(@as(u16, 120), (win.width * 9) / 10);
+        const box_height: u16 = @min(@as(u16, 40), (win.height * 4) / 5);
+        const box_x: u16 = (win.width -| box_width) / 2;
+        const box_y: u16 = (win.height -| box_height) / 2;
+
+        const bg: vaxis.Cell.Style = theme.styles.panel.background;
+        const border: vaxis.Cell.Style = bg;
+        const title_style: vaxis.Cell.Style = theme.styles.panel.title;
+        const selected_style: vaxis.Cell.Style = .{
+            .fg = .{ .index = theme.colors.palette.bright_white },
+            .bg = .{ .index = theme.colors.palette.blue },
+            .bold = true,
+        };
+        const hint_style: vaxis.Cell.Style = .{
+            .fg = .{ .rgb = theme.colors.syntax.comment },
+            .bg = bg.bg,
+            .italic = true,
+        };
+
+        // Top border + title row.
+        _ = win.printSegment(.{ .text = "╭", .style = border }, .{ .row_offset = box_y, .col_offset = box_x });
+        for (1..box_width - 1) |i| {
+            _ = win.printSegment(.{ .text = "─", .style = border }, .{ .row_offset = box_y, .col_offset = box_x + @as(u16, @intCast(i)) });
+        }
+        _ = win.printSegment(.{ .text = "╮", .style = border }, .{ .row_offset = box_y, .col_offset = box_x + box_width - 1 });
+
+        fillRow(win, box_x, box_y + 1, box_width, bg);
+        _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = box_y + 1, .col_offset = box_x });
+        _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = box_y + 1, .col_offset = box_x + box_width - 1 });
+        _ = win.printSegment(.{ .text = title, .style = title_style }, .{ .row_offset = box_y + 1, .col_offset = box_x + 1 });
+
+        const list_top: u16 = box_y + 2;
+        const list_bottom: u16 = box_y + box_height - 2;
+        const list_rows: usize = @intCast(list_bottom - list_top);
+
+        var effective_scroll = scroll_offset;
+        if (selected < effective_scroll) effective_scroll = selected;
+        if (selected >= effective_scroll + list_rows) {
+            effective_scroll = if (selected + 1 > list_rows) selected + 1 - list_rows else 0;
+        }
+
+        var row: u16 = list_top;
+        var i: usize = effective_scroll;
+        while (i < row_count and row < list_bottom) : ({
+            i += 1;
+            row += 1;
+        }) {
+            fillRow(win, box_x, row, box_width, bg);
+            _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = row, .col_offset = box_x });
+            _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = row, .col_offset = box_x + box_width - 1 });
+
+            const is_sel = i == selected;
+            if (is_sel) {
+                var col: u16 = box_x + 1;
+                while (col < box_x + box_width - 1) : (col += 1) {
+                    _ = win.printSegment(.{ .text = " ", .style = selected_style }, .{ .row_offset = row, .col_offset = col });
+                }
+            }
+            const inner_max: u16 = if (box_width > 4) box_width - 4 else 0;
+            try ctx.drawRow(win, row, box_x + 2, inner_max, i, is_sel);
+        }
+        while (row < list_bottom) : (row += 1) {
+            fillRow(win, box_x, row, box_width, bg);
+            _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = row, .col_offset = box_x });
+            _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = row, .col_offset = box_x + box_width - 1 });
+        }
+
+        // Footer with key hints.
+        fillRow(win, box_x, list_bottom, box_width, bg);
+        _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = list_bottom, .col_offset = box_x });
+        _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = list_bottom, .col_offset = box_x + box_width - 1 });
+        if (footer_hint.len + 2 < box_width) {
+            _ = win.printSegment(.{ .text = footer_hint, .style = hint_style }, .{ .row_offset = list_bottom, .col_offset = box_x + 1 });
+        }
+
+        _ = win.printSegment(.{ .text = "╰", .style = border }, .{ .row_offset = box_y + box_height - 1, .col_offset = box_x });
+        for (1..box_width - 1) |bx| {
+            _ = win.printSegment(.{ .text = "─", .style = border }, .{ .row_offset = box_y + box_height - 1, .col_offset = box_x + @as(u16, @intCast(bx)) });
+        }
+        _ = win.printSegment(.{ .text = "╯", .style = border }, .{ .row_offset = box_y + box_height - 1, .col_offset = box_x + box_width - 1 });
+    }
+
+    fn drawReferencesPicker(
+        win: vaxis.Window,
+        symbol: ?[]const u8,
+        entries: []const protocol.ReferenceEntry,
+        selected: usize,
+        scroll_offset: usize,
+    ) !void {
+        var title_buf: [128]u8 = undefined;
+        const title = if (symbol) |sym|
+            std.fmt.bufPrint(&title_buf, " References — {s} ({d})", .{ sym, entries.len }) catch " References "
+        else
+            std.fmt.bufPrint(&title_buf, " References ({d})", .{entries.len}) catch " References ";
+
+        const Ctx = struct {
+            entries: []const protocol.ReferenceEntry,
+            fn drawRow(self: @This(), w: vaxis.Window, row: u16, base_col: u16, max_w: u16, i: usize, is_sel: bool) !void {
+                _ = is_sel;
+                const e = self.entries[i];
+                const bg: vaxis.Cell.Style = theme.styles.panel.background;
+                const path_style: vaxis.Cell.Style = .{ .fg = .{ .rgb = theme.colors.syntax.namespace }, .bg = bg.bg, .bold = true };
+                const linecol_style: vaxis.Cell.Style = .{ .fg = .{ .rgb = theme.colors.syntax.number }, .bg = bg.bg };
+                const snippet_style: vaxis.Cell.Style = bg;
+
+                var line_buf: [16]u8 = undefined;
+                const linecol = std.fmt.bufPrint(&line_buf, "{d}:{d}", .{ e.line + 1, e.col + 1 }) catch "?";
+
+                var col: u16 = base_col;
+                _ = w.printSegment(.{ .text = e.display_path, .style = path_style }, .{ .row_offset = row, .col_offset = col });
+                col += @intCast(@min(e.display_path.len, @as(usize, max_w / 3)));
+                _ = w.printSegment(.{ .text = " :", .style = bg }, .{ .row_offset = row, .col_offset = col });
+                col += 2;
+                _ = w.printSegment(.{ .text = linecol, .style = linecol_style }, .{ .row_offset = row, .col_offset = col });
+                col += @intCast(linecol.len);
+                _ = w.printSegment(.{ .text = "  ", .style = bg }, .{ .row_offset = row, .col_offset = col });
+                col += 2;
+                const remaining: usize = if (col > base_col + max_w) 0 else base_col + max_w - col;
+                const snip_take = if (e.snippet.len > remaining) e.snippet[0..remaining] else e.snippet;
+                _ = w.printSegment(.{ .text = snip_take, .style = snippet_style }, .{ .row_offset = row, .col_offset = col });
+            }
+        };
+        const ctx = Ctx{ .entries = entries };
+        try drawModalList(win, title, " j/k move · ⏎ open · g/G top/bottom · esc back ", entries.len, selected, scroll_offset, ctx);
+    }
+
+    fn drawDiagnosticsPicker(
+        win: vaxis.Window,
+        entries: []const protocol.DiagnosticPickerEntry,
+        selected: usize,
+        scroll_offset: usize,
+    ) !void {
+        var title_buf: [64]u8 = undefined;
+        const title = std.fmt.bufPrint(&title_buf, " Diagnostics ({d})", .{entries.len}) catch " Diagnostics ";
+
+        const Ctx = struct {
+            entries: []const protocol.DiagnosticPickerEntry,
+            fn drawRow(self: @This(), w: vaxis.Window, row: u16, base_col: u16, max_w: u16, i: usize, is_sel: bool) !void {
+                _ = is_sel;
+                const e = self.entries[i];
+                const bg: vaxis.Cell.Style = theme.styles.panel.background;
+                const sev_glyph: []const u8 = switch (e.severity) {
+                    .err => "E ",
+                    .warning => "W ",
+                    .info => "I ",
+                    .hint => "H ",
+                };
+                const sev_style: vaxis.Cell.Style = switch (e.severity) {
+                    .err => .{ .fg = .{ .rgb = .{ 224, 108, 117 } }, .bg = bg.bg, .bold = true },
+                    .warning => .{ .fg = .{ .rgb = .{ 229, 192, 123 } }, .bg = bg.bg, .bold = true },
+                    .info => .{ .fg = .{ .rgb = .{ 86, 182, 194 } }, .bg = bg.bg },
+                    .hint => .{ .fg = .{ .rgb = .{ 128, 128, 140 } }, .bg = bg.bg },
+                };
+                const linecol_style: vaxis.Cell.Style = .{ .fg = .{ .rgb = theme.colors.syntax.number }, .bg = bg.bg };
+                const msg_style: vaxis.Cell.Style = bg;
+
+                var line_buf: [16]u8 = undefined;
+                const linecol = std.fmt.bufPrint(&line_buf, "{d}:{d}", .{ e.line + 1, e.col + 1 }) catch "?";
+
+                var col: u16 = base_col;
+                _ = w.printSegment(.{ .text = sev_glyph, .style = sev_style }, .{ .row_offset = row, .col_offset = col });
+                col += @intCast(sev_glyph.len);
+                _ = w.printSegment(.{ .text = linecol, .style = linecol_style }, .{ .row_offset = row, .col_offset = col });
+                col += @intCast(linecol.len);
+                _ = w.printSegment(.{ .text = "  ", .style = bg }, .{ .row_offset = row, .col_offset = col });
+                col += 2;
+                const remaining: usize = if (col > base_col + max_w) 0 else base_col + max_w - col;
+                const msg_take = if (e.message.len > remaining) e.message[0..remaining] else e.message;
+                _ = w.printSegment(.{ .text = msg_take, .style = msg_style }, .{ .row_offset = row, .col_offset = col });
+            }
+        };
+        const ctx = Ctx{ .entries = entries };
+        try drawModalList(win, title, " j/k move · ⏎ jump · g/G top/bottom · esc back ", entries.len, selected, scroll_offset, ctx);
+    }
+
     /// Fill an interior row (`box_x+1` through `box_x+width-2`) with
     /// blanks in the popup background so syntax tokens behind the
     /// popup don't bleed through.
@@ -2028,40 +2378,55 @@ pub const View = struct {
     // static catalogue in `ui/which_key.zig` so the popup never
     // claims a binding that doesn't exist.
 
-    fn drawWhichKey(self: *View, win: vaxis.Window) !void {
+    fn drawWhichKey(self: *View, win: vaxis.Window, leader_chord: ?u8) !void {
         _ = self;
         const wk = @import("which_key.zig");
 
         if (win.width < 30 or win.height < 8) return;
 
-        // Group ordering picked so column heights balance: large
-        // groups paired with small ones rather than two big groups
-        // stacking on the same column.
-        const groups = [_]wk.Group{ .file, .splits, .edit, .misc, .lsp, .navigation };
+        // Pick the entry list for the current chord context.
+        // No chord → top-level catalogue; in a chord → sub-list.
+        const entries = wk.entriesFor(leader_chord);
+        const title = wk.titleFor(leader_chord);
 
-        // Count entries per group + compute the tallest column.
-        var per_group_counts: [groups.len]usize = .{0} ** groups.len;
-        for (wk.entries) |e| {
+        // Discover the unique groups present in `entries`, in the
+        // order they first appear. This keeps the popup layout
+        // stable and makes the chord sub-popups (which may have
+        // only one group) render cleanly without empty sections.
+        var groups_buf: [@typeInfo(wk.Group).@"enum".fields.len]wk.Group = undefined;
+        var groups_len: usize = 0;
+        for (entries) |e| {
+            var seen = false;
+            for (groups_buf[0..groups_len]) |g| {
+                if (g == e.group) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                groups_buf[groups_len] = e.group;
+                groups_len += 1;
+            }
+        }
+        const groups = groups_buf[0..groups_len];
+
+        // Count entries per group + tallest column.
+        var per_group_counts: [@typeInfo(wk.Group).@"enum".fields.len]usize = .{0} ** @typeInfo(wk.Group).@"enum".fields.len;
+        for (entries) |e| {
             for (groups, 0..) |g, gi| {
                 if (e.group == g) per_group_counts[gi] += 1;
             }
         }
-        var tallest: usize = 0;
-        for (per_group_counts) |c| tallest = @max(tallest, c);
 
-        // Cap popup width so it never dominates the screen. On wide
-        // terminals: 3-column compact layout. On medium: 2 columns.
-        // On narrow: 1 column. The previous version stretched
-        // edge-to-edge and made small terminals unusable.
+        // Cap popup width so it never dominates the screen.
         const max_popup_w: u16 = 70;
         const popup_width: u16 = @min(max_popup_w, win.width -| 4);
-        const columns: u16 = if (popup_width >= 60) 3 else if (popup_width >= 40) 2 else 1;
+        const columns: u16 = if (popup_width >= 60 and groups_len >= 3) 3 else if (popup_width >= 40 and groups_len >= 2) 2 else 1;
         const col_width: u16 = if (columns > 0) (popup_width - 4) / columns else popup_width;
 
-        const rows_per_col = (groups.len + columns - 1) / columns;
+        const rows_per_col = if (columns > 0) (groups_len + columns - 1) / columns else groups_len;
         const popup_height: u16 = blk: {
-            // Each column section: 1 header + N entries + 1 separator,
-            // stacked vertically per column.
+            // Each column section: 1 header + N entries + 1 separator.
             var section_rows: usize = 0;
             var col: usize = 0;
             while (col < columns) : (col += 1) {
@@ -2069,17 +2434,17 @@ pub const View = struct {
                 var sec: usize = 0;
                 while (sec < rows_per_col) : (sec += 1) {
                     const idx = col * rows_per_col + sec;
-                    if (idx >= groups.len) break;
-                    col_rows += 1 + per_group_counts[idx] + 1; // header + entries + spacer
+                    if (idx >= groups_len) break;
+                    col_rows += 1 + per_group_counts[idx] + 1;
                 }
                 section_rows = @max(section_rows, col_rows);
             }
-            // +2 for top/bottom border, +1 for title row.
             const natural = section_rows + 3;
-            // Cap at half the viewport so the popup never swallows
-            // the active line. The user explicitly opted in via
-            // Space-Space; they still want to see the editor under it.
-            const max_pop_h: usize = @min(@as(usize, win.height) / 2 + 4, 18);
+            // Top-level popup carries every chord's sub-bindings
+            // now (10 groups, ~46 entries) — let it use up to ~80%
+            // of the viewport so nothing gets clipped. Chord-only
+            // popups stay tiny because `natural` will be small.
+            const max_pop_h: usize = (@as(usize, win.height) * 4) / 5;
             break :blk @intCast(@min(@min(natural, max_pop_h), @as(usize, win.height) - 1));
         };
 
@@ -2088,17 +2453,17 @@ pub const View = struct {
 
         const styles = whichKeyStyles();
 
-        // Frame.
+        // Top frame.
         _ = win.printSegment(.{ .text = "╭", .style = styles.border }, .{ .row_offset = box_y, .col_offset = box_x });
         for (1..popup_width - 1) |i| {
             _ = win.printSegment(.{ .text = "─", .style = styles.border }, .{ .row_offset = box_y, .col_offset = box_x + @as(u16, @intCast(i)) });
         }
         _ = win.printSegment(.{ .text = "╮", .style = styles.border }, .{ .row_offset = box_y, .col_offset = box_x + popup_width - 1 });
 
-        // Title row.
+        // Title row. Reflects the active chord prefix.
         fillRow(win, box_x, box_y + 1, popup_width, styles.bg);
-        _ = win.printSegment(.{ .text = " Space — leader", .style = styles.title }, .{ .row_offset = box_y + 1, .col_offset = box_x + 2 });
-        const hint = "esc cancel";
+        _ = win.printSegment(.{ .text = title, .style = styles.title }, .{ .row_offset = box_y + 1, .col_offset = box_x + 2 });
+        const hint = if (leader_chord != null) "esc back" else "esc cancel";
         if (popup_width > hint.len + 6) {
             const hint_col = box_x + popup_width - 1 - @as(u16, @intCast(hint.len)) - 1;
             _ = win.printSegment(.{ .text = hint, .style = styles.hint }, .{ .row_offset = box_y + 1, .col_offset = hint_col });
@@ -2106,11 +2471,9 @@ pub const View = struct {
         _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = box_y + 1, .col_offset = box_x });
         _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = box_y + 1, .col_offset = box_x + popup_width - 1 });
 
-        // Inner area starts at box_y + 2 (after frame + title).
         const inner_top = box_y + 2;
-        const inner_bottom = box_y + popup_height - 1; // bottom border row
+        const inner_bottom = box_y + popup_height - 1;
 
-        // Fill background for interior rows.
         var iy: u16 = inner_top;
         while (iy < inner_bottom) : (iy += 1) {
             fillRow(win, box_x, iy, popup_width, styles.bg);
@@ -2118,7 +2481,6 @@ pub const View = struct {
             _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = iy, .col_offset = box_x + popup_width - 1 });
         }
 
-        // Lay out each group inside its column.
         var col_idx: usize = 0;
         while (col_idx < columns) : (col_idx += 1) {
             const col_left = box_x + 2 + @as(u16, @intCast(col_idx)) * col_width;
@@ -2126,7 +2488,7 @@ pub const View = struct {
             var sec_idx: usize = 0;
             while (sec_idx < rows_per_col) : (sec_idx += 1) {
                 const gi = col_idx * rows_per_col + sec_idx;
-                if (gi >= groups.len) break;
+                if (gi >= groups_len) break;
                 if (row_in_col >= inner_bottom) break;
                 const g = groups[gi];
                 _ = win.printSegment(.{ .text = g.title(), .style = styles.group_title }, .{
@@ -2134,12 +2496,9 @@ pub const View = struct {
                     .col_offset = col_left,
                 });
                 row_in_col += 1;
-                for (wk.entries) |e| {
+                for (entries) |e| {
                     if (e.group != g) continue;
                     if (row_in_col >= inner_bottom) break;
-                    // `e.key` is a static string literal in `which_key.zig`
-                    // — no lifetime concerns, vaxis can retain the
-                    // pointer for as long as it likes.
                     _ = win.printSegment(.{ .text = e.key, .style = styles.key }, .{
                         .row_offset = row_in_col,
                         .col_offset = col_left + 1,
@@ -2150,12 +2509,10 @@ pub const View = struct {
                     });
                     row_in_col += 1;
                 }
-                // Spacer between sections.
                 row_in_col += 1;
             }
         }
 
-        // Bottom border.
         _ = win.printSegment(.{ .text = "╰", .style = styles.border }, .{ .row_offset = inner_bottom, .col_offset = box_x });
         for (1..popup_width - 1) |i| {
             _ = win.printSegment(.{ .text = "─", .style = styles.border }, .{ .row_offset = inner_bottom, .col_offset = box_x + @as(u16, @intCast(i)) });

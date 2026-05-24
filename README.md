@@ -155,8 +155,12 @@ stem --version             # version info
 ## Key bindings
 
 Stem leans on a Space leader and a discoverable command palette
-(`Space a`) for most actions. The bindings below cover everyday
+(`Space :`) for most actions. The bindings below cover everyday
 editing; everything else is reachable through the palette.
+
+Press `Space ;` (or `Space ?`) at any time to pop up the which-key
+reference — it shows every available follow-up key. While in a
+chord like `Space l` the popup shows that chord's sub-bindings.
 
 ### Modes
 
@@ -250,36 +254,96 @@ On macOS use `Cmd`, on Linux/Windows use `Ctrl`:
 | `Cmd/Ctrl+W` | Close active buffer |
 | `Cmd/Ctrl+Q` | Quit |
 
-### Space leader
+### Space leader — top level
+
+The highest-frequency actions live as a single key after Space.
 
 | Key | Action |
 |-----|--------|
-| `Space a` | Command palette |
-| `Space f` | File picker (fuzzy) |
+| `Space e` | Open file (tree-shaped explorer — also `Cmd/Ctrl+O`) |
 | `Space b` | Buffer picker |
-| `Space /` | Project-wide search & replace |
 | `Space s` | Save |
 | `Space q` | Quit |
 | `Space k` | Close current pane / buffer |
-| `Space w` | Help view |
 | `Space n` / `Space p` | Next / previous buffer |
+| `Space [1-9]` | Quick switch to buffer N |
+| `Space :` | Command palette (vim convention) |
+| `Space /` | Project-wide search & replace |
+| `Space ,` / `Space .` | Jump back / forward |
+| `Space z` | Center cursor in viewport |
 | `Space u` / `Space r` | Undo / redo |
 | `Space c` / `Space x` / `Space v` | Copy / cut / paste |
-| `Space -` / `` Space ` `` | Horizontal / vertical split |
+| `Space a` | Code actions (LSP) |
+| `Space -` / `Space \|` | Horizontal / vertical split |
 | `Space ←/→/↑/↓` | Focus split pane in that direction |
-| `Space g` | LSP go-to-definition |
-| `Space l` | LSP find references |
-| `Space h` | LSP hover |
-| `Space d` | LSP diagnostics |
-| `Space m` | LSP rename |
-| `Space o` | Document symbols |
-| `Space O` | Workspace symbols |
-| `Space C` | LSP code actions (pick `1-9` to apply, any other key cancels) |
-| `Space F` | LSP format selection (visual range or current line) |
-| `Space ,` / `Space .` | Jump back / forward |
+| `Space h` | Help view |
 | `Space j` | Background jobs list |
-| `Space D` | Git diff (via bundled git plugin) |
+| `Space ;` / `Space ?` | Toggle which-key popup |
 | `Space Esc` | Cancel the leader |
+
+### Space leader — chord groups
+
+Related families live under a chord prefix. Tap `Space ;` inside
+any chord to see the contents on screen.
+
+#### `Space l` — LSP
+
+| Key | Action |
+|-----|--------|
+| `Space l d` | Go to definition |
+| `Space l r` | Find references |
+| `Space l h` | Hover (docs) |
+| `Space l a` | Code actions (alias for `Space a`) |
+| `Space l f` | Format buffer |
+| `Space l F` | Format selection |
+| `Space l D` | Diagnostics list |
+| `Space l s` | Document symbols |
+| `Space l S` | Workspace symbols |
+| `Space l t` | Toggle inline diagnostics |
+| `Space l i` | Toggle inlay hints |
+| `Space l =` | Toggle format-on-save |
+
+Signature help auto-pops above the cursor in Insert mode when you
+type `(` or `,`. Dismissed by `)`, Esc, or mode change.
+
+#### `Space g` — Git
+
+| Key | Action |
+|-----|--------|
+| `Space g d` | Git diff (via bundled git plugin) |
+
+#### `Space w` — Window / splits
+
+| Key | Action |
+|-----|--------|
+| `Space w -` | Horizontal split |
+| `Space w \|` | Vertical split |
+| `Space w h/j/k/l` | Focus pane left / down / up / right |
+| `Space w q` | Close pane |
+
+#### `Space t` — Toggle
+
+| Key | Action |
+|-----|--------|
+| `Space t d` | Toggle inline diagnostics |
+| `Space t i` | Toggle inlay hints |
+| `Space t =` | Toggle format-on-save |
+
+### File explorer (`Space e` — also `Cmd/Ctrl+O`)
+
+The single entry point for opening files. Modal, tree-shaped
+overlay rooted at the project root.
+
+| Key | Action |
+|-----|--------|
+| `↑/↓` or `j/k` | Move selection |
+| `→` / `l` | Expand directory |
+| `←` / `h` | Collapse directory (or jump to parent) |
+| `g` / `G` | Top / bottom of list |
+| `Enter` / `Space` | Open file (or toggle directory) |
+| `H` | Toggle hidden files |
+| `Ctrl+r` | Rebuild tree |
+| `Esc` | Close explorer |
 
 ### Project-wide search & replace
 

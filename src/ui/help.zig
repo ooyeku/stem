@@ -44,7 +44,7 @@ pub const help_text = cli_help_text ++
     \\## Navigation
     \\
     \\- `h`, `j`, `k`, `l` : Move Left, Down, Up, Right
-    \\- `Arrow Keys`       : Move Cursor
+    \\- `Arrow Keys`       : Move cursor
     \\- `[N] + Motion`     : Repeat motion (e.g. `5j` = 5 down)
     \\- `Page Up/Down`     : Scroll by page
     \\- `%`                : Jump to matching bracket (( ) { } [ ] < >)
@@ -75,7 +75,7 @@ pub const help_text = cli_help_text ++
     \\- `m<a-z>`   : Set bookmark slot `<x>` at the cursor.
     \\- `'<a-z>`   : Jump to bookmark `<x>` (works across files).
     \\- Bookmarks persist per-project under `~/.stem/cache/bookmarks/`.
-    \\- Command: `bookmark.list` opens a `[Bookmarks]` buffer; `bookmark.clear_all` removes them all.
+    \\- Commands: `bookmark.list` opens `[Bookmarks]`; `bookmark.clear_all` removes them all.
     \\
     \\## Word-Under-Cursor Highlight
     \\
@@ -107,63 +107,108 @@ pub const help_text = cli_help_text ++
     \\- `Ctrl+D` adds the next occurrence of the word under the cursor
     \\  (or the active visual selection) as a secondary cursor. Repeat
     \\  to add more.
-    \\- Typing in insert mode replicates at every cursor; backspace
-    \\  too. Newlines and structural commands fall back to the primary
-    \\  cursor.
+    \\- Typing in insert mode replicates at every cursor; backspace too.
     \\- `Esc` in select mode clears all secondary cursors.
     \\
-    \\## Commands (Leader Key: Space)
+    \\## Leader (Space) Bindings
     \\
-    \\- `Space + a`: Open Command Palette / Actions
-    \\- `Space + f`: Open File Picker
-    \\- `Space + b`: Open Buffer Picker (Switch Tabs)
-    \\- `Space + [1-9]`: Quick switch to buffer by number
-    \\- `Space + s`: Save File
-    \\- `Space + q`: Quit Editor
-    \\- `Space + k`: Close (Kill) Current Buffer
-    \\- `Space + n`: Next Buffer
-    \\- `Space + p`: Previous Buffer
-    \\- `Space + w`: Open this Help (Wiki/What)
-    \\- `Space + u`: Undo last change
-    \\- `Space + r`: Redo last undone change
-    \\- `Space + j`: Show background jobs
-    \\- `Space + c`: Copy selected text
-    \\- `Space + x`: Cut selected text
-    \\- `Space + v`: Paste clipboard contents
+    \\Stem's leader is `Space`. Most actions are a single key after
+    \\Space (e.g. `Space s` to save). Related families that grow over
+    \\time live under a chord prefix — `Space l` for LSP, `Space g`
+    \\for git, `Space w` for window/splits, `Space t` for toggles.
+    \\Press `Space ;` (or `Space ?`) at any time to pop up the which-key
+    \\reference; while in a chord the popup shows that chord's bindings.
     \\
-    \\## File Picker
+    \\### Top-level — files & buffers
     \\
-    \\- `↑/↓` or `j/k`          : Navigate files
-    \\- `Enter` on file         : Open file
-    \\- `Enter` on directory    : Navigate into directory
-    \\- `Shift+Enter` / `^O`    : Open ALL files in directory (recursive)
-    \\- `Backspace`             : Go to parent directory
-    \\- `Esc`                   : Cancel file picker
+    \\- `Space e`  : Open file (tree-shaped explorer, single entry point)
+    \\- `Space b`  : Buffer picker
+    \\- `Space s`  : Save
+    \\- `Space k`  : Close current pane / buffer
+    \\- `Space q`  : Quit
+    \\- `Space n`  : Next buffer
+    \\- `Space p`  : Previous buffer
+    \\- `Space [1-9]` : Quick switch to buffer N
     \\
-    \\Note: `^O` (or Shift+Enter) skips hidden files and common dirs (.git, node_modules)
+    \\### Top-level — navigation
     \\
-    \\## LSP Commands (Space + Key)
+    \\- `Space :`  : Command palette
+    \\- `Space /`  : Project-wide search
+    \\- `Space ,`  : Jump back
+    \\- `Space .`  : Jump forward
+    \\- `Space z`  : Center cursor in viewport (vim zz)
     \\
-    \\- `Space + g`: Go to Definition
-    \\- `Space + l`: Find References (List/Lookup)
-    \\- `Space + h`: Show Hover Info
-    \\- `Space + d`: Show Diagnostics
-    \\- `Space + m`: Rename symbol
-    \\- `Space + o` / `Space + O`: Document / workspace symbols
-    \\- `Space + C`: Code actions — picker prompts for 1–9 to apply
-    \\- `Space + F`: Format selection (visual range or current line)
-    \\- Signature help: auto-popup above the cursor in Insert mode
-    \\  when you type `(` or `,`. Dismissed by `)`, Esc, or mode change.
-    \\- Inlay hints: opt-in via `editor.toggle_inlay_hints`.
-    \\  Renders type / param-name hints as dim inline virtual text.
-    \\- Inline diagnostics: on by default. Toggle with
-    \\  `editor.toggle_inline_diagnostics`. When off, only the
-    \\  cursor's line shows its diagnostic at end-of-line.
+    \\### Top-level — edit
+    \\
+    \\- `Space u`  : Undo
+    \\- `Space r`  : Redo
+    \\- `Space c`  : Copy
+    \\- `Space x`  : Cut
+    \\- `Space v`  : Paste
+    \\- `Space a`  : Code actions (LSP)
+    \\
+    \\### Top-level — splits & misc
+    \\
+    \\- `Space -`  : Split horizontal
+    \\- `Space |`  : Split vertical
+    \\- `Space Arrow` : Focus pane in direction
+    \\- `Space h`  : Open this help
+    \\- `Space j`  : Background jobs
+    \\- `Space ;`  : Toggle which-key popup (also `Space ?`)
+    \\
+    \\### Space l — LSP submenu
+    \\
+    \\- `Space l d` : Go to definition
+    \\- `Space l r` : Find references
+    \\- `Space l h` : Hover (docs)
+    \\- `Space l a` : Code actions (alias for `Space a`)
+    \\- `Space l f` : Format buffer
+    \\- `Space l F` : Format selection
+    \\- `Space l D` : Diagnostics list
+    \\- `Space l s` : Document symbols
+    \\- `Space l S` : Workspace symbols
+    \\- `Space l t` : Toggle inline diagnostics
+    \\- `Space l i` : Toggle inlay hints
+    \\- `Space l =` : Toggle format-on-save
+    \\
+    \\Signature help auto-pops above the cursor in Insert mode when
+    \\you type `(` or `,`. Dismissed by `)`, Esc, or mode change.
+    \\
+    \\### Space g — Git submenu
+    \\
+    \\- `Space g d` : Git diff
+    \\
+    \\### Space w — Window submenu
+    \\
+    \\- `Space w -` : Horizontal split
+    \\- `Space w |` : Vertical split
+    \\- `Space w h/j/k/l` : Focus pane left / down / up / right
+    \\- `Space w q` : Close pane
+    \\
+    \\### Space t — Toggle submenu
+    \\
+    \\- `Space t d` : Toggle inline diagnostics
+    \\- `Space t i` : Toggle inlay hints
+    \\- `Space t =` : Toggle format-on-save
+    \\
+    \\## File Explorer (Space e — also `Cmd/Ctrl+O`)
+    \\
+    \\The single entry point for opening files. Modal, tree-shaped
+    \\overlay rooted at the project cwd.
+    \\
+    \\- `↑/↓` or `j/k`          : Move selection
+    \\- `→` or `l`              : Expand directory
+    \\- `←` or `h`              : Collapse directory (or jump to parent)
+    \\- `g` / `G`               : Top / bottom of list
+    \\- `Enter` or `Space`      : Open file (or toggle directory)
+    \\- `H`                     : Toggle hidden files (dotfiles)
+    \\- `Ctrl+r`                : Rebuild tree (after external changes)
+    \\- `Esc`                   : Close explorer
     \\
     \\## Large-File Mode
     \\
-    \\Files past `editor.large_file_threshold_bytes` (default 5 MB)
-    \\or `editor.large_file_threshold_lines` (default 50k) open with
+    \\Files past `editor.large_file_threshold_bytes` (default 5 MB) or
+    \\`editor.large_file_threshold_lines` (default 50k) open with
     \\tree-sitter, brackets, LSP, and auto-pair disabled. The status
     \\bar shows `[LARGE]`. Files past `large_file_hard_limit_bytes`
     \\(default 100 MB) are rejected at open. Re-open after editing
@@ -185,61 +230,52 @@ pub const help_text = cli_help_text ++
     \\See "Diagnostics & Hunks" above for `]d`/`[d`, `]g`/`[g`,
     \\`]s`/`[s`, `]m`/`[m`.
     \\
-    \\## Copy & Paste
-    \\
-    \\- Visual Mode (`v`): Select text with hjkl or arrow keys
-    \\- `y` (in visual mode): Yank (copy) selection
-    \\- `x` (in visual mode): Cut selection
-    \\- `Space + o` (any mode): Paste from clipboard
-    \\
     \\## Quick Buffer Switching
     \\
     \\Buffer tabs are numbered (1, 2, 3...). You can switch quickly:
-    \\- `Space + 1`: Switch to buffer 1 (instant if <10 buffers)
-    \\- `Space + 2`: Switch to buffer 2
-    \\- `Space + 12`: Switch to buffer 12 (multi-digit for 10+ buffers)
+    \\- `Space 1`: Switch to buffer 1 (instant if <10 buffers)
+    \\- `Space 2`: Switch to buffer 2
+    \\- `Space 12`: Switch to buffer 12 (multi-digit for 10+ buffers)
     \\
     \\Switching is instant when your input uniquely identifies a buffer.
     \\
-    \\In Buffer Picker (`Space + b`):
-    \\- Type a number then Enter to jump to that buffer
-    \\- Or use arrow keys / j/k to navigate
+    \\In the buffer picker (`Space b`): type a number then Enter to
+    \\jump, or use arrow keys / j/k.
     \\
     \\## Undo/Redo
     \\
-    \\Stem supports transactional undo/redo with automatic grouping:
+    \\Transactional undo/redo with automatic grouping:
     \\- Multiple rapid edits are grouped into single undo operations
-    \\- `Space + u` or `edit.undo` to undo
-    \\- `Space + r` or `edit.redo` to redo
+    \\- `Space u` or `edit.undo` to undo
+    \\- `Space r` or `edit.redo` to redo
     \\- Cursor position is restored on undo/redo
     \\
     \\## Scratch Buffers
     \\
     \\Create temporary buffers that aren't saved to disk:
-    \\- Use Command Palette: `buffer.new_scratch`
+    \\- Command palette: `buffer.new_scratch`
     \\- Great for notes, temporary code, or experiments
-    \\- Buffer will be lost when closed
+    \\- Lost when closed
     \\
     \\## Background Jobs
     \\
-    \\Long-running operations run in the background:
-    \\- `Space + j`: View active background jobs
-    \\- Status bar shows spinner when jobs are running
+    \\- `Space j`: View active background jobs
+    \\- Status bar shows a spinner when jobs are running
     \\- Jobs include: file indexing, search operations, etc.
     \\
     \\## Zig Build Commands
     \\
-    \\Stem automatically detects your Zig workspace (build.zig).
-    \\Use Command Palette (`Space + P`) and type "zig" or "build":
+    \\Stem auto-detects your Zig workspace (build.zig). Use the
+    \\command palette (`Space :`) and type "zig" or "build":
     \\
-    \\- `Zig: Build`  : Run `zig build`
-    \\- `Zig: Test`   : Run `zig build test`
-    \\- `Zig: Show Build Output` : View last build result
+    \\- `Zig: Build`            : Run `zig build`
+    \\- `Zig: Test`             : Run `zig build test`
+    \\- `Zig: Show Build Output`: View last build result
     \\
-    \\Build output appears in a dedicated [Build] buffer.
-    \\Errors are shown as decorations in source files.
+    \\Build output appears in a dedicated [Build] buffer. Errors are
+    \\shown as decorations in source files.
     \\
-    \\## Global Shortcuts
+    \\## Global Shortcuts (modifier-prefixed)
     \\
     \\- `Cmd + s`          : Save
     \\- `Cmd + o`          : Open File
@@ -247,124 +283,96 @@ pub const help_text = cli_help_text ++
     \\- `Cmd + w`          : Close Buffer
     \\- `Cmd + Shift + ]`  : Next Buffer
     \\- `Cmd + Shift + [`  : Previous Buffer
+    \\- `Ctrl + h/j/k/l`   : Focus pane in direction
+    \\- `Ctrl + d`         : Add next occurrence (multi-cursor)
+    \\- `Ctrl + r`         : Start replace-confirmation walk (in `Space /`)
     \\
-    \\## Split/Pane Management
+    \\## Command Palette Reference
     \\
-    \\- `Space + -` : Horizontal Split (side-by-side)
-    \\- `Space + \`` : Vertical Split (top/bottom)
-    \\- `Space + Arrow` : Focus pane in direction (when in splits)
-    \\- `Ctrl + h` : Focus Left Pane
-    \\- `Ctrl + l` : Focus Right Pane
-    \\- `Ctrl + k` : Focus Upper Pane
-    \\- `Ctrl + j` : Focus Lower Pane
+    \\Press `Space :` to open. Type to filter; Enter to run.
+    \\Highlights of commonly-used commands:
     \\
-    \\Use Command Palette (`Space + P`) for:
-    \\- Pane: Close / Focus / Swap
-    \\
-    \\## Command Palette Commands
-    \\
-    \\### File Management
-    \\- file.save       : Save current file
-    \\- file.open       : Open file picker
-    \\- file.new        : Create new buffer
-    \\- file.save_as    : Save file as...
-    \\- file.reload     : Reload from disk
-    \\- file.quit       : Quit editor
-    \\
-    \\### Buffer Management
-    \\- buffer.switch   : Open buffer picker
-    \\- buffer.new      : Create new untitled buffer
-    \\- buffer.next     : Go to next buffer
-    \\- buffer.prev     : Go to previous buffer (Space+p)
-    \\- buffer.close    : Close current buffer (Space+k)
-    \\- buffer.close_others : Close all others
-    \\- buffer.new_scratch : Create scratch buffer
+    \\### File / buffer
+    \\- file.save / file.open / file.new / file.save_as
+    \\- file.reload / file.quit
+    \\- buffer.switch / buffer.new / buffer.next / buffer.prev
+    \\- buffer.close / buffer.close_others / buffer.new_scratch
+    \\- buffer.restore_backups
     \\
     \\### Navigation
-    \\- nav.go_to_line  : Jump to line number
-    \\- nav.go_to_symbol: Find symbols in file
-    \\- nav.match_bracket: Jump to matching bracket (%)
-    \\- nav.expand_selection: Expand to syntax boundary
-    \\- nav.top_of_file : Go to start
-    \\- nav.bottom_of_file: Go to end
-    \\- nav.center_view : Center cursor
-    \\- search.find_in_buffer: Search in file
+    \\- nav.go_to_line / nav.go_to_symbol
+    \\- nav.match_bracket / nav.expand_selection
+    \\- nav.top_of_file / nav.bottom_of_file
+    \\- nav.center_view (also `Space z`)
+    \\- search.find_in_buffer
     \\
     \\### Editing
-    \\- edit.undo          : Undo last change
-    \\- edit.redo          : Redo last undone
-    \\- edit.copy          : Copy selection (Space+c)
-    \\- edit.cut           : Cut selection (Space+x)
-    \\- edit.paste         : Paste from clipboard (Space+v)
-    \\- edit.delete_line   : Delete current line
-    \\- edit.duplicate_line: Copy line below
-    \\- edit.move_line_up  : Swap line up
-    \\- edit.move_line_down: Swap line down
-    \\- edit.join_lines    : Merge with next line
-    \\- edit.insert_datetime: Insert timestamp
+    \\- edit.undo / edit.redo
+    \\- edit.copy / edit.cut / edit.paste
+    \\- edit.delete_line / edit.duplicate_line
+    \\- edit.move_line_up / edit.move_line_down
+    \\- edit.join_lines / edit.insert_datetime
     \\
-    \\### LSP (Zig Files)
-    \\- lsp.format               : Format document
-    \\- lsp.definition           : Go to definition
-    \\- lsp.references           : Find references
-    \\- lsp.hover                : Show hover info
-    \\- lsp.diagnostics          : Show errors/warnings
-    \\- lsp.restart              : Restart ZLS
-    \\- lsp.toggle_format_on_save: Toggle automatic format on every save
+    \\### LSP
+    \\- lsp.format / lsp.format_selection
+    \\- lsp.definition / lsp.references / lsp.hover
+    \\- lsp.diagnostics / lsp.rename
+    \\- lsp.code_action
+    \\- lsp.restart
+    \\- lsp.toggle_format_on_save
+    \\
+    \\### Editor toggles
+    \\- editor.toggle_inline_diagnostics
+    \\- editor.toggle_inlay_hints
     \\
     \\### Bookmarks
-    \\- bookmark.list      : Open the [Bookmarks] buffer
-    \\- bookmark.clear_all : Remove every bookmark for this project
+    \\- bookmark.list / bookmark.clear_all
     \\
-    \\### Split/Pane
-    \\- split.vertical  : Split top/bottom
-    \\- split.horizontal: Split left/right
-    \\- pane.close      : Close current pane
-    \\- pane.focus_*    : Navigate panes
-    \\- pane.swap_*     : Swap pane contents
+    \\### Split / pane
+    \\- split.vertical / split.horizontal
+    \\- pane.close / pane.focus_* / pane.swap_*
     \\
-    \\### Background Jobs
-    \\- job.list        : View active jobs
-    \\
-    \\### Modes
-    \\- mode.insert     : Switch to insert mode
-    \\- mode.visual     : Switch to visual mode
-    \\- mode.terminal   : Switch to terminal mode
-    \\- mode.select     : Switch to select mode
-    \\
-    \\### Plugins
-    \\- plugin.show     : List loaded plugins
-    \\
-    \\### Help
-    \\- help.show       : Show this help
+    \\### Modes / plugins / help
+    \\- mode.insert / mode.visual / mode.terminal / mode.select
+    \\- plugin.show
+    \\- help.show
     \\
     \\## Configuration
     \\
     \\Use `stem config` to manage settings:
-    \\- `stem config list`          : Show all settings
-    \\- `stem config get <key>`     : Get a setting value
-    \\- `stem config set <key> <v>` : Update a setting
+    \\- `stem config list`            : Show all settings
+    \\- `stem config get <key>`       : Get a setting value
+    \\- `stem config set <key> <v>`   : Update a setting
     \\
     \\### Available Settings
-    \\- `editor.tab_size`       : Tab width (default: 4)
-    \\- `editor.insert_spaces`  : Insert spaces instead of tabs
-    \\- `editor.line_numbers`   : absolute / relative / none
-    \\- `editor.wrap`           : Enable word wrapping
-    \\- `editor.auto_pairs`     : Auto-close brackets and quotes
-    \\- `editor.cursor_line`    : Highlight the cursor's line
-    \\- `editor.format_on_save` : Run LSP formatter before each save
-    \\- `ui.show_status_bar`    : Render the status bar
-    \\- `logging.level`         : Log level (debug/info/warn/err)
+    \\
+    \\- `editor.tab_size`                       : Tab width (default: 4)
+    \\- `editor.insert_spaces`                  : Insert spaces instead of tabs
+    \\- `editor.line_numbers`                   : absolute / relative / none
+    \\- `editor.wrap`                           : Enable word wrapping
+    \\- `editor.auto_pairs`                     : Auto-close brackets and quotes
+    \\- `editor.cursor_line`                    : Highlight the cursor's line
+    \\- `editor.format_on_save`                 : Run LSP formatter before each save
+    \\- `editor.inline_diagnostics`             : Render errors at end-of-line (default: true)
+    \\- `editor.inlay_hints`                    : LSP type / param hints as virtual text
+    \\- `editor.auto_save_backup`               : Periodic dirty-buffer snapshots (default: true)
+    \\- `editor.auto_save_interval_seconds`     : Backup cadence (default: 30)
+    \\- `editor.large_file_threshold_bytes`     : Disable rich features above this (default: 5 MB)
+    \\- `editor.large_file_threshold_lines`     : Disable rich features above this (default: 50000)
+    \\- `editor.large_file_hard_limit_bytes`    : Refuse to open files above this (default: 100 MB)
+    \\- `ui.show_status_bar`                    : Render the status bar
+    \\- `logging.level`                         : Log level (debug/info/warn/err)
     \\
     \\Logs are written to `~/.stem/logs/stem.log`
     \\
     \\## Tips
     \\
-    \\- Use `Space + a` to quickly access any command.
-    \\- Use `Space + f` to quickly find files in your project.
+    \\- Use `Space :` to quickly access any command.
+    \\- Use `Space e` (or `Cmd/Ctrl+O`) to open files via the tree explorer.
+    \\- `Space ;` (or `Space ?`) toggles which-key — discover bindings on the fly.
+    \\- In any chord (`Space l`, `Space g`, ...) which-key shows the sub-bindings.
     \\- Visual Mode (`v`) allows you to select text using navigation keys.
     \\- Terminal Mode (`t`) gives you a full shell inside the editor.
-    \\- Undo groups rapid typing into single operations for natural undo.
-    \\- LSP commands work with cursor anywhere in an identifier.
+    \\- LSP commands work with the cursor anywhere in an identifier.
     \\
 ;

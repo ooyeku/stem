@@ -12,7 +12,9 @@ pub const FileCommands = struct {
     }
 
     pub fn cmdFileOpen(core: anytype) anyerror!void {
-        try core.openFilePicker();
+        // The redundant fuzzy/list picker was retired; the file
+        // explorer is now the single entry point for "open a file".
+        try core.openFileExplorer();
     }
 
     pub fn cmdFileNew(core: anytype) anyerror!void {

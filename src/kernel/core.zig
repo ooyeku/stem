@@ -9,6 +9,7 @@ const auto_pair = @import("../core/auto_pair.zig");
 const unicode = @import("../core/unicode.zig");
 const Keys = @import("../config/keys.zig").Keys;
 const BufferManager = @import("buffer_manager.zig").BufferManager;
+const Buffer = @import("buffer_manager.zig").Buffer;
 const JumpList = @import("jump_list.zig").JumpList;
 const BookmarkStore = @import("bookmarks.zig").BookmarkStore;
 const protocol = @import("protocol.zig");
@@ -75,6 +76,23 @@ pub const MultiCursor = struct {
     col: usize,
 };
 
+/// Durable backing entry for the references picker — owns its
+/// strings via the core allocator. Mirrored to the per-frame arena
+/// in `protocol.ReferenceEntry` for the snapshot.
+pub const ReferenceEntryOwned = struct {
+    full_path: []u8,
+    display_path: []u8,
+    line: u32,
+    col: u32,
+    snippet: []u8,
+
+    pub fn deinit(self: *ReferenceEntryOwned, allocator: std.mem.Allocator) void {
+        allocator.free(self.full_path);
+        allocator.free(self.display_path);
+        allocator.free(self.snippet);
+    }
+};
+
 pub const Core = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -101,6 +119,10 @@ pub const Core = struct {
     mode: protocol.Mode = .select,
     previous_mode: protocol.Mode = .select,
     file_manager: FileManager,
+    /// File-explorer state. Allocated lazily on first
+    /// `Space e` so the cwd scan doesn't run for users who
+    /// never open the explorer.
+    file_explorer: ?@import("file_explorer.zig").FileExplorer = null,
     terminal_input: std.ArrayListUnmanaged(u8),
     terminal_service: TerminalService,
     terminal_output: std.ArrayListUnmanaged(u8) = .empty,
@@ -113,6 +135,16 @@ pub const Core = struct {
     /// In-flight plugin-keybind chord. Reset when a chord matches,
     /// no longer prefixes any binding, or the leader gate closes.
     plugin_chord_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// Native chord-prefix progress. When the user types
+    /// `Space <prefix>` where `<prefix>` ∈ {l, g, w, t}, this
+    /// captures the prefix byte; the next leader key is then
+    /// dispatched through that group's sub-switch
+    /// (`handleLeaderChord`). null = no chord prefix pending; the
+    /// leader handler then dispatches via the top-level switch.
+    /// Cleared whenever the chord completes, is cancelled (Esc),
+    /// or the leader chord ends. Tied to `leader_pending` — if
+    /// `leader_pending` is false this must be null.
+    leader_chord: ?u8 = null,
     /// One of `[` or `]` pressed, awaiting target key (e.g. `d` for
     /// diagnostic). null = no bracket-prefix pending.
     bracket_pending: ?u8 = null,
@@ -278,6 +310,24 @@ pub const Core = struct {
     references_symbol_name: ?[]u8 = null,
     references_source_file: ?[]u8 = null,
     references_source_line: usize = 0,
+
+    /// References-picker backing store. Owned by `self.allocator`;
+    /// each entry owns its strings. Replaced wholesale on each new
+    /// references request — never appended to incrementally.
+    references_picker_entries: std.ArrayListUnmanaged(ReferenceEntryOwned) = .empty,
+    references_picker_selected: usize = 0,
+    references_picker_scroll_offset: usize = 0,
+    /// Where the user was when they pressed `Space l r`. Restored
+    /// on Esc out of the picker; null when the picker isn't open.
+    references_picker_origin: ?Buffer.OpenedFrom = null,
+
+    /// Diagnostics-picker scratch — index and scroll are kept in
+    /// Core because the diagnostic list itself lives in the LSP
+    /// server's per-URI cache. Origin is restored on Esc, same
+    /// pattern as references.
+    diagnostics_picker_selected: usize = 0,
+    diagnostics_picker_scroll_offset: usize = 0,
+    diagnostics_picker_origin: ?Buffer.OpenedFrom = null,
     completion_pending: bool = false,
     completion_active: bool = false,
     completion_items: std.ArrayListUnmanaged(CompletionDisplayItem) = .empty,
@@ -487,6 +537,7 @@ pub const Core = struct {
         self.arena_pool.deinit();
         self.buffer_manager.deinit();
         self.file_manager.deinit();
+        if (self.file_explorer) |*fx| fx.deinit();
         self.terminal_input.deinit(self.allocator);
         self.terminal_output.deinit(self.allocator);
         self.terminal_saved_input.deinit(self.allocator);
@@ -512,6 +563,8 @@ pub const Core = struct {
         self.lsp_manager.deinit();
         if (self.references_symbol_name) |name| self.allocator.free(name);
         if (self.references_source_file) |path| self.allocator.free(path);
+        for (self.references_picker_entries.items) |*entry| entry.deinit(self.allocator);
+        self.references_picker_entries.deinit(self.allocator);
         if (self.hover_content) |c| self.allocator.free(c);
         if (self.hover_doc) |*doc| doc.deinit();
         self.syntax_manager.deinit();
@@ -622,11 +675,69 @@ pub const Core = struct {
     }
 
     pub fn openVirtualBuffer(self: *Core, name: []const u8, content: []const u8) !void {
+        // Snapshot where we are *before* swapping buffers so the
+        // jump_list and the new buffer's `opened_from` field both
+        // record the trigger location. Without this, opening
+        // [References] / [Help] / etc. leaves no breadcrumb and
+        // Space , / Ctrl+O have nothing to walk back to.
+        self.recordJumpFromCurrent();
+        const from = self.captureCurrentLocation();
+
         try self.buffer_manager.openVirtual(name, content);
         if (self.split_manager) |*sm| {
             sm.setFocusedBuffer(self.buffer_manager.active_index);
         }
+
+        // Stamp opened_from on the *new* buffer so closing it can
+        // restore the trigger position (see closeCurrentPaneOrBuffer).
+        if (from) |loc| {
+            const idx = self.buffer_manager.active_index;
+            if (idx < self.buffer_manager.buffers.items.len) {
+                self.buffer_manager.buffers.items[idx].opened_from = .{
+                    .buffer_id = loc.buffer_id,
+                    .row = loc.row,
+                    .col = loc.col,
+                };
+            }
+        }
     }
+
+    /// Record (current file_path, row, col) into the jump_list.
+    /// No-op if the active buffer isn't backed by a file (e.g. a
+    /// scratch or virtual buffer — those don't have meaningful
+    /// breadcrumbs of their own; the trigger location was already
+    /// recorded when the virtual buffer was opened).
+    pub fn recordJumpFromCurrent(self: *Core) void {
+        const s = self.state();
+        const path = s.file_path orelse return;
+        self.jump_list.recordJump(path, s.cursor_row, s.cursor_col) catch |err| {
+            log.debug("recordJumpFromCurrent failed: {}", .{err});
+        };
+    }
+
+    /// Snapshot the current cursor location for "opened_from"
+    /// metadata. Returns null when the active buffer isn't a real
+    /// file, in which case we'd have nothing useful to restore to.
+    pub fn captureCurrentLocation(self: *Core) ?BufferLocation {
+        const s = self.state();
+        const path = s.file_path orelse return null;
+        return .{
+            .buffer_id = self.buffer_manager.getActive().id,
+            .file_path = path,
+            .row = s.cursor_row,
+            .col = s.cursor_col,
+        };
+    }
+
+    pub const BufferLocation = struct {
+        buffer_id: u32,
+        /// Borrowed slice — points into the source buffer's
+        /// file_path which outlives the snapshot. Don't store these
+        /// past the source buffer's lifetime.
+        file_path: []const u8,
+        row: usize,
+        col: usize,
+    };
 
     pub fn syncPaneToState(self: *Core) void {
         if (self.split_manager) |*sm| {
@@ -986,6 +1097,10 @@ pub const Core = struct {
         _ = context;
         const self: *Core = @ptrCast(@alignCast(ctx));
 
+        // Symbol pick is a jumpable navigation; record now so the
+        // user can Space , back to wherever they triggered it from.
+        self.recordJumpFromCurrent();
+
         const s = self.state();
         const file_path = s.file_path orelse return;
 
@@ -1162,6 +1277,9 @@ pub const Core = struct {
     }
 
     fn openWorkspaceSymbolPicker(self: *Core) !void {
+        // Jumpable navigation — snapshot the trigger location so
+        // Space , can return after picking a symbol.
+        self.recordJumpFromCurrent();
         // Reset state, switch mode. The first request goes out empty
         // immediately so the popup has *something* to show; further
         // requests fire as the user types, debounced.
@@ -1789,107 +1907,13 @@ pub const Core = struct {
                                 defer self.lsp_manager.freeReferences(refs);
 
                                 if (refs.len > 0) {
-                                    var text = std.ArrayListUnmanaged(u8).empty;
-                                    defer text.deinit(self.allocator);
-
-                                    try text.appendSlice(self.allocator,
-                                        \\+------------------------------------------------------------------+
-                                        \\|  SYMBOL REFERENCES                                               |
-                                        \\+------------------------------------------------------------------+
-                                        \\
-                                        \\
-                                    );
-
-                                    if (self.references_symbol_name) |sym_name| {
-                                        const sym_line = try std.fmt.allocPrint(self.allocator, "Symbol: {s}\n", .{sym_name});
-                                        defer self.allocator.free(sym_line);
-                                        try text.appendSlice(self.allocator, sym_line);
-                                    }
-                                    if (self.references_source_file) |src| {
-                                        const src_line = try std.fmt.allocPrint(self.allocator, "  -> Defined at: {s}:{d}\n\n", .{
-                                            std.fs.path.basename(src),
-                                            self.references_source_line + 1,
-                                        });
-                                        defer self.allocator.free(src_line);
-                                        try text.appendSlice(self.allocator, src_line);
-                                    }
-
-                                    var file_count: usize = 0;
-                                    var last_file: ?[]const u8 = null;
-                                    for (refs) |r| {
-                                        if (last_file == null or !std.mem.eql(u8, last_file.?, r.file_path)) {
-                                            file_count += 1;
-                                            last_file = r.file_path;
-                                        }
-                                    }
-
-                                    const summary = try std.fmt.allocPrint(self.allocator, "-------------------------------------------------------------------\nFound {d} reference(s) in {d} file(s):\n\n", .{ refs.len, file_count });
-                                    defer self.allocator.free(summary);
-                                    try text.appendSlice(self.allocator, summary);
-
-                                    var current_file: ?[]const u8 = null;
-                                    for (refs) |r| {
-                                        if (current_file == null or !std.mem.eql(u8, current_file.?, r.file_path)) {
-                                            if (current_file != null) {
-                                                try text.appendSlice(self.allocator, "\n");
-                                            }
-                                            const file_header = try std.fmt.allocPrint(self.allocator, "[{s}]\n", .{
-                                                std.fs.path.basename(r.file_path),
-                                            });
-                                            defer self.allocator.free(file_header);
-                                            try text.appendSlice(self.allocator, file_header);
-                                            current_file = r.file_path;
-                                        }
-
-                                        var snippet: []const u8 = "";
-                                        var snippet_allocated = false;
-                                        if (std.Io.Dir.openFileAbsolute(self.io, r.file_path, .{})) |file| {
-                                            defer file.close(self.io);
-                                            const content = std.Io.Dir.cwd().readFileAlloc(self.io, r.file_path, self.allocator, .limited(10 * 1024 * 1024)) catch null;
-                                            if (content) |c| {
-                                                defer self.allocator.free(c);
-                                                var line_num: u32 = 0;
-                                                var line_start: usize = 0;
-                                                for (c, 0..) |ch, idx| {
-                                                    if (line_num == r.line) {
-                                                        var line_end = idx;
-                                                        while (line_end < c.len and c[line_end] != '\n') : (line_end += 1) {}
-                                                        const line_content = std.mem.trim(u8, c[line_start..line_end], " \t");
-                                                        const max_len: usize = 60;
-                                                        if (line_content.len > max_len) {
-                                                            snippet = self.allocator.dupe(u8, line_content[0..max_len]) catch "";
-                                                        } else {
-                                                            snippet = self.allocator.dupe(u8, line_content) catch "";
-                                                        }
-                                                        snippet_allocated = snippet.len > 0;
-                                                        break;
-                                                    }
-                                                    if (ch == '\n') {
-                                                        line_num += 1;
-                                                        line_start = idx + 1;
-                                                    }
-                                                }
-                                            }
-                                        } else |_| {}
-
-                                        defer if (snippet_allocated) self.allocator.free(snippet);
-
-                                        const ref_line = try std.fmt.allocPrint(self.allocator, "   Ln {d}: {s}\n", .{
-                                            r.line + 1,
-                                            if (snippet.len > 0) snippet else "(unable to read)",
-                                        });
-                                        defer self.allocator.free(ref_line);
-                                        try text.appendSlice(self.allocator, ref_line);
-                                    }
-
-                                    try self.openVirtualBuffer("[References]", text.items);
+                                    self.openReferencesPicker(refs) catch |err| {
+                                        log.warn("Failed to open references picker: {}", .{err});
+                                        self.setStatusLiteralLeveled(.err, "Failed to load references", 2000);
+                                    };
                                     self.setStatus("Found {d} reference{s}", .{ refs.len, if (refs.len == 1) "" else "s" }, 2000);
                                     try self.sendUpdate();
                                 } else {
-                                    const sym = self.references_symbol_name orelse "symbol";
-                                    const no_refs_msg = try std.fmt.allocPrint(self.allocator, "+------------------------------------------------------------------+\n|  SYMBOL REFERENCES                                               |\n+------------------------------------------------------------------+\n\nNo references found for: {s}\n", .{sym});
-                                    defer self.allocator.free(no_refs_msg);
-                                    try self.openVirtualBuffer("[References]", no_refs_msg);
                                     self.setStatusLiteralLeveled(.warning, "No references found", 2000);
                                     self.requestRender();
                                 }
@@ -2152,6 +2176,21 @@ pub const Core = struct {
                                     try self.sendUpdate();
                                 }
                             },
+                            .file_explorer => {
+                                if (try self.handleFileExplorerInput(key)) {
+                                    try self.sendUpdate();
+                                }
+                            },
+                            .references_picker => {
+                                if (try self.handleReferencesPickerInput(key)) {
+                                    try self.sendUpdate();
+                                }
+                            },
+                            .diagnostics_picker => {
+                                if (try self.handleDiagnosticsPickerInput(key)) {
+                                    try self.sendUpdate();
+                                }
+                            },
                             .buffer_picker => {
                                 if (try self.handleBufferPickerInput(key)) {
                                     try self.sendUpdate();
@@ -2400,7 +2439,7 @@ pub const Core = struct {
                     .command => |cmd| {
                         switch (cmd) {
                             .save => try self.saveCurrentFile(),
-                            .open => try self.openFilePicker(),
+                            .open => try self.openFileExplorer(),
                             .close => {
                                 const removed_index = self.buffer_manager.active_index;
                                 const closed = self.buffer_manager.closeActive();
@@ -2411,6 +2450,7 @@ pub const Core = struct {
                                 }
                             },
                             .next_buffer => {
+                                self.recordJumpFromCurrent();
                                 self.syncStateToPane();
                                 self.buffer_manager.nextBuffer();
                                 self.refreshSyntaxForCurrentBuffer();
@@ -2418,6 +2458,7 @@ pub const Core = struct {
                                 self.syncPaneToState();
                             },
                             .prev_buffer => {
+                                self.recordJumpFromCurrent();
                                 self.syncStateToPane();
                                 self.buffer_manager.prevBuffer();
                                 self.refreshSyntaxForCurrentBuffer();
@@ -2697,47 +2738,75 @@ pub const Core = struct {
                 return true;
             }
 
-            log.debug("Leader action key: codepoint={d} ('{c}') shift={}", .{ key.codepoint, @as(u8, @intCast(key.codepoint & 0xFF)), key.mods.shift });
+            log.debug("Leader action key: codepoint={d} ('{c}') shift={} chord={?c}", .{ key.codepoint, @as(u8, @intCast(key.codepoint & 0xFF)), key.mods.shift, self.leader_chord });
+
+            // 1. Esc cancels the chord (and any pending sub-chord).
+            if (key.matches(vaxis.Key.escape, .{})) {
+                self.leader_pending = false;
+                self.leader_chord = null;
+                self.leader_help_requested = false;
+                return true;
+            }
+
+            // 2. Which-key popup toggle. Honored even mid-chord so
+            //    the user can peek at the sub-bindings of an LSP /
+            //    git / window prefix. Three keystroke shapes work:
+            //    `;` (unambiguous), `?` (universal convention), and
+            //    `/` with shift (some terminals deliver Shift+/ that
+            //    way). Does NOT clear leader_pending — the popup is
+            //    informational, the chord stays armed.
+            if (key.codepoint == Keys.action_which_key or
+                key.codepoint == Keys.action_which_key_alt or
+                (key.codepoint == '/' and key.mods.shift))
+            {
+                self.leader_help_requested = !self.leader_help_requested;
+                return true;
+            }
+
+            // 3. If we're inside a sub-chord (`Space l <key>`), the
+            //    incoming key is the sub-action. Dispatch, clear the
+            //    sub-chord, but keep leader_pending true so the user
+            //    can chain (`Space l d l h` → def then hover).
+            if (self.leader_chord) |prefix| {
+                try self.handleLeaderChordKey(prefix, key);
+                self.leader_chord = null;
+                self.leader_help_requested = false;
+                return true;
+            }
+
+            // 4. Chord-prefix detection. Enter the sub-state and
+            //    wait for the next key. The which-key popup will
+            //    auto-update to show this chord's contents.
+            if (key.codepoint == Keys.chord_lsp or
+                key.codepoint == Keys.chord_git or
+                key.codepoint == Keys.chord_window or
+                key.codepoint == Keys.chord_toggle)
+            {
+                self.leader_chord = @intCast(key.codepoint);
+                return true;
+            }
+
+            // 5. Top-level single-step actions.
             switch (key.codepoint) {
                 Keys.action_save => try self.saveCurrentFile(),
-                Keys.action_open => {
-                    try self.openFilePicker();
-                    self.leader_pending = false;
-                },
+                // `Space f` retired. `Space e` is the single
+                // entry point for the file explorer; `f` is left
+                // unbound (free for a future feature). Cmd/Ctrl+O
+                // still works as the global "open" shortcut.
                 Keys.action_buffer => {
+                    self.recordJumpFromCurrent();
                     self.previous_mode = self.mode;
                     self.mode = .buffer_picker;
                     self.buffer_manager.pickerReset();
                     self.buffer_picker_number_input.clearRetainingCapacity();
                     self.leader_pending = false;
                 },
-                Keys.action_quit => return error.UserQuit,
-                Keys.action_close => {
-                    if (self.split_manager) |*sm| {
-                        if (sm.hasSplits()) {
-                            self.syncStateToPane();
-                            sm.closePane();
-                            self.syncPaneToState();
-                            const remaining_pane = sm.getFocusedPane();
-                            if (remaining_pane.buffer_index < self.buffer_manager.buffers.items.len) {
-                                self.buffer_manager.active_index = remaining_pane.buffer_index;
-                            }
-                            if (!sm.hasSplits()) {
-                                sm.deinit();
-                                self.split_manager = null;
-                            }
-                        } else {
-                            const pane = sm.getFocusedPane();
-                            if (pane.buffer_index < self.buffer_manager.buffers.items.len) {
-                                self.buffer_manager.active_index = pane.buffer_index;
-                            }
-                            sm.deinit();
-                            self.split_manager = null;
-                        }
-                    } else {
-                        _ = self.buffer_manager.closeActive();
-                    }
+                Keys.action_file_explorer => {
+                    try self.openFileExplorer();
+                    self.leader_pending = false;
                 },
+                Keys.action_quit => return error.UserQuit,
+                Keys.action_close => self.closeCurrentPaneOrBuffer(),
                 Keys.action_next => {
                     const s = self.state();
                     if (s.file_path) |path| {
@@ -2745,7 +2814,6 @@ pub const Core = struct {
                             log.debug("Failed to record jump location: {}", .{err});
                         };
                     }
-
                     self.syncStateToPane();
                     self.buffer_manager.nextBuffer();
                     self.refreshSyntaxForCurrentBuffer();
@@ -2759,7 +2827,6 @@ pub const Core = struct {
                             log.debug("Failed to record jump location: {}", .{err});
                         };
                     }
-
                     self.syncStateToPane();
                     self.buffer_manager.prevBuffer();
                     self.refreshSyntaxForCurrentBuffer();
@@ -2771,7 +2838,7 @@ pub const Core = struct {
                     try self.openVirtualBuffer("[HELP]", Help.help_text);
                     self.leader_pending = false;
                 },
-                Keys.action_palette, ':' => {
+                Keys.action_palette => {
                     self.previous_mode = self.mode;
                     self.mode = .command_palette;
                     self.command_palette_input.clearRetainingCapacity();
@@ -2787,18 +2854,15 @@ pub const Core = struct {
                 Keys.action_cut => try EditCommands.cmdEditCut(self),
                 Keys.action_paste => try EditCommands.cmdEditPaste(self),
 
-                Keys.action_lsp_definition => try LspCommands.cmdLspGoToDefinition(self),
-                Keys.action_lsp_references => try LspCommands.cmdLspFindReferences(self),
-                Keys.action_lsp_hover => try LspCommands.cmdLspHover(self),
-                Keys.action_lsp_diagnostics => try LspCommands.cmdLspShowDiagnostics(self),
-                Keys.action_document_symbols => try cmdDocumentSymbols(self, null),
-                Keys.action_workspace_symbols => try cmdWorkspaceSymbols(self, null),
                 Keys.action_code_action => try cmdLspCodeAction(self, null),
-                Keys.action_format_selection => try cmdLspFormatSelection(self, null),
+                Keys.action_center_view => try NavCommands.cmdNavCenterView(self),
 
                 Keys.action_jump_back => try cmdJumpBack(self, null),
                 Keys.action_jump_forward => try cmdJumpForward(self, null),
 
+                // Top-level split shortcuts — `Space -` / `Space |`
+                // are common enough to deserve a single-step
+                // binding alongside the `Space w` chord.
                 Keys.action_split_horizontal => try SplitCommands.cmdSplitHorizontal(self),
                 Keys.action_split_vertical => try SplitCommands.cmdSplitVertical(self),
 
@@ -2815,70 +2879,26 @@ pub const Core = struct {
                     self.leader_pending = false;
                 },
 
-                Keys.action_git_diff => try GitCommands.cmdGitDiff(self),
-
                 vaxis.Key.left => {
-                    if (self.split_manager) |*sm| {
-                        self.syncStateToPane();
-                        sm.focusLeft();
-                        self.syncPaneToState();
-                        self.ensureLspDocument() catch |err| {
-                            log.debug("ensureLspDocument failed on pane focus: {}", .{err});
-                        };
-                    }
+                    self.focusPaneLeft();
                     self.leader_pending = false;
                 },
                 vaxis.Key.right => {
-                    if (self.split_manager) |*sm| {
-                        self.syncStateToPane();
-                        sm.focusRight();
-                        self.syncPaneToState();
-                        self.ensureLspDocument() catch |err| {
-                            log.debug("ensureLspDocument failed on pane focus: {}", .{err});
-                        };
-                    }
+                    self.focusPaneRight();
                     self.leader_pending = false;
                 },
                 vaxis.Key.up => {
-                    if (self.split_manager) |*sm| {
-                        self.syncStateToPane();
-                        sm.focusUp();
-                        self.syncPaneToState();
-                        self.ensureLspDocument() catch |err| {
-                            log.debug("ensureLspDocument failed on pane focus: {}", .{err});
-                        };
-                    }
+                    self.focusPaneUp();
                     self.leader_pending = false;
                 },
                 vaxis.Key.down => {
-                    if (self.split_manager) |*sm| {
-                        self.syncStateToPane();
-                        sm.focusDown();
-                        self.syncPaneToState();
-                        self.ensureLspDocument() catch |err| {
-                            log.debug("ensureLspDocument failed on pane focus: {}", .{err});
-                        };
-                    }
+                    self.focusPaneDown();
                     self.leader_pending = false;
-                },
-
-                vaxis.Key.escape => {
-                    self.leader_pending = false;
-                },
-
-                // `Space ;` → reveal the which-key popup. Toggles, so
-                // a second `;` hides it again without leaving the
-                // chord. Picked `;` after `?` proved ambiguous: many
-                // terminals deliver `Shift+/` as codepoint `'/'` with
-                // a shift modifier, which fell through to
-                // `action_global_search` ('/') in this switch. `;` is
-                // unshifted, on the right home row, and unused
-                // anywhere else in the leader chord.
-                Keys.action_which_key => {
-                    self.leader_help_requested = !self.leader_help_requested;
                 },
 
                 else => {
+                    // Unknown leader key — bail out of the chord
+                    // so the user can start fresh without Esc.
                     self.leader_pending = false;
                     self.leader_help_requested = false;
                 },
@@ -2915,7 +2935,7 @@ pub const Core = struct {
             return true;
         }
         if (key.matches(Keys.open.codepoint, Keys.open.mods)) {
-            try self.openFilePicker();
+            try self.openFileExplorer();
             return true;
         }
         if (key.matches(Keys.quit.codepoint, Keys.quit.mods)) {
@@ -3159,7 +3179,23 @@ pub const Core = struct {
         }
 
         if (key.matches('%', .{ .shift = true })) {
+            // Bracket jump can travel many lines; record the start
+            // so the user can Space , back.
+            self.recordJumpFromCurrent();
             try NavCommands.cmdNavMatchBracket(self);
+            return true;
+        }
+
+        // Vim-convention jump-list aliases. `Ctrl+O` walks back
+        // through `jump_list`, `Ctrl+I` walks forward. Equivalent
+        // to `Space ,` / `Space .` — present so users with vim/
+        // helix muscle memory don't have to relearn the leader.
+        if (key.matches('o', .{ .ctrl = true })) {
+            try cmdJumpBack(self, null);
+            return true;
+        }
+        if (key.matches('i', .{ .ctrl = true })) {
+            try cmdJumpForward(self, null);
             return true;
         }
 
@@ -3790,7 +3826,7 @@ pub const Core = struct {
         }
 
         if (key.matches(Keys.open.codepoint, Keys.open.mods)) {
-            try self.openFilePicker();
+            try self.openFileExplorer();
             return true;
         }
         if (key.matches(Keys.save.codepoint, Keys.save.mods)) {
@@ -4079,52 +4115,67 @@ pub const Core = struct {
 
     fn handleViewInput(self: *Core, key: vaxis.Key) !bool {
         if (self.leader_pending) {
+            // Same preamble as Select-mode leader: Esc, which-key,
+            // sub-chord dispatch, chord-prefix detection. View
+            // mode is read-only so a couple of single-step bindings
+            // (copy, paste, etc.) are omitted from the top-level
+            // switch, but the chord groups behave identically.
+            if (key.matches(vaxis.Key.escape, .{})) {
+                self.leader_pending = false;
+                self.leader_chord = null;
+                self.leader_help_requested = false;
+                return true;
+            }
+            if (key.codepoint == Keys.action_which_key or
+                key.codepoint == Keys.action_which_key_alt or
+                (key.codepoint == '/' and key.mods.shift))
+            {
+                self.leader_help_requested = !self.leader_help_requested;
+                return true;
+            }
+            if (self.leader_chord) |prefix| {
+                try self.handleLeaderChordKey(prefix, key);
+                self.leader_chord = null;
+                self.leader_help_requested = false;
+                return true;
+            }
+            if (key.codepoint == Keys.chord_lsp or
+                key.codepoint == Keys.chord_git or
+                key.codepoint == Keys.chord_window or
+                key.codepoint == Keys.chord_toggle)
+            {
+                self.leader_chord = @intCast(key.codepoint);
+                return true;
+            }
+
             switch (key.codepoint) {
                 Keys.action_save => try self.saveCurrentFile(),
-                Keys.action_open => {
-                    try self.openFilePicker();
-                    self.leader_pending = false;
-                },
+                // `Space f` retired. `Space e` is the single
+                // entry point for the file explorer; `f` is left
+                // unbound (free for a future feature). Cmd/Ctrl+O
+                // still works as the global "open" shortcut.
                 Keys.action_buffer => {
+                    self.recordJumpFromCurrent();
                     self.previous_mode = self.mode;
                     self.mode = .buffer_picker;
                     self.buffer_manager.pickerReset();
                     self.buffer_picker_number_input.clearRetainingCapacity();
                     self.leader_pending = false;
                 },
-                Keys.action_quit => return error.UserQuit,
-                Keys.action_close => {
-                    if (self.split_manager) |*sm| {
-                        if (sm.hasSplits()) {
-                            self.syncStateToPane();
-                            sm.closePane();
-                            self.syncPaneToState();
-                            const remaining_pane = sm.getFocusedPane();
-                            if (remaining_pane.buffer_index < self.buffer_manager.buffers.items.len) {
-                                self.buffer_manager.active_index = remaining_pane.buffer_index;
-                            }
-                            if (!sm.hasSplits()) {
-                                sm.deinit();
-                                self.split_manager = null;
-                            }
-                        } else {
-                            const pane = sm.getFocusedPane();
-                            if (pane.buffer_index < self.buffer_manager.buffers.items.len) {
-                                self.buffer_manager.active_index = pane.buffer_index;
-                            }
-                            sm.deinit();
-                            self.split_manager = null;
-                        }
-                    } else {
-                        _ = self.buffer_manager.closeActive();
-                    }
+                Keys.action_file_explorer => {
+                    try self.openFileExplorer();
+                    self.leader_pending = false;
                 },
+                Keys.action_quit => return error.UserQuit,
+                Keys.action_close => self.closeCurrentPaneOrBuffer(),
                 Keys.action_next => {
+                    self.recordJumpFromCurrent();
                     self.buffer_manager.nextBuffer();
                     self.refreshSyntaxForCurrentBuffer();
                     if (self.split_manager) |*sm| sm.setFocusedBuffer(self.buffer_manager.active_index);
                 },
                 Keys.action_prev => {
+                    self.recordJumpFromCurrent();
                     self.buffer_manager.prevBuffer();
                     self.refreshSyntaxForCurrentBuffer();
                     if (self.split_manager) |*sm| sm.setFocusedBuffer(self.buffer_manager.active_index);
@@ -4133,7 +4184,7 @@ pub const Core = struct {
                     try self.openVirtualBuffer("[HELP]", Help.help_text);
                     self.leader_pending = false;
                 },
-                Keys.action_palette, ':' => {
+                Keys.action_palette => {
                     self.previous_mode = self.mode;
                     self.mode = .command_palette;
                     self.command_palette_input.clearRetainingCapacity();
@@ -4149,31 +4200,14 @@ pub const Core = struct {
                 Keys.action_cut => try EditCommands.cmdEditCut(self),
                 Keys.action_paste => try EditCommands.cmdEditPaste(self),
 
-                Keys.action_lsp_definition => try LspCommands.cmdLspGoToDefinition(self),
-                Keys.action_lsp_references => try LspCommands.cmdLspFindReferences(self),
-                Keys.action_lsp_hover => try LspCommands.cmdLspHover(self),
-                Keys.action_lsp_diagnostics => try LspCommands.cmdLspShowDiagnostics(self),
                 Keys.action_code_action => try cmdLspCodeAction(self, null),
-                Keys.action_format_selection => try cmdLspFormatSelection(self, null),
+                Keys.action_center_view => try NavCommands.cmdNavCenterView(self),
 
                 Keys.action_jump_back => try cmdJumpBack(self, null),
                 Keys.action_jump_forward => try cmdJumpForward(self, null),
 
-                vaxis.Key.escape => {
-                    self.leader_pending = false;
-                },
-
-                // `Space ;` → reveal the which-key popup. Toggles, so
-                // a second `;` hides it again without leaving the
-                // chord. Picked `;` after `?` proved ambiguous: many
-                // terminals deliver `Shift+/` as codepoint `'/'` with
-                // a shift modifier, which fell through to
-                // `action_global_search` ('/') in this switch. `;` is
-                // unshifted, on the right home row, and unused
-                // anywhere else in the leader chord.
-                Keys.action_which_key => {
-                    self.leader_help_requested = !self.leader_help_requested;
-                },
+                Keys.action_split_horizontal => try SplitCommands.cmdSplitHorizontal(self),
+                Keys.action_split_vertical => try SplitCommands.cmdSplitVertical(self),
 
                 else => {
                     self.leader_pending = false;
@@ -4191,7 +4225,7 @@ pub const Core = struct {
         }
 
         if (key.matches(Keys.open.codepoint, Keys.open.mods)) {
-            try self.openFilePicker();
+            try self.openFileExplorer();
             return true;
         }
         if (key.matches(Keys.save.codepoint, Keys.save.mods)) {
@@ -4339,67 +4373,7 @@ pub const Core = struct {
         if (key.matches(vaxis.Key.enter, .{})) {
             if (try self.file_manager.enter()) |file_path| {
                 defer self.allocator.free(file_path);
-                const opened_buffer = try self.buffer_manager.openFile(file_path);
-
-                try self.workspace_manager.registerBuffer(opened_buffer.id, file_path);
-
-                const lang = SyntaxManager.Language.fromFilename(file_path);
-                const opened_is_large = opened_buffer.is_large;
-                if (opened_is_large) {
-                    self.setStatusLeveled(.warning, "Opened {s} in large-file mode — LSP, syntax, brackets disabled", .{opened_buffer.name}, 3000);
-                }
-
-                if (!opened_is_large and (lang == .zig or lang == .python or lang == .javascript or lang == .typescript or lang == .go or lang == .rust)) {
-                    var project_root_owned: ?[]const u8 = null;
-                    defer if (project_root_owned) |p| self.allocator.free(p);
-
-                    const ws_root = if (self.workspace_manager.getBufferWorkspace(opened_buffer.id)) |ws|
-                        ws.root_path
-                    else blk: {
-                        project_root_owned = try self.findProjectRoot(file_path);
-                        break :blk if (project_root_owned) |p| p else self.file_manager.cwd;
-                    };
-
-                    const lang_id = switch (lang) {
-                        .zig => "zig",
-                        .python => "python",
-                        .javascript => "javascript",
-                        .typescript => "typescript",
-                        .go => "go",
-                        .rust => "rust",
-                        else => unreachable,
-                    };
-                    try self.lsp_manager.startServer(lang_id, ws_root);
-
-                    const content = try self.state().buffer.toString(self.allocator);
-                    defer self.allocator.free(content);
-                    self.lsp_manager.documentOpened(file_path, content) catch |err| {
-                        log.warn("LSP document sync failed after file open '{s}': {}", .{ file_path, err });
-                    };
-                    self.lsp_doc_version = 1;
-                }
-
-                if (lang != .unknown and !opened_is_large) {
-                    self.syntax_manager.setLanguageEnum(lang) catch |err| {
-                        log.warn("Syntax manager language set failed for {}: {}", .{ lang, err });
-                    };
-                    if (self.state().buffer.toString(self.allocator)) |content| {
-                        defer self.allocator.free(content);
-                        const buf_id = self.buffer_manager.getActive().id;
-                        // Async — first render uses an empty token list,
-                        // then the worker's `tree_updated` flag triggers
-                        // a re-render with full syntax once the parse
-                        // completes (typically <100 ms even for big files).
-                        self.syntax_manager.submitParse(content, buf_id) catch |err| {
-                            log.debug("Syntax parse submit failed after buffer load: {}", .{err});
-                        };
-                    } else |_| {}
-                }
-
-                if (self.split_manager) |*sm| {
-                    sm.setFocusedBuffer(self.buffer_manager.active_index);
-                }
-
+                try self.openFileByPath(file_path);
                 self.mode = .select;
             }
             return true;
@@ -4527,6 +4501,605 @@ pub const Core = struct {
         self.previous_mode = self.mode;
         self.mode = .file_picker;
         try self.file_manager.refresh();
+    }
+
+    /// Open the tree-shaped file explorer rooted at the file
+    /// manager's cwd (which tracks the project root). Lazily
+    /// constructs the FileExplorer on first call so users who
+    /// never open it pay nothing.
+    pub fn openFileExplorer(self: *Core) !void {
+        // Record current location so Space , can walk back if the
+        // user opens a file from the tree and wants to return.
+        self.recordJumpFromCurrent();
+        const FileExplorerMod = @import("file_explorer.zig").FileExplorer;
+        if (self.file_explorer == null) {
+            self.file_explorer = try FileExplorerMod.init(
+                self.allocator,
+                self.io,
+                self.file_manager.cwd,
+            );
+        } else {
+            // If the cwd moved since last open, re-root.
+            const fx = &self.file_explorer.?;
+            if (!std.mem.eql(u8, fx.root, self.file_manager.cwd)) {
+                fx.deinit();
+                self.file_explorer = try FileExplorerMod.init(
+                    self.allocator,
+                    self.io,
+                    self.file_manager.cwd,
+                );
+            }
+        }
+        try self.file_explorer.?.rebuild();
+        self.previous_mode = self.mode;
+        self.mode = .file_explorer;
+    }
+
+    /// Dispatch a key that arrived after a leader chord prefix
+    /// (e.g. `Space l <key>`, `Space g <key>`). Unknown keys are
+    /// silently ignored so the user can bail without typing Esc.
+    fn handleLeaderChordKey(self: *Core, prefix: u8, key: vaxis.Key) !void {
+        switch (prefix) {
+            Keys.chord_lsp => switch (key.codepoint) {
+                Keys.lsp_definition => try LspCommands.cmdLspGoToDefinition(self),
+                Keys.lsp_references => try LspCommands.cmdLspFindReferences(self),
+                Keys.lsp_hover => try LspCommands.cmdLspHover(self),
+                Keys.lsp_code_action => try cmdLspCodeAction(self, null),
+                Keys.lsp_format_buffer => try LspCommands.cmdLspFormatDocument(self),
+                Keys.lsp_format_selection => try cmdLspFormatSelection(self, null),
+                Keys.lsp_diagnostics => self.openDiagnosticsPicker(),
+                Keys.lsp_document_symbols => try cmdDocumentSymbols(self, null),
+                Keys.lsp_workspace_symbols => try cmdWorkspaceSymbols(self, null),
+                Keys.lsp_toggle_inline_diagnostics => try cmdEditorToggleInlineDiagnostics(self, null),
+                Keys.lsp_toggle_inlay_hints => try cmdEditorToggleInlayHints(self, null),
+                Keys.lsp_toggle_format_on_save => try cmdLspToggleFormatOnSave(self, null),
+                else => {},
+            },
+            Keys.chord_git => switch (key.codepoint) {
+                Keys.git_diff => try GitCommands.cmdGitDiff(self),
+                else => {},
+            },
+            Keys.chord_window => switch (key.codepoint) {
+                Keys.win_split_horizontal => try SplitCommands.cmdSplitHorizontal(self),
+                Keys.win_split_vertical => try SplitCommands.cmdSplitVertical(self),
+                Keys.win_focus_left => self.focusPaneLeft(),
+                Keys.win_focus_down => self.focusPaneDown(),
+                Keys.win_focus_up => self.focusPaneUp(),
+                Keys.win_focus_right => self.focusPaneRight(),
+                Keys.win_close => self.closeCurrentPaneOrBuffer(),
+                else => {},
+            },
+            Keys.chord_toggle => switch (key.codepoint) {
+                Keys.toggle_inline_diagnostics => try cmdEditorToggleInlineDiagnostics(self, null),
+                Keys.toggle_inlay_hints => try cmdEditorToggleInlayHints(self, null),
+                Keys.toggle_format_on_save => try cmdLspToggleFormatOnSave(self, null),
+                // Other toggles (line_numbers, wrap, whitespace,
+                // cursor_line) don't have command wrappers yet — wire
+                // them up here as their setters land in config.
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    /// Move pane focus or close the active pane. Extracted from
+    /// the leader switch so both the top-level arrow bindings and
+    /// the `Space w <hjkl>` chord can share the same code.
+    fn focusPaneLeft(self: *Core) void {
+        if (self.split_manager) |*sm| {
+            self.syncStateToPane();
+            sm.focusLeft();
+            self.syncPaneToState();
+            self.ensureLspDocument() catch |err| {
+                log.debug("ensureLspDocument failed on pane focus: {}", .{err});
+            };
+        }
+    }
+    fn focusPaneRight(self: *Core) void {
+        if (self.split_manager) |*sm| {
+            self.syncStateToPane();
+            sm.focusRight();
+            self.syncPaneToState();
+            self.ensureLspDocument() catch |err| {
+                log.debug("ensureLspDocument failed on pane focus: {}", .{err});
+            };
+        }
+    }
+    fn focusPaneUp(self: *Core) void {
+        if (self.split_manager) |*sm| {
+            self.syncStateToPane();
+            sm.focusUp();
+            self.syncPaneToState();
+            self.ensureLspDocument() catch |err| {
+                log.debug("ensureLspDocument failed on pane focus: {}", .{err});
+            };
+        }
+    }
+    fn focusPaneDown(self: *Core) void {
+        if (self.split_manager) |*sm| {
+            self.syncStateToPane();
+            sm.focusDown();
+            self.syncPaneToState();
+            self.ensureLspDocument() catch |err| {
+                log.debug("ensureLspDocument failed on pane focus: {}", .{err});
+            };
+        }
+    }
+    fn closeCurrentPaneOrBuffer(self: *Core) void {
+        // Snapshot opened_from off the *current* buffer before we
+        // close it — once closed, the Buffer entry is freed and the
+        // field is gone. We'll consult it below to restore the
+        // trigger cursor on the successor buffer.
+        const opened_from: ?Buffer.OpenedFrom = blk: {
+            const idx = self.buffer_manager.active_index;
+            if (idx >= self.buffer_manager.buffers.items.len) break :blk null;
+            break :blk self.buffer_manager.buffers.items[idx].opened_from;
+        };
+
+        if (self.split_manager) |*sm| {
+            if (sm.hasSplits()) {
+                self.syncStateToPane();
+                sm.closePane();
+                self.syncPaneToState();
+                const remaining = sm.getFocusedPane();
+                if (remaining.buffer_index < self.buffer_manager.buffers.items.len) {
+                    self.buffer_manager.active_index = remaining.buffer_index;
+                }
+                if (!sm.hasSplits()) {
+                    sm.deinit();
+                    self.split_manager = null;
+                }
+            } else {
+                const pane = sm.getFocusedPane();
+                if (pane.buffer_index < self.buffer_manager.buffers.items.len) {
+                    self.buffer_manager.active_index = pane.buffer_index;
+                }
+                sm.deinit();
+                self.split_manager = null;
+            }
+        } else {
+            _ = self.buffer_manager.closeActive();
+        }
+
+        // If the just-closed buffer had an opened_from snapshot and
+        // the successor active buffer is the one we were on when we
+        // opened it, jump the cursor back to the trigger location.
+        // No-op when buffer ids don't match (e.g. the user moved
+        // through several files in between).
+        if (opened_from) |of| {
+            if (self.buffer_manager.active_index < self.buffer_manager.buffers.items.len) {
+                const dst = &self.buffer_manager.buffers.items[self.buffer_manager.active_index];
+                if (dst.id == of.buffer_id) {
+                    const s = &dst.state;
+                    s.cursor_row = of.row;
+                    s.cursor_col = of.col;
+                    s.preferred_col = null;
+                    // Center the restored cursor so the user
+                    // doesn't lose visual context.
+                    const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
+                    const half = visible_rows / 2;
+                    s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
+                }
+            }
+        }
+    }
+
+    /// Populate the references picker from the LSP result and
+    /// switch into `.references_picker` mode. Snapshots the trigger
+    /// location into `references_picker_origin` so Esc returns the
+    /// cursor home.
+    fn openReferencesPicker(self: *Core, refs: []LSPManager.Location) !void {
+        // Free any prior entries — caller's result may be smaller.
+        for (self.references_picker_entries.items) |*entry| entry.deinit(self.allocator);
+        self.references_picker_entries.clearRetainingCapacity();
+
+        try self.references_picker_entries.ensureTotalCapacity(self.allocator, refs.len);
+        for (refs) |r| {
+            const full = try self.allocator.dupe(u8, r.file_path);
+            errdefer self.allocator.free(full);
+            const display = try self.allocator.dupe(u8, std.fs.path.basename(r.file_path));
+            errdefer self.allocator.free(display);
+
+            // Pull a trimmed source preview from disk; same logic
+            // the old text-buffer build used, just per-entry.
+            const snippet = readReferenceSnippet(self, r.file_path, r.line) catch
+                try self.allocator.dupe(u8, "(unable to read)");
+
+            try self.references_picker_entries.append(self.allocator, .{
+                .full_path = full,
+                .display_path = display,
+                .line = r.line,
+                .col = r.col,
+                .snippet = snippet,
+            });
+        }
+
+        self.references_picker_selected = 0;
+        self.references_picker_scroll_offset = 0;
+        self.references_picker_origin = self.captureCurrentLocationAsOpenedFrom();
+        self.previous_mode = self.mode;
+        self.mode = .references_picker;
+    }
+
+    /// Best-effort snippet read for the references picker — opens
+    /// the file, scans to the target line, trims and length-caps.
+    /// Returns an owned slice; caller frees with self.allocator.
+    fn readReferenceSnippet(self: *Core, file_path: []const u8, target_line: u32) ![]u8 {
+        const content = std.Io.Dir.cwd().readFileAlloc(
+            self.io,
+            file_path,
+            self.allocator,
+            .limited(10 * 1024 * 1024),
+        ) catch return error.SnippetUnavailable;
+        defer self.allocator.free(content);
+
+        var line_num: u32 = 0;
+        var line_start: usize = 0;
+        for (content, 0..) |ch, idx| {
+            if (line_num == target_line) {
+                var line_end = idx;
+                while (line_end < content.len and content[line_end] != '\n') : (line_end += 1) {}
+                const line_content = std.mem.trim(u8, content[line_start..line_end], " \t");
+                const max_len: usize = 120;
+                const take = if (line_content.len > max_len) line_content[0..max_len] else line_content;
+                return try self.allocator.dupe(u8, take);
+            }
+            if (ch == '\n') {
+                line_num += 1;
+                line_start = idx + 1;
+            }
+        }
+        return error.SnippetUnavailable;
+    }
+
+    /// Helper — like captureCurrentLocation but returns the type
+    /// the buffer's opened_from field uses (id-keyed, no path).
+    fn captureCurrentLocationAsOpenedFrom(self: *Core) ?Buffer.OpenedFrom {
+        const s = self.state();
+        if (s.file_path == null) return null;
+        return .{
+            .buffer_id = self.buffer_manager.getActive().id,
+            .row = s.cursor_row,
+            .col = s.cursor_col,
+        };
+    }
+
+    /// Esc out of the references picker — restore the trigger
+    /// position (if the origin buffer is still present and current)
+    /// and switch back to the previous mode.
+    fn closeReferencesPicker(self: *Core) void {
+        if (self.references_picker_origin) |of| {
+            const idx = self.buffer_manager.indexOfId(of.buffer_id);
+            if (idx) |i| {
+                self.buffer_manager.active_index = i;
+                const s = &self.buffer_manager.buffers.items[i].state;
+                s.cursor_row = of.row;
+                s.cursor_col = of.col;
+                s.preferred_col = null;
+                const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
+                const half = visible_rows / 2;
+                s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
+            }
+        }
+        self.references_picker_origin = null;
+        self.mode = .select;
+    }
+
+    /// Key dispatch for `.references_picker`. j/k move; Enter opens
+    /// the entry (records a jump); Esc dismisses + restores
+    /// trigger position.
+    fn handleReferencesPickerInput(self: *Core, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.closeReferencesPicker();
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+            if (self.references_picker_selected > 0) self.references_picker_selected -= 1;
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+            if (self.references_picker_selected + 1 < self.references_picker_entries.items.len) {
+                self.references_picker_selected += 1;
+            }
+            return true;
+        }
+        if (key.matches('g', .{})) {
+            self.references_picker_selected = 0;
+            return true;
+        }
+        if (key.matches('G', .{ .shift = true })) {
+            if (self.references_picker_entries.items.len > 0) {
+                self.references_picker_selected = self.references_picker_entries.items.len - 1;
+            }
+            return true;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            const idx = self.references_picker_selected;
+            if (idx >= self.references_picker_entries.items.len) return true;
+            const entry = self.references_picker_entries.items[idx];
+
+            // Record the trigger location into the jump_list so the
+            // user can Ctrl+O back even after this picker closes.
+            // (openReferencesPicker stamped origin already; this is
+            // a complementary jump_list breadcrumb.)
+            if (self.references_picker_origin) |of| {
+                if (self.buffer_manager.indexOfId(of.buffer_id)) |i| {
+                    if (self.buffer_manager.buffers.items[i].file_path) |p| {
+                        self.jump_list.recordJump(p, of.row, of.col) catch |err| {
+                            log.debug("references picker jump_list record failed: {}", .{err});
+                        };
+                    }
+                }
+            }
+
+            try self.openFileByPath(entry.full_path);
+            const new_state = self.state();
+            new_state.cursor_row = entry.line;
+            new_state.cursor_col = entry.col;
+            new_state.preferred_col = null;
+            const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
+            const half = visible_rows / 2;
+            new_state.scroll_offset = if (new_state.cursor_row >= half) new_state.cursor_row - half else 0;
+
+            // Picker has done its job; close (without restoring
+            // origin — the user explicitly went somewhere).
+            self.references_picker_origin = null;
+            self.mode = .select;
+            return true;
+        }
+        return false;
+    }
+
+    /// Open the diagnostics picker — same picker pattern as
+    /// references. The diagnostic list itself lives in the LSP
+    /// server's per-URI cache (fetched fresh by sendUpdate), so
+    /// Core just tracks the selected index, scroll offset, and
+    /// trigger origin.
+    pub fn openDiagnosticsPicker(self: *Core) void {
+        // Only meaningful when the current buffer has a file path
+        // — diagnostics are keyed by URI. Toast and bail otherwise.
+        const s = self.state();
+        if (s.file_path == null) {
+            self.setStatusLiteralLeveled(.warning, "No diagnostics for unsaved buffer", 1500);
+            return;
+        }
+        self.diagnostics_picker_selected = 0;
+        self.diagnostics_picker_scroll_offset = 0;
+        self.diagnostics_picker_origin = self.captureCurrentLocationAsOpenedFrom();
+        self.previous_mode = self.mode;
+        self.mode = .diagnostics_picker;
+    }
+
+    fn closeDiagnosticsPicker(self: *Core) void {
+        if (self.diagnostics_picker_origin) |of| {
+            if (self.buffer_manager.indexOfId(of.buffer_id)) |i| {
+                self.buffer_manager.active_index = i;
+                const s = &self.buffer_manager.buffers.items[i].state;
+                s.cursor_row = of.row;
+                s.cursor_col = of.col;
+                s.preferred_col = null;
+                const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
+                const half = visible_rows / 2;
+                s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
+            }
+        }
+        self.diagnostics_picker_origin = null;
+        self.mode = .select;
+    }
+
+    fn handleDiagnosticsPickerInput(self: *Core, key: vaxis.Key) !bool {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.closeDiagnosticsPicker();
+            return true;
+        }
+        // The diagnostic count is derived from the LSP cache at
+        // render time, but for input dispatch we need a stable
+        // count *now*. Re-fetch — cheap, just a HashMap probe.
+        const diag_count = self.activeDiagnosticCount();
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+            if (self.diagnostics_picker_selected > 0) self.diagnostics_picker_selected -= 1;
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+            if (self.diagnostics_picker_selected + 1 < diag_count) {
+                self.diagnostics_picker_selected += 1;
+            }
+            return true;
+        }
+        if (key.matches('g', .{})) {
+            self.diagnostics_picker_selected = 0;
+            return true;
+        }
+        if (key.matches('G', .{ .shift = true })) {
+            if (diag_count > 0) self.diagnostics_picker_selected = diag_count - 1;
+            return true;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            // Apply the jump in the trigger buffer (the diagnostic
+            // is keyed to the current file). We don't openFileByPath
+            // — diagnostics never cross files.
+            if (self.diagnostics_picker_origin) |of| {
+                if (self.buffer_manager.indexOfId(of.buffer_id)) |i| {
+                    self.buffer_manager.active_index = i;
+                    const target = self.activeDiagnosticAt(self.diagnostics_picker_selected) orelse return true;
+                    const s = &self.buffer_manager.buffers.items[i].state;
+                    // Record the trigger origin in jump_list first.
+                    if (self.buffer_manager.buffers.items[i].file_path) |p| {
+                        self.jump_list.recordJump(p, of.row, of.col) catch |err| {
+                            log.debug("diagnostics picker jump_list record failed: {}", .{err});
+                        };
+                    }
+                    s.cursor_row = target.start_line;
+                    s.cursor_col = target.start_col;
+                    s.preferred_col = null;
+                    const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
+                    const half = visible_rows / 2;
+                    s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
+                }
+            }
+            self.diagnostics_picker_origin = null;
+            self.mode = .select;
+            return true;
+        }
+        return false;
+    }
+
+    /// Count diagnostics for the active buffer's file. Returns 0
+    /// for unsaved buffers and on LSP fetch failure.
+    fn activeDiagnosticCount(self: *Core) usize {
+        const s = self.state();
+        const path = s.file_path orelse return 0;
+        const diags = self.lsp_manager.getDiagnosticsForFile(self.allocator, path) catch return 0;
+        defer LSPManager.freeDiagnostics(self.allocator, diags);
+        return diags.len;
+    }
+
+    /// Snapshot of a single diagnostic at sorted-list index `idx`
+    /// (sorted by line then col, matching the picker's render
+    /// order). Returns null on out-of-range or LSP miss.
+    fn activeDiagnosticAt(self: *Core, idx: usize) ?protocol.DiagnosticSnapshot {
+        const s = self.state();
+        const path = s.file_path orelse return null;
+        const diags = self.lsp_manager.getDiagnosticsForFile(self.allocator, path) catch return null;
+        defer LSPManager.freeDiagnostics(self.allocator, diags);
+
+        std.mem.sort(LSPManager.Diagnostic, diags, {}, struct {
+            fn lt(_: void, a: LSPManager.Diagnostic, b: LSPManager.Diagnostic) bool {
+                if (a.start_line != b.start_line) return a.start_line < b.start_line;
+                return a.start_col < b.start_col;
+            }
+        }.lt);
+        if (idx >= diags.len) return null;
+        const d = diags[idx];
+        return .{
+            .start_line = d.start_line,
+            .start_col = d.start_col,
+            .end_line = d.end_line,
+            .end_col = d.end_col,
+            .severity = switch (d.severity) {
+                .err => .err,
+                .warning => .warning,
+                .info => .info,
+                .hint => .hint,
+            },
+            .message = "",
+        };
+    }
+
+    /// Open a file at `path` into a fresh buffer, wire it into the
+    /// workspace, start the LSP for its language if applicable, and
+    /// fire an async syntax parse. Shared by the fuzzy file picker
+    /// and the file explorer so both code paths get identical
+    /// behavior (e.g. large-file mode detection, LSP attach).
+    pub fn openFileByPath(self: *Core, file_path: []const u8) !void {
+        const opened_buffer = try self.buffer_manager.openFile(file_path);
+        try self.workspace_manager.registerBuffer(opened_buffer.id, file_path);
+
+        const lang = SyntaxManager.Language.fromFilename(file_path);
+        const opened_is_large = opened_buffer.is_large;
+        if (opened_is_large) {
+            self.setStatusLeveled(.warning, "Opened {s} in large-file mode — LSP, syntax, brackets disabled", .{opened_buffer.name}, 3000);
+        }
+
+        if (!opened_is_large and (lang == .zig or lang == .python or lang == .javascript or lang == .typescript or lang == .go or lang == .rust)) {
+            var project_root_owned: ?[]const u8 = null;
+            defer if (project_root_owned) |p| self.allocator.free(p);
+
+            const ws_root = if (self.workspace_manager.getBufferWorkspace(opened_buffer.id)) |ws|
+                ws.root_path
+            else blk: {
+                project_root_owned = try self.findProjectRoot(file_path);
+                break :blk if (project_root_owned) |p| p else self.file_manager.cwd;
+            };
+
+            const lang_id = switch (lang) {
+                .zig => "zig",
+                .python => "python",
+                .javascript => "javascript",
+                .typescript => "typescript",
+                .go => "go",
+                .rust => "rust",
+                else => unreachable,
+            };
+            try self.lsp_manager.startServer(lang_id, ws_root);
+
+            const content = try self.state().buffer.toString(self.allocator);
+            defer self.allocator.free(content);
+            self.lsp_manager.documentOpened(file_path, content) catch |err| {
+                log.warn("LSP document sync failed after file open '{s}': {}", .{ file_path, err });
+            };
+            self.lsp_doc_version = 1;
+        }
+
+        if (lang != .unknown and !opened_is_large) {
+            self.syntax_manager.setLanguageEnum(lang) catch |err| {
+                log.warn("Syntax manager language set failed for {}: {}", .{ lang, err });
+            };
+            if (self.state().buffer.toString(self.allocator)) |content| {
+                defer self.allocator.free(content);
+                const buf_id = self.buffer_manager.getActive().id;
+                self.syntax_manager.submitParse(content, buf_id) catch |err| {
+                    log.debug("Syntax parse submit failed after buffer load: {}", .{err});
+                };
+            } else |_| {}
+        }
+
+        if (self.split_manager) |*sm| {
+            sm.setFocusedBuffer(self.buffer_manager.active_index);
+        }
+    }
+
+    /// Key dispatch for the modal file-explorer overlay (Mode
+    /// `.file_explorer`). Returns true if the key was consumed.
+    fn handleFileExplorerInput(self: *Core, key: vaxis.Key) !bool {
+        const fx = if (self.file_explorer) |*v| v else return false;
+
+        // Esc dismisses the explorer back to whatever mode opened it.
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.mode = self.previous_mode;
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+            fx.moveUp();
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+            fx.moveDown();
+            return true;
+        }
+        if (key.matches('g', .{})) {
+            fx.moveTop();
+            return true;
+        }
+        if (key.matches('G', .{ .shift = true })) {
+            fx.moveBottom();
+            return true;
+        }
+        if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{})) {
+            _ = try fx.expand();
+            return true;
+        }
+        if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
+            _ = try fx.collapseOrAscend();
+            return true;
+        }
+        if (key.matches('H', .{ .shift = true })) {
+            try fx.toggleHidden();
+            return true;
+        }
+        if (key.matches('r', .{ .ctrl = true })) {
+            try fx.rebuild();
+            return true;
+        }
+        if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.space, .{})) {
+            if (try fx.activate()) |opened| {
+                defer self.allocator.free(opened);
+                try self.openFileByPath(opened);
+                self.mode = .select;
+            }
+            return true;
+        }
+        return false;
     }
 
     /// Opens all files in the given directory recursively. The walk runs on
@@ -5940,6 +6513,74 @@ pub const Core = struct {
             }
         }
 
+        var explorer_entries: ?[]const protocol.ExplorerEntry = null;
+        var explorer_cwd: ?[]const u8 = null;
+        var explorer_selected: usize = 0;
+        var explorer_scroll: usize = 0;
+        if (self.mode == .file_explorer) {
+            if (self.file_explorer) |*fx| {
+                explorer_cwd = try alloc.dupe(u8, fx.root);
+                explorer_entries = try fx.snapshot(alloc);
+                explorer_selected = fx.selected;
+                explorer_scroll = fx.scroll_offset;
+            }
+        }
+
+        // Mirror the references picker entries into the per-frame
+        // arena so the renderer doesn't have to hold the core
+        // allocator's slices across the message boundary.
+        var refs_snap: ?[]const protocol.ReferenceEntry = null;
+        var refs_sym_snap: ?[]const u8 = null;
+        if (self.mode == .references_picker and self.references_picker_entries.items.len > 0) {
+            const out = try alloc.alloc(protocol.ReferenceEntry, self.references_picker_entries.items.len);
+            for (self.references_picker_entries.items, 0..) |e, i| {
+                out[i] = .{
+                    .full_path = try alloc.dupe(u8, e.full_path),
+                    .display_path = try alloc.dupe(u8, e.display_path),
+                    .line = e.line,
+                    .col = e.col,
+                    .snippet = try alloc.dupe(u8, e.snippet),
+                };
+            }
+            refs_snap = out;
+            if (self.references_symbol_name) |sym| {
+                refs_sym_snap = try alloc.dupe(u8, sym);
+            }
+        }
+
+        // Diagnostics picker: fetch + sort + dupe message strings
+        // into the arena.
+        var diag_picker_snap: ?[]const protocol.DiagnosticPickerEntry = null;
+        if (self.mode == .diagnostics_picker) {
+            const ds = self.state();
+            if (ds.file_path) |path| {
+                if (self.lsp_manager.getDiagnosticsForFile(self.allocator, path)) |diags| {
+                    defer LSPManager.freeDiagnostics(self.allocator, diags);
+                    std.mem.sort(LSPManager.Diagnostic, diags, {}, struct {
+                        fn lt(_: void, a: LSPManager.Diagnostic, b: LSPManager.Diagnostic) bool {
+                            if (a.start_line != b.start_line) return a.start_line < b.start_line;
+                            return a.start_col < b.start_col;
+                        }
+                    }.lt);
+                    const out = try alloc.alloc(protocol.DiagnosticPickerEntry, diags.len);
+                    for (diags, 0..) |d, i| {
+                        out[i] = .{
+                            .line = d.start_line,
+                            .col = d.start_col,
+                            .severity = switch (d.severity) {
+                                .err => .err,
+                                .warning => .warning,
+                                .info => .info,
+                                .hint => .hint,
+                            },
+                            .message = try alloc.dupe(u8, d.message),
+                        };
+                    }
+                    diag_picker_snap = out;
+                } else |_| {}
+            }
+        }
+
         @import("../services/thread_name.zig").markStep("send:buffer_infos");
         const buffer_infos = try alloc.alloc(protocol.BufferInfo, self.buffer_manager.buffers.items.len);
         for (self.buffer_manager.buffers.items, 0..) |buf, i| {
@@ -6342,6 +6983,17 @@ pub const Core = struct {
             .buffer_picker_selected = self.buffer_manager.picker_selected,
             .file_picker_cwd = file_picker_cwd,
             .file_picker_entries = picker_entries,
+            .references_entries = refs_snap,
+            .references_selected = self.references_picker_selected,
+            .references_scroll_offset = self.references_picker_scroll_offset,
+            .references_symbol = refs_sym_snap,
+            .diagnostics_entries = diag_picker_snap,
+            .diagnostics_picker_selected = self.diagnostics_picker_selected,
+            .diagnostics_picker_scroll_offset = self.diagnostics_picker_scroll_offset,
+            .file_explorer_cwd = explorer_cwd,
+            .file_explorer_entries = explorer_entries,
+            .file_explorer_selected = explorer_selected,
+            .file_explorer_scroll_offset = explorer_scroll,
             .file_picker_selected = self.file_manager.selected_index,
             .buffer_picker_scroll_offset = self.buffer_manager.picker_scroll_offset,
             .buffer_picker_number_input = if (self.mode == .buffer_picker and self.buffer_picker_number_input.items.len > 0)
@@ -6365,6 +7017,7 @@ pub const Core = struct {
             .hover_sticky = self.hover_sticky,
             .hover_loading = hover_loading,
             .which_key_visible = which_key_visible,
+            .leader_chord = self.leader_chord,
             .go_to_line_input = go_to_line_input_slice,
             .symbol_picker_query = symbol_picker_query_slice,
             .workspace_symbol_query = workspace_symbol_query_slice,
