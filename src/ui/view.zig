@@ -2200,19 +2200,28 @@ pub const View = struct {
             i += 1;
             row += 1;
         }) {
-            fillRow(win, box_x, row, box_width, bg);
+            const is_sel = i == selected;
+            // Fill the row's interior with the row's *final* background
+            // up front (blue for selected, panel bg otherwise). Without
+            // this two-step the content drawn by `ctx.drawRow` would
+            // overwrite the highlight with its own panel-bg cells and
+            // leave only the trailing whitespace highlighted — exactly
+            // the "sloppy" look the user reported.
+            const row_bg: vaxis.Cell.Style = if (is_sel) selected_style else bg;
+            fillRow(win, box_x, row, box_width, row_bg);
             _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = row, .col_offset = box_x });
             _ = win.printSegment(.{ .text = "│", .style = border }, .{ .row_offset = row, .col_offset = box_x + box_width - 1 });
 
-            const is_sel = i == selected;
-            if (is_sel) {
-                var col: u16 = box_x + 1;
-                while (col < box_x + box_width - 1) : (col += 1) {
-                    _ = win.printSegment(.{ .text = " ", .style = selected_style }, .{ .row_offset = row, .col_offset = col });
-                }
-            }
-            const inner_max: u16 = if (box_width > 4) box_width - 4 else 0;
-            try ctx.drawRow(win, row, box_x + 2, inner_max, i, is_sel);
+            // Selection arrow: `▶ ` on the selected row, `  ` on the
+            // others so columns align. Gives a glanceable indicator
+            // even when colour styling is muted (low-contrast themes,
+            // screenshots, colour-blind users).
+            const indicator: []const u8 = if (is_sel) "▶ " else "  ";
+            const indicator_style: vaxis.Cell.Style = if (is_sel) selected_style else bg;
+            _ = win.printSegment(.{ .text = indicator, .style = indicator_style }, .{ .row_offset = row, .col_offset = box_x + 2 });
+
+            const inner_max: u16 = if (box_width > 6) box_width - 6 else 0;
+            try ctx.drawRow(win, row, box_x + 4, inner_max, i, is_sel);
         }
         while (row < list_bottom) : (row += 1) {
             fillRow(win, box_x, row, box_width, bg);
@@ -2251,12 +2260,20 @@ pub const View = struct {
         const Ctx = struct {
             entries: []const protocol.ReferenceEntry,
             fn drawRow(self: @This(), w: vaxis.Window, row: u16, base_col: u16, max_w: u16, i: usize, is_sel: bool) !void {
-                _ = is_sel;
                 const e = self.entries[i];
-                const bg: vaxis.Cell.Style = theme.styles.panel.background;
-                const path_style: vaxis.Cell.Style = .{ .fg = .{ .rgb = theme.colors.syntax.namespace }, .bg = bg.bg, .bold = true };
-                const linecol_style: vaxis.Cell.Style = .{ .fg = .{ .rgb = theme.colors.syntax.number }, .bg = bg.bg };
-                const snippet_style: vaxis.Cell.Style = bg;
+                const panel_bg: vaxis.Cell.Style = theme.styles.panel.background;
+                // Selected row inherits the blue bg so the fg-only
+                // styles below don't punch holes in the highlight.
+                const row_bg = if (is_sel)
+                    vaxis.Cell.Style{ .bg = .{ .index = theme.colors.palette.blue } }
+                else
+                    panel_bg;
+                const path_style: vaxis.Cell.Style = .{ .fg = .{ .rgb = theme.colors.syntax.namespace }, .bg = row_bg.bg, .bold = true };
+                const linecol_style: vaxis.Cell.Style = .{ .fg = .{ .rgb = theme.colors.syntax.number }, .bg = row_bg.bg };
+                const snippet_style: vaxis.Cell.Style = if (is_sel)
+                    .{ .fg = .{ .index = theme.colors.palette.bright_white }, .bg = row_bg.bg, .bold = true }
+                else
+                    panel_bg;
 
                 var line_buf: [16]u8 = undefined;
                 const linecol = std.fmt.bufPrint(&line_buf, "{d}:{d}", .{ e.line + 1, e.col + 1 }) catch "?";
@@ -2264,11 +2281,11 @@ pub const View = struct {
                 var col: u16 = base_col;
                 _ = w.printSegment(.{ .text = e.display_path, .style = path_style }, .{ .row_offset = row, .col_offset = col });
                 col += @intCast(@min(e.display_path.len, @as(usize, max_w / 3)));
-                _ = w.printSegment(.{ .text = " :", .style = bg }, .{ .row_offset = row, .col_offset = col });
+                _ = w.printSegment(.{ .text = " :", .style = row_bg }, .{ .row_offset = row, .col_offset = col });
                 col += 2;
                 _ = w.printSegment(.{ .text = linecol, .style = linecol_style }, .{ .row_offset = row, .col_offset = col });
                 col += @intCast(linecol.len);
-                _ = w.printSegment(.{ .text = "  ", .style = bg }, .{ .row_offset = row, .col_offset = col });
+                _ = w.printSegment(.{ .text = "  ", .style = row_bg }, .{ .row_offset = row, .col_offset = col });
                 col += 2;
                 const remaining: usize = if (col > base_col + max_w) 0 else base_col + max_w - col;
                 const snip_take = if (e.snippet.len > remaining) e.snippet[0..remaining] else e.snippet;
@@ -2291,9 +2308,14 @@ pub const View = struct {
         const Ctx = struct {
             entries: []const protocol.DiagnosticPickerEntry,
             fn drawRow(self: @This(), w: vaxis.Window, row: u16, base_col: u16, max_w: u16, i: usize, is_sel: bool) !void {
-                _ = is_sel;
                 const e = self.entries[i];
-                const bg: vaxis.Cell.Style = theme.styles.panel.background;
+                const panel_bg: vaxis.Cell.Style = theme.styles.panel.background;
+                // Selected row inherits the blue bg so the fg-only
+                // severity / linecol styles below preserve the highlight.
+                const row_bg = if (is_sel)
+                    vaxis.Cell.Style{ .bg = .{ .index = theme.colors.palette.blue } }
+                else
+                    panel_bg;
                 const sev_glyph: []const u8 = switch (e.severity) {
                     .err => "E ",
                     .warning => "W ",
@@ -2301,13 +2323,16 @@ pub const View = struct {
                     .hint => "H ",
                 };
                 const sev_style: vaxis.Cell.Style = switch (e.severity) {
-                    .err => .{ .fg = .{ .rgb = .{ 224, 108, 117 } }, .bg = bg.bg, .bold = true },
-                    .warning => .{ .fg = .{ .rgb = .{ 229, 192, 123 } }, .bg = bg.bg, .bold = true },
-                    .info => .{ .fg = .{ .rgb = .{ 86, 182, 194 } }, .bg = bg.bg },
-                    .hint => .{ .fg = .{ .rgb = .{ 128, 128, 140 } }, .bg = bg.bg },
+                    .err => .{ .fg = .{ .rgb = .{ 224, 108, 117 } }, .bg = row_bg.bg, .bold = true },
+                    .warning => .{ .fg = .{ .rgb = .{ 229, 192, 123 } }, .bg = row_bg.bg, .bold = true },
+                    .info => .{ .fg = .{ .rgb = .{ 86, 182, 194 } }, .bg = row_bg.bg },
+                    .hint => .{ .fg = .{ .rgb = .{ 128, 128, 140 } }, .bg = row_bg.bg },
                 };
-                const linecol_style: vaxis.Cell.Style = .{ .fg = .{ .rgb = theme.colors.syntax.number }, .bg = bg.bg };
-                const msg_style: vaxis.Cell.Style = bg;
+                const linecol_style: vaxis.Cell.Style = .{ .fg = .{ .rgb = theme.colors.syntax.number }, .bg = row_bg.bg };
+                const msg_style: vaxis.Cell.Style = if (is_sel)
+                    .{ .fg = .{ .index = theme.colors.palette.bright_white }, .bg = row_bg.bg, .bold = true }
+                else
+                    panel_bg;
 
                 var line_buf: [16]u8 = undefined;
                 const linecol = std.fmt.bufPrint(&line_buf, "{d}:{d}", .{ e.line + 1, e.col + 1 }) catch "?";
@@ -2317,7 +2342,7 @@ pub const View = struct {
                 col += @intCast(sev_glyph.len);
                 _ = w.printSegment(.{ .text = linecol, .style = linecol_style }, .{ .row_offset = row, .col_offset = col });
                 col += @intCast(linecol.len);
-                _ = w.printSegment(.{ .text = "  ", .style = bg }, .{ .row_offset = row, .col_offset = col });
+                _ = w.printSegment(.{ .text = "  ", .style = row_bg }, .{ .row_offset = row, .col_offset = col });
                 col += 2;
                 const remaining: usize = if (col > base_col + max_w) 0 else base_col + max_w - col;
                 const msg_take = if (e.message.len > remaining) e.message[0..remaining] else e.message;

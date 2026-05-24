@@ -509,7 +509,15 @@ pub const SyntaxManager = struct {
             // the content.
             if (installed) {
                 if (job.resource_id) |id| {
-                    self.last_parse_content_len.put(self.allocator, id, job.source.len) catch {};
+                    // OOM here means the parked-tree cache loses
+                    // its content_len marker for this buffer. The
+                    // next setActiveBuffer will discard the parked
+                    // tree as "unknown freshness" and force a
+                    // reparse — correct but slower. Log so we'd
+                    // notice if this starts firing.
+                    self.last_parse_content_len.put(self.allocator, id, job.source.len) catch |err| {
+                        log.debug("last_parse_content_len put failed for buffer {d}: {s}", .{ id, @errorName(err) });
+                    };
                 }
             }
 
@@ -2958,4 +2966,82 @@ test "all shipped languages: setLanguage succeeds (query compiles)" {
             return err;
         };
     }
+}
+
+// ────────────────────────────────────────────────────────────
+// Regression tests for the per-buffer tree cache (A2).
+// These exercise the "switch away → tree parked → switch back →
+// tree restored" round trip that's the user-visible payoff: no
+// flash of unhighlighted text on buffer switch.
+// ────────────────────────────────────────────────────────────
+
+test "setActiveBuffer parks and restores tree for same lang + matching content_len" {
+    var sm = try SyntaxManager.init(std.testing.allocator);
+    defer sm.deinit();
+
+    try sm.setLanguage("zig");
+
+    // Parse buffer A. Tree lands on self.tree.
+    const a_src = "const a = 1;";
+    try sm.parse(a_src, 100);
+    try std.testing.expect(sm.tree != null);
+    const a_tree_ptr = sm.tree;
+
+    // Record buffer A's content length the way the worker would,
+    // so park-on-switch knows the parked tree is fresh.
+    try sm.last_parse_content_len.put(sm.allocator, 100, a_src.len);
+
+    // Switch to buffer B. Parks A's tree, clears self.tree
+    // (because we have nothing parked for B yet).
+    sm.setActiveBuffer(200, .zig, "const b = 2;".len);
+    try std.testing.expect(sm.tree == null);
+    try std.testing.expect(sm.state_cache.contains(100));
+
+    // Switch back to buffer A with matching content_len → tree
+    // should be restored from the cache. This is the user-visible
+    // "no flash of unhighlighted text on tab switch" payoff.
+    sm.setActiveBuffer(100, .zig, a_src.len);
+    try std.testing.expect(sm.tree != null);
+    try std.testing.expectEqual(a_tree_ptr.?, sm.tree.?);
+    try std.testing.expect(!sm.state_cache.contains(100));
+}
+
+test "setActiveBuffer discards parked tree when content_len changed" {
+    var sm = try SyntaxManager.init(std.testing.allocator);
+    defer sm.deinit();
+
+    try sm.setLanguage("zig");
+    const original_src = "const a = 1;";
+    try sm.parse(original_src, 100);
+    try sm.last_parse_content_len.put(sm.allocator, 100, original_src.len);
+
+    // Switch away → parks.
+    sm.setActiveBuffer(200, .zig, 0);
+    try std.testing.expect(sm.state_cache.contains(100));
+
+    // Switch back with a different content_len (simulating an edit
+    // that happened to buffer 100 while we were away). The parked
+    // tree should be discarded as stale, not restored.
+    sm.setActiveBuffer(100, .zig, original_src.len + 50);
+    try std.testing.expect(sm.tree == null);
+    try std.testing.expect(!sm.state_cache.contains(100));
+}
+
+test "dropBuffer evicts parked tree" {
+    var sm = try SyntaxManager.init(std.testing.allocator);
+    defer sm.deinit();
+
+    try sm.setLanguage("zig");
+    try sm.parse("const a = 1;", 100);
+    try sm.last_parse_content_len.put(sm.allocator, 100, "const a = 1;".len);
+
+    sm.setActiveBuffer(200, .zig, 0);
+    try std.testing.expect(sm.state_cache.contains(100));
+    try std.testing.expect(sm.last_parse_content_len.contains(100));
+
+    // Closing buffer 100 should evict it from both caches so the
+    // session doesn't accumulate trees from closed buffers.
+    sm.dropBuffer(100);
+    try std.testing.expect(!sm.state_cache.contains(100));
+    try std.testing.expect(!sm.last_parse_content_len.contains(100));
 }

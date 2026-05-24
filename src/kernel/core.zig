@@ -50,6 +50,13 @@ const NavCommands = @import("commands/nav_commands.zig").NavCommands;
 const BufferCommands = @import("commands/buffer_commands.zig").BufferCommands;
 const FileCommands = @import("commands/file_commands.zig").FileCommands;
 const ToggleCommands = @import("commands/toggle_commands.zig").ToggleCommands;
+const BookmarkCommands = @import("commands/bookmark_commands.zig").BookmarkCommands;
+const LeaderDispatch = @import("leader_dispatch.zig").LeaderDispatch;
+const render_mod = @import("render.zig");
+const pickers = @import("pickers.zig");
+const input = @import("input.zig");
+const ReferencesPicker = pickers.ReferencesPicker;
+const DiagnosticsPicker = pickers.DiagnosticsPicker;
 
 pub const CompletionDisplayItem = struct {
     label: []const u8,
@@ -134,6 +141,15 @@ pub const Core = struct {
     terminal_cwd: ?[]const u8 = null,
     terminal_old_cwd: ?[]const u8 = null,
     leader_pending: bool,
+    /// Wall-clock ms when `leader_pending` last went true. Read by
+    /// the tick handler to auto-cancel after
+    /// `leader_pending_timeout_ms` so a chord left dangling (user
+    /// walked away, lost focus mid-chord, etc.) doesn't stay
+    /// armed forever and surprise the next keystroke. Refreshed
+    /// on every double-Space tap so users actively re-arming the
+    /// chord don't get auto-cancelled out from under them.
+    leader_pending_set_ms: i64 = 0,
+    leader_pending_timeout_ms: i64 = 2000,
     /// In-flight plugin-keybind chord. Reset when a chord matches,
     /// no longer prefixes any binding, or the leader gate closes.
     plugin_chord_buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -810,7 +826,7 @@ pub const Core = struct {
         self.cached_focused_pane_height = null;
     }
 
-    fn insertCharWithHistory(self: *Core, char: u8) !void {
+    pub fn insertCharWithHistory(self: *Core, char: u8) !void {
         const s = self.state();
 
         // Single-cursor fast path.
@@ -919,7 +935,7 @@ pub const Core = struct {
         self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
     }
 
-    fn deleteCharWithHistory(self: *Core) !void {
+    pub fn deleteCharWithHistory(self: *Core) !void {
         const s = self.state();
         const offset = s.getOffsetFromCursor();
         if (offset >= s.buffer.totalLength()) return;
@@ -931,7 +947,7 @@ pub const Core = struct {
         self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
     }
 
-    fn backspaceCharWithHistory(self: *Core) !void {
+    pub fn backspaceCharWithHistory(self: *Core) !void {
         const s = self.state();
 
         // Single-cursor fast path.
@@ -1095,115 +1111,9 @@ pub const Core = struct {
         return result;
     }
 
-    fn cmdDocumentSymbols(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-
-        // Symbol pick is a jumpable navigation; record now so the
-        // user can Space , back to wherever they triggered it from.
-        self.recordJumpFromCurrent();
-
-        const s = self.state();
-        const file_path = s.file_path orelse return;
-
-        self.lsp_manager.requestDocumentSymbols(file_path) catch |err| {
-            log.warn("LSP document symbols request failed for {s}: {}", .{ file_path, err });
-        };
-
-        var attempts: u32 = 0;
-        while (attempts < 50) : (attempts += 1) {
-            if (self.lsp_manager.popDocumentSymbolsResult()) |symbols| {
-                defer self.lsp_manager.freeDocumentSymbols(symbols);
-
-                for (self.symbol_picker_all_symbols.items) |entry| {
-                    self.allocator.free(entry.name);
-                }
-                self.symbol_picker_all_symbols.clearRetainingCapacity();
-                for (self.symbol_picker_results.items) |entry| {
-                    self.allocator.free(entry.name);
-                }
-                self.symbol_picker_results.clearRetainingCapacity();
-
-                for (symbols) |sym| {
-                    const kind_str = switch (sym.kind) {
-                        .file => "file",
-                        .module => "module",
-                        .namespace => "namespace",
-                        .package => "package",
-                        .class => "class",
-                        .method => "method",
-                        .property => "property",
-                        .field => "field",
-                        .constructor => "constructor",
-                        .enumType => "enum",
-                        .interface => "interface",
-                        .function => "function",
-                        .variable => "variable",
-                        .constant => "constant",
-                        .string => "string",
-                        .number => "number",
-                        .boolean => "boolean",
-                        .array => "array",
-                        .object => "object",
-                        .key => "key",
-                        .null_type => "null",
-                        .enumMember => "enumMember",
-                        .struct_type => "struct",
-                        .event => "event",
-                        .operator => "operator",
-                        .type_parameter => "typeParameter",
-                    };
-
-                    const name_dupe = try self.allocator.dupe(u8, sym.name);
-                    try self.symbol_picker_all_symbols.append(self.allocator, .{
-                        .name = name_dupe,
-                        .kind = kind_str,
-                        .line = sym.line,
-                    });
-                }
-
-                self.previous_mode = self.mode;
-                self.mode = .symbol_picker;
-                self.symbol_picker_query.clearRetainingCapacity();
-                self.symbol_picker_selected = 0;
-                try self.updateSymbolSearch();
-                try self.sendUpdate();
-                return;
-            }
-            // best-effort: sleep cancellation is fine, loop will check condition again
-            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
-        }
-
-        self.previous_mode = self.mode;
-        self.mode = .symbol_picker;
-        self.symbol_picker_query.clearRetainingCapacity();
-        self.symbol_picker_selected = 0;
-        try self.updateSymbolSearch();
-        try self.sendUpdate();
-    }
-
-    fn cmdWorkspaceSymbols(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-        try self.openWorkspaceSymbolPicker();
-    }
-
-    fn cmdBookmarkList(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-        try self.openBookmarksBuffer();
-    }
-
-    fn cmdBookmarkClearAll(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-        self.bookmarks.clearAll();
-        self.bookmarks.save(self.io) catch |err| {
-            log.warn("Failed to persist bookmarks after clearAll: {}", .{err});
-        };
-        self.setStatusLiteralLeveled(.info, "Bookmarks cleared", 1500);
-        try self.sendUpdate();
-    }
+    // cmdDocumentSymbols, cmdWorkspaceSymbols → commands/lsp_commands.zig
+    // cmdBookmarkList, cmdBookmarkClearAll → commands/bookmark_commands.zig
+    // All registered via the Wrap(...).run adapter — see registerCommands.
 
     // Editor-toggle commands extracted to commands/toggle_commands.zig
     // — see ToggleCommands.cmd* there. Registered via the same
@@ -1255,7 +1165,7 @@ pub const Core = struct {
         };
     }
 
-    fn openWorkspaceSymbolPicker(self: *Core) !void {
+    pub fn openWorkspaceSymbolPicker(self: *Core) !void {
         // Jumpable navigation — snapshot the trigger location so
         // Space , can return after picking a symbol.
         self.recordJumpFromCurrent();
@@ -1297,7 +1207,7 @@ pub const Core = struct {
     /// Issue another workspace/symbol request with the current query
     /// after honouring a tiny debounce so typing fast doesn't blast
     /// the server.
-    fn dispatchWorkspaceSymbolQuery(self: *Core) !void {
+    pub fn dispatchWorkspaceSymbolQuery(self: *Core) !void {
         const now = std.Io.Clock.real.now(self.io).toMilliseconds();
         if (now - self.workspace_symbol_last_request_ms < self.workspace_symbol_debounce_ms) return;
 
@@ -1312,65 +1222,8 @@ pub const Core = struct {
         };
     }
 
-    fn cmdJumpBack(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-
-        if (self.jump_list.jumpBack()) |location| {
-            const s = self.state();
-            const current_file = s.file_path orelse "";
-
-            if (!std.mem.eql(u8, current_file, location.file_path)) {
-                _ = try self.buffer_manager.openFile(location.file_path);
-                self.refreshSyntaxForCurrentBuffer();
-            }
-
-            const new_state = self.state();
-            new_state.cursor_row = location.row;
-            new_state.cursor_col = location.col;
-            new_state.preferred_col = null;
-
-            const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
-            const half = visible_rows / 2;
-            if (new_state.cursor_row >= half) {
-                new_state.scroll_offset = new_state.cursor_row - half;
-            } else {
-                new_state.scroll_offset = 0;
-            }
-
-            try self.sendUpdate();
-        }
-    }
-
-    fn cmdJumpForward(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-
-        if (self.jump_list.jumpForward()) |location| {
-            const s = self.state();
-            const current_file = s.file_path orelse "";
-
-            if (!std.mem.eql(u8, current_file, location.file_path)) {
-                _ = try self.buffer_manager.openFile(location.file_path);
-                self.refreshSyntaxForCurrentBuffer();
-            }
-
-            const new_state = self.state();
-            new_state.cursor_row = location.row;
-            new_state.cursor_col = location.col;
-            new_state.preferred_col = null;
-
-            const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
-            const half = visible_rows / 2;
-            if (new_state.cursor_row >= half) {
-                new_state.scroll_offset = new_state.cursor_row - half;
-            } else {
-                new_state.scroll_offset = 0;
-            }
-
-            try self.sendUpdate();
-        }
-    }
+    // cmdJumpBack / cmdJumpForward → commands/nav_commands.zig
+    // (NavCommands.cmdJumpBack / .cmdJumpForward)
 
     pub fn registerCommands(self: *Core) !void {
         const R = self.command_registry;
@@ -1389,7 +1242,7 @@ pub const Core = struct {
         try R.register("buffer.close", "Buffer: Close", "Close the active buffer", Wrap(BufferCommands.cmdBufferClose).run, null);
         try R.register("buffer.close_others", "Buffer: Close Others", "Close all buffers except active", Wrap(BufferCommands.cmdBufferCloseOthers).run, null);
         try R.register("buffer.new_scratch", "Buffer: New Scratch", "Create a new scratch buffer (not saved to disk)", Wrap(BufferCommands.cmdBufferNewScratch).run, null);
-        try R.register("buffer.restore_backups", "Buffer: Restore Backups", "List auto-save backups in ~/.stem/recover/", cmdBufferRestoreBackups, null);
+        try R.register("buffer.restore_backups", "Buffer: Restore Backups", "List auto-save backups in ~/.stem/recover/", Wrap(BufferCommands.cmdBufferRestoreBackups).run, null);
 
         try R.register("edit.delete_line", "Edit: Delete Line", "Remove the current line", Wrap(EditCommands.cmdEditDeleteLine).run, null);
         try R.register("edit.duplicate_line", "Edit: Duplicate Line", "Copy current line and insert below", Wrap(EditCommands.cmdEditDuplicateLine).run, null);
@@ -1412,19 +1265,19 @@ pub const Core = struct {
         try R.register("nav.match_bracket", "Nav: Match Bracket", "Jump to matching (), {}, [], or <> (%)", Wrap(NavCommands.cmdNavMatchBracket).run, null);
         try R.register("search.find_in_buffer", "Search: Find in Buffer", "Search within current file", Wrap(NavCommands.cmdSearchFindInBuffer).run, null);
 
-        try R.register("bookmark.list", "Bookmark: List", "Open the [Bookmarks] buffer", cmdBookmarkList, null);
-        try R.register("bookmark.clear_all", "Bookmark: Clear All", "Remove every set bookmark for this project", cmdBookmarkClearAll, null);
+        try R.register("bookmark.list", "Bookmark: List", "Open the [Bookmarks] buffer", Wrap(BookmarkCommands.cmdBookmarkList).run, null);
+        try R.register("bookmark.clear_all", "Bookmark: Clear All", "Remove every set bookmark for this project", Wrap(BookmarkCommands.cmdBookmarkClearAll).run, null);
 
         try R.register("lsp.format", "LSP: Format Document", "Format the entire file using zls", Wrap(LspCommands.cmdLspFormatDocument).run, null);
-        try R.register("lsp.format_selection", "LSP: Format Selection", "Format the visual selection (or current line) via textDocument/rangeFormatting", cmdLspFormatSelection, null);
-        try R.register("lsp.code_action", "LSP: Code Actions", "Show available code actions at the cursor (Space .)", cmdLspCodeAction, null);
+        try R.register("lsp.format_selection", "LSP: Format Selection", "Format the visual selection (or current line) via textDocument/rangeFormatting", Wrap(LspCommands.cmdLspFormatSelection).run, null);
+        try R.register("lsp.code_action", "LSP: Code Actions", "Show available code actions at the cursor (Space .)", Wrap(LspCommands.cmdLspCodeAction).run, null);
         try R.register("lsp.definition", "LSP: Go to Definition", "Jump to symbol definition", Wrap(LspCommands.cmdLspGoToDefinition).run, null);
         try R.register("lsp.diagnostics", "LSP: Show Diagnostics", "List all errors/warnings for current file", Wrap(LspCommands.cmdLspShowDiagnostics).run, null);
         try R.register("lsp.restart", "LSP: Restart Server", "Force restart the embedded zls instance", Wrap(LspCommands.cmdLspRestartServer).run, null);
         try R.register("lsp.prewarm", "LSP: Prewarm Workspace", "Scan the workspace and start servers for every detected language", Wrap(LspCommands.cmdLspPrewarm).run, null);
         try R.register("lsp.hover", "LSP: Hover", "Trigger hover information for symbol under cursor", Wrap(LspCommands.cmdLspHover).run, null);
         try R.register("lsp.references", "LSP: Find References", "Find all references to symbol under cursor", Wrap(LspCommands.cmdLspFindReferences).run, null);
-        try R.register("lsp.workspace_symbols", "LSP: Workspace Symbols", "Fuzzy find symbols across the workspace via LSP", cmdWorkspaceSymbols, null);
+        try R.register("lsp.workspace_symbols", "LSP: Workspace Symbols", "Fuzzy find symbols across the workspace via LSP", Wrap(LspCommands.cmdWorkspaceSymbols).run, null);
         try R.register("lsp.toggle_format_on_save", "LSP: Toggle Format on Save", "Run the LSP formatter automatically before each save", Wrap(ToggleCommands.cmdLspToggleFormatOnSave).run, null);
         try R.register("editor.toggle_inline_diagnostics", "Editor: Toggle Inline Diagnostics", "Show diagnostic messages inline at end-of-line on every affected line (\"error lens\")", Wrap(ToggleCommands.cmdEditorToggleInlineDiagnostics).run, null);
         try R.register("editor.toggle_inlay_hints", "Editor: Toggle Inlay Hints", "Render LSP inlay hints (type annotations, param names) as dim virtual text", Wrap(ToggleCommands.cmdEditorToggleInlayHints).run, null);
@@ -1737,6 +1590,15 @@ pub const Core = struct {
                         // flash decorations across the viewport.
                         self.maybeRefreshWordHighlight();
 
+                        // Auto-cancel a leader chord that's been sitting
+                        // armed past `leader_pending_timeout_ms` —
+                        // matches vim's `timeoutlen`. Without this, a
+                        // chord left dangling (user walked away mid-
+                        // chord, lost focus, hit Space accidentally,
+                        // etc.) stays armed and surprises the next
+                        // keystroke they make.
+                        self.maybeTimeoutLeaderChord();
+
                         // Hover and which-key are both user-driven —
                         // the auto-hover idle timer used to fire
                         // here, but it stole focus on small terminals
@@ -1899,7 +1761,7 @@ pub const Core = struct {
                                 defer self.lsp_manager.freeReferences(refs);
 
                                 if (refs.len > 0) {
-                                    self.openReferencesPicker(refs) catch |err| {
+                                    ReferencesPicker.open(self, refs) catch |err| {
                                         log.warn("Failed to open references picker: {}", .{err});
                                         self.setStatusLiteralLeveled(.err, "Failed to load references", 2000);
                                     };
@@ -2132,7 +1994,7 @@ pub const Core = struct {
                         switch (self.mode) {
                             .log_view => {},
                             .select => {
-                                const result = self.handleSelectInput(key) catch |err| {
+                                const result = input.select.handle(self, key) catch |err| {
                                     if (err == error.UserQuit) {
                                         // best-effort: shutting down anyway; UI may have already exited
                                         self.sendQuitToUI() catch {};
@@ -2145,81 +2007,81 @@ pub const Core = struct {
                                 }
                             },
                             .visual => {
-                                if (try self.handleVisualInput(key)) {
+                                if (try input.visual.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .insert => {
-                                if (try self.handleInsertInput(key)) {
+                                if (try input.insert.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .view => {
-                                if (try self.handleViewInput(key)) {
+                                if (try input.view.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .terminal => {
-                                try self.handleTerminalInput(key);
+                                try input.terminal.handle(self, key);
                                 try self.sendUpdate();
                             },
                             .file_picker => {
-                                if (try self.handleFilePickerInput(key)) {
+                                if (try input.file_picker.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .file_explorer => {
-                                if (try self.handleFileExplorerInput(key)) {
+                                if (try input.file_explorer.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .references_picker => {
-                                if (try self.handleReferencesPickerInput(key)) {
+                                if (try ReferencesPicker.handleInput(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .diagnostics_picker => {
-                                if (try self.handleDiagnosticsPickerInput(key)) {
+                                if (try DiagnosticsPicker.handleInput(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .buffer_picker => {
-                                if (try self.handleBufferPickerInput(key)) {
+                                if (try input.buffer_picker.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .save_as_mode => {
-                                if (try self.handleSaveAsInput(key)) {
+                                if (try input.save_as.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .visual_search => {
-                                if (try self.handleVisualSearchInput(key)) {
+                                if (try input.visual_search.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .command_palette => {
-                                if (try self.handleCommandPaletteInput(key)) {
+                                if (try input.command_palette.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .go_to_line => {
-                                if (try self.handleGoToLineInput(key)) {
+                                if (try input.go_to_line.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .symbol_picker => {
-                                if (try self.handleSymbolPickerInput(key)) {
+                                if (try input.symbol_picker.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .workspace_symbol_picker => {
-                                if (try self.handleWorkspaceSymbolPickerInput(key)) {
+                                if (try input.workspace_symbol_picker.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
                             .global_search => {
-                                if (try self.handleGlobalSearchInput(key)) {
+                                if (try input.global_search.handle(self, key)) {
                                     try self.sendUpdate();
                                 }
                             },
@@ -2502,772 +2364,10 @@ pub const Core = struct {
         }
     }
 
-    fn handleSelectInput(self: *Core, key: vaxis.Key) !bool {
-        // Esc clears all transient select-mode state — multi-cursors,
-        // pending chord prefixes, the nav repeat count — so the user
-        // can always bail back to a clean slate.
-        if (key.matches(vaxis.Key.escape, .{})) {
-            if (self.multi_cursors.items.len > 0) {
-                self.clearMultiCursors();
-            }
-            self.bracket_pending = null;
-            self.bookmark_set_pending = false;
-            self.bookmark_jump_pending = false;
-            self.text_object_state = .none;
-            self.nav_repeat_count = 0;
-            return true;
-        }
+    // handleSelectInput → kernel/input/select.zig
 
-        // Text-object chord: `s i <c>` selects inside, `s a <c>` selects
-        // around. Each follow-up advances the state machine; any
-        // non-matching key cancels.
-        switch (self.text_object_state) {
-            .none => {},
-            .s_seen => {
-                self.text_object_state = .none;
-                if (key.matches('i', .{})) {
-                    self.text_object_state = .inside_pending;
-                    return true;
-                }
-                if (key.matches('a', .{})) {
-                    self.text_object_state = .around_pending;
-                    return true;
-                }
-                if (key.matches('d', .{})) {
-                    self.text_object_state = .surround_delete_pending;
-                    return true;
-                }
-                if (key.matches('r', .{})) {
-                    self.text_object_state = .surround_replace_old_pending;
-                    return true;
-                }
-                // Cancel; fall through to normal handling.
-            },
-            .inside_pending, .around_pending => {
-                const around = self.text_object_state == .around_pending;
-                self.text_object_state = .none;
-                if (key.codepoint > 0 and key.codepoint < 0x80) {
-                    try self.selectTextObject(@intCast(key.codepoint), around);
-                    return true;
-                }
-                // Non-ASCII or modified key cancels the chord.
-            },
-            .surround_delete_pending => {
-                self.text_object_state = .none;
-                if (key.codepoint > 0 and key.codepoint < 0x80) {
-                    try self.deleteSurround(@intCast(key.codepoint));
-                    return true;
-                }
-            },
-            .surround_replace_old_pending => {
-                if (key.codepoint > 0 and key.codepoint < 0x80) {
-                    self.surround_replace_old = @intCast(key.codepoint);
-                    self.text_object_state = .surround_replace_new_pending;
-                    return true;
-                }
-                self.text_object_state = .none;
-            },
-            .surround_replace_new_pending => {
-                const old = self.surround_replace_old;
-                self.text_object_state = .none;
-                if (key.codepoint > 0 and key.codepoint < 0x80) {
-                    try self.replaceSurround(old, @intCast(key.codepoint));
-                    return true;
-                }
-            },
-            .surround_add_pending => {
-                // `S <c>` is a visual-mode chord; if we end up here in
-                // select mode (mode switched mid-chord), cancel safely.
-                self.text_object_state = .none;
-            },
-        }
 
-        // `m<a-z>` sets the bookmark slot, `'<a-z>` jumps to it. Both
-        // are one-shot chords; any non-matching follow-up cancels.
-        if (self.bookmark_set_pending) {
-            self.bookmark_set_pending = false;
-            if (key.codepoint >= 'a' and key.codepoint <= 'z' and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
-                try self.setBookmark(@intCast(key.codepoint));
-                return true;
-            }
-            // Fall through — unknown follow-up dispatches normally.
-        }
-        if (self.bookmark_jump_pending) {
-            self.bookmark_jump_pending = false;
-            if (key.codepoint >= 'a' and key.codepoint <= 'z' and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
-                try self.jumpToBookmark(@intCast(key.codepoint));
-                return true;
-            }
-            // Fall through — unknown follow-up dispatches normally.
-        }
-
-        // Code-action picker: a digit picks an action; anything else
-        // (Esc, letter, navigation) dismisses the pending list.
-        if (self.code_action_pending) |list| {
-            if (key.codepoint >= '1' and key.codepoint <= '9' and !key.mods.ctrl and !key.mods.alt and !key.mods.super) {
-                const idx: usize = @intCast(key.codepoint - '1');
-                if (idx < list.len) {
-                    const chosen = list[idx];
-                    // Take ownership: clear the slot so the apply
-                    // callback can't see a half-freed list if it
-                    // re-enters the dispatcher.
-                    self.code_action_pending = null;
-                    defer self.lsp_manager.freeCodeActions(list);
-                    self.applyCodeAction(chosen) catch |err| {
-                        self.setStatus("Code action apply failed: {}", .{err}, 3000);
-                    };
-                    return true;
-                }
-            }
-            // Any other key (Esc, letter, etc.) cancels the chord.
-            self.lsp_manager.freeCodeActions(list);
-            self.code_action_pending = null;
-            self.setStatusLiteralLeveled(.info, "Code actions: cancelled", 1000);
-            // Fall through — let the key do its normal job.
-        }
-
-        // `]d` / `[d` jump to next/previous diagnostic. The bracket prefix
-        // is a one-shot — any non-matching follow-up cancels it.
-        if (self.bracket_pending) |prefix| {
-            self.bracket_pending = null;
-            if (key.matches('d', .{})) {
-                try self.jumpToDiagnostic(prefix == ']');
-                return true;
-            }
-            // `]g` / `[g` — next/previous git diff hunk in this buffer.
-            if (key.matches('g', .{})) {
-                try self.jumpToHunk(prefix == ']');
-                return true;
-            }
-            // Tree-sitter AST motions:
-            //   `]s` / `[s` — next/previous sibling
-            //   `]m` / `[m` — next/previous function or method
-            if (key.matches('s', .{})) {
-                if (try self.jumpToSibling(prefix == ']')) return true;
-                return true;
-            }
-            if (key.matches('m', .{})) {
-                if (try self.jumpToFunction(prefix == ']')) return true;
-                return true;
-            }
-            // Fall through and let the new key be dispatched normally.
-        }
-        if (key.matches(']', .{}) and !self.leader_pending) {
-            self.bracket_pending = ']';
-            return true;
-        }
-        if (key.matches('[', .{}) and !self.leader_pending) {
-            self.bracket_pending = '[';
-            return true;
-        }
-        if (self.leader_pending) {
-            // Plugin keybindings: manifests can declare a
-            // chord like `"keybinding": "Space g s"`. We accumulate
-            // ASCII keystrokes into `plugin_chord_buf` (after the
-            // leader) and consult the manager. Exact match runs the
-            // command; prefix match keeps the leader open; otherwise
-            // we fall through to the built-in chord switch.
-            if (key.codepoint > 0 and key.codepoint < 0x80) {
-                const ch: u8 = @intCast(key.codepoint);
-                self.plugin_chord_buf.append(self.allocator, ch) catch {};
-                // Build "Space <buf>" with spaces between chars.
-                var seq: std.ArrayListUnmanaged(u8) = .empty;
-                defer seq.deinit(self.allocator);
-                seq.appendSlice(self.allocator, "Space") catch {};
-                for (self.plugin_chord_buf.items) |c| {
-                    seq.append(self.allocator, ' ') catch {};
-                    seq.append(self.allocator, c) catch {};
-                }
-                if (self.plugin_manager.lookupKeybind(seq.items)) |cmd_id| {
-                    self.syncPaneToState();
-                    self.command_registry.execute(cmd_id, self) catch |err| {
-                        log.warn("plugin keybind '{s}' exec failed: {s}", .{ cmd_id, @errorName(err) });
-                    };
-                    self.plugin_chord_buf.clearRetainingCapacity();
-                    self.leader_pending = false;
-                    return true;
-                }
-                if (self.plugin_manager.isKeybindPrefix(seq.items)) {
-                    // Prefix match — keep leader open for the next char.
-                    return true;
-                }
-                // No plugin match — drop the chord buffer and fall
-                // through to the built-in leader switch below.
-                self.plugin_chord_buf.clearRetainingCapacity();
-            }
-
-            if (key.codepoint >= '0' and key.codepoint <= '9') {
-                try self.leader_number_input.append(self.allocator, @intCast(key.codepoint));
-
-                const num_str = self.leader_number_input.items;
-                const buf_num = std.fmt.parseInt(usize, num_str, 10) catch 0;
-                const total_buffers = self.buffer_manager.buffers.items.len;
-
-                if (buf_num > 0 and buf_num <= total_buffers) {
-                    const next_possible = buf_num * 10;
-                    if (next_possible > total_buffers) {
-                        self.leader_number_input.clearRetainingCapacity();
-                        self.buffer_manager.switchTo(buf_num - 1);
-                        self.refreshSyntaxForCurrentBuffer();
-                        if (self.split_manager) |*sm| sm.setFocusedBuffer(self.buffer_manager.active_index);
-                        return true;
-                    }
-                }
-
-                return true;
-            }
-
-            if (self.leader_number_input.items.len > 0) {
-                const num_str = self.leader_number_input.items;
-                const buf_num = std.fmt.parseInt(usize, num_str, 10) catch 0;
-                self.leader_number_input.clearRetainingCapacity();
-
-                if (buf_num > 0 and buf_num <= self.buffer_manager.buffers.items.len) {
-                    self.buffer_manager.switchTo(buf_num - 1);
-                    self.refreshSyntaxForCurrentBuffer();
-                    if (self.split_manager) |*sm| sm.setFocusedBuffer(self.buffer_manager.active_index);
-                }
-                return true;
-            }
-
-            log.debug("Leader action key: codepoint={d} ('{c}') shift={} chord={?c}", .{ key.codepoint, @as(u8, @intCast(key.codepoint & 0xFF)), key.mods.shift, self.leader_chord });
-
-            // 1. Esc cancels the chord (and any pending sub-chord).
-            if (key.matches(vaxis.Key.escape, .{})) {
-                self.leader_pending = false;
-                self.leader_chord = null;
-                self.leader_help_requested = false;
-                return true;
-            }
-
-            // 2. Which-key popup toggle. Honored even mid-chord so
-            //    the user can peek at the sub-bindings of an LSP /
-            //    git / window prefix. Three keystroke shapes work:
-            //    `;` (unambiguous), `?` (universal convention), and
-            //    `/` with shift (some terminals deliver Shift+/ that
-            //    way). Does NOT clear leader_pending — the popup is
-            //    informational, the chord stays armed.
-            if (key.codepoint == Keys.action_which_key or
-                key.codepoint == Keys.action_which_key_alt or
-                (key.codepoint == '/' and key.mods.shift))
-            {
-                self.leader_help_requested = !self.leader_help_requested;
-                return true;
-            }
-
-            // 3. If we're inside a sub-chord (`Space l <key>`), the
-            //    incoming key is the sub-action. Dispatch, clear the
-            //    sub-chord, but keep leader_pending true so the user
-            //    can chain (`Space l d l h` → def then hover).
-            if (self.leader_chord) |prefix| {
-                try self.handleLeaderChordKey(prefix, key);
-                self.leader_chord = null;
-                self.leader_help_requested = false;
-                return true;
-            }
-
-            // 4. Chord-prefix detection. Enter the sub-state and
-            //    wait for the next key. The which-key popup will
-            //    auto-update to show this chord's contents.
-            if (key.codepoint == Keys.chord_lsp or
-                key.codepoint == Keys.chord_git or
-                key.codepoint == Keys.chord_window or
-                key.codepoint == Keys.chord_toggle)
-            {
-                self.leader_chord = @intCast(key.codepoint);
-                return true;
-            }
-
-            // 5. Top-level single-step actions.
-            switch (key.codepoint) {
-                Keys.action_save => try self.saveCurrentFile(),
-                // `Space f` retired. `Space e` is the single
-                // entry point for the file explorer; `f` is left
-                // unbound (free for a future feature). Cmd/Ctrl+O
-                // still works as the global "open" shortcut.
-                Keys.action_buffer => {
-                    self.recordJumpFromCurrent();
-                    self.previous_mode = self.mode;
-                    self.mode = .buffer_picker;
-                    self.buffer_manager.pickerReset();
-                    self.buffer_picker_number_input.clearRetainingCapacity();
-                    self.leader_pending = false;
-                },
-                Keys.action_file_explorer => {
-                    try self.openFileExplorer();
-                    self.leader_pending = false;
-                },
-                Keys.action_quit => return error.UserQuit,
-                Keys.action_close => self.closeCurrentPaneOrBuffer(),
-                Keys.action_next => {
-                    const s = self.state();
-                    if (s.file_path) |path| {
-                        self.jump_list.recordJump(path, s.cursor_row, s.cursor_col) catch |err| {
-                            log.debug("Failed to record jump location: {}", .{err});
-                        };
-                    }
-                    self.syncStateToPane();
-                    self.buffer_manager.nextBuffer();
-                    self.refreshSyntaxForCurrentBuffer();
-                    if (self.split_manager) |*sm| sm.setFocusedBuffer(self.buffer_manager.active_index);
-                    self.syncPaneToState();
-                },
-                Keys.action_prev => {
-                    const s = self.state();
-                    if (s.file_path) |path| {
-                        self.jump_list.recordJump(path, s.cursor_row, s.cursor_col) catch |err| {
-                            log.debug("Failed to record jump location: {}", .{err});
-                        };
-                    }
-                    self.syncStateToPane();
-                    self.buffer_manager.prevBuffer();
-                    self.refreshSyntaxForCurrentBuffer();
-                    if (self.split_manager) |*sm| sm.setFocusedBuffer(self.buffer_manager.active_index);
-                    self.syncPaneToState();
-                },
-
-                Keys.action_help => {
-                    try self.openVirtualBuffer("[HELP]", Help.help_text);
-                    self.leader_pending = false;
-                },
-                Keys.action_palette, Keys.action_palette_alt => {
-                    self.previous_mode = self.mode;
-                    self.mode = .command_palette;
-                    self.command_palette_input.clearRetainingCapacity();
-                    self.command_palette_results.clearRetainingCapacity();
-                    try self.command_registry.search("", &self.command_palette_results, self.allocator);
-                    self.command_palette_selected = 0;
-                    self.leader_pending = false;
-                },
-                Keys.action_undo => try EditCommands.cmdEditUndo(self),
-                Keys.action_redo => try EditCommands.cmdEditRedo(self),
-                Keys.action_jobs => try SystemCommands.cmdJobList(self),
-                Keys.action_copy => try EditCommands.cmdEditCopy(self),
-                Keys.action_cut => try EditCommands.cmdEditCut(self),
-                Keys.action_paste => try EditCommands.cmdEditPaste(self),
-
-                Keys.action_code_action => try cmdLspCodeAction(self, null),
-                Keys.action_center_view => {
-                    // Center view edits scroll_offset on the buffer
-                    // state. In split mode the pane has its *own*
-                    // scroll_offset that masks the buffer's; sync
-                    // before/after so the scroll is actually visible.
-                    self.syncStateToPane();
-                    try NavCommands.cmdNavCenterView(self);
-                    self.syncPaneToState();
-                },
-                Keys.action_bookmarks => {
-                    // Opens the [Bookmarks] view from the leader so
-                    // users following the `Space <letter>` convention
-                    // can reach bookmarks without remembering the
-                    // direct `m<a-z>` chord. Direct chord still works.
-                    try self.openBookmarksBuffer();
-                    self.leader_pending = false;
-                },
-
-                Keys.action_jump_back => try cmdJumpBack(self, null),
-                Keys.action_jump_forward => try cmdJumpForward(self, null),
-
-                // Top-level split shortcuts — `Space -` / `Space |`
-                // are common enough to deserve a single-step
-                // binding alongside the `Space w` chord.
-                Keys.action_split_horizontal => try SplitCommands.cmdSplitHorizontal(self),
-                Keys.action_split_vertical => try SplitCommands.cmdSplitVertical(self),
-
-                Keys.action_global_search => {
-                    self.previous_mode = self.mode;
-                    self.mode = .global_search;
-                    self.global_search_query.clearRetainingCapacity();
-                    self.global_search_replace.clearRetainingCapacity();
-                    self.global_search_selected_file = 0;
-                    self.global_search_selected_match = 0;
-                    self.global_search_focus_replace = false;
-                    self.clearGlobalSearchResults();
-                    self.global_search_ran = false;
-                    self.leader_pending = false;
-                },
-
-                vaxis.Key.left => {
-                    self.focusPaneLeft();
-                    self.leader_pending = false;
-                },
-                vaxis.Key.right => {
-                    self.focusPaneRight();
-                    self.leader_pending = false;
-                },
-                vaxis.Key.up => {
-                    self.focusPaneUp();
-                    self.leader_pending = false;
-                },
-                vaxis.Key.down => {
-                    self.focusPaneDown();
-                    self.leader_pending = false;
-                },
-
-                else => {
-                    // Unknown leader key — bail out of the chord
-                    // so the user can start fresh without Esc.
-                    self.leader_pending = false;
-                    self.leader_help_requested = false;
-                },
-            }
-            return true;
-        }
-
-        if (key.codepoint >= '0' and key.codepoint <= '9' and !key.mods.alt and !key.mods.ctrl and !key.mods.super) {
-            const digit = key.codepoint - '0';
-            if (digit == 0 and self.nav_repeat_count == 0) {
-                const s = self.state();
-                s.cursor_col = 0;
-                return true;
-            }
-            self.nav_repeat_count = self.nav_repeat_count * 10 + digit;
-            return true;
-        }
-
-        const count = if (self.nav_repeat_count > 0) self.nav_repeat_count else 1;
-        self.nav_repeat_count = 0;
-
-        if (key.matches(Keys.leader, .{})) {
-            self.leader_pending = true;
-            self.leader_help_requested = false;
-            // Toast the hint so the user knows the chord is open and
-            // there's a way to see all the bindings without trial
-            // and error. Short enough to never get in the way.
-            self.setStatusLiteralLeveled(.info, "Space ; for command help", 1500);
-            return true;
-        }
-
-        if (key.matches(Keys.save.codepoint, Keys.save.mods)) {
-            try self.saveCurrentFile();
-            return true;
-        }
-        if (key.matches(Keys.open.codepoint, Keys.open.mods)) {
-            try self.openFileExplorer();
-            return true;
-        }
-        if (key.matches(Keys.quit.codepoint, Keys.quit.mods)) {
-            return error.UserQuit;
-        }
-        if (key.matches(Keys.close_buffer.codepoint, Keys.close_buffer.mods)) {
-            log.info("Cmd+W pressed", .{});
-            if (self.split_manager) |*sm| {
-                log.info("split_manager exists, hasSplits={}", .{sm.hasSplits()});
-                log.info("focused_pane_id={}, countPanes={}", .{ sm.getFocusedPaneId(), sm.countPanes() });
-                if (sm.hasSplits()) {
-                    self.syncStateToPane();
-                    sm.closePane();
-                    log.info("After closePane: hasSplits={}, countPanes={}", .{ sm.hasSplits(), sm.countPanes() });
-                    self.syncPaneToState();
-                    const remaining_pane = sm.getFocusedPane();
-                    log.info("remaining_pane id={}, buffer_index={}", .{ remaining_pane.id, remaining_pane.buffer_index });
-                    if (remaining_pane.buffer_index < self.buffer_manager.buffers.items.len) {
-                        self.buffer_manager.active_index = remaining_pane.buffer_index;
-                        log.info("Set buffer_manager.active_index={}", .{self.buffer_manager.active_index});
-                    }
-                    if (!sm.hasSplits()) {
-                        log.info("No more splits, deiniting split_manager", .{});
-                        sm.deinit();
-                        self.split_manager = null;
-                    }
-                } else {
-                    log.info("hasSplits=false, deiniting", .{});
-                    const pane = sm.getFocusedPane();
-                    if (pane.buffer_index < self.buffer_manager.buffers.items.len) {
-                        self.buffer_manager.active_index = pane.buffer_index;
-                    }
-                    sm.deinit();
-                    self.split_manager = null;
-                }
-                log.info("Calling sendUpdate, split_manager null={}", .{self.split_manager == null});
-                try self.sendUpdate();
-            } else {
-                log.info("No split_manager, closing active buffer", .{});
-                _ = self.buffer_manager.closeActive();
-            }
-            return true;
-        }
-        if (key.matches(Keys.next_buffer.codepoint, Keys.next_buffer.mods)) {
-            self.syncStateToPane();
-            self.buffer_manager.nextBuffer();
-            self.refreshSyntaxForCurrentBuffer();
-            if (self.split_manager) |*sm| sm.setFocusedBuffer(self.buffer_manager.active_index);
-            self.syncPaneToState();
-            return true;
-        }
-        if (key.matches(Keys.prev_buffer.codepoint, Keys.prev_buffer.mods)) {
-            self.syncStateToPane();
-            self.buffer_manager.prevBuffer();
-            self.refreshSyntaxForCurrentBuffer();
-            if (self.split_manager) |*sm| sm.setFocusedBuffer(self.buffer_manager.active_index);
-            self.syncPaneToState();
-            return true;
-        }
-
-        if (key.matches(Keys.mode_view, .{})) {
-            self.mode = .view;
-            return true;
-        }
-        if (key.matches(Keys.mode_insert, .{})) {
-            self.mode = .insert;
-            return true;
-        }
-        if (key.matches('v', .{})) {
-            self.mode = .visual;
-            const s = self.state();
-            s.selection_anchor = .{ .row = s.cursor_row, .col = s.cursor_col };
-            return true;
-        }
-        // `V` selects the smallest AST node under the cursor — entry
-        // point for tree-sitter aware visual editing. `+` / `-` in
-        // visual mode then expand or shrink the selection.
-        if (key.matches('V', .{})) {
-            const s = self.state();
-            if (self.syntax_manager.selectCurrentNode(s.cursor_row, s.cursor_col)) |sel| {
-                s.selection_anchor = .{ .row = sel.start_line, .col = sel.start_col };
-                s.cursor_row = sel.end_line;
-                s.cursor_col = sel.end_col;
-                self.mode = .visual;
-                return true;
-            }
-            // Fallthrough: no tree, leave to normal handling.
-        }
-        if (key.matches(Keys.mode_terminal, .{})) {
-            self.mode = .terminal;
-            self.terminal_input.clearRetainingCapacity();
-            return true;
-        }
-
-        if (self.split_manager) |*sm| {
-            if (key.matches('h', .{ .ctrl = true })) {
-                self.syncStateToPane();
-                sm.focusLeft();
-                self.syncPaneToState();
-                self.invalidatePaneHeightCache();
-                return true;
-            }
-            if (key.matches('l', .{ .ctrl = true })) {
-                self.syncStateToPane();
-                sm.focusRight();
-                self.syncPaneToState();
-                self.invalidatePaneHeightCache();
-                return true;
-            }
-            if (key.matches('k', .{ .ctrl = true })) {
-                self.syncStateToPane();
-                sm.focusUp();
-                self.syncPaneToState();
-                self.invalidatePaneHeightCache();
-                return true;
-            }
-            if (key.matches('j', .{ .ctrl = true })) {
-                self.syncStateToPane();
-                sm.focusDown();
-                self.syncPaneToState();
-                self.invalidatePaneHeightCache();
-                return true;
-            }
-        }
-
-        if (key.matches(vaxis.Key.left, .{}) or key.matches(Keys.nav_left, .{})) {
-            const s = self.state();
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorLeftGrapheme();
-            return true;
-        }
-        if (key.matches(vaxis.Key.right, .{}) or key.matches(Keys.nav_right, .{})) {
-            const s = self.state();
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorRightGrapheme();
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{}) or key.matches(Keys.nav_down, .{})) {
-            self.state().moveCursorDown(count);
-            return true;
-        }
-        if (key.matches(vaxis.Key.up, .{}) or key.matches(Keys.nav_up, .{})) {
-            self.state().moveCursorUp(count);
-            return true;
-        }
-        if (key.matches(vaxis.Key.page_down, .{})) {
-            self.state().moveCursorDown(20 * count);
-            self.scroll_in_progress = true;
-            self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
-            return true;
-        }
-        if (key.matches(vaxis.Key.page_up, .{})) {
-            self.state().moveCursorUp(20 * count);
-            self.scroll_in_progress = true;
-            self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
-            return true;
-        }
-        if (key.matches(vaxis.Key.home, .{})) {
-            self.state().moveCursorToLineStart();
-            return true;
-        }
-        if (key.matches(vaxis.Key.end, .{})) {
-            self.state().moveCursorToLineEnd();
-            return true;
-        }
-
-        // Bookmark chord triggers. `m` opens the set chord; `'` opens
-        // the jump chord. The follow-up letter resolves both.
-        if (key.matches('m', .{})) {
-            self.bookmark_set_pending = true;
-            self.setStatusLiteralLeveled(.info, "Set bookmark: a-z", 2000);
-            return true;
-        }
-        if (key.matches('\'', .{})) {
-            self.bookmark_jump_pending = true;
-            self.setStatusLiteralLeveled(.info, "Jump to bookmark: a-z", 2000);
-            return true;
-        }
-
-        // Text-object trigger. `s` starts the chord; `i <c>` / `a <c>`
-        // resolve it.
-        if (key.matches('s', .{})) {
-            self.text_object_state = .s_seen;
-            self.setStatusLiteralLeveled(.info, "Select: i<c>=inside, a<c>=around (w W p \" ' ` ( [ { <)", 2500);
-            return true;
-        }
-
-        // Multi-cursor: add next occurrence of the word under cursor
-        // (or current selection in visual mode) as a secondary cursor.
-        if (key.matches('d', .{ .ctrl = true })) {
-            try self.addNextOccurrence();
-            return true;
-        }
-
-        // Word motions: vim-style w/b/e for word boundaries (mixing
-        // identifier and punctuation runs), W/B for WORD boundaries
-        // (whitespace-separated). `e` lands on the last char of a word.
-        if (key.matches('w', .{})) {
-            const s = self.state();
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorNextWord();
-            return true;
-        }
-        if (key.matches('b', .{})) {
-            const s = self.state();
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorPrevWord();
-            return true;
-        }
-        if (key.matches('e', .{})) {
-            const s = self.state();
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorNextWordEnd();
-            return true;
-        }
-        if (key.matches('W', .{ .shift = true })) {
-            const s = self.state();
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorNextBigWord();
-            return true;
-        }
-        if (key.matches('B', .{ .shift = true })) {
-            const s = self.state();
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorPrevBigWord();
-            return true;
-        }
-
-        // Paragraph jumps: `}` next blank-line-separated block, `{` previous.
-        if (key.matches('}', .{ .shift = true })) {
-            const s = self.state();
-            var i: usize = 0;
-            while (i < count) : (i += 1) s.moveCursorNextParagraph();
-            return true;
-        }
-        if (key.matches('{', .{ .shift = true })) {
-            const s = self.state();
-            var i: usize = 0;
-            while (i < count) : (i += 1) s.moveCursorPrevParagraph();
-            return true;
-        }
-
-        if (key.matches('%', .{ .shift = true })) {
-            // Bracket jump can travel many lines; record the start
-            // so the user can Space , back.
-            self.recordJumpFromCurrent();
-            try NavCommands.cmdNavMatchBracket(self);
-            return true;
-        }
-
-        // Vim-convention jump-list aliases. `Ctrl+O` walks back
-        // through `jump_list`, `Ctrl+I` walks forward. Equivalent
-        // to `Space ,` / `Space .` — present so users with vim/
-        // helix muscle memory don't have to relearn the leader.
-        if (key.matches('o', .{ .ctrl = true })) {
-            try cmdJumpBack(self, null);
-            return true;
-        }
-        if (key.matches('i', .{ .ctrl = true })) {
-            try cmdJumpForward(self, null);
-            return true;
-        }
-
-        if (key.matches(Keys.search_next, .{})) {
-            if (self.last_search_query.items.len > 0) {
-                const s = self.state();
-                const query = self.last_search_query.items;
-                const start_offset = s.getOffsetFromCursor() + 1;
-
-                if (try s.buffer.find(query, start_offset)) |found_offset| {
-                    s.updateCursorFromOffset(found_offset);
-                    s.preferred_col = null;
-                    self.setStatus("Next match: {s}", .{query}, 1500);
-                } else if (try s.buffer.find(query, 0)) |found_offset| {
-                    s.updateCursorFromOffset(found_offset);
-                    s.preferred_col = null;
-                    self.setStatusLeveled(.info, "Search wrapped to top: {s}", .{query}, 1500);
-                } else {
-                    self.setStatusLeveled(.warning, "No match for {s}", .{query}, 1500);
-                }
-            } else {
-                self.setStatusLiteralLeveled(.info, "No previous search", 1500);
-            }
-            return true;
-        }
-        if (key.matches(Keys.search_prev, .{})) {
-            if (self.last_search_query.items.len > 0) {
-                const s = self.state();
-                const query = self.last_search_query.items;
-                const end_offset = s.getOffsetFromCursor();
-
-                if (try s.buffer.findLast(query, end_offset)) |found_offset| {
-                    s.updateCursorFromOffset(found_offset);
-                    s.preferred_col = null;
-                    self.setStatus("Previous match: {s}", .{query}, 1500);
-                } else blk: {
-                    const len = s.buffer.totalLength();
-                    if (try s.buffer.findLast(query, len)) |found_offset| {
-                        s.updateCursorFromOffset(found_offset);
-                        s.preferred_col = null;
-                        self.setStatusLeveled(.info, "Search wrapped to bottom: {s}", .{query}, 1500);
-                        break :blk;
-                    }
-                    self.setStatusLeveled(.warning, "No match for {s}", .{query}, 1500);
-                }
-            } else {
-                self.setStatusLiteralLeveled(.info, "No previous search", 1500);
-            }
-            return true;
-        }
-
-        if (key.matches('/', .{})) {
-            try self.enterIncrementalSearch(.select, .forward);
-            return true;
-        }
-        if (key.matches('?', .{ .shift = true })) {
-            try self.enterIncrementalSearch(.select, .backward);
-            return true;
-        }
-
-        return false;
-    }
-
-    fn enterIncrementalSearch(self: *Core, prev_mode: protocol.Mode, direction: enum { forward, backward }) !void {
+    pub fn enterIncrementalSearch(self: *Core, prev_mode: protocol.Mode, direction: enum { forward, backward }) !void {
         self.previous_mode = prev_mode;
         self.mode = .visual_search;
         self.search_input.clearRetainingCapacity();
@@ -3279,275 +2379,15 @@ pub const Core = struct {
         self.search_match_index = 0;
     }
 
-    fn handleVisualInput(self: *Core, key: vaxis.Key) !bool {
-        // Text-object chord: in visual mode, `i <c>` / `a <c>` extend
-        // the selection to the inside/around of the named object.
-        // Matches vim's standard visual-mode bindings.
-        switch (self.text_object_state) {
-            .inside_pending, .around_pending => {
-                const around = self.text_object_state == .around_pending;
-                self.text_object_state = .none;
-                if (key.codepoint > 0 and key.codepoint < 0x80) {
-                    try self.selectTextObject(@intCast(key.codepoint), around);
-                    return true;
-                }
-            },
-            else => {},
-        }
-        if (key.matches('i', .{})) {
-            self.text_object_state = .inside_pending;
-            return true;
-        }
-        if (key.matches('a', .{})) {
-            self.text_object_state = .around_pending;
-            return true;
-        }
+    // handleVisualInput → kernel/input/visual.zig
 
-        // Surround-add chord: `S <c>` wraps the current selection
-        // with the matching pair for <c>. Single delimiter (")` or
-        // bracket-style pair (( → ( … )).
-        if (self.text_object_state == .none and key.matches('S', .{ .shift = true })) {
-            self.text_object_state = .surround_add_pending;
-            return true;
-        }
-        // Multi-cursor: Ctrl+D in visual mode uses the selection as
-        // the seed query for next-occurrence search.
-        if (key.matches('d', .{ .ctrl = true })) {
-            try self.addNextOccurrence();
-            return true;
-        }
-        if (self.text_object_state == .surround_add_pending) {
-            self.text_object_state = .none;
-            if (key.codepoint > 0 and key.codepoint < 0x80) {
-                try self.addSurround(@intCast(key.codepoint));
-                return true;
-            }
-        }
-
-        if (key.matches(vaxis.Key.delete, .{}) or key.matches(vaxis.Key.backspace, .{})) {
-            const s = self.state();
-
-            var start_row: usize = s.cursor_row;
-            var start_col: usize = s.cursor_col;
-            var end_row: usize = s.cursor_row;
-            var end_col: usize = s.cursor_col;
-
-            if (s.selection_anchor) |anchor| {
-                if (anchor.row < s.cursor_row or (anchor.row == s.cursor_row and anchor.col <= s.cursor_col)) {
-                    start_row = anchor.row;
-                    start_col = anchor.col;
-                    end_row = s.cursor_row;
-                    end_col = s.cursor_col;
-                } else {
-                    start_row = s.cursor_row;
-                    start_col = s.cursor_col;
-                    end_row = anchor.row;
-                    end_col = anchor.col;
-                }
-            }
-
-            const start_off = s.getOffsetFor(start_row, start_col);
-            const end_off = s.getOffsetFor(end_row, end_col);
-            try s.deleteRange(start_off, end_off);
-
-            s.selection_anchor = null;
-            self.mode = .select;
-            // Send LSP didChange immediately, not via the debouncer:
-            // a hover / goto-def / signature-help fired right after
-            // the delete would otherwise see stale server-side text
-            // for up to `lsp_debounce_ms`. The tree-sitter parse
-            // inside `sendLspDocChanged` is already async (via
-            // `submitParse`), so this is cheap.
-            try self.sendLspDocChanged();
-            try self.sendUpdate();
-            return true;
-        }
-
-        if (key.matches('/', .{})) {
-            try self.enterIncrementalSearch(.visual, .forward);
-            return true;
-        }
-        if (key.matches('?', .{ .shift = true })) {
-            try self.enterIncrementalSearch(.visual, .backward);
-            return true;
-        }
-
-        // Structural expand / shrink. `+` grows the selection to the
-        // enclosing AST node; `-` walks back to the first named child.
-        if (key.matches('+', .{}) or key.matches('=', .{})) {
-            try self.adjustSelectionStructural(.expand);
-            return true;
-        }
-        if (key.matches('-', .{})) {
-            try self.adjustSelectionStructural(.shrink);
-            return true;
-        }
-
-        if (key.matches('y', .{})) {
-            try EditCommands.cmdEditCopy(self);
-            return true;
-        }
-
-        if (key.matches('x', .{})) {
-            try EditCommands.cmdEditCut(self);
-            return true;
-        }
-
-        if (key.matches(vaxis.Key.escape, .{}) or key.matches('v', .{})) {
-            self.mode = .select;
-            self.state().selection_anchor = null;
-            self.nav_repeat_count = 0;
-            return true;
-        }
-
-        if (key.codepoint >= '0' and key.codepoint <= '9' and !key.mods.alt and !key.mods.ctrl and !key.mods.super) {
-            const digit = key.codepoint - '0';
-            if (digit == 0 and self.nav_repeat_count == 0) {
-                const s = self.state();
-                s.cursor_col = 0;
-                return true;
-            }
-            self.nav_repeat_count = self.nav_repeat_count * 10 + digit;
-            return true;
-        }
-
-        const count = if (self.nav_repeat_count > 0) self.nav_repeat_count else 1;
-        self.nav_repeat_count = 0;
-
-        const s = self.state();
-        if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorLeftGrapheme();
-            return true;
-        }
-        if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{})) {
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorRightGrapheme();
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            s.moveCursorDown(count);
-            return true;
-        }
-        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-            s.moveCursorUp(count);
-            return true;
-        }
-        if (key.matches(vaxis.Key.page_down, .{})) {
-            s.moveCursorDown(20 * count);
-            self.scroll_in_progress = true;
-            self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
-            return true;
-        }
-        if (key.matches(vaxis.Key.page_up, .{})) {
-            s.moveCursorUp(20 * count);
-            self.scroll_in_progress = true;
-            self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
-            return true;
-        }
-        if (key.matches(vaxis.Key.home, .{})) {
-            s.moveCursorToLineStart();
-            return true;
-        }
-        if (key.matches(vaxis.Key.end, .{})) {
-            s.moveCursorToLineEnd();
-            return true;
-        }
-
-        // Word + paragraph motions extend the selection.
-        if (key.matches('w', .{})) {
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorNextWord();
-            return true;
-        }
-        if (key.matches('b', .{})) {
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorPrevWord();
-            return true;
-        }
-        if (key.matches('e', .{})) {
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorNextWordEnd();
-            return true;
-        }
-        if (key.matches('W', .{ .shift = true })) {
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorNextBigWord();
-            return true;
-        }
-        if (key.matches('B', .{ .shift = true })) {
-            var i: usize = 0;
-            while (i < count) : (i += 1) try s.moveCursorPrevBigWord();
-            return true;
-        }
-        if (key.matches('}', .{ .shift = true })) {
-            var i: usize = 0;
-            while (i < count) : (i += 1) s.moveCursorNextParagraph();
-            return true;
-        }
-        if (key.matches('{', .{ .shift = true })) {
-            var i: usize = 0;
-            while (i < count) : (i += 1) s.moveCursorPrevParagraph();
-            return true;
-        }
-
-        return false;
-    }
-
-    fn handleVisualSearchInput(self: *Core, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (self.search_input.items.len > 0) {
-                self.last_search_query.clearRetainingCapacity();
-                self.last_search_query.appendSlice(self.allocator, self.search_input.items) catch |err| {
-                    log.warn("Failed to persist last search query: {}", .{err});
-                };
-                // Cursor is already on the live-previewed match; just
-                // exit the prompt and keep it where it is.
-                self.mode = self.previous_mode;
-                if (self.mode == .select) {
-                    const s = self.state();
-                    s.selection_anchor = null;
-                }
-                self.search_input.clearRetainingCapacity();
-            } else {
-                self.mode = self.previous_mode;
-                self.decoration_manager.removeBySource("search");
-            }
-            return true;
-        } else if (key.matches(vaxis.Key.escape, .{})) {
-            // Revert cursor to its pre-search location so a cancelled
-            // search doesn't leave the user stranded mid-preview.
-            const s = self.state();
-            s.cursor_row = self.search_origin_row;
-            s.cursor_col = self.search_origin_col;
-            s.preferred_col = null;
-            self.mode = self.previous_mode;
-            self.search_input.clearRetainingCapacity();
-            self.decoration_manager.removeBySource("search");
-            self.search_match_count = 0;
-            self.search_match_index = 0;
-            return true;
-        } else if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.search_input.items.len > 0) {
-                _ = self.search_input.pop();
-                try self.updateSearchDecorations();
-                self.jumpToIncrementalMatch();
-                return true;
-            }
-        } else if (key.text) |text| {
-            try self.search_input.appendSlice(self.allocator, text);
-            try self.updateSearchDecorations();
-            self.jumpToIncrementalMatch();
-            return true;
-        }
-        return false;
-    }
+    // handleVisualSearchInput → kernel/input/visual_search.zig
 
     /// Move the cursor to the closest match in `search_direction`
     /// starting from `search_origin_*`. Called on every keystroke
     /// during the search prompt so the user can preview where Enter
     /// will land. Wraps at file boundaries.
-    fn jumpToIncrementalMatch(self: *Core) void {
+    pub fn jumpToIncrementalMatch(self: *Core) void {
         const query = self.search_input.items;
         if (query.len == 0) {
             const s = self.state();
@@ -3757,7 +2597,7 @@ pub const Core = struct {
         return true;
     }
 
-    fn updateSearchDecorations(self: *Core) !void {
+    pub fn updateSearchDecorations(self: *Core) !void {
         self.decoration_manager.removeBySource("search");
 
         // While the prompt is open we use the live `search_input`;
@@ -3818,143 +2658,9 @@ pub const Core = struct {
         try self.decoration_manager.addSearchMatches(matches.items, current_idx);
     }
 
-    fn handleInsertInput(self: *Core, key: vaxis.Key) !bool {
-        if (self.completion_active) {
-            if (key.matches(vaxis.Key.up, .{})) {
-                if (self.completion_selected > 0) self.completion_selected -= 1;
-                return true;
-            }
-            if (key.matches(vaxis.Key.down, .{})) {
-                if (self.filtered_completion_items.items.len > 0) {
-                    if (self.completion_selected < self.filtered_completion_items.items.len - 1) {
-                        self.completion_selected += 1;
-                    }
-                }
-                return true;
-            }
-            if ((key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.enter, .{})) and self.filtered_completion_items.items.len > 0) {
-                try self.confirmCompletion();
-                return true;
-            }
-            if (key.matches(vaxis.Key.escape, .{})) {
-                self.dismissCompletion();
-                return true;
-            }
-        }
+    // handleInsertInput → kernel/input/insert.zig
 
-        if (key.matches(Keys.open.codepoint, Keys.open.mods)) {
-            try self.openFileExplorer();
-            return true;
-        }
-        if (key.matches(Keys.save.codepoint, Keys.save.mods)) {
-            try self.saveCurrentFile();
-            return true;
-        }
-
-        const s = self.state();
-        if (key.matches(vaxis.Key.left, .{})) {
-            try s.moveCursorLeftGrapheme();
-        } else if (key.matches(vaxis.Key.right, .{})) {
-            try s.moveCursorRightGrapheme();
-        } else if (key.matches(vaxis.Key.down, .{})) {
-            s.moveCursorDown(1);
-        } else if (key.matches(vaxis.Key.up, .{})) {
-            s.moveCursorUp(1);
-        } else if (key.matches(vaxis.Key.page_down, .{})) {
-            s.moveCursorDown(20);
-            self.scroll_in_progress = true;
-            self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
-        } else if (key.matches(vaxis.Key.page_up, .{})) {
-            s.moveCursorUp(20);
-            self.scroll_in_progress = true;
-            self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
-        } else if (key.matches(vaxis.Key.home, .{})) {
-            s.moveCursorToLineStart();
-        } else if (key.matches(vaxis.Key.end, .{})) {
-            s.moveCursorToLineEnd();
-        } else if (key.matches(vaxis.Key.backspace, .{})) {
-            const config = auto_pair.AutoPairConfig{
-                // Disable auto-pairs in large-file mode so backspace stays
-                // a pure 1-char delete (and we don't scan around the cursor
-                // for matching brackets on every keystroke in a huge file).
-                .enabled = self.storage.config.editor.auto_pairs and !self.activeBufferIsLarge(),
-                .smart_deletion = true,
-            };
-
-            if (config.enabled and config.smart_deletion) {
-                const deleted_pair = try auto_pair.smartBackspace(s);
-                if (!deleted_pair) {
-                    try self.backspaceCharWithHistory();
-                }
-            } else {
-                try self.backspaceCharWithHistory();
-            }
-            try self.updateCompletionFilter();
-            self.markLspDirty();
-        } else if (key.matches(vaxis.Key.delete, .{})) {
-            try self.deleteCharWithHistory();
-            try self.updateCompletionFilter();
-            self.markLspDirty();
-        } else if (key.matches(vaxis.Key.enter, .{})) {
-            if (s.file_path) |path| {
-                if (std.mem.endsWith(u8, path, ".zig")) {
-                    try s.insertNewlineWithIndent();
-                } else {
-                    try s.insertNewline();
-                }
-            } else {
-                try s.insertNewline();
-            }
-            self.markLspDirty();
-        } else if (key.matches(vaxis.Key.tab, .{})) {
-            try s.insertTabWithSize(self.storage.config.editor.tab_size);
-            self.markLspDirty();
-        } else if (key.text) |text| {
-            if (text.len == 1) {
-                const char = text[0];
-
-                const config = auto_pair.AutoPairConfig{
-                    .enabled = self.storage.config.editor.auto_pairs and !self.activeBufferIsLarge(),
-                    .wrap_selection = true,
-                    .smart_deletion = true,
-                    .context_aware = false,
-                };
-
-                const result = try auto_pair.handleCharInput(s, char, config);
-
-                switch (result) {
-                    .wrapped => {},
-                    .skipped => {},
-                    .inserted => {
-                        if (auto_pair.isOpeningChar(char)) |_| {} else {
-                            try self.insertCharWithHistory(char);
-                        }
-                    },
-                }
-
-                if (char == '.' or char == '@') {
-                    try self.triggerCompletion();
-                }
-
-                // Signature help: `(` opens, `,` re-fires to update the
-                // active-parameter index, `)` dismisses. Cheap fire-and-
-                // forget — the tick handler drains the response.
-                if (char == '(' or char == ',') {
-                    self.triggerSignatureHelp() catch |err| {
-                        log.debug("triggerSignatureHelp failed: {s}", .{@errorName(err)});
-                    };
-                } else if (char == ')') {
-                    self.dismissSignatureHelp();
-                }
-
-                try self.updateCompletionFilter();
-                self.markLspDirty();
-            }
-        }
-        return true;
-    }
-
-    fn triggerSignatureHelp(self: *Core) !void {
+    pub fn triggerSignatureHelp(self: *Core) !void {
         if (self.activeBufferIsLarge()) return;
         const s = self.state();
         const path = s.file_path orelse return;
@@ -3973,7 +2679,7 @@ pub const Core = struct {
         self.signature_help_pending = false;
     }
 
-    fn triggerCompletion(self: *Core) !void {
+    pub fn triggerCompletion(self: *Core) !void {
         // Skip in large-file mode — neither the LSP nor the user wants
         // us shoving multi-MB content into the server every keystroke.
         if (self.activeBufferIsLarge()) return;
@@ -3992,7 +2698,7 @@ pub const Core = struct {
         self.completion_prefix_start = s.cursor_col;
     }
 
-    fn dismissCompletion(self: *Core) void {
+    pub fn dismissCompletion(self: *Core) void {
         self.completion_active = false;
         self.completion_pending = false;
         for (self.completion_items.items) |item| {
@@ -4003,7 +2709,7 @@ pub const Core = struct {
         self.filtered_completion_items.clearRetainingCapacity();
     }
 
-    fn updateCompletionFilter(self: *Core) !void {
+    pub fn updateCompletionFilter(self: *Core) !void {
         self.filtered_completion_items.clearRetainingCapacity();
         if (self.completion_items.items.len == 0) return;
 
@@ -4036,7 +2742,7 @@ pub const Core = struct {
         self.completion_selected = 0;
     }
 
-    fn confirmCompletion(self: *Core) !void {
+    pub fn confirmCompletion(self: *Core) !void {
         if (!self.completion_active) return;
         if (self.filtered_completion_items.items.len == 0) return;
         if (self.completion_selected >= self.filtered_completion_items.items.len) return;
@@ -4067,7 +2773,7 @@ pub const Core = struct {
         self.dismissCompletion();
     }
 
-    fn markLspDirty(self: *Core) void {
+    pub fn markLspDirty(self: *Core) void {
         self.lsp_dirty = true;
 
         self.plugin_manager.broadcastEvent(.buffer_changed, self.buffer_manager.getActive().name);
@@ -4130,397 +2836,15 @@ pub const Core = struct {
         }
     }
 
-    fn handleViewInput(self: *Core, key: vaxis.Key) !bool {
-        if (self.leader_pending) {
-            // Same preamble as Select-mode leader: Esc, which-key,
-            // sub-chord dispatch, chord-prefix detection. View
-            // mode is read-only so a couple of single-step bindings
-            // (copy, paste, etc.) are omitted from the top-level
-            // switch, but the chord groups behave identically.
-            if (key.matches(vaxis.Key.escape, .{})) {
-                self.leader_pending = false;
-                self.leader_chord = null;
-                self.leader_help_requested = false;
-                return true;
-            }
-            if (key.codepoint == Keys.action_which_key or
-                key.codepoint == Keys.action_which_key_alt or
-                (key.codepoint == '/' and key.mods.shift))
-            {
-                self.leader_help_requested = !self.leader_help_requested;
-                return true;
-            }
-            if (self.leader_chord) |prefix| {
-                try self.handleLeaderChordKey(prefix, key);
-                self.leader_chord = null;
-                self.leader_help_requested = false;
-                return true;
-            }
-            if (key.codepoint == Keys.chord_lsp or
-                key.codepoint == Keys.chord_git or
-                key.codepoint == Keys.chord_window or
-                key.codepoint == Keys.chord_toggle)
-            {
-                self.leader_chord = @intCast(key.codepoint);
-                return true;
-            }
+    // handleViewInput → kernel/input/view.zig
 
-            switch (key.codepoint) {
-                Keys.action_save => try self.saveCurrentFile(),
-                // `Space f` retired. `Space e` is the single
-                // entry point for the file explorer; `f` is left
-                // unbound (free for a future feature). Cmd/Ctrl+O
-                // still works as the global "open" shortcut.
-                Keys.action_buffer => {
-                    self.recordJumpFromCurrent();
-                    self.previous_mode = self.mode;
-                    self.mode = .buffer_picker;
-                    self.buffer_manager.pickerReset();
-                    self.buffer_picker_number_input.clearRetainingCapacity();
-                    self.leader_pending = false;
-                },
-                Keys.action_file_explorer => {
-                    try self.openFileExplorer();
-                    self.leader_pending = false;
-                },
-                Keys.action_quit => return error.UserQuit,
-                Keys.action_close => self.closeCurrentPaneOrBuffer(),
-                Keys.action_next => {
-                    self.recordJumpFromCurrent();
-                    self.buffer_manager.nextBuffer();
-                    self.refreshSyntaxForCurrentBuffer();
-                    if (self.split_manager) |*sm| sm.setFocusedBuffer(self.buffer_manager.active_index);
-                },
-                Keys.action_prev => {
-                    self.recordJumpFromCurrent();
-                    self.buffer_manager.prevBuffer();
-                    self.refreshSyntaxForCurrentBuffer();
-                    if (self.split_manager) |*sm| sm.setFocusedBuffer(self.buffer_manager.active_index);
-                },
-                Keys.action_help => {
-                    try self.openVirtualBuffer("[HELP]", Help.help_text);
-                    self.leader_pending = false;
-                },
-                Keys.action_palette, Keys.action_palette_alt => {
-                    self.previous_mode = self.mode;
-                    self.mode = .command_palette;
-                    self.command_palette_input.clearRetainingCapacity();
-                    self.command_palette_results.clearRetainingCapacity();
-                    try self.command_registry.search("", &self.command_palette_results, self.allocator);
-                    self.command_palette_selected = 0;
-                    self.leader_pending = false;
-                },
-                Keys.action_undo => try EditCommands.cmdEditUndo(self),
-                Keys.action_redo => try EditCommands.cmdEditRedo(self),
-                Keys.action_jobs => try SystemCommands.cmdJobList(self),
-                Keys.action_copy => try EditCommands.cmdEditCopy(self),
-                Keys.action_cut => try EditCommands.cmdEditCut(self),
-                Keys.action_paste => try EditCommands.cmdEditPaste(self),
+    // handleTerminalInput → kernel/input/terminal.zig
 
-                Keys.action_code_action => try cmdLspCodeAction(self, null),
-                Keys.action_center_view => {
-                    self.syncStateToPane();
-                    try NavCommands.cmdNavCenterView(self);
-                    self.syncPaneToState();
-                },
-                Keys.action_bookmarks => {
-                    try self.openBookmarksBuffer();
-                    self.leader_pending = false;
-                },
+    // handleFilePickerInput → kernel/input/file_picker.zig
 
-                Keys.action_jump_back => try cmdJumpBack(self, null),
-                Keys.action_jump_forward => try cmdJumpForward(self, null),
+    // handleBufferPickerInput → kernel/input/buffer_picker.zig
 
-                Keys.action_split_horizontal => try SplitCommands.cmdSplitHorizontal(self),
-                Keys.action_split_vertical => try SplitCommands.cmdSplitVertical(self),
-
-                else => {
-                    self.leader_pending = false;
-                    self.leader_help_requested = false;
-                },
-            }
-            return true;
-        }
-
-        if (key.matches(Keys.leader, .{})) {
-            self.leader_pending = true;
-            self.leader_help_requested = false;
-            self.setStatusLiteralLeveled(.info, "Space ; for command help", 1500);
-            return true;
-        }
-
-        if (key.matches(Keys.open.codepoint, Keys.open.mods)) {
-            try self.openFileExplorer();
-            return true;
-        }
-        if (key.matches(Keys.save.codepoint, Keys.save.mods)) {
-            try self.saveCurrentFile();
-            return true;
-        }
-
-        const s = self.state();
-        if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
-            try s.moveCursorLeftGrapheme();
-        } else if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{})) {
-            try s.moveCursorRightGrapheme();
-        } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            s.moveCursorDown(1);
-        } else if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-            s.moveCursorUp(1);
-        } else if (key.matches(vaxis.Key.page_down, .{})) {
-            s.moveCursorDown(20);
-            self.scroll_in_progress = true;
-            self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
-        } else if (key.matches(vaxis.Key.page_up, .{})) {
-            s.moveCursorUp(20);
-            self.scroll_in_progress = true;
-            self.last_scroll_time = std.Io.Clock.real.now(self.io).toMilliseconds();
-        } else if (key.matches(vaxis.Key.home, .{})) {
-            s.moveCursorToLineStart();
-        } else if (key.matches(vaxis.Key.end, .{})) {
-            s.moveCursorToLineEnd();
-        }
-        return true;
-    }
-
-    fn handleTerminalInput(self: *Core, key: vaxis.Key) !void {
-        if (key.matches('c', .{ .ctrl = true })) {
-            if (self.terminal_running) {
-                if (self.terminal_service.cancelCurrentJob()) {
-                    try self.terminal_output.appendSlice(self.allocator, "\n^C\n");
-                    self.terminal_running = false;
-                }
-            }
-            return;
-        }
-
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (self.terminal_input.items.len > 0 and !self.terminal_running) {
-                try terminal_proc.executeTerminalCommand(self);
-            }
-            return;
-        }
-
-        if (key.matches(vaxis.Key.up, .{})) {
-            if (self.terminal_service.history_index == null and self.terminal_input.items.len > 0) {
-                self.terminal_saved_input.clearRetainingCapacity();
-                try self.terminal_saved_input.appendSlice(self.allocator, self.terminal_input.items);
-            }
-
-            if (self.terminal_service.historyPrevious()) |prev_cmd| {
-                self.terminal_input.clearRetainingCapacity();
-                try self.terminal_input.appendSlice(self.allocator, prev_cmd);
-            }
-            return;
-        }
-
-        if (key.matches(vaxis.Key.down, .{})) {
-            if (self.terminal_service.historyNext()) |next_cmd| {
-                self.terminal_input.clearRetainingCapacity();
-                try self.terminal_input.appendSlice(self.allocator, next_cmd);
-            } else {
-                self.terminal_input.clearRetainingCapacity();
-                if (self.terminal_saved_input.items.len > 0) {
-                    try self.terminal_input.appendSlice(self.allocator, self.terminal_saved_input.items);
-                }
-            }
-            return;
-        }
-
-        if (key.matches(vaxis.Key.page_up, .{})) {
-            if (self.terminal_scroll_offset >= 10) {
-                self.terminal_scroll_offset -= 10;
-            } else {
-                self.terminal_scroll_offset = 0;
-            }
-            return;
-        }
-
-        if (key.matches(vaxis.Key.page_down, .{})) {
-            var total_lines: usize = 0;
-            for (self.terminal_output.items) |c| {
-                if (c == '\n') total_lines += 1;
-            }
-            if (self.terminal_output.items.len > 0 and
-                self.terminal_output.items[self.terminal_output.items.len - 1] != '\n')
-            {
-                total_lines += 1;
-            }
-            const visible_height = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
-            const max_offset = if (total_lines > visible_height) total_lines - visible_height else 0;
-            self.terminal_scroll_offset = @min(self.terminal_scroll_offset + 10, max_offset);
-            return;
-        }
-
-        if (key.matches(vaxis.Key.tab, .{})) {
-            try terminal_proc.completeTerminalInput(self);
-            return;
-        }
-
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.terminal_input.items.len > 0) {
-                _ = self.terminal_input.pop();
-                self.terminal_service.resetHistoryNavigation();
-            }
-            return;
-        }
-
-        if (key.text) |text| {
-            try self.terminal_input.appendSlice(self.allocator, text);
-            self.terminal_service.resetHistoryNavigation();
-        }
-    }
-
-    fn handleFilePickerInput(self: *Core, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-            self.file_manager.moveUp();
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            self.file_manager.moveDown();
-            return true;
-        }
-        if (key.matches(vaxis.Key.enter, .{ .shift = true }) or
-            key.matches(vaxis.Key.enter, .{ .alt = true }) or
-            key.matches('o', .{ .ctrl = true }))
-        {
-            const selected = self.file_manager.getSelectedEntry();
-            if (selected) |entry| {
-                if (entry.is_dir) {
-                    const dir_path = try std.fs.path.join(self.allocator, &.{ self.file_manager.cwd, entry.name });
-                    defer self.allocator.free(dir_path);
-                    try self.openAllFilesInDirectory(dir_path);
-                    self.mode = .select;
-                    return true;
-                }
-            }
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (try self.file_manager.enter()) |file_path| {
-                defer self.allocator.free(file_path);
-                try self.openFileByPath(file_path);
-                self.mode = .select;
-            }
-            return true;
-        }
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            try self.file_manager.goParent();
-            return true;
-        }
-        return false;
-    }
-
-    fn handleBufferPickerInput(self: *Core, key: vaxis.Key) !bool {
-        if (key.codepoint >= '0' and key.codepoint <= '9') {
-            try self.buffer_picker_number_input.append(self.allocator, @intCast(key.codepoint));
-            return true;
-        }
-
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.buffer_picker_number_input.items.len > 0) {
-                _ = self.buffer_picker_number_input.pop();
-                return true;
-            }
-            return false;
-        }
-
-        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-            self.buffer_picker_number_input.clearRetainingCapacity();
-            self.buffer_manager.pickerMoveUp();
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            self.buffer_picker_number_input.clearRetainingCapacity();
-            self.buffer_manager.pickerMoveDown();
-            return true;
-        }
-
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (self.buffer_picker_number_input.items.len > 0) {
-                const num_str = self.buffer_picker_number_input.items;
-                const buf_num = std.fmt.parseInt(usize, num_str, 10) catch 0;
-                self.buffer_picker_number_input.clearRetainingCapacity();
-
-                if (buf_num > 0 and buf_num <= self.buffer_manager.buffers.items.len) {
-                    self.buffer_manager.switchTo(buf_num - 1);
-                    self.notifyBufferSwitched();
-                    self.refreshSyntaxForCurrentBuffer();
-                    if (self.split_manager) |*sm| {
-                        sm.setFocusedBuffer(self.buffer_manager.active_index);
-                    }
-                }
-            } else {
-                self.buffer_manager.pickerSelect();
-                self.notifyBufferSwitched();
-                self.refreshSyntaxForCurrentBuffer();
-                if (self.split_manager) |*sm| {
-                    sm.setFocusedBuffer(self.buffer_manager.active_index);
-                }
-            }
-            self.mode = .select;
-            return true;
-        }
-
-        return false;
-    }
-
-    fn handleSaveAsInput(self: *Core, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (self.save_as_input.items.len > 0) {
-                const filename = try self.allocator.dupe(u8, self.save_as_input.items);
-                defer self.allocator.free(filename);
-
-                const full_path = if (std.fs.path.isAbsolute(filename))
-                    try self.allocator.dupe(u8, filename)
-                else
-                    try std.fs.path.join(self.allocator, &.{ self.file_manager.cwd, filename });
-                defer self.allocator.free(full_path);
-
-                try self.state().saveFileAs(full_path);
-
-                const active_buf = self.buffer_manager.getActive();
-                self.allocator.free(active_buf.name);
-                active_buf.name = try self.allocator.dupe(u8, std.fs.path.basename(full_path));
-                if (active_buf.file_path) |old| self.allocator.free(old);
-                active_buf.file_path = try self.allocator.dupe(u8, full_path);
-
-                // Save-as: spin up the LSP for the new file's language if
-                // there is one. Was a hand-rolled 5-language ladder; now
-                // delegates to the canonical detector. Skipped when the
-                // buffer is in large-file mode (same reason as everywhere
-                // else: no point indexing a 5 MB log).
-                if (!self.activeBufferIsLarge()) {
-                    if (LSPManager.getLangFromPath(full_path)) |lang_id| {
-                        const project_root = try self.findProjectRoot(full_path);
-                        defer if (project_root) |p| self.allocator.free(p);
-
-                        const root = if (project_root) |p| p else self.file_manager.cwd;
-                        try self.lsp_manager.startServer(lang_id, root);
-
-                        const content = try self.state().buffer.toString(self.allocator);
-                        defer self.allocator.free(content);
-                        self.lsp_manager.documentOpened(full_path, content) catch |err| {
-                            log.warn("LSP document sync failed in save-as '{s}': {}", .{ full_path, err });
-                        };
-                        self.lsp_doc_version = 1;
-                    }
-                }
-
-                self.mode = .select;
-                self.save_as_input.clearRetainingCapacity();
-            }
-            return true;
-        } else if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.save_as_input.items.len > 0) {
-                _ = self.save_as_input.pop();
-                return true;
-            }
-        } else if (key.text) |text| {
-            try self.save_as_input.appendSlice(self.allocator, text);
-            return true;
-        }
-        return false;
-    }
+    // handleSaveAsInput → kernel/input/save_as.zig
 
     pub fn openFilePicker(self: *Core) !void {
         self.previous_mode = self.mode;
@@ -4563,484 +2887,24 @@ pub const Core = struct {
     /// Dispatch a key that arrived after a leader chord prefix
     /// (e.g. `Space l <key>`, `Space g <key>`). Unknown keys are
     /// silently ignored so the user can bail without typing Esc.
-    fn handleLeaderChordKey(self: *Core, prefix: u8, key: vaxis.Key) !void {
-        switch (prefix) {
-            Keys.chord_lsp => switch (key.codepoint) {
-                Keys.lsp_definition => try LspCommands.cmdLspGoToDefinition(self),
-                Keys.lsp_references => try LspCommands.cmdLspFindReferences(self),
-                Keys.lsp_hover => try LspCommands.cmdLspHover(self),
-                Keys.lsp_code_action => try cmdLspCodeAction(self, null),
-                Keys.lsp_format_buffer => try LspCommands.cmdLspFormatDocument(self),
-                Keys.lsp_format_selection => try cmdLspFormatSelection(self, null),
-                Keys.lsp_diagnostics => self.openDiagnosticsPicker(),
-                Keys.lsp_document_symbols => try cmdDocumentSymbols(self, null),
-                Keys.lsp_workspace_symbols => try cmdWorkspaceSymbols(self, null),
-                Keys.lsp_toggle_inline_diagnostics => try ToggleCommands.cmdEditorToggleInlineDiagnostics(self),
-                Keys.lsp_toggle_inlay_hints => try ToggleCommands.cmdEditorToggleInlayHints(self),
-                Keys.lsp_toggle_format_on_save => try ToggleCommands.cmdLspToggleFormatOnSave(self),
-                else => {},
-            },
-            Keys.chord_git => switch (key.codepoint) {
-                Keys.git_diff => try GitCommands.cmdGitDiff(self),
-                else => {},
-            },
-            Keys.chord_window => switch (key.codepoint) {
-                Keys.win_split_horizontal => try SplitCommands.cmdSplitHorizontal(self),
-                Keys.win_split_vertical => try SplitCommands.cmdSplitVertical(self),
-                Keys.win_focus_left => self.focusPaneLeft(),
-                Keys.win_focus_down => self.focusPaneDown(),
-                Keys.win_focus_up => self.focusPaneUp(),
-                Keys.win_focus_right => self.focusPaneRight(),
-                Keys.win_close => self.closeCurrentPaneOrBuffer(),
-                else => {},
-            },
-            Keys.chord_toggle => switch (key.codepoint) {
-                Keys.toggle_inline_diagnostics => try ToggleCommands.cmdEditorToggleInlineDiagnostics(self),
-                Keys.toggle_inlay_hints => try ToggleCommands.cmdEditorToggleInlayHints(self),
-                Keys.toggle_format_on_save => try ToggleCommands.cmdLspToggleFormatOnSave(self),
-                // Other toggles (line_numbers, wrap, whitespace,
-                // cursor_line) don't have command wrappers yet — wire
-                // them up here as their setters land in config.
-                else => {},
-            },
-            else => {},
-        }
-    }
+    // Leader chord dispatch + pane focus / close helpers extracted
+    // to leader_dispatch.zig. See LeaderDispatch.handle and
+    // LeaderDispatch.focusPaneLeft / .focusPaneRight / .focusPaneUp
+    // / .focusPaneDown / .closeCurrentPaneOrBuffer.
 
-    /// Move pane focus or close the active pane. Extracted from
-    /// the leader switch so both the top-level arrow bindings and
-    /// the `Space w <hjkl>` chord can share the same code.
-    fn focusPaneLeft(self: *Core) void {
-        if (self.split_manager) |*sm| {
-            self.syncStateToPane();
-            sm.focusLeft();
-            self.syncPaneToState();
-            self.ensureLspDocument() catch |err| {
-                log.debug("ensureLspDocument failed on pane focus: {}", .{err});
-            };
-        }
-    }
-    fn focusPaneRight(self: *Core) void {
-        if (self.split_manager) |*sm| {
-            self.syncStateToPane();
-            sm.focusRight();
-            self.syncPaneToState();
-            self.ensureLspDocument() catch |err| {
-                log.debug("ensureLspDocument failed on pane focus: {}", .{err});
-            };
-        }
-    }
-    fn focusPaneUp(self: *Core) void {
-        if (self.split_manager) |*sm| {
-            self.syncStateToPane();
-            sm.focusUp();
-            self.syncPaneToState();
-            self.ensureLspDocument() catch |err| {
-                log.debug("ensureLspDocument failed on pane focus: {}", .{err});
-            };
-        }
-    }
-    fn focusPaneDown(self: *Core) void {
-        if (self.split_manager) |*sm| {
-            self.syncStateToPane();
-            sm.focusDown();
-            self.syncPaneToState();
-            self.ensureLspDocument() catch |err| {
-                log.debug("ensureLspDocument failed on pane focus: {}", .{err});
-            };
-        }
-    }
-    fn closeCurrentPaneOrBuffer(self: *Core) void {
-        // Snapshot opened_from off the *current* buffer before we
-        // close it — once closed, the Buffer entry is freed and the
-        // field is gone. We'll consult it below to restore the
-        // trigger cursor on the successor buffer.
-        const opened_from: ?Buffer.OpenedFrom = blk: {
-            const idx = self.buffer_manager.active_index;
-            if (idx >= self.buffer_manager.buffers.items.len) break :blk null;
-            break :blk self.buffer_manager.buffers.items[idx].opened_from;
-        };
+    // References + diagnostics picker logic extracted to pickers.zig.
+    // See ReferencesPicker.open / .close / .handleInput and
+    // DiagnosticsPicker.open / .close / .handleInput. State fields
+    // (references_picker_*, diagnostics_picker_*) stay on Core
+    // because the snapshot builder in sendUpdate reads them.
 
-        if (self.split_manager) |*sm| {
-            if (sm.hasSplits()) {
-                self.syncStateToPane();
-                sm.closePane();
-                self.syncPaneToState();
-                const remaining = sm.getFocusedPane();
-                if (remaining.buffer_index < self.buffer_manager.buffers.items.len) {
-                    self.buffer_manager.active_index = remaining.buffer_index;
-                }
-                if (!sm.hasSplits()) {
-                    sm.deinit();
-                    self.split_manager = null;
-                }
-            } else {
-                const pane = sm.getFocusedPane();
-                if (pane.buffer_index < self.buffer_manager.buffers.items.len) {
-                    self.buffer_manager.active_index = pane.buffer_index;
-                }
-                sm.deinit();
-                self.split_manager = null;
-            }
-        } else {
-            // Track which id is going away so we can evict its
-            // parked syntax tree from the SyntaxManager cache —
-            // otherwise closed-but-reopened-from-cwd buffers would
-            // keep the cache growing across the session.
-            if (self.buffer_manager.closeActiveReturningId()) |closed_id| {
-                self.syntax_manager.dropBuffer(closed_id);
-            }
-        }
-
-        // Pull the successor buffer's content if it's still lazy.
-        // Without this the user sees an empty buffer after closing
-        // a virtual buffer (or anything else) on top of a buffer
-        // that was opened via `Space e` / "open directory" /
-        // session restore — all of which mark new buffers
-        // `not_loaded = true` and rely on the first switch to
-        // call `loadBufferContent`. Every other buffer-switch
-        // site goes through `refreshSyntaxForCurrentBuffer`; this
-        // one was missed when the close helper was extracted.
-        self.refreshSyntaxForCurrentBuffer();
-
-        // If the just-closed buffer had an opened_from snapshot and
-        // the successor active buffer is the one we were on when we
-        // opened it, jump the cursor back to the trigger location.
-        // No-op when buffer ids don't match (e.g. the user moved
-        // through several files in between).
-        if (opened_from) |of| {
-            if (self.buffer_manager.active_index < self.buffer_manager.buffers.items.len) {
-                const dst = &self.buffer_manager.buffers.items[self.buffer_manager.active_index];
-                if (dst.id == of.buffer_id) {
-                    const s = &dst.state;
-                    s.cursor_row = of.row;
-                    s.cursor_col = of.col;
-                    s.preferred_col = null;
-                    // Center the restored cursor so the user
-                    // doesn't lose visual context.
-                    const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
-                    const half = visible_rows / 2;
-                    s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
-                }
-            }
-        }
-    }
-
-    /// Populate the references picker from the LSP result and
-    /// switch into `.references_picker` mode. Snapshots the trigger
-    /// location into `references_picker_origin` so Esc returns the
-    /// cursor home.
-    fn openReferencesPicker(self: *Core, refs: []LSPManager.Location) !void {
-        // Free any prior entries — caller's result may be smaller.
-        for (self.references_picker_entries.items) |*entry| entry.deinit(self.allocator);
-        self.references_picker_entries.clearRetainingCapacity();
-
-        try self.references_picker_entries.ensureTotalCapacity(self.allocator, refs.len);
-        for (refs) |r| {
-            const full = try self.allocator.dupe(u8, r.file_path);
-            errdefer self.allocator.free(full);
-            const display = try self.allocator.dupe(u8, std.fs.path.basename(r.file_path));
-            errdefer self.allocator.free(display);
-
-            // Pull a trimmed source preview from disk; same logic
-            // the old text-buffer build used, just per-entry.
-            const snippet = readReferenceSnippet(self, r.file_path, r.line) catch
-                try self.allocator.dupe(u8, "(unable to read)");
-
-            try self.references_picker_entries.append(self.allocator, .{
-                .full_path = full,
-                .display_path = display,
-                .line = r.line,
-                .col = r.col,
-                .snippet = snippet,
-            });
-        }
-
-        self.references_picker_selected = 0;
-        self.references_picker_scroll_offset = 0;
-        self.references_picker_origin = self.captureCurrentLocationAsOpenedFrom();
-        self.previous_mode = self.mode;
-        self.mode = .references_picker;
-    }
-
-    /// Best-effort snippet read for the references picker — opens
-    /// the file, scans to the target line, trims and length-caps.
-    /// Returns an owned slice; caller frees with self.allocator.
-    fn readReferenceSnippet(self: *Core, file_path: []const u8, target_line: u32) ![]u8 {
-        const content = std.Io.Dir.cwd().readFileAlloc(
-            self.io,
-            file_path,
-            self.allocator,
-            .limited(10 * 1024 * 1024),
-        ) catch return error.SnippetUnavailable;
-        defer self.allocator.free(content);
-
-        var line_num: u32 = 0;
-        var line_start: usize = 0;
-        for (content, 0..) |ch, idx| {
-            if (line_num == target_line) {
-                var line_end = idx;
-                while (line_end < content.len and content[line_end] != '\n') : (line_end += 1) {}
-                const line_content = std.mem.trim(u8, content[line_start..line_end], " \t");
-                const max_len: usize = 120;
-                const take = if (line_content.len > max_len) line_content[0..max_len] else line_content;
-                return try self.allocator.dupe(u8, take);
-            }
-            if (ch == '\n') {
-                line_num += 1;
-                line_start = idx + 1;
-            }
-        }
-        return error.SnippetUnavailable;
-    }
-
-    /// Helper — like captureCurrentLocation but returns the type
-    /// the buffer's opened_from field uses (id-keyed, no path).
-    fn captureCurrentLocationAsOpenedFrom(self: *Core) ?Buffer.OpenedFrom {
-        const s = self.state();
-        if (s.file_path == null) return null;
-        return .{
-            .buffer_id = self.buffer_manager.getActive().id,
-            .row = s.cursor_row,
-            .col = s.cursor_col,
-        };
-    }
-
-    /// Esc out of the references picker — restore the trigger
-    /// position (if the origin buffer is still present and current)
-    /// and switch back to the previous mode.
-    fn closeReferencesPicker(self: *Core) void {
-        if (self.references_picker_origin) |of| {
-            const idx = self.buffer_manager.indexOfId(of.buffer_id);
-            if (idx) |i| {
-                self.buffer_manager.active_index = i;
-                const s = &self.buffer_manager.buffers.items[i].state;
-                s.cursor_row = of.row;
-                s.cursor_col = of.col;
-                s.preferred_col = null;
-                const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
-                const half = visible_rows / 2;
-                s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
-                // Push the restored state down to the focused pane so
-                // split-mode users actually see the cursor / scroll
-                // move. The buffer manager is now correct; without
-                // this the pane keeps its picker-time state and the
-                // restore is invisible.
-                self.syncPaneToState();
-            }
-        }
-        self.references_picker_origin = null;
-        self.mode = .select;
-    }
-
-    /// Key dispatch for `.references_picker`. j/k move; Enter opens
-    /// the entry (records a jump); Esc dismisses + restores
-    /// trigger position.
-    fn handleReferencesPickerInput(self: *Core, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.escape, .{})) {
-            self.closeReferencesPicker();
-            return true;
-        }
-        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-            if (self.references_picker_selected > 0) self.references_picker_selected -= 1;
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            if (self.references_picker_selected + 1 < self.references_picker_entries.items.len) {
-                self.references_picker_selected += 1;
-            }
-            return true;
-        }
-        if (key.matches('g', .{})) {
-            self.references_picker_selected = 0;
-            return true;
-        }
-        if (key.matches('G', .{ .shift = true })) {
-            if (self.references_picker_entries.items.len > 0) {
-                self.references_picker_selected = self.references_picker_entries.items.len - 1;
-            }
-            return true;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            const idx = self.references_picker_selected;
-            if (idx >= self.references_picker_entries.items.len) return true;
-            const entry = self.references_picker_entries.items[idx];
-
-            // Record the trigger location into the jump_list so the
-            // user can Ctrl+O back even after this picker closes.
-            // (openReferencesPicker stamped origin already; this is
-            // a complementary jump_list breadcrumb.)
-            if (self.references_picker_origin) |of| {
-                if (self.buffer_manager.indexOfId(of.buffer_id)) |i| {
-                    if (self.buffer_manager.buffers.items[i].file_path) |p| {
-                        self.jump_list.recordJump(p, of.row, of.col) catch |err| {
-                            log.debug("references picker jump_list record failed: {}", .{err});
-                        };
-                    }
-                }
-            }
-
-            try self.openFileByPath(entry.full_path);
-            const new_state = self.state();
-            new_state.cursor_row = entry.line;
-            new_state.cursor_col = entry.col;
-            new_state.preferred_col = null;
-            const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
-            const half = visible_rows / 2;
-            new_state.scroll_offset = if (new_state.cursor_row >= half) new_state.cursor_row - half else 0;
-            // Push the new state to the focused pane so the cursor
-            // and scroll actually appear there (split-mode fix).
-            self.syncPaneToState();
-
-            // Picker has done its job; close (without restoring
-            // origin — the user explicitly went somewhere).
-            self.references_picker_origin = null;
-            self.mode = .select;
-            return true;
-        }
-        return false;
-    }
-
-    /// Open the diagnostics picker — same picker pattern as
-    /// references. The diagnostic list itself lives in the LSP
-    /// server's per-URI cache (fetched fresh by sendUpdate), so
-    /// Core just tracks the selected index, scroll offset, and
-    /// trigger origin.
+    /// Thin re-export so the leader dispatch table (and any other
+    /// caller that needs to pop the diagnostics picker without
+    /// importing pickers.zig directly) can still write the short
+    /// `core.openDiagnosticsPicker()` form. New code should call
+    /// `DiagnosticsPicker.open(core)` directly.
     pub fn openDiagnosticsPicker(self: *Core) void {
-        // Only meaningful when the current buffer has a file path
-        // — diagnostics are keyed by URI. Toast and bail otherwise.
-        const s = self.state();
-        if (s.file_path == null) {
-            self.setStatusLiteralLeveled(.warning, "No diagnostics for unsaved buffer", 1500);
-            return;
-        }
-        self.diagnostics_picker_selected = 0;
-        self.diagnostics_picker_scroll_offset = 0;
-        self.diagnostics_picker_origin = self.captureCurrentLocationAsOpenedFrom();
-        self.previous_mode = self.mode;
-        self.mode = .diagnostics_picker;
-    }
-
-    fn closeDiagnosticsPicker(self: *Core) void {
-        if (self.diagnostics_picker_origin) |of| {
-            if (self.buffer_manager.indexOfId(of.buffer_id)) |i| {
-                self.buffer_manager.active_index = i;
-                const s = &self.buffer_manager.buffers.items[i].state;
-                s.cursor_row = of.row;
-                s.cursor_col = of.col;
-                s.preferred_col = null;
-                const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
-                const half = visible_rows / 2;
-                s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
-                // Push restored state to the focused pane — see
-                // closeReferencesPicker for the same fix rationale.
-                self.syncPaneToState();
-            }
-        }
-        self.diagnostics_picker_origin = null;
-        self.mode = .select;
-    }
-
-    fn handleDiagnosticsPickerInput(self: *Core, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.escape, .{})) {
-            self.closeDiagnosticsPicker();
-            return true;
-        }
-        // The diagnostic count is derived from the LSP cache at
-        // render time, but for input dispatch we need a stable
-        // count *now*. Re-fetch — cheap, just a HashMap probe.
-        const diag_count = self.activeDiagnosticCount();
-        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-            if (self.diagnostics_picker_selected > 0) self.diagnostics_picker_selected -= 1;
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            if (self.diagnostics_picker_selected + 1 < diag_count) {
-                self.diagnostics_picker_selected += 1;
-            }
-            return true;
-        }
-        if (key.matches('g', .{})) {
-            self.diagnostics_picker_selected = 0;
-            return true;
-        }
-        if (key.matches('G', .{ .shift = true })) {
-            if (diag_count > 0) self.diagnostics_picker_selected = diag_count - 1;
-            return true;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            // Apply the jump in the trigger buffer (the diagnostic
-            // is keyed to the current file). We don't openFileByPath
-            // — diagnostics never cross files.
-            if (self.diagnostics_picker_origin) |of| {
-                if (self.buffer_manager.indexOfId(of.buffer_id)) |i| {
-                    self.buffer_manager.active_index = i;
-                    const target = self.activeDiagnosticAt(self.diagnostics_picker_selected) orelse return true;
-                    const s = &self.buffer_manager.buffers.items[i].state;
-                    // Record the trigger origin in jump_list first.
-                    if (self.buffer_manager.buffers.items[i].file_path) |p| {
-                        self.jump_list.recordJump(p, of.row, of.col) catch |err| {
-                            log.debug("diagnostics picker jump_list record failed: {}", .{err});
-                        };
-                    }
-                    s.cursor_row = target.start_line;
-                    s.cursor_col = target.start_col;
-                    s.preferred_col = null;
-                    const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
-                    const half = visible_rows / 2;
-                    s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
-                    // Push the cursor + scroll down to the focused
-                    // pane so split-mode users actually see the jump.
-                    self.syncPaneToState();
-                }
-            }
-            self.diagnostics_picker_origin = null;
-            self.mode = .select;
-            return true;
-        }
-        return false;
-    }
-
-    /// Count diagnostics for the active buffer's file. Returns 0
-    /// for unsaved buffers and on LSP fetch failure.
-    fn activeDiagnosticCount(self: *Core) usize {
-        const s = self.state();
-        const path = s.file_path orelse return 0;
-        const diags = self.lsp_manager.getDiagnosticsForFile(self.allocator, path) catch return 0;
-        defer LSPManager.freeDiagnostics(self.allocator, diags);
-        return diags.len;
-    }
-
-    /// Snapshot of a single diagnostic at sorted-list index `idx`
-    /// (sorted by line then col, matching the picker's render
-    /// order). Returns null on out-of-range or LSP miss.
-    fn activeDiagnosticAt(self: *Core, idx: usize) ?protocol.DiagnosticSnapshot {
-        const s = self.state();
-        const path = s.file_path orelse return null;
-        const diags = self.lsp_manager.getDiagnosticsForFile(self.allocator, path) catch return null;
-        defer LSPManager.freeDiagnostics(self.allocator, diags);
-
-        std.mem.sort(LSPManager.Diagnostic, diags, {}, struct {
-            fn lt(_: void, a: LSPManager.Diagnostic, b: LSPManager.Diagnostic) bool {
-                if (a.start_line != b.start_line) return a.start_line < b.start_line;
-                return a.start_col < b.start_col;
-            }
-        }.lt);
-        if (idx >= diags.len) return null;
-        const d = diags[idx];
-        return .{
-            .start_line = d.start_line,
-            .start_col = d.start_col,
-            .end_line = d.end_line,
-            .end_col = d.end_col,
-            .severity = switch (d.severity) {
-                .err => .err,
-                .warning => .warning,
-                .info => .info,
-                .hint => .hint,
-            },
-            .message = "",
-        };
+        DiagnosticsPicker.open(self);
     }
 
     /// Open a file at `path` into a fresh buffer, wire it into the
@@ -5117,56 +2981,7 @@ pub const Core = struct {
 
     /// Key dispatch for the modal file-explorer overlay (Mode
     /// `.file_explorer`). Returns true if the key was consumed.
-    fn handleFileExplorerInput(self: *Core, key: vaxis.Key) !bool {
-        const fx = if (self.file_explorer) |*v| v else return false;
-
-        // Esc dismisses the explorer back to whatever mode opened it.
-        if (key.matches(vaxis.Key.escape, .{})) {
-            self.mode = self.previous_mode;
-            return true;
-        }
-        if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-            fx.moveUp();
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-            fx.moveDown();
-            return true;
-        }
-        if (key.matches('g', .{})) {
-            fx.moveTop();
-            return true;
-        }
-        if (key.matches('G', .{ .shift = true })) {
-            fx.moveBottom();
-            return true;
-        }
-        if (key.matches(vaxis.Key.right, .{}) or key.matches('l', .{})) {
-            _ = try fx.expand();
-            return true;
-        }
-        if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
-            _ = try fx.collapseOrAscend();
-            return true;
-        }
-        if (key.matches('H', .{ .shift = true })) {
-            try fx.toggleHidden();
-            return true;
-        }
-        if (key.matches('r', .{ .ctrl = true })) {
-            try fx.rebuild();
-            return true;
-        }
-        if (key.matches(vaxis.Key.enter, .{}) or key.matches(vaxis.Key.space, .{})) {
-            if (try fx.activate()) |opened| {
-                defer self.allocator.free(opened);
-                try self.openFileByPath(opened);
-                self.mode = .select;
-            }
-            return true;
-        }
-        return false;
-    }
+    // handleFileExplorerInput → kernel/input/file_explorer.zig
 
     /// Opens all files in the given directory recursively. The walk runs on
     /// a background worker thread so the editor remains responsive even on
@@ -5268,7 +3083,12 @@ pub const Core = struct {
         const take = @min(self.scan_paths.items.len, max_per_tick);
         var batch: [64][]u8 = undefined;
         for (0..take) |i| batch[i] = self.scan_paths.items[i];
-        if (take > 0) self.scan_paths.replaceRange(self.allocator, 0, take, &.{}) catch {};
+        if (take > 0) self.scan_paths.replaceRange(self.allocator, 0, take, &.{}) catch |err| {
+            // OOM trimming the scan queue means we'll re-process
+            // these paths on the next tick — duplicate work but no
+            // correctness issue. Log so a recurring failure shows.
+            log.debug("scan_paths trim failed: {s}", .{@errorName(err)});
+        };
         const skipped = self.scan_skipped_count;
         if (take > 0) self.scan_skipped_count = 0;
         self.scan_paths_mutex.unlock(self.io);
@@ -5435,84 +3255,8 @@ pub const Core = struct {
     /// via the file picker and reconcile; deleting the backup is a
     /// follow-up command. Read-only buffer; this is a recovery
     /// surface, not an editor.
-    fn cmdBufferRestoreBackups(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-
-        const home_dir = self.homeDir() catch |err| {
-            self.setStatusLeveled(.err, "Cannot resolve $HOME: {}", .{err}, 3000);
-            return;
-        };
-        defer self.allocator.free(home_dir);
-
-        const recover_dir = try std.fs.path.join(self.allocator, &.{ home_dir, ".stem", "recover" });
-        defer self.allocator.free(recover_dir);
-
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
-        const w = &aw.writer;
-
-        try w.print("Recovery backups in {s}\n", .{recover_dir});
-        try w.writeAll("(Each `.bak` is an autosave of a buffer that was dirty when stem last ran.\n");
-        try w.writeAll(" To restore: open the original file, then paste from the backup, or use\n");
-        try w.writeAll(" `cat <backup>` from a shell. Backups are deleted on next clean exit.)\n\n");
-
-        var dir = std.Io.Dir.openDirAbsolute(self.io, recover_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => {
-                try w.writeAll("(no backup directory yet — nothing to recover)\n");
-                try self.buffer_manager.openVirtual("[Recovery Backups]", aw.written());
-                try self.sendUpdate();
-                return;
-            },
-            else => return err,
-        };
-        defer dir.close(self.io);
-
-        var any = false;
-        var iter = dir.iterate();
-        while (try iter.next(self.io)) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".bak")) continue;
-            any = true;
-
-            // Resolve the original path from the sidecar.
-            const bak_path = try std.fs.path.join(self.allocator, &.{ recover_dir, entry.name });
-            defer self.allocator.free(bak_path);
-            const sidecar = try std.fmt.allocPrint(self.allocator, "{s}.path", .{bak_path});
-            defer self.allocator.free(sidecar);
-
-            var original: ?[]u8 = null;
-            defer if (original) |o| self.allocator.free(o);
-            if (std.Io.Dir.openFileAbsolute(self.io, sidecar, .{})) |sf| {
-                defer sf.close(self.io);
-                const len = sf.length(self.io) catch 0;
-                if (len > 0 and len < 4096) {
-                    const buf = self.allocator.alloc(u8, @intCast(len)) catch null;
-                    if (buf) |b| {
-                        const n = sf.readPositionalAll(self.io, b, 0) catch 0;
-                        original = b[0..n];
-                    }
-                }
-            } else |_| {}
-
-            const bak_file = std.Io.Dir.openFileAbsolute(self.io, bak_path, .{}) catch continue;
-            defer bak_file.close(self.io);
-            const bak_stat = bak_file.stat(self.io) catch continue;
-            const bak_size = bak_file.length(self.io) catch 0;
-
-            const orig = original orelse "(unknown — .path sidecar missing)";
-            try w.print("  {s}\n    backup: {s} ({d} bytes, mtime_ns={d})\n\n", .{
-                orig,
-                bak_path,
-                bak_size,
-                bak_stat.mtime.toNanoseconds(),
-            });
-        }
-        if (!any) try w.writeAll("(no backups present)\n");
-
-        try self.buffer_manager.openVirtual("[Recovery Backups]", aw.written());
-        try self.sendUpdate();
-    }
+    // cmdBufferRestoreBackups → commands/buffer_commands.zig
+    // (BufferCommands.cmdBufferRestoreBackups)
 
     /// Stat the active buffer's file; if its mtime moved forward since we
     /// last touched it, the file was modified externally (formatter, git
@@ -5548,6 +3292,26 @@ pub const Core = struct {
     /// Repaint the word-under-cursor highlight if the cursor has been
     /// still for `word_highlight_idle_ms`. Idempotent — re-walking on
     /// the same word is a no-op (we cache it). Clears immediately when
+    /// Auto-cancel the leader chord if it's been armed past the
+    /// configured timeout. Matches vim's `timeoutlen` behavior so
+    /// users who tap Space and walk away don't return to a
+    /// surprise-armed editor. Also clears `leader_chord` so a
+    /// dangling sub-prefix (e.g. `Space l` followed by silence)
+    /// doesn't intercept the next keystroke.
+    fn maybeTimeoutLeaderChord(self: *Core) void {
+        if (!self.leader_pending) return;
+        const now = std.Io.Clock.real.now(self.io).toMilliseconds();
+        if (now - self.leader_pending_set_ms < self.leader_pending_timeout_ms) return;
+        self.leader_pending = false;
+        self.leader_chord = null;
+        self.leader_help_requested = false;
+        self.plugin_chord_buf.clearRetainingCapacity();
+        // Request a render so the persistent SPC indicator goes
+        // away promptly; otherwise it stays on screen until some
+        // other event triggers a frame.
+        self.requestRender();
+    }
+
     /// the cursor moves, so the highlight follows intent.
     fn maybeRefreshWordHighlight(self: *Core) void {
         // Skip during modal interactions where highlighting would be
@@ -5668,7 +3432,7 @@ pub const Core = struct {
         };
     }
 
-    fn homeDir(self: *Core) ![]u8 {
+    pub fn homeDir(self: *Core) ![]u8 {
         // platform.getEnv is cross-platform — env.getPosix doesn't
         // compile on Windows in Zig 0.16. Returns an owned slice
         // (no extra dupe needed here).
@@ -5872,7 +3636,7 @@ pub const Core = struct {
     /// formatting (`formatAndSave`) and range formatting
     /// (`cmdLspFormatSelection`); the response shape is identical so
     /// one path handles both.
-    fn waitAndApplyFormatEdits(self: *Core) !bool {
+    pub fn waitAndApplyFormatEdits(self: *Core) !bool {
         const s = self.state();
         var attempts: usize = 0;
         while (attempts < 10) : (attempts += 1) {
@@ -5925,160 +3689,8 @@ pub const Core = struct {
 
     /// `lsp.format_selection`. Sends `textDocument/rangeFormatting`
     /// for the current visual selection (or, if not in visual mode,
-    /// the current line). Falls back to whole-document format if the
-    /// server doesn't support range formatting — easier than parsing
-    /// `capabilities.documentRangeFormattingProvider` from initialize.
-    fn cmdLspFormatSelection(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-        if (self.activeBufferIsLarge()) {
-            self.setStatusLiteralLeveled(.warning, "Format selection: skipped (large-file mode)", 2000);
-            return;
-        }
-        const s = self.state();
-        const path = s.file_path orelse {
-            self.setStatusLiteralLeveled(.warning, "Format selection: buffer has no file path", 2000);
-            return;
-        };
-
-        // Resolve the range: visual selection if present, else the
-        // cursor's line. Tracking the in-flight mode here (vs. just
-        // reading `selection_anchor`) keeps "no selection" working
-        // outside Visual mode without surprising the user.
-        var start_line: u32 = @intCast(s.cursor_row);
-        var start_col: u32 = 0;
-        var end_line: u32 = @intCast(s.cursor_row + 1);
-        var end_col: u32 = 0;
-        if (s.selection_anchor) |a| {
-            const a_row: u32 = @intCast(a.row);
-            const c_row: u32 = @intCast(s.cursor_row);
-            const a_col: u32 = @intCast(a.col);
-            const c_col: u32 = @intCast(s.cursor_col);
-            if (a_row < c_row or (a_row == c_row and a_col <= c_col)) {
-                start_line = a_row;
-                start_col = a_col;
-                end_line = c_row;
-                end_col = c_col;
-            } else {
-                start_line = c_row;
-                start_col = c_col;
-                end_line = a_row;
-                end_col = a_col;
-            }
-            // Empty range (anchor at cursor) — fall through to line-based
-            // range below.
-            if (start_line == end_line and start_col == end_col) {
-                start_col = 0;
-                end_line = start_line + 1;
-                end_col = 0;
-            }
-        }
-
-        try self.ensureLspDocument();
-        self.lsp_manager.requestRangeFormatting(path, start_line, start_col, end_line, end_col) catch |err| switch (err) {
-            error.ServerNotReady, error.ServerNotRunning, error.UnsupportedLanguage => {
-                self.setStatusLiteralLeveled(.warning, "Format selection: LSP not ready, falling back to full document", 2000);
-                try self.lsp_manager.requestFormatting(path);
-            },
-            else => return err,
-        };
-        const applied = try self.waitAndApplyFormatEdits();
-        if (applied) {
-            self.setStatusLiteralLeveled(.success, "Format selection: applied", 1500);
-        } else {
-            self.setStatusLiteralLeveled(.info, "Format selection: no changes", 1500);
-        }
-        try self.sendUpdate();
-    }
-
-    /// `lsp.code_action` — Space `.`. Asks the LSP for available
-    /// actions at the cursor (or visual selection), waits briefly,
-    /// then either applies the single action automatically or
-    /// stashes the list and prompts for a digit to pick one.
-    fn cmdLspCodeAction(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-        if (self.activeBufferIsLarge()) {
-            self.setStatusLiteralLeveled(.warning, "Code actions: skipped (large-file mode)", 2000);
-            return;
-        }
-        const s = self.state();
-        const path = s.file_path orelse {
-            self.setStatusLiteralLeveled(.warning, "Code actions: buffer has no file path", 2000);
-            return;
-        };
-
-        // Resolve range — visual selection or cursor's char.
-        var start_line: u32 = @intCast(s.cursor_row);
-        var start_col: u32 = @intCast(s.cursor_col);
-        var end_line: u32 = @intCast(s.cursor_row);
-        var end_col: u32 = @intCast(s.cursor_col);
-        if (s.selection_anchor) |a| {
-            const a_row: u32 = @intCast(a.row);
-            const a_col: u32 = @intCast(a.col);
-            if (a_row < start_line or (a_row == start_line and a_col < start_col)) {
-                start_line = a_row;
-                start_col = a_col;
-            } else {
-                end_line = a_row;
-                end_col = a_col;
-            }
-        }
-
-        try self.ensureLspDocument();
-        self.lsp_manager.requestCodeAction(path, start_line, start_col, end_line, end_col) catch |err| {
-            self.setStatus("Code actions: request failed: {}", .{err}, 2000);
-            return;
-        };
-
-        // Wait briefly for the response. Up to ~300 ms — code-action
-        // round trips are typically much faster on small files; we
-        // bail out cleanly if the LSP is slow.
-        var attempts: usize = 0;
-        var actions: ?[]LspServer.CodeAction = null;
-        while (attempts < 30) : (attempts += 1) {
-            if (self.lsp_manager.popCodeActionResult()) |list| {
-                actions = list;
-                break;
-            }
-            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
-        }
-
-        const list = actions orelse {
-            self.setStatusLiteralLeveled(.info, "Code actions: no response", 2000);
-            return;
-        };
-        if (list.len == 0) {
-            self.lsp_manager.freeCodeActions(list);
-            self.setStatusLiteralLeveled(.info, "Code actions: none available", 2000);
-            return;
-        }
-
-        if (list.len == 1) {
-            // Single action — just apply.
-            defer self.lsp_manager.freeCodeActions(list);
-            try self.applyCodeAction(list[0]);
-            return;
-        }
-
-        // Multiple — stash and prompt. Cap to 9 so a digit selects.
-        const visible = @min(list.len, 9);
-        if (self.code_action_pending) |old| self.lsp_manager.freeCodeActions(old);
-        self.code_action_pending = list;
-
-        var preview: std.ArrayListUnmanaged(u8) = .empty;
-        defer preview.deinit(self.allocator);
-        try preview.appendSlice(self.allocator, "Code actions: ");
-        for (list[0..visible], 0..) |a, i| {
-            if (i > 0) try preview.appendSlice(self.allocator, "  ");
-            const entry = try std.fmt.allocPrint(self.allocator, "[{d}] {s}", .{ i + 1, a.title });
-            defer self.allocator.free(entry);
-            try preview.appendSlice(self.allocator, entry);
-        }
-        if (list.len > visible) try preview.appendSlice(self.allocator, "  …");
-        self.setStatus("{s}", .{preview.items}, 8000);
-        try self.sendUpdate();
-    }
+    // cmdLspFormatSelection, cmdLspCodeAction → commands/lsp_commands.zig
+    // (LspCommands.cmdLspFormatSelection / .cmdLspCodeAction)
 
     /// Apply one `CodeAction`. Handles the two shapes we care about:
     /// `WorkspaceEdit.changes` (per-URI TextEdit lists) and
@@ -6086,7 +3698,7 @@ pub const Core = struct {
     /// `Command` actions are not executed yet — they require
     /// `workspace/executeCommand` which most servers gate behind a
     /// capability we don't advertise.
-    fn applyCodeAction(self: *Core, action: LspServer.CodeAction) !void {
+    pub fn applyCodeAction(self: *Core, action: LspServer.CodeAction) !void {
         const edit_json = action.edit_json orelse {
             self.setStatus("Code action '{s}': command-only actions not yet supported", .{action.title}, 3000);
             return;
@@ -6360,933 +3972,11 @@ pub const Core = struct {
     /// counting each soft-wrapped continuation as an extra row. Walks
     /// lines from `top_row` up to (and into) `cursor_row`, accumulating
     /// the wrap height contributed by each line.
-    fn visualRowOfCursor(
-        s: *EditorState,
-        top_row: usize,
-        cursor_row: usize,
-        cursor_col: usize,
-        text_width: usize,
-        tab_size: usize,
-        allocator: std.mem.Allocator,
-    ) !usize {
-        if (text_width == 0 or cursor_row < top_row) return 0;
-        var visual: usize = 0;
-        var row: usize = top_row;
-        while (row < cursor_row) : (row += 1) {
-            visual += wrappedRowsForLine(s, row, text_width, tab_size, allocator);
-        }
-        // Cursor row: count rows up to `cursor_col` characters in.
-        const line = s.getLineContent(cursor_row) catch return visual;
-        defer allocator.free(line);
-        var col_used: usize = 0;
-        var byte_idx: usize = 0;
-        var char_idx: usize = 0;
-        var extra_rows: usize = 0;
-        while (byte_idx < line.len and char_idx < cursor_col) {
-            const len = std.unicode.utf8ByteSequenceLength(line[byte_idx]) catch 1;
-            if (byte_idx + len > line.len) break;
-            const cw: usize = if (line[byte_idx] == '\t') tab_size else 1;
-            if (col_used + cw > text_width) {
-                extra_rows += 1;
-                col_used = 0;
-            }
-            col_used += cw;
-            byte_idx += len;
-            char_idx += 1;
-        }
-        return visual + extra_rows;
-    }
-
-    fn wrappedRowsForLine(
-        s: *EditorState,
-        row: usize,
-        text_width: usize,
-        tab_size: usize,
-        allocator: std.mem.Allocator,
-    ) usize {
-        if (text_width == 0) return 1;
-        const line = s.getLineContent(row) catch return 1;
-        defer allocator.free(line);
-        var rows: usize = 1;
-        var col_used: usize = 0;
-        var byte_idx: usize = 0;
-        while (byte_idx < line.len) {
-            const len = std.unicode.utf8ByteSequenceLength(line[byte_idx]) catch 1;
-            if (byte_idx + len > line.len) break;
-            const cw: usize = if (line[byte_idx] == '\t') tab_size else 1;
-            if (col_used + cw > text_width) {
-                rows += 1;
-                col_used = 0;
-            }
-            col_used += cw;
-            byte_idx += len;
-        }
-        return rows;
-    }
+    // visualRowOfCursor → kernel/render.zig
+    // wrappedRowsForLine → kernel/render.zig
 
     pub fn sendUpdate(self: *Core) !void {
-        @import("../services/thread_name.zig").markStep("send:enter");
-        const now = std.Io.Clock.real.now(self.io).toMilliseconds();
-
-        // Soft frame-rate cap. A snapshot built <16 ms ago is still
-        // in the bus (or just consumed); building another one now
-        // produces a frame the user can't perceive and the bus would
-        // coalesce anyway (see main.zig render_update drain). Mark
-        // need-to-render so the tick handler catches up and bail.
-        // Critical UX paths (mode change, file open) still feel
-        // instant because the previous render was, by definition,
-        // <16 ms old.
-        if (self.last_render_time > 0 and now - self.last_render_time < self.min_render_interval_ms) {
-            self.needs_render = true;
-            @import("../services/thread_name.zig").markStep("send:throttled");
-            return;
-        }
-        self.last_render_time = now;
-        self.needs_render = false;
-
-        if (self.scroll_in_progress and self.last_scroll_time > 0) {
-            if (now - self.last_scroll_time > self.scroll_timeout_ms) {
-                self.scroll_in_progress = false;
-            }
-        }
-
-        // Re-scan search decorations against the current buffer if a
-        // search is still active. Without this, edits that shift text
-        // leave the post-prompt highlights pointing at stale byte
-        // ranges. The scan is bounded to ~100 visible lines and cheap.
-        if (self.last_search_query.items.len > 0 and self.search_input.items.len == 0) {
-            self.updateSearchDecorations() catch |err| {
-                log.debug("search decoration refresh failed: {}", .{err});
-            };
-        }
-
-        defer self.scroll_in_progress = false;
-
-        self.version += 1;
-
-        // Pool the arena across frames so we don't bounce pages in and out
-        // of the process at the render cadence.
-        const arena = try self.arena_pool.acquire();
-        errdefer self.arena_pool.release(arena);
-        const alloc = arena.allocator();
-
-        if (self.mode == .buffer_picker) {
-            const picker_visible_rows = if (self.win_size.rows > 5) self.win_size.rows - 5 else 1;
-            if (self.buffer_manager.picker_selected < self.buffer_manager.picker_scroll_offset) {
-                self.buffer_manager.picker_scroll_offset = self.buffer_manager.picker_selected;
-            } else if (self.buffer_manager.picker_selected >= self.buffer_manager.picker_scroll_offset + picker_visible_rows) {
-                self.buffer_manager.picker_scroll_offset = self.buffer_manager.picker_selected - picker_visible_rows + 1;
-            }
-        }
-
-        const s = self.state();
-
-        var visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
-        if (self.split_manager) |*sm| {
-            if (sm.getAllPaneBounds(alloc, .{
-                .cols = self.win_size.cols,
-                .rows = self.win_size.rows,
-            })) |bounds| {
-                for (bounds.items) |pane_bound| {
-                    if (pane_bound.pane.id == sm.focused_pane_id) {
-                        visible_rows = if (pane_bound.height > 2) pane_bound.height - 1 else 1;
-                        break;
-                    }
-                }
-            } else |_| {}
-        }
-
-        if (s.cursor_row < s.scroll_offset) {
-            s.scroll_offset = s.cursor_row;
-        } else if (s.cursor_row >= s.scroll_offset + visible_rows) {
-            s.scroll_offset = s.cursor_row - visible_rows + 1;
-        }
-
-        // Wrap-aware adjustment: long lines that soft-wrap to multiple
-        // visual rows can push the cursor's *visual* position out of
-        // the viewport even when its logical row is technically in
-        // range. Walk the lines from `scroll_offset` to `cursor_row`,
-        // summing wrapped row counts, and advance `scroll_offset` if
-        // the cursor's visual position would land below the visible
-        // area. The text width here approximates what the renderer
-        // uses; it's exact for an unsplit window and a conservative
-        // overestimate for splits, which only ever scrolls a hair too
-        // far — preferable to leaving the cursor invisible.
-        {
-            const total_lines = s.buffer.lineCount();
-            const gutter_digits: usize = if (total_lines > 0)
-                std.math.log10_int(total_lines) + 1
-            else
-                1;
-            const gutter_width = gutter_digits + 1;
-            const text_width: usize = if (self.win_size.cols > gutter_width)
-                self.win_size.cols - gutter_width
-            else
-                1;
-            const tab_size: usize = self.storage.config.editor.tab_size;
-
-            // Find a `scroll_offset` such that the cursor's visual
-            // row (relative to the top of the viewport) is < visible_rows.
-            // Cap the loop so a pathological line can't spin here.
-            var guard: usize = 0;
-            while (guard < 64) : (guard += 1) {
-                const visual_row = visualRowOfCursor(
-                    s,
-                    s.scroll_offset,
-                    s.cursor_row,
-                    s.cursor_col,
-                    text_width,
-                    tab_size,
-                    self.allocator,
-                ) catch break;
-                if (visual_row < visible_rows) break;
-                if (s.scroll_offset >= s.cursor_row) break;
-                s.scroll_offset += 1;
-            }
-        }
-
-        if (self.split_manager) |*sm| {
-            if (sm.sync_scroll) {
-                sm.setAllPanesScrollOffset(s.scroll_offset);
-            }
-        }
-
-        self.syncStateToPane();
-
-        @import("../services/thread_name.zig").markStep("send:visible_lines");
-        const visible_lines = try s.buffer.getVisibleLines(alloc, s.scroll_offset, visible_rows + 5);
-
-        @import("../services/thread_name.zig").markStep("send:terminal_slices");
-        const terminal_input_slice = if (self.terminal_input.items.len > 0)
-            try alloc.dupe(u8, self.terminal_input.items)
-        else
-            null;
-
-        const terminal_output_slice = if (self.terminal_output.items.len > 0)
-            try alloc.dupe(u8, self.terminal_output.items)
-        else
-            null;
-
-        const save_as_input_slice = if (self.mode == .save_as_mode) try alloc.dupe(u8, self.save_as_input.items) else null;
-        const search_input_slice = if (self.mode == .visual_search) try alloc.dupe(u8, self.search_input.items) else null;
-        const command_palette_query_slice = if (self.mode == .command_palette) try alloc.dupe(u8, self.command_palette_input.items) else null;
-        const go_to_line_input_slice = if (self.mode == .go_to_line) try alloc.dupe(u8, self.go_to_line_input.items) else null;
-        const symbol_picker_query_slice = if (self.mode == .symbol_picker) try alloc.dupe(u8, self.symbol_picker_query.items) else null;
-        const workspace_symbol_query_slice = if (self.mode == .workspace_symbol_picker) try alloc.dupe(u8, self.workspace_symbol_query.items) else null;
-
-        @import("../services/thread_name.zig").markStep("send:logs");
-        var logs_slice: ?[]const protocol.LogEntry = null;
-        if (self.mode == .log_view) {
-            if (logger_service.getGlobal()) |l| {
-                const entries = try l.getEntries(alloc);
-                const proto_entries = try alloc.alloc(protocol.LogEntry, entries.len);
-                for (entries, 0..) |e, i| {
-                    proto_entries[i] = .{
-                        .timestamp = e.timestamp,
-                        .level = e.level,
-                        .scope = e.scope,
-                        .message = e.message,
-                    };
-                }
-                logs_slice = proto_entries;
-            }
-        }
-
-        @import("../services/thread_name.zig").markStep("send:cmd_palette");
-        var command_palette_results: ?[]const protocol.CommandEntry = null;
-        if (self.mode == .command_palette) {
-            const entries = try alloc.alloc(protocol.CommandEntry, self.command_palette_results.items.len);
-            for (self.command_palette_results.items, 0..) |cmd, i| {
-                entries[i] = .{ .id = try alloc.dupe(u8, cmd.id), .title = try alloc.dupe(u8, cmd.title), .description = try alloc.dupe(u8, cmd.description) };
-            }
-            command_palette_results = entries;
-        }
-
-        @import("../services/thread_name.zig").markStep("send:file_picker");
-        var picker_entries: ?[]const protocol.DirEntry = null;
-        var file_picker_cwd: ?[]const u8 = null;
-        if (self.mode == .file_picker or self.mode == .terminal) {
-            file_picker_cwd = try alloc.dupe(u8, self.file_manager.cwd);
-            if (self.mode == .file_picker and self.file_manager.entries.items.len > 0) {
-                const entries = try alloc.alloc(protocol.DirEntry, self.file_manager.entries.items.len);
-                for (self.file_manager.entries.items, 0..) |entry, i| {
-                    entries[i] = .{ .name = try alloc.dupe(u8, entry.name), .is_dir = entry.is_dir };
-                }
-                picker_entries = entries;
-            }
-        }
-
-        var explorer_entries: ?[]const protocol.ExplorerEntry = null;
-        var explorer_cwd: ?[]const u8 = null;
-        var explorer_selected: usize = 0;
-        var explorer_scroll: usize = 0;
-        if (self.mode == .file_explorer) {
-            if (self.file_explorer) |*fx| {
-                explorer_cwd = try alloc.dupe(u8, fx.root);
-                explorer_entries = try fx.snapshot(alloc);
-                explorer_selected = fx.selected;
-                explorer_scroll = fx.scroll_offset;
-            }
-        }
-
-        // Mirror the references picker entries into the per-frame
-        // arena so the renderer doesn't have to hold the core
-        // allocator's slices across the message boundary.
-        var refs_snap: ?[]const protocol.ReferenceEntry = null;
-        var refs_sym_snap: ?[]const u8 = null;
-        if (self.mode == .references_picker and self.references_picker_entries.items.len > 0) {
-            const out = try alloc.alloc(protocol.ReferenceEntry, self.references_picker_entries.items.len);
-            for (self.references_picker_entries.items, 0..) |e, i| {
-                out[i] = .{
-                    .full_path = try alloc.dupe(u8, e.full_path),
-                    .display_path = try alloc.dupe(u8, e.display_path),
-                    .line = e.line,
-                    .col = e.col,
-                    .snippet = try alloc.dupe(u8, e.snippet),
-                };
-            }
-            refs_snap = out;
-            if (self.references_symbol_name) |sym| {
-                refs_sym_snap = try alloc.dupe(u8, sym);
-            }
-        }
-
-        // Diagnostics picker: fetch + sort + dupe message strings
-        // into the arena.
-        var diag_picker_snap: ?[]const protocol.DiagnosticPickerEntry = null;
-        if (self.mode == .diagnostics_picker) {
-            const ds = self.state();
-            if (ds.file_path) |path| {
-                if (self.lsp_manager.getDiagnosticsForFile(self.allocator, path)) |diags| {
-                    defer LSPManager.freeDiagnostics(self.allocator, diags);
-                    std.mem.sort(LSPManager.Diagnostic, diags, {}, struct {
-                        fn lt(_: void, a: LSPManager.Diagnostic, b: LSPManager.Diagnostic) bool {
-                            if (a.start_line != b.start_line) return a.start_line < b.start_line;
-                            return a.start_col < b.start_col;
-                        }
-                    }.lt);
-                    const out = try alloc.alloc(protocol.DiagnosticPickerEntry, diags.len);
-                    for (diags, 0..) |d, i| {
-                        out[i] = .{
-                            .line = d.start_line,
-                            .col = d.start_col,
-                            .severity = switch (d.severity) {
-                                .err => .err,
-                                .warning => .warning,
-                                .info => .info,
-                                .hint => .hint,
-                            },
-                            .message = try alloc.dupe(u8, d.message),
-                        };
-                    }
-                    diag_picker_snap = out;
-                } else |_| {}
-            }
-        }
-
-        @import("../services/thread_name.zig").markStep("send:buffer_infos");
-        const buffer_infos = try alloc.alloc(protocol.BufferInfo, self.buffer_manager.buffers.items.len);
-        for (self.buffer_manager.buffers.items, 0..) |buf, i| {
-            buffer_infos[i] = .{
-                .id = buf.id,
-                .name = try alloc.dupe(u8, buf.name),
-                .modified = buf.state.modified,
-                .is_active = i == self.buffer_manager.active_index,
-                .is_large = buf.is_large,
-            };
-        }
-
-        @import("../services/thread_name.zig").markStep("send:syntax_setup");
-        var syntax_tokens: ?[]const protocol.SyntaxToken = null;
-
-        // Inlay hints: throttled refresh request. The LSP returns
-        // the entire file's hints, so we don't re-fire per-scroll
-        // — once every 500 ms is enough to track edits and buffer
-        // switches without flooding the server.
-        if (self.storage.config.editor.inlay_hints and !self.activeBufferIsLarge()) blk_inlay: {
-            const path = s.file_path orelse break :blk_inlay;
-            if (LSPManager.getLangFromPath(path) == null) break :blk_inlay;
-            const now_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
-            if (now_ms - self.last_inlay_request_ms >= 500) {
-                self.last_inlay_request_ms = now_ms;
-                const start_line: u32 = @intCast(s.scroll_offset);
-                const end_line: u32 = @intCast(s.scroll_offset + visible_rows + 5);
-                self.lsp_manager.requestInlayHint(path, start_line, end_line) catch |err| {
-                    log.debug("requestInlayHint failed for {s}: {s}", .{ path, @errorName(err) });
-                };
-            }
-        }
-
-        var lang = SyntaxManager.Language.unknown;
-        if (s.file_path) |path| {
-            lang = SyntaxManager.Language.fromFilename(path);
-        } else {
-            lang = SyntaxManager.Language.fromFilename(self.buffer_manager.getActive().name);
-        }
-
-        // Large-file mode short-circuit: skip tree-sitter, brackets, LSP
-        // tokens entirely. The buffer renders as plain text so editing a
-        // 5 MB log stays responsive. `is_large` is set once at open and
-        // sticky for the buffer's lifetime, so this branch is a single
-        // pointer dereference.
-        const is_large_active = self.activeBufferIsLarge();
-        if (lang != .unknown and !is_large_active) {
-            // Materialize the active buffer's content exactly once for
-            // every consumer below (parse submit, markdown highlight,
-            // bracket finder). Previously each consumer called
-            // `s.buffer.toString` independently — 3-4x rope flatten on a
-            // 50k-line file per render frame. The arena owns this slice
-            // so we don't free it explicitly.
-            @import("../services/thread_name.zig").markStep("send:buffer_tostring");
-            const active_content_opt: ?[]const u8 = s.buffer.toString(alloc) catch null;
-
-            // Snapshot under the tree lock — without this, reading
-            // `current_lang`/`current_resource_id`/`tree` races with
-            // the parse worker that swaps them in under the same lock.
-            const syn_state = self.syntax_manager.stateSnapshot();
-            const active_buffer_id = self.buffer_manager.getActive().id;
-            const buffer_changed = (syn_state.resource_id != active_buffer_id);
-
-            // Buffer switch: park the outgoing tree + try to
-            // restore a previously-parked tree for the incoming
-            // buffer. If the parked tree's content_len matches
-            // current content, it slots in instantly — no flash of
-            // unhighlighted text waiting on the async parse. If
-            // stale or absent, the tree is cleared and the normal
-            // submitParse path below populates it.
-            if (buffer_changed and syn_state.lang == lang) {
-                const cur_len: usize = if (active_content_opt) |c| c.len else 0;
-                self.syntax_manager.setActiveBuffer(active_buffer_id, lang, cur_len);
-            }
-
-            if (!self.scroll_in_progress) {
-                const needs_reparse = (syn_state.lang != lang) or
-                    buffer_changed or
-                    (!syn_state.has_tree);
-
-                if (needs_reparse) {
-                    if (syn_state.lang != lang) {
-                        self.syntax_manager.setLanguageEnum(lang) catch |err| {
-                            log.warn("Failed to set syntax language to {}: {}", .{ lang, err });
-                        };
-                    }
-                    // Async — render proceeds with whatever tree we
-                    // currently have (possibly the parked one we
-                    // just restored, possibly none), and re-fires
-                    // once the worker installs the new tree.
-                    if (active_content_opt) |content| {
-                        self.syntax_manager.submitParse(content, active_buffer_id) catch |err| {
-                            log.debug("Syntax reparse submit failed for active buffer: {}", .{err});
-                        };
-                    }
-                }
-            } else {
-                if (!syn_state.has_tree or syn_state.lang != lang) {
-                    if (syn_state.lang != lang) {
-                        self.syntax_manager.setLanguageEnum(lang) catch |err| {
-                            log.warn("Failed to set syntax language to {}: {}", .{ lang, err });
-                        };
-                    }
-                    if (active_content_opt) |content| {
-                        self.syntax_manager.submitParse(content, active_buffer_id) catch |err| {
-                            log.debug("Syntax parse submit during scroll failed: {}", .{err});
-                        };
-                    }
-                }
-            }
-
-            // Use LSP semantic tokens for any language whose LSP is wired.
-            // Tree-sitter is still the fallback when no LSP tokens are
-            // available yet (cold start, server not installed, etc.).
-            const use_lsp = if (s.file_path != null) switch (lang) {
-                .zig, .c, .cpp, .rust, .go, .python, .javascript, .typescript, .tsx, .java, .ruby, .csharp => true,
-                else => false,
-            } else false;
-
-            if (use_lsp) {
-                @import("../services/thread_name.zig").markStep("send:lsp_tokens");
-                if (self.lsp_manager.copyVisibleTokens(alloc, s.file_path.?, s.scroll_offset, s.scroll_offset + visible_rows + 5)) |tokens| {
-                    syntax_tokens = tokens;
-                } else |_| {
-                    syntax_tokens = null;
-                }
-            }
-
-            // Highlights and bracket coloring always run, scroll or not.
-            // The previous `if (!scroll_in_progress)` guard left the visible
-            // region with only LSP tokens during scroll, which produced a
-            // flash of unhighlighted text whenever LSP wasn't ready (cold
-            // start, no LSP for the language, just-revealed lines). The
-            // tree-sitter highlight is bounded to the visible range and is
-            // microseconds; brackets are cached per buffer-version (see
-            // `findBrackets`) so scroll is cheap.
-            if (syntax_tokens == null or syntax_tokens.?.len == 0) {
-                if (lang == .markdown) {
-                    @import("../services/thread_name.zig").markStep("send:highlight_md");
-                    if (active_content_opt) |content| {
-                        syntax_tokens = self.syntax_manager.highlightMarkdown(alloc, content, s.scroll_offset, s.scroll_offset + visible_rows + 5) catch null;
-                    }
-                } else {
-                    @import("../services/thread_name.zig").markStep("send:highlight_ts");
-                    syntax_tokens = self.syntax_manager.highlight(alloc, s.scroll_offset, s.scroll_offset + visible_rows + 5) catch null;
-                }
-            }
-
-            if (lang != .markdown and lang != .unknown) {
-                @import("../services/thread_name.zig").markStep("send:brackets");
-                if (active_content_opt) |content| {
-                    if (self.syntax_manager.findBrackets(alloc, content, s.scroll_offset, s.scroll_offset + visible_rows + 5)) |bracket_tokens| {
-                        if (bracket_tokens.len > 0) {
-                            const existing = syntax_tokens orelse &.{};
-                            const merged = alloc.alloc(protocol.SyntaxToken, existing.len + bracket_tokens.len) catch null;
-                            if (merged) |m| {
-                                @memcpy(m[0..existing.len], existing);
-                                @memcpy(m[existing.len..], bracket_tokens);
-                                syntax_tokens = m;
-                            }
-                        }
-                    } else |_| {}
-                }
-            }
-        }
-
-        @import("../services/thread_name.zig").markStep("send:symbol_picker");
-        var symbol_picker_results: ?[]const protocol.SymbolEntry = null;
-        if (self.mode == .symbol_picker) {
-            const entries = try alloc.alloc(protocol.SymbolEntry, self.symbol_picker_results.items.len);
-            for (self.symbol_picker_results.items, 0..) |sym, i| {
-                entries[i] = .{ .name = try alloc.dupe(u8, sym.name), .kind = try alloc.dupe(u8, sym.kind), .line = sym.line };
-            }
-            symbol_picker_results = entries;
-        }
-
-        @import("../services/thread_name.zig").markStep("send:workspace_symbols");
-        var workspace_symbol_results: ?[]const protocol.WorkspaceSymbolEntry = null;
-        if (self.mode == .workspace_symbol_picker) {
-            const entries = try alloc.alloc(protocol.WorkspaceSymbolEntry, self.workspace_symbol_results.items.len);
-            for (self.workspace_symbol_results.items, 0..) |sym, i| {
-                entries[i] = .{
-                    .name = try alloc.dupe(u8, sym.name),
-                    .kind = try alloc.dupe(u8, sym.kind),
-                    .file_path = try alloc.dupe(u8, sym.file_path),
-                    .line = sym.line,
-                    .col = sym.col,
-                };
-            }
-            workspace_symbol_results = entries;
-        }
-
-        @import("../services/thread_name.zig").markStep("send:completion");
-        var completion_items: ?[]const protocol.CompletionEntry = null;
-        if (self.completion_active and self.filtered_completion_items.items.len > 0) {
-            const entries = try alloc.alloc(protocol.CompletionEntry, self.filtered_completion_items.items.len);
-            for (self.filtered_completion_items.items, 0..) |item, i| {
-                entries[i] = .{
-                    .label = try alloc.dupe(u8, item.label),
-                    .kind = try alloc.dupe(u8, item.kind_icon),
-                    .detail = if (item.detail) |d| try alloc.dupe(u8, d) else "",
-                    .kind_category = item.kind_category,
-                };
-            }
-            completion_items = entries;
-        }
-
-        @import("../services/thread_name.zig").markStep("send:hover");
-        var hover_content: ?[]const u8 = null;
-        if (self.hover_content) |h| hover_content = try alloc.dupe(u8, h);
-
-        var hover_document_slot: ?hover_doc_mod.HoverDocument = null;
-        if (self.hover_doc) |doc| {
-            hover_document_slot = doc.clone(alloc) catch null;
-        }
-
-        const hover_loading = blk: {
-            if (!self.hover_pending) break :blk false;
-            const t_now = std.Io.Clock.real.now(self.io).toMilliseconds();
-            break :blk (t_now - self.hover_request_sent_ms) >= self.hover_loading_grace_ms;
-        };
-
-        // Which-key: only visible when the user has explicitly asked
-        // for it (Space twice). Never time-triggered — the auto-popup
-        // hid the active editor line on small terminals.
-        const which_key_visible = self.leader_pending and self.leader_help_requested;
-
-        var file_path_slice: ?[]const u8 = null;
-        if (s.file_path) |p| file_path_slice = try alloc.dupe(u8, p);
-
-        @import("../services/thread_name.zig").markStep("send:panes");
-        var pane_snapshots: []const protocol.PaneSnapshot = &.{};
-        var split_enabled = false;
-        var focused_pane_id: u32 = 0;
-
-        if (self.split_manager) |*sm| {
-            const content_rows = if (self.win_size.rows > 1) self.win_size.rows - 1 else 1;
-            const params = protocol.RenderParams{ .rows = content_rows, .cols = self.win_size.cols };
-            var bounds_list = try sm.getAllPaneBounds(alloc, params);
-            defer bounds_list.deinit(alloc);
-            const bounds = bounds_list.items;
-            if (bounds.len > 0) {
-                split_enabled = true;
-                focused_pane_id = sm.getFocusedPaneId();
-
-                const panes = try alloc.alloc(protocol.PaneSnapshot, bounds.len);
-                for (bounds, 0..) |b, i| {
-                    if (b.pane.buffer_index >= self.buffer_manager.buffers.items.len) continue;
-                    const pane_buffer = &self.buffer_manager.buffers.items[b.pane.buffer_index];
-                    const p_state = &pane_buffer.state;
-
-                    const pane_ptr = sm.getPaneById(b.pane.id);
-                    const pane_scroll = if (pane_ptr) |p| p.scroll_offset else p_state.scroll_offset;
-                    const pane_cursor_row = if (pane_ptr) |p| p.cursor_row else p_state.cursor_row;
-                    const pane_cursor_col = if (pane_ptr) |p| p.cursor_col else p_state.cursor_col;
-                    const pane_sel_row = if (pane_ptr) |p| p.selection_anchor_row else if (p_state.selection_anchor) |a| a.row else null;
-                    const pane_sel_col = if (pane_ptr) |p| p.selection_anchor_col else if (p_state.selection_anchor) |a| a.col else null;
-
-                    const pane_rows: usize = if (b.height > 1) b.height - 1 else 1;
-                    const safe_pane_rows = if (pane_rows < 1) 1 else pane_rows;
-
-                    const pane_lines = try p_state.buffer.getVisibleLines(alloc, pane_scroll, safe_pane_rows + 1);
-
-                    var pane_tokens: ?[]const protocol.SyntaxToken = null;
-
-                    var pane_lang = SyntaxManager.Language.unknown;
-                    if (p_state.file_path) |path| {
-                        pane_lang = SyntaxManager.Language.fromFilename(path);
-                    } else {
-                        pane_lang = SyntaxManager.Language.fromFilename(pane_buffer.name);
-                    }
-
-                    const pane_is_large = self.bufferIsLargeAt(b.pane.buffer_index);
-                    if (pane_lang != .unknown and !pane_is_large) {
-                        // One toString per pane, shared by parse-submit
-                        // and markdown-highlight (same rationale as the
-                        // active-buffer block above).
-                        const pane_content_opt: ?[]const u8 = p_state.buffer.toString(alloc) catch null;
-
-                        if (!self.scroll_in_progress) {
-                            const pane_buffer_id = pane_buffer.id;
-                            const pane_syn = self.syntax_manager.stateSnapshot();
-                            if (pane_syn.lang != pane_lang or pane_syn.resource_id != pane_buffer_id) {
-                                if (pane_syn.lang != pane_lang) {
-                                    self.syntax_manager.setLanguageEnum(pane_lang) catch |err| {
-                                        log.warn("Failed to set pane syntax language to {}: {}", .{ pane_lang, err });
-                                    };
-                                }
-                                if (pane_content_opt) |content| {
-                                    self.syntax_manager.submitParse(content, pane_buffer_id) catch |err| {
-                                        log.debug("Pane syntax parse submit failed: {}", .{err});
-                                    };
-                                }
-                            }
-                        }
-
-                        const use_lsp = if (p_state.file_path != null) switch (pane_lang) {
-                            .zig, .c, .cpp, .rust, .go, .python, .javascript, .typescript, .tsx, .java, .ruby, .csharp => true,
-                            else => false,
-                        } else false;
-                        if (use_lsp) {
-                            if (self.lsp_manager.copyVisibleTokens(alloc, p_state.file_path.?, pane_scroll, pane_scroll + safe_pane_rows + 5)) |tokens| {
-                                pane_tokens = tokens;
-                            } else |_| {
-                                pane_tokens = null;
-                            }
-                        }
-
-                        if (pane_tokens == null or pane_tokens.?.len == 0) {
-                            if (pane_lang == .markdown) {
-                                if (pane_content_opt) |content| {
-                                    pane_tokens = self.syntax_manager.highlightMarkdown(alloc, content, pane_scroll, pane_scroll + safe_pane_rows + 5) catch null;
-                                }
-                            } else {
-                                pane_tokens = self.syntax_manager.highlight(alloc, pane_scroll, pane_scroll + safe_pane_rows + 5) catch null;
-                            }
-                        }
-                    }
-
-                    panes[i] = .{
-                        .id = b.pane.id,
-                        .buffer_index = b.pane.buffer_index,
-                        .is_focused = b.pane.id == focused_pane_id,
-                        .x = @as(f32, @floatFromInt(b.x)) / @as(f32, @floatFromInt(self.win_size.cols)),
-                        .y = @as(f32, @floatFromInt(b.y)) / @as(f32, @floatFromInt(content_rows)),
-                        .width = @as(f32, @floatFromInt(b.width)) / @as(f32, @floatFromInt(self.win_size.cols)),
-                        .height = @as(f32, @floatFromInt(b.height)) / @as(f32, @floatFromInt(content_rows)),
-                        .cursor_row = pane_cursor_row,
-                        .cursor_col = pane_cursor_col,
-                        .scroll_offset = pane_scroll,
-                        .selection_anchor_row = pane_sel_row,
-                        .selection_anchor_col = pane_sel_col,
-                        .visible_lines = pane_lines,
-                        .syntax_tokens = pane_tokens,
-                        .total_lines = p_state.buffer.lineCount(),
-                        .diff_highlights = if (self.diff_highlights.items.len > 0)
-                            try alloc.dupe(protocol.DiffLineHighlight, self.diff_highlights.items)
-                        else
-                            null,
-                    };
-                }
-                pane_snapshots = panes;
-            }
-        }
-
-        // Fetch + sort diagnostics once for the active buffer. The
-        // snapshot fields below need (a) a sorted protocol-shaped list
-        // and (b) error / warning counts. Previously each was a
-        // separate `getDiagnosticsForFile` call, each acquiring the
-        // diagnostics mutex and walking the per-URI map — 3x the work
-        // for no reason. Drains to one call here.
-        @import("../services/thread_name.zig").markStep("send:diagnostics");
-        var diagnostics_snap: ?[]const protocol.DiagnosticSnapshot = null;
-        var diagnostics_err_count: u32 = 0;
-        var diagnostics_warn_count: u32 = 0;
-        if (s.file_path) |dpath| {
-            if (self.lsp_manager.getDiagnosticsForFile(alloc, dpath)) |diags| {
-                if (diags.len > 0) {
-                    std.mem.sort(LSPManager.Diagnostic, diags, {}, struct {
-                        fn lt(_: void, a: LSPManager.Diagnostic, b: LSPManager.Diagnostic) bool {
-                            if (a.start_line != b.start_line) return a.start_line < b.start_line;
-                            return a.start_col < b.start_col;
-                        }
-                    }.lt);
-                    const out = try alloc.alloc(protocol.DiagnosticSnapshot, diags.len);
-                    for (diags, 0..) |d, i| {
-                        out[i] = .{
-                            .start_line = d.start_line,
-                            .start_col = d.start_col,
-                            .end_line = d.end_line,
-                            .end_col = d.end_col,
-                            .severity = switch (d.severity) {
-                                .err => .err,
-                                .warning => .warning,
-                                .info => .info,
-                                .hint => .hint,
-                            },
-                            .message = d.message,
-                        };
-                        switch (d.severity) {
-                            .err => diagnostics_err_count += 1,
-                            .warning => diagnostics_warn_count += 1,
-                            else => {},
-                        }
-                    }
-                    diagnostics_snap = out;
-                }
-            } else |_| {}
-        }
-
-        @import("../services/thread_name.zig").markStep("send:snapshot_create");
-        const snapshot = try alloc.create(protocol.RenderSnapshot);
-        snapshot.* = .{
-            .visible_lines = visible_lines,
-            .first_visible_line = s.scroll_offset,
-            .total_lines = s.buffer.lineCount(),
-            .cursor_row = s.cursor_row,
-            .cursor_col = s.cursor_col,
-            .nav_repeat_count = self.nav_repeat_count,
-            .selection_anchor_row = if (s.selection_anchor) |a| a.row else null,
-            .selection_anchor_col = if (s.selection_anchor) |a| a.col else null,
-            .scroll_offset = s.scroll_offset,
-            .version = self.version,
-            .mode = self.mode,
-            .terminal_output = terminal_output_slice,
-            .terminal_input = terminal_input_slice,
-            .terminal_cwd = if (self.terminal_cwd) |cwd| try alloc.dupe(u8, cwd) else null,
-            .terminal_scroll_offset = self.terminal_scroll_offset,
-            .terminal_running = self.terminal_running,
-            .file_path = file_path_slice,
-            .file_modified = s.modified,
-            .buffers = buffer_infos,
-            .active_buffer_index = self.buffer_manager.active_index,
-            .buffer_picker_selected = self.buffer_manager.picker_selected,
-            .file_picker_cwd = file_picker_cwd,
-            .file_picker_entries = picker_entries,
-            .references_entries = refs_snap,
-            .references_selected = self.references_picker_selected,
-            .references_scroll_offset = self.references_picker_scroll_offset,
-            .references_symbol = refs_sym_snap,
-            .diagnostics_entries = diag_picker_snap,
-            .diagnostics_picker_selected = self.diagnostics_picker_selected,
-            .diagnostics_picker_scroll_offset = self.diagnostics_picker_scroll_offset,
-            .file_explorer_cwd = explorer_cwd,
-            .file_explorer_entries = explorer_entries,
-            .file_explorer_selected = explorer_selected,
-            .file_explorer_scroll_offset = explorer_scroll,
-            .file_picker_selected = self.file_manager.selected_index,
-            .buffer_picker_scroll_offset = self.buffer_manager.picker_scroll_offset,
-            .buffer_picker_number_input = if (self.mode == .buffer_picker and self.buffer_picker_number_input.items.len > 0)
-                try alloc.dupe(u8, self.buffer_picker_number_input.items)
-            else
-                null,
-            .save_as_input = save_as_input_slice,
-            .search_input = search_input_slice,
-            .search_direction_forward = (self.search_direction == .forward),
-            .search_match_count = self.search_match_count,
-            .search_match_index = self.search_match_index,
-            .command_palette_query = command_palette_query_slice,
-            .command_palette_results = command_palette_results,
-            .command_palette_selected = self.command_palette_selected,
-            .syntax_tokens = syntax_tokens,
-            .hover_content = hover_content,
-            .hover_document = hover_document_slot,
-            .hover_anchor_row = self.hover_anchor_row,
-            .hover_anchor_col = self.hover_anchor_col,
-            .hover_scroll_offset = self.hover_scroll_offset,
-            .hover_sticky = self.hover_sticky,
-            .hover_loading = hover_loading,
-            .which_key_visible = which_key_visible,
-            .leader_chord = self.leader_chord,
-            .go_to_line_input = go_to_line_input_slice,
-            .symbol_picker_query = symbol_picker_query_slice,
-            .workspace_symbol_query = workspace_symbol_query_slice,
-            .workspace_symbol_results = workspace_symbol_results,
-            .workspace_symbol_selected = self.workspace_symbol_selected,
-            .workspace_symbol_pending = self.workspace_symbol_pending,
-            .symbol_picker_results = symbol_picker_results,
-            .symbol_picker_selected = self.symbol_picker_selected,
-            .completion_active = self.completion_active,
-            .completion_items = completion_items,
-            .completion_selected = self.completion_selected,
-            .signature_help_label = if (self.signature_help) |sh| try alloc.dupe(u8, sh.label) else null,
-            .signature_help_active_parameter = if (self.signature_help) |sh| sh.active_parameter else 0,
-            .signature_help_parameters = if (self.signature_help) |sh| blk: {
-                const out = try alloc.alloc([]const u8, sh.parameters.len);
-                for (sh.parameters, 0..) |p, i| out[i] = try alloc.dupe(u8, p);
-                break :blk out;
-            } else null,
-            .inlay_hints = blk_ih: {
-                if (!self.storage.config.editor.inlay_hints) break :blk_ih null;
-                if (self.activeBufferIsLarge()) break :blk_ih null;
-                const path = s.file_path orelse break :blk_ih null;
-                const hints = self.lsp_manager.copyInlayHints(alloc, path) catch break :blk_ih null;
-                if (hints.len == 0) break :blk_ih null;
-                // Filter to the visible range — there's no point
-                // shipping hints the renderer will discard.
-                var out: std.ArrayListUnmanaged(protocol.InlayHintSnapshot) = .empty;
-                errdefer out.deinit(alloc);
-                const first: u32 = @intCast(s.scroll_offset);
-                const last: u32 = @intCast(s.scroll_offset + visible_rows + 5);
-                for (hints) |h| {
-                    if (h.line < first or h.line >= last) continue;
-                    try out.append(alloc, .{
-                        .line = h.line,
-                        .col = h.col,
-                        .label = h.label,
-                        .kind = h.kind,
-                        .padding_left = h.padding_left,
-                        .padding_right = h.padding_right,
-                    });
-                }
-                break :blk_ih try out.toOwnedSlice(alloc);
-            },
-            .split_enabled = split_enabled,
-            .panes = pane_snapshots,
-            .focused_pane_id = focused_pane_id,
-            .plugin_count = self.plugin_manager.wasm_plugins.count() + self.plugin_manager.process_plugins.count(),
-            .plugin_status_items = try self.plugin_manager.snapshotStatusItems(alloc),
-            .plugin_panels = try self.plugin_manager.snapshotPanels(alloc),
-            .lsp_status = try self.lsp_manager.getActiveServerStatus(alloc),
-            .logs = logs_slice,
-            .editor_config = .{
-                .tab_size = self.storage.config.editor.tab_size,
-                .insert_spaces = self.storage.config.editor.insert_spaces,
-                .line_numbers = switch (self.storage.config.editor.line_numbers) {
-                    .absolute => .absolute,
-                    .relative => .relative,
-                    .none => .none,
-                },
-                .wrap = self.storage.config.editor.wrap,
-                .show_status_bar = self.storage.config.ui.show_status_bar,
-                .cursor_line = self.storage.config.editor.cursor_line,
-                .inline_diagnostics = self.storage.config.editor.inline_diagnostics,
-                .inlay_hints = self.storage.config.editor.inlay_hints,
-            },
-            .global_search_query = if (self.global_search_query.items.len > 0)
-                try alloc.dupe(u8, self.global_search_query.items)
-            else
-                null,
-            .global_search_replace = if (self.global_search_replace.items.len > 0)
-                try alloc.dupe(u8, self.global_search_replace.items)
-            else
-                null,
-            .global_search_results = blk: {
-                if (self.global_search_results.items.len == 0) {
-                    // Send an allocated empty slice so the view can tell
-                    // "search ran, no matches" from "no search yet". The
-                    // latter is signalled by `global_search_ran = false`.
-                    break :blk try alloc.alloc(protocol.GlobalSearchFileGroup, 0);
-                }
-                const results = try alloc.alloc(protocol.GlobalSearchFileGroup, self.global_search_results.items.len);
-                for (self.global_search_results.items, 0..) |group, i| {
-                    const new_matches = try alloc.alloc(protocol.GlobalSearchMatch, group.matches.len);
-                    for (group.matches, 0..) |match, j| {
-                        new_matches[j] = .{
-                            .line_num = match.line_num,
-                            .line_content = try alloc.dupe(u8, match.line_content),
-                            .match_start = match.match_start,
-                            .match_end = match.match_end,
-                        };
-                    }
-                    results[i] = .{
-                        .file_path = try alloc.dupe(u8, group.file_path),
-                        .matches = new_matches,
-                        .collapsed = group.collapsed,
-                    };
-                }
-                break :blk results;
-            },
-            .global_search_total_matches = blk: {
-                var count: usize = 0;
-                for (self.global_search_results.items) |group| {
-                    count += group.matches.len;
-                }
-                break :blk count;
-            },
-            .global_search_total_files = self.global_search_results.items.len,
-            .global_search_selected_file = self.global_search_selected_file,
-            .global_search_selected_match = self.global_search_selected_match,
-            .global_search_focus_replace = self.global_search_focus_replace,
-            .global_search_options = self.global_search_options,
-            .global_search_ran = self.global_search_ran,
-            .git_branch = blk_g: {
-                self.refreshGitBranchIfStale();
-                if (self.git_branch) |b| break :blk_g try alloc.dupe(u8, b);
-                break :blk_g null;
-            },
-            .active_job_count = @intCast(self.job_manager.activeCount()),
-            .diff_highlight_lines = if (self.diff_highlights.items.len > 0)
-                try alloc.dupe(protocol.DiffLineHighlight, self.diff_highlights.items)
-            else
-                null,
-            .diagnostics = diagnostics_snap,
-            .diagnostic_error_count = diagnostics_err_count,
-            .diagnostic_warning_count = diagnostics_warn_count,
-            .status_message = blk: {
-                const current_time = std.Io.Clock.real.now(self.io).toMilliseconds();
-                if (self.status_message != null and current_time < self.status_message_expires) {
-                    break :blk self.status_message;
-                } else {
-                    self.status_message = null;
-                    break :blk null;
-                }
-            },
-            .status_message_level = self.status_message_level,
-        };
-
-        @import("../services/thread_name.zig").markStep("send:encode");
-        var msg = protocol.Message{ .render_update = .{
-            .snapshot_ptr = @intFromPtr(snapshot),
-            .arena_ptr = @intFromPtr(arena),
-            .pool_ptr = @intFromPtr(&self.arena_pool),
-        } };
-
-        const bytes = try msg.encode(self.allocator);
-        defer self.allocator.free(bytes);
-        // Renders coalesce: only the freshest snapshot matters. The
-        // `version` field (bumped above) is the slot identity so the
-        // bus can tell when it's actually replacing an earlier frame.
-        @import("../services/thread_name.zig").markStep("send:bus_send");
-        try self.ui_bus.sendCoalesced(.render, bytes, self.version);
-        @import("../services/thread_name.zig").markStep("send:done");
+        return render_mod.buildAndSend(self);
     }
 
     // ---- Hover helpers ---------------------------------------------------
@@ -7430,7 +4120,7 @@ pub const Core = struct {
         }
     }
 
-    fn findProjectRoot(self: *Core, start_path: []const u8) !?[]const u8 {
+    pub fn findProjectRoot(self: *Core, start_path: []const u8) !?[]const u8 {
         const dir_path = std.fs.path.dirname(start_path) orelse return null;
         var current_dir = try self.allocator.dupe(u8, dir_path);
         defer self.allocator.free(current_dir);
@@ -7662,189 +4352,20 @@ pub const Core = struct {
         }
     }
 
-    fn handleCommandPaletteInput(self: *Core, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true })) {
-            if (self.command_palette_selected > 0) {
-                self.command_palette_selected -= 1;
-            }
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
-            if (self.command_palette_results.items.len > 0 and self.command_palette_selected < self.command_palette_results.items.len - 1) {
-                self.command_palette_selected += 1;
-            }
-            return true;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (self.command_palette_results.items.len > 0) {
-                const cmd = self.command_palette_results.items[self.command_palette_selected];
+    // handleCommandPaletteInput → kernel/input/command_palette.zig
 
-                self.mode = self.previous_mode;
-                self.command_palette_input.clearRetainingCapacity();
-
-                // Trap command-execution errors at the palette boundary
-                // so a misbehaving plugin can't take the editor down.
-                // The error is logged (and visible in `:logs`) but the
-                // editor keeps running.
-                cmd.execute(self, cmd.context) catch |err| {
-                    log.err("command '{s}' failed: {s}", .{ cmd.id, @errorName(err) });
-                };
-            }
-            return true;
-        }
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.command_palette_input.items.len > 0) {
-                _ = self.command_palette_input.pop();
-                try self.updateCommandSearch();
-                return true;
-            }
-        }
-        if (key.text) |text| {
-            try self.command_palette_input.appendSlice(self.allocator, text);
-            try self.updateCommandSearch();
-            return true;
-        }
-        return false;
-    }
-
-    fn updateCommandSearch(self: *Core) !void {
+    pub fn updateCommandSearch(self: *Core) !void {
         self.command_palette_results.clearRetainingCapacity();
         try self.command_registry.search(self.command_palette_input.items, &self.command_palette_results, self.allocator);
         self.command_palette_selected = 0;
     }
 
-    fn handleGoToLineInput(self: *Core, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (self.go_to_line_input.items.len > 0) {
-                const line_str = self.go_to_line_input.items;
-                const line_num = std.fmt.parseInt(usize, line_str, 10) catch {
-                    self.mode = self.previous_mode;
-                    self.go_to_line_input.clearRetainingCapacity();
-                    return true;
-                };
+    // handleGoToLineInput → kernel/input/go_to_line.zig
+    // handleSymbolPickerInput → kernel/input/symbol_picker.zig
 
-                const s = self.state();
-                const total_lines = s.buffer.lineCount();
+    // handleWorkspaceSymbolPickerInput → kernel/input/workspace_symbol_picker.zig
 
-                if (line_num > 0) {
-                    s.cursor_row = @min(line_num - 1, if (total_lines > 0) total_lines - 1 else 0);
-                } else {
-                    s.cursor_row = 0;
-                }
-                s.cursor_col = 0;
-                self.mode = self.previous_mode;
-                self.go_to_line_input.clearRetainingCapacity();
-            }
-            return true;
-        } else if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.go_to_line_input.items.len > 0) {
-                _ = self.go_to_line_input.pop();
-                return true;
-            }
-        } else if (key.text) |text| {
-            try self.go_to_line_input.appendSlice(self.allocator, text);
-            return true;
-        }
-        return false;
-    }
-
-    fn handleSymbolPickerInput(self: *Core, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true })) {
-            if (self.symbol_picker_selected > 0) {
-                self.symbol_picker_selected -= 1;
-            }
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
-            if (self.symbol_picker_results.items.len > 0 and self.symbol_picker_selected < self.symbol_picker_results.items.len - 1) {
-                self.symbol_picker_selected += 1;
-            }
-            return true;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (self.symbol_picker_results.items.len > 0 and self.symbol_picker_selected < self.symbol_picker_results.items.len) {
-                const sym = self.symbol_picker_results.items[self.symbol_picker_selected];
-                const s = self.state();
-                s.cursor_row = sym.line;
-                s.cursor_col = 0;
-            }
-            self.mode = self.previous_mode;
-            self.symbol_picker_query.clearRetainingCapacity();
-            return true;
-        }
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.symbol_picker_query.items.len > 0) {
-                _ = self.symbol_picker_query.pop();
-                try self.updateSymbolSearch();
-                return true;
-            }
-        }
-        if (key.text) |text| {
-            try self.symbol_picker_query.appendSlice(self.allocator, text);
-            try self.updateSymbolSearch();
-            return true;
-        }
-        return false;
-    }
-
-    fn handleWorkspaceSymbolPickerInput(self: *Core, key: vaxis.Key) !bool {
-        if (key.matches(vaxis.Key.up, .{}) or key.matches('p', .{ .ctrl = true })) {
-            if (self.workspace_symbol_selected > 0) self.workspace_symbol_selected -= 1;
-            return true;
-        }
-        if (key.matches(vaxis.Key.down, .{}) or key.matches('n', .{ .ctrl = true })) {
-            if (self.workspace_symbol_results.items.len > 0 and
-                self.workspace_symbol_selected + 1 < self.workspace_symbol_results.items.len)
-            {
-                self.workspace_symbol_selected += 1;
-            }
-            return true;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (self.workspace_symbol_selected < self.workspace_symbol_results.items.len) {
-                const sym = self.workspace_symbol_results.items[self.workspace_symbol_selected];
-                // Record where we came from so Space, can take the
-                // user straight back.
-                const s = self.state();
-                if (s.file_path) |path| {
-                    self.jump_list.recordJump(path, s.cursor_row, s.cursor_col) catch |err| {
-                        log.debug("recordJump failed for {s}: {s}", .{ path, @errorName(err) });
-                    };
-                }
-                _ = self.buffer_manager.openFile(sym.file_path) catch |err| {
-                    log.warn("Open file from workspace symbol failed: {}", .{err});
-                    self.mode = self.previous_mode;
-                    return true;
-                };
-                const new_state = self.state();
-                new_state.cursor_row = sym.line;
-                new_state.cursor_col = sym.col;
-                new_state.preferred_col = null;
-                // Centre the line so the symbol isn't pinned to the top edge.
-                const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
-                const half = visible_rows / 2;
-                new_state.scroll_offset = if (new_state.cursor_row >= half) new_state.cursor_row - half else 0;
-            }
-            self.mode = self.previous_mode;
-            self.workspace_symbol_query.clearRetainingCapacity();
-            return true;
-        }
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.workspace_symbol_query.items.len > 0) {
-                _ = self.workspace_symbol_query.pop();
-                try self.dispatchWorkspaceSymbolQuery();
-            }
-            return true;
-        }
-        if (key.text) |text| {
-            try self.workspace_symbol_query.appendSlice(self.allocator, text);
-            try self.dispatchWorkspaceSymbolQuery();
-            return true;
-        }
-        return false;
-    }
-
-    fn updateSymbolSearch(self: *Core) !void {
+    pub fn updateSymbolSearch(self: *Core) !void {
         for (self.symbol_picker_results.items) |entry| {
             self.allocator.free(entry.name);
         }
@@ -7891,7 +4412,7 @@ pub const Core = struct {
         self.symbol_picker_selected = 0;
     }
 
-    fn clearGlobalSearchResults(self: *Core) void {
+    pub fn clearGlobalSearchResults(self: *Core) void {
         for (self.global_search_results.items) |*group| {
             for (group.matches) |match| {
                 self.allocator.free(match.line_content);
@@ -7902,142 +4423,16 @@ pub const Core = struct {
         self.global_search_results.clearRetainingCapacity();
     }
 
-    fn handleGlobalSearchInput(self: *Core, key: vaxis.Key) !bool {
-        // Replace-confirmation flow: intercept y/n/A/q before the
-        // normal input path so they don't get typed into the query
-        // buffer. Esc bails out cleanly.
-        if (self.global_search_replace_active) {
-            if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
-                try self.finishReplaceConfirm(false);
-                return true;
-            }
-            if (key.matches('y', .{})) {
-                try self.replaceConfirmStep(.replace);
-                return true;
-            }
-            if (key.matches('n', .{})) {
-                try self.replaceConfirmStep(.skip);
-                return true;
-            }
-            if (key.matches('A', .{ .shift = true })) {
-                self.global_search_replace_apply_all = true;
-                try self.replaceConfirmStep(.replace);
-                return true;
-            }
-            // Swallow other keys so they don't accidentally edit fields.
-            return true;
-        }
+    // handleGlobalSearchInput → kernel/input/global_search.zig
 
-        // Ctrl+R from global_search starts the replace-confirmation walk.
-        if (key.matches('r', .{ .ctrl = true })) {
-            try self.startReplaceConfirm();
-            return true;
-        }
-
-        if (key.matches(vaxis.Key.tab, .{})) {
-            self.global_search_focus_replace = !self.global_search_focus_replace;
-            return true;
-        }
-
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (self.global_search_results.items.len > 0) {
-                const file_idx = self.global_search_selected_file;
-                if (file_idx < self.global_search_results.items.len) {
-                    const group = self.global_search_results.items[file_idx];
-                    const match_idx = self.global_search_selected_match;
-                    if (match_idx < group.matches.len) {
-                        const match = group.matches[match_idx];
-                        const full_path = try std.Io.Dir.cwd().realPathFileAlloc(self.io, group.file_path, self.allocator);
-                        defer self.allocator.free(full_path);
-                        try self.openFileAtLine(full_path, match.line_num);
-                        self.mode = .select;
-                        return true;
-                    }
-                }
-            }
-            return true;
-        }
-
-        if (key.matches(vaxis.Key.escape, .{})) {
-            self.mode = self.previous_mode;
-            return true;
-        }
-
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.global_search_focus_replace) {
-                if (self.global_search_replace.items.len > 0) {
-                    _ = self.global_search_replace.pop();
-                }
-            } else {
-                if (self.global_search_query.items.len > 0) {
-                    _ = self.global_search_query.pop();
-                    try self.performGlobalSearch();
-                }
-            }
-            return true;
-        }
-
-        if (key.text) |text| {
-            if (self.global_search_focus_replace) {
-                try self.global_search_replace.appendSlice(self.allocator, text);
-            } else {
-                try self.global_search_query.appendSlice(self.allocator, text);
-                try self.performGlobalSearch();
-            }
-            return true;
-        }
-
-        if (key.matches(vaxis.Key.up, .{})) {
-            if (self.global_search_results.items.len > 0) {
-                if (self.global_search_selected_file >= self.global_search_results.items.len) {
-                    self.global_search_selected_file = self.global_search_results.items.len - 1;
-                }
-
-                if (self.global_search_selected_match > 0) {
-                    self.global_search_selected_match -= 1;
-                } else if (self.global_search_selected_file > 0) {
-                    self.global_search_selected_file -= 1;
-                    const prev_group = self.global_search_results.items[self.global_search_selected_file];
-                    if (prev_group.matches.len > 0) {
-                        self.global_search_selected_match = prev_group.matches.len - 1;
-                    } else {
-                        self.global_search_selected_match = 0;
-                    }
-                }
-            }
-            return true;
-        }
-
-        if (key.matches(vaxis.Key.down, .{})) {
-            if (self.global_search_results.items.len > 0) {
-                if (self.global_search_selected_file >= self.global_search_results.items.len) {
-                    self.global_search_selected_file = self.global_search_results.items.len - 1;
-                    self.global_search_selected_match = 0;
-                    return true;
-                }
-
-                const current_group = self.global_search_results.items[self.global_search_selected_file];
-                if (current_group.matches.len > 0 and self.global_search_selected_match + 1 < current_group.matches.len) {
-                    self.global_search_selected_match += 1;
-                } else if (self.global_search_selected_file + 1 < self.global_search_results.items.len) {
-                    self.global_search_selected_file += 1;
-                    self.global_search_selected_match = 0;
-                }
-            }
-            return true;
-        }
-
-        return false;
-    }
-
-    const ReplaceStep = enum { replace, skip };
+    pub const ReplaceStep = enum { replace, skip };
 
     /// Begin the replace-with-confirmation walk over the current search
     /// results. Snapshots query+replace so subsequent typing into the
     /// fields can't disturb the walk. Pre-conditions: both fields
     /// non-empty AND there's at least one result. Otherwise: status
     /// message, do nothing.
-    fn startReplaceConfirm(self: *Core) !void {
+    pub fn startReplaceConfirm(self: *Core) !void {
         if (self.global_search_query.items.len == 0) {
             self.setStatusLiteralLeveled(.warning, "Empty search query", 2000);
             return;
@@ -8074,7 +4469,7 @@ pub const Core = struct {
 
     /// Advance the walk by one step (replace or skip). Triggers the
     /// next prompt, or finishes the flow when there are no more matches.
-    fn replaceConfirmStep(self: *Core, step: ReplaceStep) !void {
+    pub fn replaceConfirmStep(self: *Core, step: ReplaceStep) !void {
         // Apply (or skip) the current match.
         if (step == .replace) {
             self.applyCurrentReplaceMatch() catch |err| {
@@ -8226,7 +4621,7 @@ pub const Core = struct {
         self.global_search_replace_count += 1;
     }
 
-    fn finishReplaceConfirm(self: *Core, completed: bool) !void {
+    pub fn finishReplaceConfirm(self: *Core, completed: bool) !void {
         const replaced = self.global_search_replace_count;
         const skipped = self.global_search_replace_skipped;
         self.global_search_replace_active = false;
@@ -8248,7 +4643,7 @@ pub const Core = struct {
         try self.sendUpdate();
     }
 
-    fn performGlobalSearch(self: *Core) !void {
+    pub fn performGlobalSearch(self: *Core) !void {
         self.clearGlobalSearchResults();
         self.global_search_ran = true;
 
@@ -8292,7 +4687,7 @@ pub const Core = struct {
 
     /// Move the cursor to the next or previous diagnostic in the current
     /// buffer. Wraps at file boundaries. No-op if there are none.
-    fn jumpToDiagnostic(self: *Core, forward: bool) !void {
+    pub fn jumpToDiagnostic(self: *Core, forward: bool) !void {
         const s = self.state();
         const path = s.file_path orelse return;
         const diags = self.lsp_manager.getDiagnosticsForFile(self.allocator, path) catch return;
@@ -8347,7 +4742,7 @@ pub const Core = struct {
         try self.sendUpdate();
     }
 
-    fn setBookmark(self: *Core, slot: u8) !void {
+    pub fn setBookmark(self: *Core, slot: u8) !void {
         const s = self.state();
         const path = s.file_path orelse {
             self.setStatusLiteralLeveled(.warning, "Cannot bookmark unsaved buffer", 2000);
@@ -8364,7 +4759,7 @@ pub const Core = struct {
         try self.sendUpdate();
     }
 
-    fn jumpToBookmark(self: *Core, slot: u8) !void {
+    pub fn jumpToBookmark(self: *Core, slot: u8) !void {
         const bm = self.bookmarks.get(slot) orelse {
             const msg = std.fmt.bufPrint(&self.skip_status_buf, "Bookmark '{c}' not set", .{slot}) catch return;
             self.status_message = msg;
@@ -8407,7 +4802,7 @@ pub const Core = struct {
         try self.sendUpdate();
     }
 
-    fn openBookmarksBuffer(self: *Core) !void {
+    pub fn openBookmarksBuffer(self: *Core) !void {
         const name = "[Bookmarks]";
 
         var content = std.ArrayListUnmanaged(u8).empty;
@@ -8466,7 +4861,7 @@ pub const Core = struct {
     /// visual selection rooted at the cursor. `around` includes the
     /// delimiters; `!around` excludes them. Quietly does nothing if
     /// the object isn't found.
-    fn selectTextObject(self: *Core, ch: u8, around: bool) !void {
+    pub fn selectTextObject(self: *Core, ch: u8, around: bool) !void {
         const s = self.state();
         const range = self.findTextObject(ch, around) orelse {
             self.setStatusLiteralLeveled(.warning, "Text object not found", 1200);
@@ -8688,7 +5083,7 @@ pub const Core = struct {
     /// cursor there. The primary cursor moves to the new match so the
     /// user immediately sees where they landed. Wraps at file end.
     /// Cleared by Esc or any line-altering command.
-    fn addNextOccurrence(self: *Core) !void {
+    pub fn addNextOccurrence(self: *Core) !void {
         const s = self.state();
         const buf_id = self.buffer_manager.getActive().id;
         // Buffer switched out from under us — drop stale cursors.
@@ -8831,7 +5226,7 @@ pub const Core = struct {
     /// for `<c>`. Single-byte delimiters (`"`, `'`) get the same byte
     /// on both sides; brackets get matched pairs. Cursor lands after
     /// the closer.
-    fn addSurround(self: *Core, ch: u8) !void {
+    pub fn addSurround(self: *Core, ch: u8) !void {
         const s = self.state();
         const anchor = s.selection_anchor orelse {
             self.setStatusLiteralLeveled(.warning, "No selection to surround", 1500);
@@ -8865,7 +5260,7 @@ pub const Core = struct {
 
     /// `s d <c>` in select mode: delete the enclosing pair `<c>`
     /// (e.g. the parens around the cursor). Leaves contents intact.
-    fn deleteSurround(self: *Core, ch: u8) !void {
+    pub fn deleteSurround(self: *Core, ch: u8) !void {
         const s = self.state();
         const pair = surroundPair(ch);
         const range = if (pair.open == pair.close)
@@ -8889,7 +5284,7 @@ pub const Core = struct {
 
     /// `s r <old> <new>` in select mode: swap the surrounding `<old>`
     /// pair for `<new>`. Same lookup as deleteSurround, then re-emit.
-    fn replaceSurround(self: *Core, old_ch: u8, new_ch: u8) !void {
+    pub fn replaceSurround(self: *Core, old_ch: u8, new_ch: u8) !void {
         const s = self.state();
         const old_pair = surroundPair(old_ch);
         const new_pair = surroundPair(new_ch);
@@ -8918,7 +5313,7 @@ pub const Core = struct {
     /// `]g` / `[g` — move the cursor to the start of the next or previous
     /// git diff hunk. Adjacent changed/added/deleted lines form one hunk;
     /// the cursor lands on the hunk's first line. Wraps at file boundaries.
-    fn jumpToHunk(self: *Core, forward: bool) !void {
+    pub fn jumpToHunk(self: *Core, forward: bool) !void {
         if (self.diff_highlights.items.len == 0) {
             self.setStatusLiteralLeveled(.info, "No git hunks in this buffer", 1500);
             return;
@@ -8976,7 +5371,7 @@ pub const Core = struct {
     /// `]s` / `[s` — move the cursor to the start of the next or
     /// previous named AST sibling. No-op (returns false) if the syntax
     /// tree isn't loaded or the cursor is already at a tree boundary.
-    fn jumpToSibling(self: *Core, forward: bool) !bool {
+    pub fn jumpToSibling(self: *Core, forward: bool) !bool {
         const s = self.state();
         const target = if (forward)
             self.syntax_manager.nextSiblingPosition(s.cursor_row, s.cursor_col)
@@ -8992,7 +5387,7 @@ pub const Core = struct {
 
     /// `]m` / `[m` — move to the next or previous function-like
     /// declaration (function, method, constructor, fn_proto, etc.).
-    fn jumpToFunction(self: *Core, forward: bool) !bool {
+    pub fn jumpToFunction(self: *Core, forward: bool) !bool {
         const s = self.state();
         const SM = @import("../syntax/manager.zig").SyntaxManager;
         const target = self.syntax_manager.findNodeOfKinds(
@@ -9009,11 +5404,11 @@ pub const Core = struct {
         return true;
     }
 
-    const StructuralAdjust = enum { expand, shrink };
+    pub const StructuralAdjust = enum { expand, shrink };
 
     /// Visual-mode `+` / `-` — grow or contract the selection to match
     /// the enclosing AST node (parent) or its first named child.
-    fn adjustSelectionStructural(self: *Core, kind: StructuralAdjust) !void {
+    pub fn adjustSelectionStructural(self: *Core, kind: StructuralAdjust) !void {
         const s = self.state();
         const anchor = s.selection_anchor orelse return;
 
@@ -9048,7 +5443,7 @@ pub const Core = struct {
     /// Refresh the cached git branch (at most once every 2 seconds). Runs
     /// `git symbolic-ref --short HEAD` as a subprocess. On a non-git
     /// directory the cache stays null.
-    fn refreshGitBranchIfStale(self: *Core) void {
+    pub fn refreshGitBranchIfStale(self: *Core) void {
         const now = std.Io.Clock.real.now(self.io).toMilliseconds();
         if (now - self.git_branch_refreshed_ms < 2000) return;
         self.git_branch_refreshed_ms = now;
@@ -9073,7 +5468,7 @@ pub const Core = struct {
         self.git_branch = self.allocator.dupe(u8, trimmed) catch null;
     }
 
-    fn openFileAtLine(self: *Core, path: []const u8, line: usize) !void {
+    pub fn openFileAtLine(self: *Core, path: []const u8, line: usize) !void {
         const opened = try self.buffer_manager.openFile(path);
         // Force-load if we reused an existing lazy buffer entry
         // (same fix as openFileByPath — without this, bookmark

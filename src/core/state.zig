@@ -1538,3 +1538,153 @@ test "preferred_col cleared by edit" {
     try state.insertChar('x');
     try std.testing.expectEqual(@as(?usize, null), state.preferred_col);
 }
+
+// ────────────────────────────────────────────────────────────
+// Regression tests for the edit-hook plumbing (A1).
+// Without these, a future refactor that changes the edit
+// primitives could quietly drop the hook calls and tree-sitter
+// would silently fall back to non-incremental re-parses.
+// ────────────────────────────────────────────────────────────
+
+const TestHookCapture = struct {
+    events: std.ArrayListUnmanaged(EditorState.EditEvent) = .empty,
+    allocator: std.mem.Allocator,
+
+    fn record(ctx: *anyopaque, ev: EditorState.EditEvent) void {
+        const self: *TestHookCapture = @ptrCast(@alignCast(ctx));
+        self.events.append(self.allocator, ev) catch {};
+    }
+
+    fn deinit(self: *TestHookCapture) void {
+        self.events.deinit(self.allocator);
+    }
+};
+
+test "edit hook fires on insertChar with correct deltas" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var capture = TestHookCapture{ .allocator = allocator };
+    defer capture.deinit();
+
+    var state = try EditorState.init(allocator, io_ctx.io(), "hello");
+    defer state.deinit();
+    state.edit_hook = .{ .ctx = @ptrCast(&capture), .call = TestHookCapture.record };
+
+    state.cursor_row = 0;
+    state.cursor_col = 5; // end of "hello"
+    try state.insertChar('!');
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const ev = capture.events.items[0];
+    try std.testing.expectEqual(@as(usize, 5), ev.start_byte);
+    try std.testing.expectEqual(@as(usize, 5), ev.old_end_byte);
+    try std.testing.expectEqual(@as(usize, 6), ev.new_end_byte);
+    try std.testing.expectEqual(@as(usize, 0), ev.start_row);
+    try std.testing.expectEqual(@as(usize, 5), ev.start_col);
+    try std.testing.expectEqual(@as(usize, 0), ev.new_end_row);
+    try std.testing.expectEqual(@as(usize, 6), ev.new_end_col);
+}
+
+test "edit hook fires on insertChar('\\n') with row delta" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var capture = TestHookCapture{ .allocator = allocator };
+    defer capture.deinit();
+
+    var state = try EditorState.init(allocator, io_ctx.io(), "abc");
+    defer state.deinit();
+    state.edit_hook = .{ .ctx = @ptrCast(&capture), .call = TestHookCapture.record };
+
+    state.cursor_row = 0;
+    state.cursor_col = 3;
+    try state.insertChar('\n');
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const ev = capture.events.items[0];
+    try std.testing.expectEqual(@as(usize, 1), ev.new_end_row);
+    try std.testing.expectEqual(@as(usize, 0), ev.new_end_col);
+    try std.testing.expectEqual(@as(usize, 3), ev.start_byte);
+    try std.testing.expectEqual(@as(usize, 4), ev.new_end_byte);
+}
+
+test "edit hook fires on deleteChar and backspaceChar" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var capture = TestHookCapture{ .allocator = allocator };
+    defer capture.deinit();
+
+    var state = try EditorState.init(allocator, io_ctx.io(), "abcde");
+    defer state.deinit();
+    state.edit_hook = .{ .ctx = @ptrCast(&capture), .call = TestHookCapture.record };
+
+    // Forward delete at col 2 → removes 'c'.
+    state.cursor_col = 2;
+    try state.deleteChar();
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    {
+        const ev = capture.events.items[0];
+        try std.testing.expectEqual(@as(usize, 2), ev.start_byte);
+        try std.testing.expectEqual(@as(usize, 3), ev.old_end_byte);
+        try std.testing.expectEqual(@as(usize, 2), ev.new_end_byte);
+    }
+
+    // Backspace at col 2 → removes the new char-at-1 ('b'), cursor lands at col 1.
+    try state.backspaceChar();
+    try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
+    {
+        const ev = capture.events.items[1];
+        try std.testing.expectEqual(@as(usize, 1), ev.start_byte);
+        try std.testing.expectEqual(@as(usize, 2), ev.old_end_byte);
+        try std.testing.expectEqual(@as(usize, 1), ev.new_end_byte);
+    }
+}
+
+test "edit hook is null-safe (works without installation)" {
+    // The hook is optional; the primitive must not crash or
+    // dispatch when nothing is installed. Catches the regression
+    // where someone refactors the hook plumbing and forgets the
+    // null check.
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var state = try EditorState.init(allocator, io_ctx.io(), "x");
+    defer state.deinit();
+    try std.testing.expect(state.edit_hook == null);
+
+    try state.insertChar('y');
+    try state.deleteChar();
+    try state.backspaceChar();
+    try state.insertTextAtCursor("hello");
+    try state.deleteRange(0, 2);
+    // If we reach here without crashing, the null-safe path works.
+}
+
+test "insertTextAtCursor records the full byte + row delta" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var capture = TestHookCapture{ .allocator = allocator };
+    defer capture.deinit();
+
+    var state = try EditorState.init(allocator, io_ctx.io(), "");
+    defer state.deinit();
+    state.edit_hook = .{ .ctx = @ptrCast(&capture), .call = TestHookCapture.record };
+
+    try state.insertTextAtCursor("ab\ncd");
+
+    try std.testing.expectEqual(@as(usize, 1), capture.events.items.len);
+    const ev = capture.events.items[0];
+    try std.testing.expectEqual(@as(usize, 0), ev.start_byte);
+    try std.testing.expectEqual(@as(usize, 0), ev.old_end_byte);
+    try std.testing.expectEqual(@as(usize, 5), ev.new_end_byte);
+    try std.testing.expectEqual(@as(usize, 1), ev.new_end_row);
+    try std.testing.expectEqual(@as(usize, 2), ev.new_end_col);
+}

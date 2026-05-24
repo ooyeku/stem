@@ -1380,3 +1380,73 @@ test "BufferManager.addFileLazyBackground: new buffers are marked not_loaded" {
     try std.testing.expect(added.not_loaded);
     try std.testing.expectEqualStrings("/fake/lazy.zig", added.file_path.?);
 }
+
+// ────────────────────────────────────────────────────────────
+// Regression tests for the close-and-return-id path (added so
+// Core.closeCurrentPaneOrBuffer can evict the closed buffer
+// from per-buffer caches like the SyntaxManager's tree cache).
+// ────────────────────────────────────────────────────────────
+
+test "closeActiveReturningId returns the closed buffer id" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    var mgr = BufferManager.init(allocator, io_ctx.io());
+    defer mgr.deinit();
+
+    // Add a second buffer so close has somewhere to land.
+    _ = try mgr.createUntitled();
+    const active_id_before = mgr.getActive().id;
+
+    const returned = mgr.closeActiveReturningId();
+    try std.testing.expectEqual(@as(?u32, active_id_before), returned);
+    try std.testing.expectEqual(@as(usize, 1), mgr.buffers.items.len);
+}
+
+test "closeActiveReturningId returns null when single buffer would be reset" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    var mgr = BufferManager.init(allocator, io_ctx.io());
+    defer mgr.deinit();
+
+    // Single-buffer close path resets to untitled rather than
+    // removing, so the id-returning contract says "nothing was
+    // removed → null". Without this guarantee Core would
+    // dropBuffer(0) on the SyntaxManager, which is a no-op today
+    // but would mask real bugs later if id 0 ever became a valid
+    // resource.
+    try std.testing.expectEqual(@as(usize, 1), mgr.buffers.items.len);
+    const returned = mgr.closeActiveReturningId();
+    try std.testing.expectEqual(@as(?u32, null), returned);
+    try std.testing.expectEqual(@as(usize, 1), mgr.buffers.items.len);
+}
+
+test "default_edit_hook is propagated to new buffers" {
+    // Without this, a future refactor could break the
+    // "every buffer's state.edit_hook is set" invariant that
+    // tree-sitter incremental parsing depends on.
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    var mgr = BufferManager.init(allocator, io_ctx.io());
+    defer mgr.deinit();
+
+    // Install a no-op hook.
+    const NoopCtx = struct {
+        fn call(_: *anyopaque, _: EditorState.EditEvent) void {}
+    };
+    var noop_ctx: u8 = 0;
+    mgr.default_edit_hook = .{
+        .ctx = @ptrCast(&noop_ctx),
+        .call = NoopCtx.call,
+    };
+    mgr.refreshEditHooks();
+
+    // The initial untitled buffer should now have the hook.
+    try std.testing.expect(mgr.buffers.items[0].state.edit_hook != null);
+
+    // A newly-created buffer should inherit it via newState.
+    _ = try mgr.createUntitled();
+    try std.testing.expect(mgr.buffers.items[1].state.edit_hook != null);
+}

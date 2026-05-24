@@ -245,6 +245,20 @@ pub const StatusBar = struct {
         else
             "";
 
+        // Persistent leader-chord indicator. The toast that fires on
+        // Space lives on the next render frame and clears itself
+        // after 1.5s; this badge stays put for as long as the chord
+        // is actually open, giving the user unambiguous visual
+        // confirmation that they're inside a chord. Shows the
+        // chord prefix (e.g. "SPC l") mid-chord so the user knows
+        // which sub-table is active.
+        const leader_indicator = if (snapshot.leader_pending) blk: {
+            if (snapshot.leader_chord) |prefix| {
+                break :blk try std.fmt.allocPrint(allocator, "SPC {c}\u{25b8} | ", .{prefix});
+            }
+            break :blk try std.fmt.allocPrint(allocator, "SPC\u{25b8} | ", .{});
+        } else "";
+
         // Animated spinner when background jobs are running. Frame derived
         // from snapshot.version so it advances naturally with each render.
         const spinner_frames = [_][]const u8{ "|", "/", "-", "\\" };
@@ -263,8 +277,8 @@ pub const StatusBar = struct {
 
         const right_text = try std.fmt.allocPrint(
             allocator,
-            "{s}{s}{s}{s}{s} | {s} | {s} | {s} | Ln {d}, Col {d} | Stem v{s}",
-            .{ job_indicator, plugin_indicator, lsp_indicator, git_indicator, file_type, indent_text, encoding, line_ending, snapshot.cursor_row + 1, snapshot.cursor_col + 1, version },
+            "{s}{s}{s}{s}{s}{s} | {s} | {s} | {s} | Ln {d}, Col {d} | Stem v{s}",
+            .{ leader_indicator, job_indicator, plugin_indicator, lsp_indicator, git_indicator, file_type, indent_text, encoding, line_ending, snapshot.cursor_row + 1, snapshot.cursor_col + 1, version },
         );
 
         const info_style = theme.styles.status_bar.info;

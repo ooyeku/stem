@@ -456,6 +456,14 @@ pub const RenderSnapshot = struct {
     /// chord's sub-bindings instead of the top-level catalogue.
     /// null when no chord is pending.
     leader_chord: ?u8 = null,
+    /// True while the leader-chord gate is open (post-Space,
+    /// pre-action). Distinct from `which_key_visible`, which
+    /// reflects the *popup* state. The status bar uses this to
+    /// render a persistent `SPC▸` badge so the user has
+    /// unambiguous, frame-independent feedback that the chord is
+    /// armed — separate from the transient toast that lives on
+    /// the next render frame.
+    leader_pending: bool = false,
 
     command_palette_query: ?[]const u8 = null,
     command_palette_results: ?[]const CommandEntry = null,

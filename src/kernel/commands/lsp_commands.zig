@@ -170,4 +170,259 @@ pub const LspCommands = struct {
             core.setStatusLiteralLeveled(.info, "Save the buffer first", 1500);
         }
     }
+
+    /// Open the document-symbols picker for the active buffer.
+    /// Sends `textDocument/documentSymbol`, polls the result with
+    /// a short cap (~500 ms — symbols are typically cached after
+    /// the first request), then either populates the picker with
+    /// the response or falls back to an empty picker the user can
+    /// see "this LSP didn't answer in time."
+    ///
+    /// Body extracted verbatim from `core.zig`. Mode switch leaves
+    /// the picker on screen even when the response missed the
+    /// poll window — `updateSymbolSearch` will re-run when the
+    /// reply eventually lands.
+    pub fn cmdDocumentSymbols(core: anytype) anyerror!void {
+        core.recordJumpFromCurrent();
+
+        const s = core.state();
+        const file_path = s.file_path orelse return;
+
+        core.lsp_manager.requestDocumentSymbols(file_path) catch |err| {
+            log.warn("LSP document symbols request failed for {s}: {}", .{ file_path, err });
+        };
+
+        var attempts: u32 = 0;
+        while (attempts < 50) : (attempts += 1) {
+            if (core.lsp_manager.popDocumentSymbolsResult()) |symbols| {
+                defer core.lsp_manager.freeDocumentSymbols(symbols);
+
+                for (core.symbol_picker_all_symbols.items) |entry| {
+                    core.allocator.free(entry.name);
+                }
+                core.symbol_picker_all_symbols.clearRetainingCapacity();
+                for (core.symbol_picker_results.items) |entry| {
+                    core.allocator.free(entry.name);
+                }
+                core.symbol_picker_results.clearRetainingCapacity();
+
+                for (symbols) |sym| {
+                    const kind_str = switch (sym.kind) {
+                        .file => "file",
+                        .module => "module",
+                        .namespace => "namespace",
+                        .package => "package",
+                        .class => "class",
+                        .method => "method",
+                        .property => "property",
+                        .field => "field",
+                        .constructor => "constructor",
+                        .enumType => "enum",
+                        .interface => "interface",
+                        .function => "function",
+                        .variable => "variable",
+                        .constant => "constant",
+                        .string => "string",
+                        .number => "number",
+                        .boolean => "boolean",
+                        .array => "array",
+                        .object => "object",
+                        .key => "key",
+                        .null_type => "null",
+                        .enumMember => "enumMember",
+                        .struct_type => "struct",
+                        .event => "event",
+                        .operator => "operator",
+                        .type_parameter => "typeParameter",
+                    };
+
+                    const name_dupe = try core.allocator.dupe(u8, sym.name);
+                    try core.symbol_picker_all_symbols.append(core.allocator, .{
+                        .name = name_dupe,
+                        .kind = kind_str,
+                        .line = sym.line,
+                    });
+                }
+
+                core.previous_mode = core.mode;
+                core.mode = .symbol_picker;
+                core.symbol_picker_query.clearRetainingCapacity();
+                core.symbol_picker_selected = 0;
+                try core.updateSymbolSearch();
+                try core.sendUpdate();
+                return;
+            }
+            // best-effort: sleep cancellation is fine, loop will check condition again
+            std.Io.sleep(core.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+        }
+
+        core.previous_mode = core.mode;
+        core.mode = .symbol_picker;
+        core.symbol_picker_query.clearRetainingCapacity();
+        core.symbol_picker_selected = 0;
+        try core.updateSymbolSearch();
+        try core.sendUpdate();
+    }
+
+    /// Open the workspace-wide symbols picker. The picker fires a
+    /// debounced `workspace/symbol` on each keystroke; the open
+    /// command just sets up state and switches mode.
+    pub fn cmdWorkspaceSymbols(core: anytype) anyerror!void {
+        try core.openWorkspaceSymbolPicker();
+    }
+
+    /// `lsp.format_selection` — Space `Space l F`. Sends
+    /// `textDocument/rangeFormatting` for the visual selection
+    /// (or current line). Falls back to whole-document format
+    /// when the LSP isn't ready / language doesn't support range
+    /// formatting.
+    pub fn cmdLspFormatSelection(core: anytype) anyerror!void {
+        if (core.activeBufferIsLarge()) {
+            core.setStatusLiteralLeveled(.warning, "Format selection: skipped (large-file mode)", 2000);
+            return;
+        }
+        const s = core.state();
+        const path = s.file_path orelse {
+            core.setStatusLiteralLeveled(.warning, "Format selection: buffer has no file path", 2000);
+            return;
+        };
+
+        // Resolve the range: visual selection if present, else the
+        // cursor's line. Tracking the in-flight mode here (vs. just
+        // reading `selection_anchor`) keeps "no selection" working
+        // outside Visual mode without surprising the user.
+        var start_line: u32 = @intCast(s.cursor_row);
+        var start_col: u32 = 0;
+        var end_line: u32 = @intCast(s.cursor_row + 1);
+        var end_col: u32 = 0;
+        if (s.selection_anchor) |a| {
+            const a_row: u32 = @intCast(a.row);
+            const c_row: u32 = @intCast(s.cursor_row);
+            const a_col: u32 = @intCast(a.col);
+            const c_col: u32 = @intCast(s.cursor_col);
+            if (a_row < c_row or (a_row == c_row and a_col <= c_col)) {
+                start_line = a_row;
+                start_col = a_col;
+                end_line = c_row;
+                end_col = c_col;
+            } else {
+                start_line = c_row;
+                start_col = c_col;
+                end_line = a_row;
+                end_col = a_col;
+            }
+            // Empty range (anchor at cursor) — fall through to line-based
+            // range below.
+            if (start_line == end_line and start_col == end_col) {
+                start_col = 0;
+                end_line = start_line + 1;
+                end_col = 0;
+            }
+        }
+
+        try core.ensureLspDocument();
+        core.lsp_manager.requestRangeFormatting(path, start_line, start_col, end_line, end_col) catch |err| switch (err) {
+            error.ServerNotReady, error.ServerNotRunning, error.UnsupportedLanguage => {
+                core.setStatusLiteralLeveled(.warning, "Format selection: LSP not ready, falling back to full document", 2000);
+                try core.lsp_manager.requestFormatting(path);
+            },
+            else => return err,
+        };
+        const applied = try core.waitAndApplyFormatEdits();
+        if (applied) {
+            core.setStatusLiteralLeveled(.success, "Format selection: applied", 1500);
+        } else {
+            core.setStatusLiteralLeveled(.info, "Format selection: no changes", 1500);
+        }
+        try core.sendUpdate();
+    }
+
+    /// `lsp.code_action` — Space `.`. Asks the LSP for available
+    /// actions at the cursor (or visual selection), waits briefly,
+    /// then either applies the single action automatically or
+    /// stashes the list and prompts for a digit to pick one.
+    pub fn cmdLspCodeAction(core: anytype) anyerror!void {
+        if (core.activeBufferIsLarge()) {
+            core.setStatusLiteralLeveled(.warning, "Code actions: skipped (large-file mode)", 2000);
+            return;
+        }
+        const s = core.state();
+        const path = s.file_path orelse {
+            core.setStatusLiteralLeveled(.warning, "Code actions: buffer has no file path", 2000);
+            return;
+        };
+
+        // Resolve range — visual selection or cursor's char.
+        var start_line: u32 = @intCast(s.cursor_row);
+        var start_col: u32 = @intCast(s.cursor_col);
+        var end_line: u32 = @intCast(s.cursor_row);
+        var end_col: u32 = @intCast(s.cursor_col);
+        if (s.selection_anchor) |a| {
+            const a_row: u32 = @intCast(a.row);
+            const a_col: u32 = @intCast(a.col);
+            if (a_row < start_line or (a_row == start_line and a_col < start_col)) {
+                start_line = a_row;
+                start_col = a_col;
+            } else {
+                end_line = a_row;
+                end_col = a_col;
+            }
+        }
+
+        try core.ensureLspDocument();
+        core.lsp_manager.requestCodeAction(path, start_line, start_col, end_line, end_col) catch |err| {
+            core.setStatus("Code actions: request failed: {}", .{err}, 2000);
+            return;
+        };
+
+        // Wait briefly for the response. Up to ~300 ms — code-action
+        // round trips are typically much faster on small files; we
+        // bail out cleanly if the LSP is slow.
+        var attempts: usize = 0;
+        var actions: ?[]LspServerNS.CodeAction = null;
+        while (attempts < 30) : (attempts += 1) {
+            if (core.lsp_manager.popCodeActionResult()) |list| {
+                actions = list;
+                break;
+            }
+            std.Io.sleep(core.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+        }
+
+        const list = actions orelse {
+            core.setStatusLiteralLeveled(.info, "Code actions: no response", 2000);
+            return;
+        };
+        if (list.len == 0) {
+            core.lsp_manager.freeCodeActions(list);
+            core.setStatusLiteralLeveled(.info, "Code actions: none available", 2000);
+            return;
+        }
+
+        if (list.len == 1) {
+            // Single action — just apply.
+            defer core.lsp_manager.freeCodeActions(list);
+            try core.applyCodeAction(list[0]);
+            return;
+        }
+
+        // Multiple — stash and prompt. Cap to 9 so a digit selects.
+        const visible = @min(list.len, 9);
+        if (core.code_action_pending) |old| core.lsp_manager.freeCodeActions(old);
+        core.code_action_pending = list;
+
+        var preview: std.ArrayListUnmanaged(u8) = .empty;
+        defer preview.deinit(core.allocator);
+        try preview.appendSlice(core.allocator, "Code actions: ");
+        for (list[0..visible], 0..) |a, i| {
+            if (i > 0) try preview.appendSlice(core.allocator, "  ");
+            const entry = try std.fmt.allocPrint(core.allocator, "[{d}] {s}", .{ i + 1, a.title });
+            defer core.allocator.free(entry);
+            try preview.appendSlice(core.allocator, entry);
+        }
+        if (list.len > visible) try preview.appendSlice(core.allocator, "  …");
+        core.setStatus("{s}", .{preview.items}, 8000);
+        try core.sendUpdate();
+    }
 };
+
+const LspServerNS = @import("../../services/lsp/server.zig").LSPServer;

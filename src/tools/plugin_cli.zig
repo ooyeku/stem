@@ -732,3 +732,86 @@ fn execHermeticTest(ctx: Context, m: *const manifest_mod.Manifest, entry_path: [
         try ctx.err.print("warning: {d} manifest command(s) were not re-registered by the plugin\n", .{missing});
     }
 }
+
+// ────────────────────────────────────────────────────────────
+// Regression tests for the manifest-name → directory resolver.
+// The `plugin list` command displays the manifest `name` field;
+// `info` / `test` / `inspect` used to naïvely join
+// `~/.stem/plugins/<arg>`, so any plugin whose install directory
+// differed from its manifest name (e.g. `git-wasm/` declares
+// `"name": "git"`) was unreachable from those subcommands.
+//
+// These tests are the safety net: any future refactor that
+// regresses the resolver fails CI.
+// ────────────────────────────────────────────────────────────
+
+const test_utils = @import("../test_utils.zig");
+
+test "lookupInstalledPluginDir finds plugin by manifest name when dirname differs" {
+    const allocator = std.testing.allocator;
+    var io_ctx = test_utils.TestIo.init(allocator);
+    defer io_ctx.deinit();
+    var tmp = try test_utils.Tempdir.init(allocator, io_ctx.io());
+    defer tmp.deinit();
+
+    // Lay out a fixture mirroring the real bug shape:
+    //   <root>/awkward-dirname/plugin.json   -> {"name": "git"}
+    // The resolver should return `<root>/awkward-dirname` when
+    // queried with `"git"`.
+    try tmp.makeDir("awkward-dirname");
+    try tmp.writeFile(
+        "awkward-dirname/plugin.json",
+        \\{ "name": "git", "version": "1.0.0", "runtime": "wasm", "entry": "git.wasm" }
+        ,
+    );
+
+    const found = try lookupInstalledPluginDir(allocator, io_ctx.io(), tmp.path, "git");
+    try std.testing.expect(found != null);
+    defer allocator.free(found.?);
+    try std.testing.expect(std.mem.endsWith(u8, found.?, "awkward-dirname"));
+}
+
+test "lookupInstalledPluginDir returns null for unknown name" {
+    const allocator = std.testing.allocator;
+    var io_ctx = test_utils.TestIo.init(allocator);
+    defer io_ctx.deinit();
+    var tmp = try test_utils.Tempdir.init(allocator, io_ctx.io());
+    defer tmp.deinit();
+
+    try tmp.makeDir("only-thing");
+    try tmp.writeFile(
+        "only-thing/plugin.json",
+        \\{ "name": "only-thing", "version": "1.0.0", "runtime": "wasm", "entry": "x.wasm" }
+        ,
+    );
+
+    const found = try lookupInstalledPluginDir(allocator, io_ctx.io(), tmp.path, "missing");
+    try std.testing.expect(found == null);
+}
+
+test "resolveInstalledPluginDir falls back to literal join when name doesn't match" {
+    // Preserves the legacy "the arg is the directory name"
+    // contract for users who already script against it.
+    const allocator = std.testing.allocator;
+    var io_ctx = test_utils.TestIo.init(allocator);
+    defer io_ctx.deinit();
+    var tmp = try test_utils.Tempdir.init(allocator, io_ctx.io());
+    defer tmp.deinit();
+
+    const resolved = try resolveInstalledPluginDir(allocator, io_ctx.io(), tmp.path, "no-such-plugin");
+    defer allocator.free(resolved);
+    try std.testing.expect(std.mem.endsWith(u8, resolved, "no-such-plugin"));
+}
+
+test "looksLikePath classifies arguments correctly" {
+    // Hardens the `test` subcommand's path-vs-name discriminator.
+    try std.testing.expect(looksLikePath("./local/plugin"));
+    try std.testing.expect(looksLikePath("../sibling"));
+    try std.testing.expect(looksLikePath("~/dev/plugin"));
+    try std.testing.expect(looksLikePath("/abs/path/plugin"));
+    try std.testing.expect(looksLikePath("nested/dir"));
+
+    try std.testing.expect(!looksLikePath("plain-name"));
+    try std.testing.expect(!looksLikePath("plugin_name"));
+    try std.testing.expect(!looksLikePath(""));
+}

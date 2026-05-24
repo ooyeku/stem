@@ -1,6 +1,66 @@
 const std = @import("std");
 
 pub const NavCommands = struct {
+    /// Walk the jump_list one step backward. If the destination
+    /// is in a different file, open it (and pick up its lazy
+    /// content); then jump the cursor and re-center the viewport.
+    /// Body extracted verbatim from `core.zig` — see git history
+    /// for the original layered-comment rationale.
+    pub fn cmdJumpBack(core: anytype) anyerror!void {
+        if (core.jump_list.jumpBack()) |location| {
+            const s = core.state();
+            const current_file = s.file_path orelse "";
+
+            if (!std.mem.eql(u8, current_file, location.file_path)) {
+                _ = try core.buffer_manager.openFile(location.file_path);
+                core.refreshSyntaxForCurrentBuffer();
+            }
+
+            const new_state = core.state();
+            new_state.cursor_row = location.row;
+            new_state.cursor_col = location.col;
+            new_state.preferred_col = null;
+
+            const visible_rows: usize = if (core.win_size.rows > 2) core.win_size.rows - 2 else 1;
+            const half = visible_rows / 2;
+            if (new_state.cursor_row >= half) {
+                new_state.scroll_offset = new_state.cursor_row - half;
+            } else {
+                new_state.scroll_offset = 0;
+            }
+
+            try core.sendUpdate();
+        }
+    }
+
+    /// Symmetric forward step through the jump_list.
+    pub fn cmdJumpForward(core: anytype) anyerror!void {
+        if (core.jump_list.jumpForward()) |location| {
+            const s = core.state();
+            const current_file = s.file_path orelse "";
+
+            if (!std.mem.eql(u8, current_file, location.file_path)) {
+                _ = try core.buffer_manager.openFile(location.file_path);
+                core.refreshSyntaxForCurrentBuffer();
+            }
+
+            const new_state = core.state();
+            new_state.cursor_row = location.row;
+            new_state.cursor_col = location.col;
+            new_state.preferred_col = null;
+
+            const visible_rows: usize = if (core.win_size.rows > 2) core.win_size.rows - 2 else 1;
+            const half = visible_rows / 2;
+            if (new_state.cursor_row >= half) {
+                new_state.scroll_offset = new_state.cursor_row - half;
+            } else {
+                new_state.scroll_offset = 0;
+            }
+
+            try core.sendUpdate();
+        }
+    }
+
     pub fn cmdNavGoToLine(core: anytype) anyerror!void {
         core.previous_mode = core.mode;
         core.mode = .go_to_line;
