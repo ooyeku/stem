@@ -3,6 +3,13 @@
     .version = "0.6.5",
     .fingerprint = 0x20bf92e5730ad4ee, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
+    // IMPORTANT: every dependency URL must reference a fixed commit SHA
+    // (git+...#<sha> or .../archive/<sha>.tar.gz). Branch-tip URLs
+    // (refs/heads/main, refs/heads/master) silently fail later because
+    // GitHub regenerates the tarball on every upstream commit, drifting
+    // the SHA-256 away from the recorded `.hash`. Fresh clones then hit
+    // "manifest hash mismatch" while cached clones keep working. To
+    // refresh a dep, get the new SHA and run `zig fetch --save <url>`.
     .dependencies = .{
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis.git#d569f8eb204ed636d902e21ed305581701701adf",
@@ -89,7 +96,7 @@
             .hash = "N-V-__8AAGpz0wEahQ1XcAPswpnWM9etD4V5CeiVedJF7jBu",
         },
         .tree_sitter_php = .{
-            .url = "https://github.com/tree-sitter/tree-sitter-php/archive/refs/heads/master.tar.gz",
+            .url = "https://github.com/tree-sitter/tree-sitter-php/archive/3f2465c217d0a966d41e584b42d75522f2a3149e.tar.gz",
             .hash = "N-V-__8AABgQ6QDtA30cV_6CED5zMGr5jsjUIpLkA0gSeCqS",
         },
         .tree_sitter_swift = .{
@@ -97,43 +104,43 @@
             .hash = "N-V-__8AAFuaYwPYBfoG5udU9_3HplArNuHfX-WYRuc2eeFG",
         },
         .tree_sitter_lua = .{
-            .url = "https://github.com/tree-sitter-grammars/tree-sitter-lua/archive/refs/heads/main.tar.gz",
+            .url = "https://github.com/tree-sitter-grammars/tree-sitter-lua/archive/10fe0054734eec83049514ea2e718b2a56acd0c9.tar.gz",
             .hash = "N-V-__8AAE5ZCQA-BW5BOioWVkGcPTjhC5x1Qv07BH3Xt3dR",
         },
         .tree_sitter_kotlin = .{
-            .url = "https://github.com/fwcd/tree-sitter-kotlin/archive/refs/heads/main.tar.gz",
+            .url = "https://github.com/fwcd/tree-sitter-kotlin/archive/f66d2908542e93c0204c6c241f794afe4e9cd5d1.tar.gz",
             .hash = "N-V-__8AALHPGAJsdQUdAgqbC-SwDEym9T09wKsgIp0HEp93",
         },
         .tree_sitter_elixir = .{
-            .url = "https://github.com/elixir-lang/tree-sitter-elixir/archive/refs/heads/main.tar.gz",
+            .url = "https://github.com/elixir-lang/tree-sitter-elixir/archive/7937d3b4d65fa574163cfa59394515d3c1cf16f4.tar.gz",
             .hash = "N-V-__8AAHFBzAB5XFJyJvMulqqafphEQOoizic5m6WFfy6j",
         },
         .tree_sitter_dart = .{
-            .url = "https://github.com/UserNobody14/tree-sitter-dart/archive/refs/heads/master.tar.gz",
-            .hash = "N-V-__8AAH9TkgCEY_znyjyyHQECzVUzcP0pf-blLhFbmM8R",
+            .url = "https://github.com/UserNobody14/tree-sitter-dart/archive/a9bdfa3db2fbc9b9f12c93450d04a671f33a5102.tar.gz",
+            .hash = "N-V-__8AADK2kgCMP3b5glSIqmA4iGD5fuWEpW5TYCQcCKVH",
         },
         .tree_sitter_haskell = .{
-            .url = "https://github.com/tree-sitter/tree-sitter-haskell/archive/refs/heads/master.tar.gz",
+            .url = "https://github.com/tree-sitter/tree-sitter-haskell/archive/0975ef72fc3c47b530309ca93937d7d143523628.tar.gz",
             .hash = "N-V-__8AALWgQgGf5l7eg-Dwi24SJszCffzN4_mWEtv3e3oI",
         },
         .tree_sitter_ocaml = .{
-            .url = "https://github.com/tree-sitter/tree-sitter-ocaml/archive/refs/heads/master.tar.gz",
+            .url = "https://github.com/tree-sitter/tree-sitter-ocaml/archive/6902a86ab5b3b80c622030210aae2d8cb95eb775.tar.gz",
             .hash = "N-V-__8AAPlBOAJYW9tQzmy3ZfQMePog-Dhs4ABODmZnv9xt",
         },
         .tree_sitter_r = .{
-            .url = "https://github.com/r-lib/tree-sitter-r/archive/refs/heads/main.tar.gz",
-            .hash = "N-V-__8AAFVdRgCTGT8FKTjCgBYvE6HPEOYrNA2ygHF1HThz",
+            .url = "https://github.com/r-lib/tree-sitter-r/archive/8ac99ed1e7ad319737fc11dde20c07d1e1942383.tar.gz",
+            .hash = "N-V-__8AAGh3RQA2NpIQeWwFxkXw63jqlpjYb5DFOfHUaqOo",
         },
         .tree_sitter_scala = .{
-            .url = "https://github.com/tree-sitter/tree-sitter-scala/archive/refs/heads/master.tar.gz",
-            .hash = "N-V-__8AAH5AzgFIGT4ExA8YlaMeg-JLWLvGt0V7sxm7aJco",
+            .url = "https://github.com/tree-sitter/tree-sitter-scala/archive/4d081d98670ff6e98ca42c085294fc75eec15e1d.tar.gz",
+            .hash = "N-V-__8AAJlN0gFxPUfpXqmIgQLEXkmXsrvo3caVWINVJdTb",
         },
         .tree_sitter_erlang = .{
-            .url = "https://github.com/WhatsApp/tree-sitter-erlang/archive/refs/heads/main.tar.gz",
-            .hash = "N-V-__8AAA5JKgBxanDU2CFPRV0pDV4bVW1c7RKAClBphnvK",
+            .url = "https://github.com/WhatsApp/tree-sitter-erlang/archive/e446ec60022a7cafe157805742b41c04b499cc5d.tar.gz",
+            .hash = "N-V-__8AAF1LKgDzxgHGn8Hqn1AENp1FxadoJRlcY0-afk49",
         },
         .tree_sitter_perl = .{
-            .url = "https://github.com/tree-sitter-perl/tree-sitter-perl/archive/refs/heads/release.tar.gz",
+            .url = "https://github.com/tree-sitter-perl/tree-sitter-perl/archive/883aa6a07fd4949e797e41d52abe976d78e236d1.tar.gz",
             .hash = "N-V-__8AALnzfAEYMyCueolaXmmPxZnD4bXM-vdHdjM5u4mp",
         },
     },
