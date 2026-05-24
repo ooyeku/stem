@@ -76,16 +76,23 @@ pub fn handleCdCommand(core: anytype, command: []const u8) !void {
     var new_path: []const u8 = undefined;
     var needs_free = false;
 
-    const env: std.process.Environ = .{ .block = core.environ_block };
-    const home_env: ?[]const u8 = blk: {
+    const platform = @import("platform.zig");
+    // Cross-platform env access. The returned slice is owned —
+    // mark `home_env_owned = true` if we got one so the cleanup
+    // path below frees it. Borrowed-vs-owned isn't a perf concern
+    // here (one allocation per cd), but the ownership has to be
+    // tracked or we'd leak.
+    const home_env_owned: ?[]u8 = blk: {
         if (@import("builtin").os.tag == .windows) {
-            if (env.getPosix("USERPROFILE")) |p| break :blk p;
-            if (env.getPosix("HOME")) |p| break :blk p;
+            if (platform.getEnv(core.allocator, core.environ_block, "USERPROFILE") catch null) |p| break :blk p;
+            if (platform.getEnv(core.allocator, core.environ_block, "HOME") catch null) |p| break :blk p;
             break :blk null;
         }
-        if (env.getPosix("HOME")) |p| break :blk p;
+        if (platform.getEnv(core.allocator, core.environ_block, "HOME") catch null) |p| break :blk p;
         break :blk null;
     };
+    defer if (home_env_owned) |p| core.allocator.free(p);
+    const home_env: ?[]const u8 = home_env_owned;
 
     if (target.len == 0 or std.mem.eql(u8, target, "~")) {
         new_path = (home_env orelse (if (@import("builtin").os.tag == .windows) "C:\\" else "/"));

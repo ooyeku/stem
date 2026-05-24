@@ -274,7 +274,9 @@ pub const PluginManager = struct {
     /// Ordered list of directories to scan for plugins. Each entry is
     /// an owned absolute path; caller frees.
     fn collectPluginRoots(self: *PluginManager) !std.ArrayListUnmanaged([]u8) {
-        const env: std.process.Environ = .{ .block = self.environ_block };
+        // Cross-platform env access (env.getPosix is POSIX-only in
+        // Zig 0.16; we route through platform.getEnv instead).
+        const platform = @import("../kernel/platform.zig");
         var out: std.ArrayListUnmanaged([]u8) = .empty;
         errdefer {
             for (out.items) |p| self.allocator.free(p);
@@ -282,8 +284,10 @@ pub const PluginManager = struct {
         }
 
         // 1. Per-user dir under HOME (or USERPROFILE on Windows).
-        const home_opt: ?[]const u8 = env.getPosix("HOME") orelse env.getPosix("USERPROFILE");
-        if (home_opt) |home| {
+        const home_owned: ?[]u8 = (try platform.getEnv(self.allocator, self.environ_block, "HOME")) orelse
+            (try platform.getEnv(self.allocator, self.environ_block, "USERPROFILE"));
+        defer if (home_owned) |h| self.allocator.free(h);
+        if (home_owned) |home| {
             const user_dir = try std.fs.path.join(self.allocator, &.{ home, ".stem", "plugins" });
             try out.append(self.allocator, user_dir);
         } else {
@@ -296,7 +300,7 @@ pub const PluginManager = struct {
         // `<store>/lib/stem/plugins`. We can't ask the binary where
         // it lives in Zig 0.16, so we just probe the well-known paths
         // and silently skip anything that doesn't exist.
-        if (home_opt) |home| {
+        if (home_owned) |home| {
             const local_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "lib", "stem", "plugins" });
             try out.append(self.allocator, local_dir);
         }
@@ -313,7 +317,9 @@ pub const PluginManager = struct {
         // 3. Anything on `STEM_PLUGIN_PATH`. Split on `:` on POSIX,
         // `;` on Windows. Empty segments are ignored.
         const sep: u8 = if (@import("builtin").os.tag == .windows) ';' else ':';
-        if (env.getPosix("STEM_PLUGIN_PATH")) |raw| {
+        if (try platform.getEnv(self.allocator, self.environ_block, "STEM_PLUGIN_PATH")) |raw_owned| {
+            defer self.allocator.free(raw_owned);
+            const raw = raw_owned;
             var it = std.mem.tokenizeScalar(u8, raw, sep);
             while (it.next()) |seg| {
                 if (seg.len == 0) continue;
@@ -361,8 +367,11 @@ pub const PluginManager = struct {
     /// and (re)load it via `tryLoadPluginDir`. Used by the runtime
     /// `:plugin.reload` command and the `load_plugin` plugin message.
     pub fn loadPluginByName(self: *PluginManager, name: []const u8) !void {
-        const env: std.process.Environ = .{ .block = self.environ_block };
-        const home = env.getPosix("HOME") orelse return error.NoHome;
+        const platform = @import("../kernel/platform.zig");
+        const home = (try platform.getEnv(self.allocator, self.environ_block, "HOME")) orelse
+            (try platform.getEnv(self.allocator, self.environ_block, "USERPROFILE")) orelse
+            return error.NoHome;
+        defer self.allocator.free(home);
         const plugin_dir = try std.fs.path.join(self.allocator, &.{ home, ".stem", "plugins", name });
         defer self.allocator.free(plugin_dir);
         try self.tryLoadPluginDir(plugin_dir);

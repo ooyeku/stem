@@ -340,8 +340,11 @@ fn shouldSkip(name: []const u8) bool {
 // ---------------------------------------------------------------------------
 
 fn cachePath(allocator: std.mem.Allocator, environ_block: std.process.Environ.Block, root_abs: []const u8) ![]u8 {
-    const env: std.process.Environ = .{ .block = environ_block };
-    const home = env.getPosix("HOME") orelse env.getPosix("USERPROFILE") orelse return error.NoHome;
+    const platform = @import("../kernel/platform.zig");
+    const home = (try platform.getEnv(allocator, environ_block, "HOME")) orelse
+        (try platform.getEnv(allocator, environ_block, "USERPROFILE")) orelse
+        return error.NoHome;
+    defer allocator.free(home);
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(root_abs);
     const h = hasher.final();

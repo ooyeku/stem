@@ -158,13 +158,15 @@ pub const StorageManager = struct {
     }
 
     fn getHomeDir(allocator: std.mem.Allocator, environ_block: std.process.Environ.Block) ![]const u8 {
-        const env: std.process.Environ = .{ .block = environ_block };
-        if (env.getPosix("HOME")) |home| {
-            return allocator.dupe(u8, home);
+        // Use the cross-platform helper so Windows hits
+        // GetEnvironmentVariableW instead of the broken
+        // `getPosix → GlobalBlock.view()` path.
+        if (try platform.getEnv(allocator, environ_block, "HOME")) |home| {
+            return home;
         }
         if (builtin.os.tag == .windows) {
-            if (env.getPosix("USERPROFILE")) |up| {
-                return allocator.dupe(u8, up);
+            if (try platform.getEnv(allocator, environ_block, "USERPROFILE")) |up| {
+                return up;
             }
         }
         return error.HomeDirNotFound;

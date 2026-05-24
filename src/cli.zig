@@ -16,6 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const platform = @import("kernel/platform.zig");
 const search_tool = @import("tools/search.zig");
 const vfind_tool = @import("tools/vfind.zig");
 const scope_tool = @import("tools/scope.zig");
@@ -870,8 +871,10 @@ fn runDoctor(ctx: Context) !void {
 
     // 24-bit colour detection: COLORTERM=truecolor|24bit is the
     // standard signal. We don't try anything fancy beyond that.
-    const env: std.process.Environ = .{ .block = ctx.environ_block };
-    if (env.getPosix("COLORTERM")) |ct| {
+    // Use platform.getEnv (cross-OS) instead of env.getPosix —
+    // the latter doesn't compile on Windows in Zig 0.16.
+    if (try platform.getEnv(ctx.allocator, ctx.environ_block, "COLORTERM")) |ct| {
+        defer ctx.allocator.free(ct);
         if (std.mem.eql(u8, ct, "truecolor") or std.mem.eql(u8, ct, "24bit")) {
             try doctorRow(ctx.io, .ok, "24-bit colour", "COLORTERM={s}", .{ct});
         } else {
@@ -881,7 +884,8 @@ fn runDoctor(ctx: Context) !void {
         try doctorRow(ctx.io, .warn, "24-bit colour", "COLORTERM unset — themes may look muted; try `export COLORTERM=truecolor`", .{});
     }
 
-    if (env.getPosix("TERM")) |term| {
+    if (try platform.getEnv(ctx.allocator, ctx.environ_block, "TERM")) |term| {
+        defer ctx.allocator.free(term);
         try doctorRow(ctx.io, .info, "TERM", "{s}", .{term});
     } else {
         try doctorRow(ctx.io, .warn, "TERM", "unset — stem expects a sane terminfo entry", .{});

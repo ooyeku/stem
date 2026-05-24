@@ -173,7 +173,10 @@ pub const TerminalService = struct {
         errdefer self.allocator.destroy(cancelled_flag);
 
         const pid_storage = try self.allocator.create(std.atomic.Value(platform.Pid));
-        pid_storage.* = std.atomic.Value(platform.Pid).init(0);
+        // `0` works as a sentinel on POSIX where Pid is an integer,
+        // but on Windows Pid is a HANDLE (*anyopaque) and the
+        // equivalent "no value" is the null pointer.
+        pid_storage.* = std.atomic.Value(platform.Pid).init(platform.nullPid());
         errdefer self.allocator.destroy(pid_storage);
 
         const pid_set_flag = try self.allocator.create(std.atomic.Value(bool));
@@ -391,7 +394,7 @@ pub const TerminalService = struct {
                 if (pid_set.load(.acquire)) {
                     if (job.pid_storage) |pid_storage| {
                         const pid = pid_storage.load(.acquire);
-                        if (pid != 0) {
+                        if (!platform.pidIsNull(pid)) {
                             platform.killProcess(pid);
                             return true;
                         }

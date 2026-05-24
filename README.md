@@ -37,6 +37,42 @@ with `STEM_PREFIX`:
 STEM_VERSION=v0.4.0 STEM_PREFIX=$HOME/.local sh install.sh
 ```
 
+### Prebuilt binary (Windows)
+
+Open PowerShell (5.1+ — built into every modern Windows) and run:
+
+```powershell
+# Review then install
+iwr https://raw.githubusercontent.com/ooyeku/stem/main/scripts/install.ps1 -UseBasicParsing | Set-Content install.ps1
+notepad install.ps1                          # review what it does
+.\install.ps1                                 # run it once you're satisfied
+```
+
+…or the one-liner if you're feeling confident:
+
+```powershell
+irm https://raw.githubusercontent.com/ooyeku/stem/main/scripts/install.ps1 | iex
+```
+
+The script downloads the matching `stem-vX.Y.Z-x86_64-windows.tar.gz`
+release, verifies its SHA-256, installs `stem.exe` to
+`%LOCALAPPDATA%\Programs\stem\bin\`, copies bundled plugins to
+`%LOCALAPPDATA%\Programs\stem\lib\stem\plugins\`, and adds the bin
+directory to your user `PATH`. No admin rights needed.
+
+Override the install prefix with `-Prefix`:
+
+```powershell
+.\install.ps1 -Prefix C:\tools\stem
+.\install.ps1 -Version v0.6.0 -NoPath        # pinned + skip PATH update
+```
+
+If PowerShell blocks the script with an execution-policy error,
+launch the session with `powershell -ExecutionPolicy Bypass -File .\install.ps1`.
+
+Requires `tar.exe` (built-in on Windows 10 1803 and later). For
+older systems use WSL and run `install.sh` instead.
+
 ### From source
 
 Requires **Zig 0.16+** and a C compiler. All other dependencies
@@ -57,9 +93,18 @@ To build and install system-wide from source:
 
 ### Uninstall
 
+macOS / Linux:
+
 ```bash
 ./uninstall.sh             # remove the binary and bundled plugins
 ./uninstall.sh --purge     # also remove ~/.stem (config, logs, LSP cache)
+```
+
+Windows:
+
+```powershell
+.\uninstall.ps1            # remove the binary, plugins, and PATH entry
+.\uninstall.ps1 -Purge     # also remove %APPDATA%\stem + %LOCALAPPDATA%\stem
 ```
 
 ## Features

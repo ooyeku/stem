@@ -681,8 +681,10 @@ pub const LSPManager = struct {
     /// is owned by the caller (typically transferred to an LSPServer that
     /// frees it in deinit).
     fn computeTokenCacheDir(self: *LSPManager) !?[]u8 {
-        const env: std.process.Environ = .{ .block = self.environ_block };
-        const home = env.getPosix("HOME") orelse return null;
+        const platform = @import("../kernel/platform.zig");
+        const home = (try platform.getEnv(self.allocator, self.environ_block, "HOME")) orelse
+            (try platform.getEnv(self.allocator, self.environ_block, "USERPROFILE")) orelse return null;
+        defer self.allocator.free(home);
         const dir = try std.fs.path.join(self.allocator, &.{ home, ".stem", "cache", "tokens" });
         std.Io.Dir.cwd().createDirPath(self.io, dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},

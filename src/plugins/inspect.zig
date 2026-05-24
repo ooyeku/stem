@@ -22,9 +22,13 @@ pub fn writeReport(
     manager: ?*PluginManager,
     out: *std.Io.Writer,
 ) !void {
-    const env: std.process.Environ = .{ .block = environ_block };
-    const home = env.getPosix("HOME") orelse env.getPosix("USERPROFILE") orelse return error.NoHome;
-    const plugins_root = try std.fs.path.join(allocator, &.{ home, ".stem", "plugins" });
+    // Cross-platform env access — env.getPosix is POSIX-only in Zig 0.16.
+    const platform = @import("../kernel/platform.zig");
+    const home_owned = (try platform.getEnv(allocator, environ_block, "HOME")) orelse
+        (try platform.getEnv(allocator, environ_block, "USERPROFILE")) orelse
+        return error.NoHome;
+    defer allocator.free(home_owned);
+    const plugins_root = try std.fs.path.join(allocator, &.{ home_owned, ".stem", "plugins" });
     defer allocator.free(plugins_root);
 
     try out.print("=== Stem Plugin Inspector ===\n", .{});

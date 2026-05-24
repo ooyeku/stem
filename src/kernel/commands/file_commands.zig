@@ -28,6 +28,12 @@ pub const FileCommands = struct {
             const path_dupe = try core.allocator.dupe(u8, path);
             defer core.allocator.free(path_dupe);
 
+            // Pre-reload bookkeeping: stale multi-cursors reference
+            // the OLD buffer's coordinate space — keeping them past
+            // a reload silently corrupts edits at non-existent rows.
+            // Clear them now; the user can re-add as needed.
+            core.clearMultiCursors();
+
             s.loadFile(path_dupe) catch |err| {
                 const err_msg = switch (err) {
                     error.FileNotFound => try std.fmt.allocPrint(core.allocator,
@@ -70,6 +76,13 @@ pub const FileCommands = struct {
                 try core.sendUpdate();
                 return;
             };
+            // Post-reload bookkeeping: re-run syntax/LSP wiring so
+            // tree-sitter picks up the new content and the LSP gets a
+            // fresh didChange. Without this, tree-sitter highlights
+            // and diagnostics are stale relative to disk until the
+            // next edit kicks the parser.
+            core.refreshSyntaxForCurrentBuffer();
+
             const basename = std.fs.path.basename(path_dupe);
             core.setStatus("Reloaded {s}", .{basename}, 1500);
             try core.sendUpdate();

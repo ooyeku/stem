@@ -3,6 +3,79 @@ const builtin = @import("builtin");
 
 pub const Pid = std.process.Child.Id;
 
+/// Sentinel "no PID set" value for `Pid` — type differs by OS.
+/// POSIX: `pid_t = i32`, so the zero PID is `0`.
+/// Windows: `Pid = HANDLE = *anyopaque`. `*anyopaque` doesn't
+/// allow address zero, so we use `INVALID_HANDLE_VALUE` (all-ones)
+/// as the "no PID yet" marker — matches the Win32 convention for
+/// "this handle hasn't been opened."
+/// Use this anywhere you'd write `0` to mean "no PID yet."
+pub fn nullPid() Pid {
+    if (builtin.os.tag == .windows) {
+        return @ptrFromInt(std.math.maxInt(usize));
+    } else {
+        return 0;
+    }
+}
+
+/// Returns true when `pid` equals `nullPid()`. Equivalent of the
+/// POSIX `pid == 0` check, lifted to handle the Windows HANDLE case.
+pub fn pidIsNull(pid: Pid) bool {
+    if (builtin.os.tag == .windows) {
+        return @intFromPtr(pid) == std.math.maxInt(usize);
+    } else {
+        return pid == 0;
+    }
+}
+
+/// Render a `Pid` as a `u64` for logging / status messages.
+/// POSIX: returns the integer PID widened to u64.
+/// Windows: returns the HANDLE's pointer address (which is how Win32
+/// process handles are conventionally displayed in diagnostics).
+pub fn pidToDisplay(pid: Pid) u64 {
+    if (builtin.os.tag == .windows) {
+        return @intCast(@intFromPtr(pid));
+    } else {
+        return @intCast(pid);
+    }
+}
+
+/// Cross-platform environment-variable lookup.
+///
+/// Zig 0.16's `std.process.Environ.getPosix` is — by spec — POSIX-only;
+/// on Windows it tries to call `GlobalBlock.view()` which doesn't exist
+/// and the build fails. Every place in stem that previously called
+/// `env.getPosix(key)` should now call `platform.getEnv(allocator,
+/// environ_block, key)` so the right backend gets picked per OS.
+///
+/// Returns an owned slice (caller frees) so the same shape works for
+/// both backends:
+/// * POSIX: dups the borrowed value out of the environ block.
+/// * Windows: routes through `std.process.getEnvVarOwned`, which
+///   talks to `GetEnvironmentVariableW` and returns an allocated
+///   slice already.
+///
+/// `null` means the variable isn't set. Errors propagate (typically
+/// `OutOfMemory`).
+pub fn getEnv(
+    allocator: std.mem.Allocator,
+    environ_block: std.process.Environ.Block,
+    key: []const u8,
+) !?[]u8 {
+    const env: std.process.Environ = .{ .block = environ_block };
+    // `getAlloc` is the cross-platform Environ accessor — on Windows
+    // it dispatches through `createMap → putWindowsBlock` (reads the
+    // PEB), on POSIX it walks the block normally. Avoids the broken
+    // `getPosix → GlobalBlock.view()` path that doesn't compile on
+    // Windows in Zig 0.16.
+    const owned = env.getAlloc(allocator, key) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return null,
+        error.InvalidWtf8 => return null,
+        else => return err,
+    };
+    return owned;
+}
+
 pub fn getProcessId() i64 {
     if (builtin.os.tag == .windows) {
         const kernel32 = struct {

@@ -179,7 +179,11 @@ pub fn runExternalServer(
     if (captured_pid) |pid| {
         registered = registerLiveChild(pid);
         if (!registered) {
-            log.info("LSP child {d} spawned during shutdown; killing immediately", .{pid});
+            // Pid is `*anyopaque` (HANDLE) on Windows — `{d}` is
+            // invalid for a pointer, so use the platform-neutral
+            // pidToDisplay helper that prints either the integer
+            // PID (POSIX) or the handle's address (Windows).
+            log.info("LSP child {d} spawned during shutdown; killing immediately", .{platform.pidToDisplay(pid)});
             platform.killProcessForce(pid);
             _ = child.wait(io) catch {};
             output_pipe.close();

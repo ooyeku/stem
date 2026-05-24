@@ -68,10 +68,17 @@ fn runInspect(ctx: Context) !void {
 // ---------------------------------------------------------------------------
 
 fn pluginsRoot(allocator: std.mem.Allocator, environ_block: std.process.Environ.Block) ![]u8 {
-    const env: std.process.Environ = .{ .block = environ_block };
-    const home = env.getPosix("HOME") orelse {
+    // Cross-platform env lookup (platform.getEnv handles Windows).
+    const platform = @import("../kernel/platform.zig");
+    const home = (try platform.getEnv(allocator, environ_block, "HOME")) orelse {
+        // Try USERPROFILE on Windows as a fallback for HOME-less shells.
+        if (try platform.getEnv(allocator, environ_block, "USERPROFILE")) |up| {
+            defer allocator.free(up);
+            return std.fs.path.join(allocator, &.{ up, ".stem", "plugins" });
+        }
         return error.NoHome;
     };
+    defer allocator.free(home);
     return std.fs.path.join(allocator, &.{ home, ".stem", "plugins" });
 }
 

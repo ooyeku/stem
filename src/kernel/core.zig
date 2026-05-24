@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform = @import("platform.zig");
 const logger_service = @import("../services/logger.zig");
 const log = logger_service.scoped("Core");
 const vaxis = @import("vaxis");
@@ -3768,7 +3769,16 @@ pub const Core = struct {
     fn updateSearchDecorations(self: *Core) !void {
         self.decoration_manager.removeBySource("search");
 
-        const query = self.search_input.items;
+        // While the prompt is open we use the live `search_input`;
+        // afterwards (Enter committed) we fall back to
+        // `last_search_query` so the highlighted matches re-scan
+        // each frame against the *current* buffer state. Without
+        // the fallback, deleting or pasting near a match left the
+        // old highlight stuck at its pre-edit byte position.
+        const query = if (self.search_input.items.len > 0)
+            self.search_input.items
+        else
+            self.last_search_query.items;
         if (query.len == 0) return;
 
         const s = self.state();
@@ -4814,6 +4824,12 @@ pub const Core = struct {
                 const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
                 const half = visible_rows / 2;
                 s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
+                // Push the restored state down to the focused pane so
+                // split-mode users actually see the cursor / scroll
+                // move. The buffer manager is now correct; without
+                // this the pane keeps its picker-time state and the
+                // restore is invisible.
+                self.syncPaneToState();
             }
         }
         self.references_picker_origin = null;
@@ -4875,6 +4891,9 @@ pub const Core = struct {
             const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
             const half = visible_rows / 2;
             new_state.scroll_offset = if (new_state.cursor_row >= half) new_state.cursor_row - half else 0;
+            // Push the new state to the focused pane so the cursor
+            // and scroll actually appear there (split-mode fix).
+            self.syncPaneToState();
 
             // Picker has done its job; close (without restoring
             // origin — the user explicitly went somewhere).
@@ -4916,6 +4935,9 @@ pub const Core = struct {
                 const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
                 const half = visible_rows / 2;
                 s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
+                // Push restored state to the focused pane — see
+                // closeReferencesPicker for the same fix rationale.
+                self.syncPaneToState();
             }
         }
         self.diagnostics_picker_origin = null;
@@ -4970,6 +4992,9 @@ pub const Core = struct {
                     const visible_rows: usize = if (self.win_size.rows > 2) self.win_size.rows - 2 else 1;
                     const half = visible_rows / 2;
                     s.scroll_offset = if (s.cursor_row >= half) s.cursor_row - half else 0;
+                    // Push the cursor + scroll down to the focused
+                    // pane so split-mode users actually see the jump.
+                    self.syncPaneToState();
                 }
             }
             self.diagnostics_picker_origin = null;
@@ -5029,6 +5054,15 @@ pub const Core = struct {
     pub fn openFileByPath(self: *Core, file_path: []const u8) !void {
         const opened_buffer = try self.buffer_manager.openFile(file_path);
         try self.workspace_manager.registerBuffer(opened_buffer.id, file_path);
+        // openFile() reuses an existing buffer entry by setting
+        // active_index when the path is already in the list — and
+        // an existing entry may still be `not_loaded` (lazy from a
+        // directory open / session restore). Force-load now so the
+        // user lands on actual content rather than an empty piece-
+        // table. No-op when the buffer was already materialized.
+        self.buffer_manager.loadBufferContent(opened_buffer) catch |err| {
+            log.warn("loadBufferContent failed for {s}: {}", .{ file_path, err });
+        };
 
         const lang = SyntaxManager.Language.fromFilename(file_path);
         const opened_is_large = opened_buffer.is_large;
@@ -5638,8 +5672,11 @@ pub const Core = struct {
     }
 
     fn homeDir(self: *Core) ![]u8 {
-        const env: std.process.Environ = .{ .block = self.environ_block };
-        if (env.getPosix("HOME")) |h| return self.allocator.dupe(u8, h);
+        // platform.getEnv is cross-platform — env.getPosix doesn't
+        // compile on Windows in Zig 0.16. Returns an owned slice
+        // (no extra dupe needed here).
+        if (try platform.getEnv(self.allocator, self.environ_block, "HOME")) |h| return h;
+        if (try platform.getEnv(self.allocator, self.environ_block, "USERPROFILE")) |h| return h;
         return error.HomeNotFound;
     }
 
@@ -6390,6 +6427,16 @@ pub const Core = struct {
             if (now - self.last_scroll_time > self.scroll_timeout_ms) {
                 self.scroll_in_progress = false;
             }
+        }
+
+        // Re-scan search decorations against the current buffer if a
+        // search is still active. Without this, edits that shift text
+        // leave the post-prompt highlights pointing at stale byte
+        // ranges. The scan is bounded to ~100 visible lines and cheap.
+        if (self.last_search_query.items.len > 0 and self.search_input.items.len == 0) {
+            self.updateSearchDecorations() catch |err| {
+                log.debug("search decoration refresh failed: {}", .{err});
+            };
         }
 
         defer self.scroll_in_progress = false;
@@ -7299,7 +7346,7 @@ pub const Core = struct {
         self.eagerlyOpenActiveBuffer();
     }
 
-    fn refreshSyntaxForCurrentBuffer(self: *Core) void {
+    pub fn refreshSyntaxForCurrentBuffer(self: *Core) void {
         const active_buf = self.buffer_manager.getActive();
         self.buffer_manager.loadBufferContent(active_buf) catch |err| {
             log.warn("Failed to load lazy content: {}", .{err});
@@ -8289,6 +8336,27 @@ pub const Core = struct {
             self.status_message_expires = std.Io.Clock.real.now(self.io).toMilliseconds() + 1500;
             return;
         };
+        // Stat the target path before we attempt to open — if the
+        // file was deleted / moved externally, fall through to a
+        // useful error instead of letting openFileAtLine fail and
+        // dropping the user on an empty buffer (the old behavior).
+        const stat_ok = blk: {
+            const f = std.Io.Dir.openFileAbsolute(self.io, bm.file_path, .{}) catch break :blk false;
+            f.close(self.io);
+            break :blk true;
+        };
+        if (!stat_ok) {
+            const msg = std.fmt.bufPrint(
+                &self.skip_status_buf,
+                "Bookmark '{c}' points at missing file: {s}",
+                .{ slot, bm.file_path },
+            ) catch return;
+            self.status_message = msg;
+            self.status_message_level = .warning;
+            self.status_message_expires = std.Io.Clock.real.now(self.io).toMilliseconds() + 3000;
+            try self.sendUpdate();
+            return;
+        }
         // Record the current spot in the jump list before we leave, so
         // Space `,` can bring the user back.
         if (self.state().file_path) |cur_path| {
@@ -8650,7 +8718,7 @@ pub const Core = struct {
         try self.sendUpdate();
     }
 
-    fn clearMultiCursors(self: *Core) void {
+    pub fn clearMultiCursors(self: *Core) void {
         self.multi_cursors.clearRetainingCapacity();
         self.multi_cursor_query.clearRetainingCapacity();
         self.decoration_manager.removeBySource("multi_cursor");
@@ -8971,7 +9039,13 @@ pub const Core = struct {
     }
 
     fn openFileAtLine(self: *Core, path: []const u8, line: usize) !void {
-        _ = try self.buffer_manager.openFile(path);
+        const opened = try self.buffer_manager.openFile(path);
+        // Force-load if we reused an existing lazy buffer entry
+        // (same fix as openFileByPath — without this, bookmark
+        // jumps to lazy-loaded files land on an empty piece-table).
+        self.buffer_manager.loadBufferContent(opened) catch |err| {
+            log.warn("loadBufferContent failed for {s}: {}", .{ path, err });
+        };
 
         try self.ensureLspDocument();
 

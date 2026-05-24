@@ -87,11 +87,9 @@ pub const Installer = struct {
     }
 
     fn homeDir(self: *Installer) ![]u8 {
-        const env: std.process.Environ = .{ .block = self.environ_block };
-        if (env.getPosix("HOME")) |h| return self.allocator.dupe(u8, h);
-        if (builtin.os.tag == .windows) {
-            if (env.getPosix("USERPROFILE")) |up| return self.allocator.dupe(u8, up);
-        }
+        const platform = @import("../../kernel/platform.zig");
+        if (try platform.getEnv(self.allocator, self.environ_block, "HOME")) |h| return h;
+        if (try platform.getEnv(self.allocator, self.environ_block, "USERPROFILE")) |up| return up;
         return error.HomeNotFound;
     }
 
@@ -103,9 +101,9 @@ pub const Installer = struct {
 
     fn tempDir(self: *Installer) ![]u8 {
         if (builtin.os.tag == .windows) {
-            const env: std.process.Environ = .{ .block = self.environ_block };
-            if (env.getPosix("TEMP")) |t| return self.allocator.dupe(u8, t);
-            if (env.getPosix("TMP")) |t| return self.allocator.dupe(u8, t);
+            const platform = @import("../../kernel/platform.zig");
+            if (try platform.getEnv(self.allocator, self.environ_block, "TEMP")) |t| return t;
+            if (try platform.getEnv(self.allocator, self.environ_block, "TMP")) |t| return t;
             return self.allocator.dupe(u8, "C:\\Windows\\Temp");
         }
         return self.allocator.dupe(u8, "/tmp");
@@ -271,9 +269,13 @@ pub const Installer = struct {
         defer env_map.deinit();
         // Inherit keys that matter for `go install`.
         const inherit_keys = [_][]const u8{ "PATH", "HOME", "USERPROFILE", "GOPATH", "GOMODCACHE", "GOCACHE", "GOPROXY", "GOFLAGS" };
-        const parent: std.process.Environ = .{ .block = self.environ_block };
+        const platform = @import("../../kernel/platform.zig");
         for (inherit_keys) |k| {
-            if (parent.getPosix(k)) |v| try env_map.put(k, v);
+            const v = platform.getEnv(self.allocator, self.environ_block, k) catch null;
+            if (v) |val| {
+                defer self.allocator.free(val);
+                try env_map.put(k, val);
+            }
         }
         try env_map.put("GOBIN", bin_dir);
 
@@ -457,10 +459,12 @@ pub const Installer = struct {
     /// list of common locations (brew/cargo/ghcup/opam/coursier/
     /// sdkman/asdf/etc.). The first hit wins.
     fn findBinary(self: *Installer, name: []const u8, extra_dirs: []const []const u8) ?[]u8 {
-        const env: std.process.Environ = .{ .block = self.environ_block };
+        const platform = @import("../../kernel/platform.zig");
         const sep: u8 = if (builtin.os.tag == .windows) ';' else ':';
 
-        if (env.getPosix("PATH")) |path| {
+        // Cross-platform env access — env.getPosix would crash the build on Windows.
+        if (platform.getEnv(self.allocator, self.environ_block, "PATH") catch null) |path| {
+            defer self.allocator.free(path);
             var it = std.mem.tokenizeScalar(u8, path, sep);
             while (it.next()) |dir| {
                 if (self.tryJoinFile(dir, name)) |p| return p;
@@ -471,11 +475,12 @@ pub const Installer = struct {
             if (self.expandAndTry(dir, name)) |p| return p;
         }
 
-        const home = env.getPosix("HOME") orelse env.getPosix("USERPROFILE") orelse "";
+        // expandAndTry itself does HOME expansion; we don't need a
+        // local `home` here. The previous code captured it for
+        // documentation but never used it.
         const common = commonBinDirs();
         for (common) |dir| {
             if (self.expandAndTry(dir, name)) |p| return p;
-            _ = home; // referenced via expandAndTry through getPosix
         }
 
         // Some toolchains expose binaries via glob-y dirs (`~/.opam/<switch>/bin`,
@@ -540,11 +545,12 @@ pub const Installer = struct {
     /// Resolve a `~/`-prefixed directory against `$HOME` (or
     /// `%USERPROFILE%`), then probe for `<dir>/<name>`.
     fn expandAndTry(self: *Installer, dir: []const u8, name: []const u8) ?[]u8 {
-        const env: std.process.Environ = .{ .block = self.environ_block };
-        const home_opt: ?[]const u8 = env.getPosix("HOME") orelse env.getPosix("USERPROFILE");
-
+        const platform = @import("../../kernel/platform.zig");
         if (std.mem.startsWith(u8, dir, "~/")) {
+            const home_opt: ?[]u8 = (platform.getEnv(self.allocator, self.environ_block, "HOME") catch null) orelse
+                (platform.getEnv(self.allocator, self.environ_block, "USERPROFILE") catch null);
             const home = home_opt orelse return null;
+            defer self.allocator.free(home);
             const expanded = std.fs.path.join(self.allocator, &.{ home, dir[2..] }) catch return null;
             defer self.allocator.free(expanded);
             return self.tryJoinFile(expanded, name);
@@ -558,8 +564,9 @@ pub const Installer = struct {
     /// shallow scan is the only reliable way short of running
     /// `opam env`.
     fn findInOpamSwitches(self: *Installer, name: []const u8) ?[]u8 {
-        const env: std.process.Environ = .{ .block = self.environ_block };
-        const home = env.getPosix("HOME") orelse return null;
+        const platform = @import("../../kernel/platform.zig");
+        const home = (platform.getEnv(self.allocator, self.environ_block, "HOME") catch null) orelse return null;
+        defer self.allocator.free(home);
         const opam_root = std.fs.path.join(self.allocator, &.{ home, ".opam" }) catch return null;
         defer self.allocator.free(opam_root);
 
@@ -585,8 +592,9 @@ pub const Installer = struct {
     /// is a common installer for JVM-ecosystem tools (Kotlin, Scala,
     /// gradle, etc.) and creates `current/` symlinks per candidate.
     fn findInSdkmanCandidates(self: *Installer, name: []const u8) ?[]u8 {
-        const env: std.process.Environ = .{ .block = self.environ_block };
-        const home = env.getPosix("HOME") orelse return null;
+        const platform = @import("../../kernel/platform.zig");
+        const home = (platform.getEnv(self.allocator, self.environ_block, "HOME") catch null) orelse return null;
+        defer self.allocator.free(home);
         const root = std.fs.path.join(self.allocator, &.{ home, ".sdkman", "candidates" }) catch return null;
         defer self.allocator.free(root);
 
