@@ -102,6 +102,34 @@ pub const BufferManager = struct {
     large_file_threshold_lines: usize = 50_000,
     large_file_hard_limit_bytes: usize = 100 * 1024 * 1024,
 
+    /// Optional edit hook applied to every `EditorState` this
+    /// manager creates. Core sets this once at boot, pointed at a
+    /// trampoline that forwards edits into `SyntaxManager.recordEdit`
+    /// — without it, tree-sitter falls back to content-match
+    /// subtree reuse on the parse worker (still correct, just less
+    /// efficient on large files).
+    default_edit_hook: ?EditorState.EditHook = null,
+
+    /// Construct a fresh `EditorState` with `default_edit_hook` already
+    /// attached. Use this everywhere a buffer's state field is
+    /// initialised — keeps the hook plumbing in one place instead of
+    /// requiring every construction site to remember the assignment.
+    fn newState(self: *BufferManager, initial: []const u8) !EditorState {
+        var s = try EditorState.init(self.allocator, self.io, initial);
+        s.edit_hook = self.default_edit_hook;
+        return s;
+    }
+
+    /// Re-attach the current `default_edit_hook` to every existing
+    /// buffer's state. Idempotent. Called by Core after wiring its
+    /// trampoline so buffers created before the hook was set still
+    /// pick it up.
+    pub fn refreshEditHooks(self: *BufferManager) void {
+        for (self.buffers.items) |*buf| {
+            buf.state.edit_hook = self.default_edit_hook;
+        }
+    }
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io) BufferManager {
         var mgr = BufferManager{
             .allocator = allocator,
@@ -144,7 +172,7 @@ pub const BufferManager = struct {
 
         const buffer = Buffer{
             .id = self.next_id,
-            .state = try EditorState.init(self.allocator, self.io, ""),
+            .state = try self.newState(""),
             .name = name,
             .file_path = null,
         };
@@ -185,7 +213,7 @@ pub const BufferManager = struct {
         const file_path = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(file_path);
 
-        var state = try EditorState.init(self.allocator, self.io, content_slice);
+        var state = try self.newState(content_slice);
         errdefer state.deinit();
         if (state.file_path) |old| self.allocator.free(old);
         state.file_path = try self.allocator.dupe(u8, path);
@@ -218,7 +246,7 @@ pub const BufferManager = struct {
 
         const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
         errdefer self.allocator.free(name);
-        var state = try EditorState.init(self.allocator, self.io, "");
+        var state = try self.newState("");
         errdefer state.deinit();
         if (state.file_path) |old| self.allocator.free(old);
         state.file_path = try self.allocator.dupe(u8, path);
@@ -255,7 +283,7 @@ pub const BufferManager = struct {
 
         const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
         errdefer self.allocator.free(name);
-        var state = try EditorState.init(self.allocator, self.io, "");
+        var state = try self.newState("");
         errdefer state.deinit();
         if (state.file_path) |old| self.allocator.free(old);
         state.file_path = try self.allocator.dupe(u8, path);
@@ -288,7 +316,7 @@ pub const BufferManager = struct {
         const decision = classifyContent(content[0..read_n], self.large_file_threshold_bytes, self.large_file_threshold_lines);
 
         buffer.state.deinit();
-        buffer.state = try EditorState.init(self.allocator, self.io, content[0..read_n]);
+        buffer.state = try self.newState(content[0..read_n]);
 
         if (buffer.state.file_path) |old| self.allocator.free(old);
         buffer.state.file_path = try self.allocator.dupe(u8, path);
@@ -307,7 +335,7 @@ pub const BufferManager = struct {
         for (self.buffers.items, 0..) |*buf, i| {
             if (std.mem.eql(u8, buf.name, name)) {
                 buf.state.deinit();
-                buf.state = try EditorState.init(self.allocator, self.io, content);
+                buf.state = try self.newState(content);
                 buf.state.modified = false;
                 self.active_index = i;
                 return;
@@ -317,7 +345,7 @@ pub const BufferManager = struct {
         const buf_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(buf_name);
 
-        var state = try EditorState.init(self.allocator, self.io, content);
+        var state = try self.newState(content);
         errdefer state.deinit();
         state.modified = false;
 
@@ -334,28 +362,39 @@ pub const BufferManager = struct {
     }
 
     pub fn closeActive(self: *BufferManager) bool {
+        // True iff a buffer was actually removed — matches the
+        // historical contract: single-buffer "close" resets that
+        // buffer to untitled rather than removing it, and returns
+        // false so callers know there's still something on screen.
+        return self.closeActiveReturningId() != null;
+    }
+
+    /// Same as `closeActive` but returns the closed buffer's stable
+    /// `id` so callers (Core) can evict matching state from other
+    /// subsystems (syntax tree cache, decoration markers, etc.).
+    /// Returns null when there was nothing to close (single-buffer
+    /// case, which reuses the slot via `resetBufferToUntitled`).
+    pub fn closeActiveReturningId(self: *BufferManager) ?u32 {
         if (self.buffers.items.len <= 1) {
             if (self.buffers.items.len == 1) {
                 self.resetBufferToUntitled(&self.buffers.items[0]);
             }
-            return false;
+            return null;
         }
-
+        const closed_id = self.buffers.items[self.active_index].id;
         var buf = self.buffers.orderedRemove(self.active_index);
         buf.deinit(self.allocator);
-
         if (self.active_index >= self.buffers.items.len) {
             self.active_index = self.buffers.items.len - 1;
         }
-
-        return true;
+        return closed_id;
     }
 
     fn resetBufferToUntitled(self: *BufferManager, buf: *Buffer) void {
         // Build the fresh empty state first; if that fails there's no
         // sane way to recover (the old state's allocations are still
         // valid), so leave the buffer as-is.
-        var new_state = EditorState.init(self.allocator, self.io, "") catch |err| {
+        var new_state = self.newState("") catch |err| {
             std.log.warn("Failed to allocate empty buffer state during reset: {}", .{err});
             return;
         };

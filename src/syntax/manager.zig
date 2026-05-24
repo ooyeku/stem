@@ -72,6 +72,35 @@ pub const SyntaxManager = struct {
     /// some other event (mouse move, keystroke) happens to fire a render.
     tree_updated: std.atomic.Value(bool) = .{ .raw = false },
 
+    /// Per-buffer tree cache. When the user switches away from a
+    /// buffer, `setActiveBuffer` parks that buffer's tree here so a
+    /// switch *back* can restore it instantly — no flash of
+    /// unhighlighted text waiting on the async parse. Keyed on the
+    /// buffer's stable `resource_id`. Each entry remembers the
+    /// language and content length at parse time so a stale tree
+    /// (the user edited the buffer just before leaving) can be
+    /// identified and discarded on restore rather than rendered
+    /// against mismatched positions.
+    ///
+    /// Memory: one TSTree per cached buffer (~tens of KB typical).
+    /// Capped indirectly by the buffer count — closed buffers call
+    /// `dropBuffer` which evicts.
+    state_cache: std.AutoHashMapUnmanaged(u64, ParkedTree) = .empty,
+    /// Most-recent parsed content length per buffer, written by the
+    /// parse worker on install and read by `setActiveBuffer` when
+    /// parking the live tree. Mirrors the resource_ids in
+    /// state_cache + the current live buffer.
+    last_parse_content_len: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    /// Guards `state_cache` and `last_parse_content_len`. Brief;
+    /// never held across a tree-sitter call.
+    state_mutex: std.Io.Mutex = .init,
+
+    pub const ParkedTree = struct {
+        tree: *c.TSTree,
+        lang: Language,
+        content_len_at_parse: usize,
+    };
+
     pub const HighlightCache = struct {
         resource_id: u64 = 0,
         lang: Language = .unknown,
@@ -139,6 +168,12 @@ pub const SyntaxManager = struct {
     }
     inline fn parseUnlock(self: *SyntaxManager) void {
         if (self.io) |io| self.parse_mutex.unlock(io);
+    }
+    inline fn stateLock(self: *SyntaxManager) void {
+        if (self.io) |io| self.state_mutex.lockUncancelable(io);
+    }
+    inline fn stateUnlock(self: *SyntaxManager) void {
+        if (self.io) |io| self.state_mutex.unlock(io);
     }
 
     pub const Language = enum {
@@ -274,6 +309,12 @@ pub const SyntaxManager = struct {
         if (self.worker_parser) |p| c.ts_parser_delete(p);
         self.highlight_cache.invalidate(self.allocator);
         self.bracket_cache.invalidate(self.allocator);
+
+        // Drop every parked tree.
+        var it = self.state_cache.valueIterator();
+        while (it.next()) |parked| c.ts_tree_delete(parked.tree);
+        self.state_cache.deinit(self.allocator);
+        self.last_parse_content_len.deinit(self.allocator);
     }
 
     /// Spawn the background parse worker. Idempotent — safe to call if one
@@ -455,6 +496,23 @@ pub const SyntaxManager = struct {
                 thread_name.markStep("parse:delete_old_tree_unlocked");
                 c.ts_tree_delete(t);
             }
+
+            // Record the parse-time content length on the parked
+            // entry for this buffer. Used by `setActiveBuffer` to
+            // distinguish "tree matches current content" (instant
+            // restore) from "tree is stale, need a fresh parse".
+            // We don't install into state_cache here — the LIVE
+            // tree stays in `self.tree`; state_cache is populated
+            // when the buffer is switched *away from*. But we DO
+            // need to track the most-recent parse's content_len
+            // so the park step can record it without re-walking
+            // the content.
+            if (installed) {
+                if (job.resource_id) |id| {
+                    self.last_parse_content_len.put(self.allocator, id, job.source.len) catch {};
+                }
+            }
+
             thread_name.markStep("parse:idle");
 
             // Signal core's tick handler that highlighting can be redrawn.
@@ -873,6 +931,112 @@ pub const SyntaxManager = struct {
             .resource_id = self.current_resource_id,
             .has_tree = self.tree != null,
         };
+    }
+
+    /// Switch the live syntax state to a different buffer.
+    ///
+    /// On switch-AWAY, parks the current `self.tree` into
+    /// `state_cache` under the *old* resource_id, tagged with the
+    /// content length at last parse (so a future restore knows
+    /// whether the tree is still valid against current content).
+    ///
+    /// On switch-TO, if `state_cache` has a tree for `new_id`,
+    /// restores it as `self.tree` immediately — no flash of
+    /// unhighlighted text waiting on the async parse. If the
+    /// caller passes a `current_content_len` that doesn't match
+    /// the parked entry's `content_len_at_parse`, the parked tree
+    /// is discarded (stale: the user edited in between) and the
+    /// usual reparse path takes over.
+    ///
+    /// Caller is still responsible for calling `submitParse` after
+    /// switching, to guarantee freshness — this method is purely
+    /// the cache-hit fast-path on top of that flow.
+    pub fn setActiveBuffer(
+        self: *SyntaxManager,
+        new_id: u64,
+        new_lang: Language,
+        current_content_len: usize,
+    ) void {
+        self.treeLock();
+        defer self.treeUnlock();
+
+        // Park the outgoing tree (if any) under its resource_id.
+        // Same-buffer "switch" is a no-op — the tree stays live.
+        const old_id = self.current_resource_id;
+        if (old_id != 0 and old_id != new_id and self.tree != null) {
+            self.stateLock();
+            const parked_len: usize = blk: {
+                if (self.last_parse_content_len.get(old_id)) |n| break :blk n;
+                break :blk 0;
+            };
+            const parked: ParkedTree = .{
+                .tree = self.tree.?,
+                .lang = self.current_lang,
+                .content_len_at_parse = parked_len,
+            };
+            // If an older parked entry already exists for old_id,
+            // free it first — we're overwriting. `fetchPut` returns
+            // `!?KV`: error union of optional, so the unwrap is
+            // two-step (handle OOM first, then handle "key was
+            // already present").
+            if (self.state_cache.fetchPut(self.allocator, old_id, parked)) |maybe_prev| {
+                if (maybe_prev) |prev_kv| {
+                    if (prev_kv.value.tree != parked.tree) c.ts_tree_delete(prev_kv.value.tree);
+                }
+            } else |_| {
+                // OOM on put — fall back to deleting our tree (no cache).
+                c.ts_tree_delete(self.tree.?);
+            }
+            self.stateUnlock();
+            self.tree = null;
+        }
+
+        // Try to restore a parked tree for the new buffer.
+        if (new_id != old_id) {
+            self.stateLock();
+            const restored: ?ParkedTree = blk: {
+                if (self.state_cache.fetchRemove(new_id)) |kv| break :blk kv.value;
+                break :blk null;
+            };
+            self.stateUnlock();
+
+            if (restored) |p| {
+                if (p.lang == new_lang and p.content_len_at_parse == current_content_len) {
+                    // Cache hit — instant restore.
+                    self.tree = p.tree;
+                    self.current_lang = new_lang;
+                    self.current_resource_id = new_id;
+                    self.highlight_cache.invalidate(self.allocator);
+                    self.bracket_cache.invalidate(self.allocator);
+                    return;
+                } else {
+                    // Stale (different lang or content len changed):
+                    // discard, fall through to "no tree".
+                    c.ts_tree_delete(p.tree);
+                }
+            }
+
+            // No usable cached tree — clear the live tree so the
+            // caller's subsequent submitParse populates from scratch.
+            if (self.tree) |t| c.ts_tree_delete(t);
+            self.tree = null;
+            self.current_resource_id = new_id;
+            self.current_lang = new_lang;
+            self.highlight_cache.invalidate(self.allocator);
+            self.bracket_cache.invalidate(self.allocator);
+        }
+    }
+
+    /// Drop any parked tree + parse-len entry for `id`. Called by
+    /// Core when a buffer is closed so the cache doesn't grow
+    /// unboundedly across the session.
+    pub fn dropBuffer(self: *SyntaxManager, id: u64) void {
+        self.stateLock();
+        defer self.stateUnlock();
+        if (self.state_cache.fetchRemove(id)) |kv| {
+            c.ts_tree_delete(kv.value.tree);
+        }
+        _ = self.last_parse_content_len.remove(id);
     }
 
     /// Legacy entry point — kept for tests and for callers that

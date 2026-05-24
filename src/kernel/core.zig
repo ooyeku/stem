@@ -49,6 +49,7 @@ const PluginCommands = @import("commands/plugin_commands.zig").PluginCommands;
 const NavCommands = @import("commands/nav_commands.zig").NavCommands;
 const BufferCommands = @import("commands/buffer_commands.zig").BufferCommands;
 const FileCommands = @import("commands/file_commands.zig").FileCommands;
+const ToggleCommands = @import("commands/toggle_commands.zig").ToggleCommands;
 
 pub const CompletionDisplayItem = struct {
     label: []const u8,
@@ -1204,32 +1205,9 @@ pub const Core = struct {
         try self.sendUpdate();
     }
 
-    fn cmdLspToggleFormatOnSave(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-        self.storage.config.editor.format_on_save = !self.storage.config.editor.format_on_save;
-        const tag: []const u8 = if (self.storage.config.editor.format_on_save) "ON" else "OFF";
-        self.setStatus("Format-on-save: {s}", .{tag}, 2000);
-        try self.sendUpdate();
-    }
-
-    fn cmdEditorToggleInlineDiagnostics(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-        self.storage.config.editor.inline_diagnostics = !self.storage.config.editor.inline_diagnostics;
-        const tag: []const u8 = if (self.storage.config.editor.inline_diagnostics) "ON" else "OFF";
-        self.setStatus("Inline diagnostics: {s}", .{tag}, 2000);
-        try self.sendUpdate();
-    }
-
-    fn cmdEditorToggleInlayHints(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
-        _ = context;
-        const self: *Core = @ptrCast(@alignCast(ctx));
-        self.storage.config.editor.inlay_hints = !self.storage.config.editor.inlay_hints;
-        const tag: []const u8 = if (self.storage.config.editor.inlay_hints) "ON" else "OFF";
-        self.setStatus("Inlay hints: {s}", .{tag}, 2000);
-        try self.sendUpdate();
-    }
+    // Editor-toggle commands extracted to commands/toggle_commands.zig
+    // — see ToggleCommands.cmd* there. Registered via the same
+    // Wrap(...).run adapter the other commands/*.zig modules use.
 
     /// Cheap precondition for format-on-save: do we even have an LSP
     /// class for this file's language? If not, skip the formatter
@@ -1447,9 +1425,9 @@ pub const Core = struct {
         try R.register("lsp.hover", "LSP: Hover", "Trigger hover information for symbol under cursor", Wrap(LspCommands.cmdLspHover).run, null);
         try R.register("lsp.references", "LSP: Find References", "Find all references to symbol under cursor", Wrap(LspCommands.cmdLspFindReferences).run, null);
         try R.register("lsp.workspace_symbols", "LSP: Workspace Symbols", "Fuzzy find symbols across the workspace via LSP", cmdWorkspaceSymbols, null);
-        try R.register("lsp.toggle_format_on_save", "LSP: Toggle Format on Save", "Run the LSP formatter automatically before each save", cmdLspToggleFormatOnSave, null);
-        try R.register("editor.toggle_inline_diagnostics", "Editor: Toggle Inline Diagnostics", "Show diagnostic messages inline at end-of-line on every affected line (\"error lens\")", cmdEditorToggleInlineDiagnostics, null);
-        try R.register("editor.toggle_inlay_hints", "Editor: Toggle Inlay Hints", "Render LSP inlay hints (type annotations, param names) as dim virtual text", cmdEditorToggleInlayHints, null);
+        try R.register("lsp.toggle_format_on_save", "LSP: Toggle Format on Save", "Run the LSP formatter automatically before each save", Wrap(ToggleCommands.cmdLspToggleFormatOnSave).run, null);
+        try R.register("editor.toggle_inline_diagnostics", "Editor: Toggle Inline Diagnostics", "Show diagnostic messages inline at end-of-line on every affected line (\"error lens\")", Wrap(ToggleCommands.cmdEditorToggleInlineDiagnostics).run, null);
+        try R.register("editor.toggle_inlay_hints", "Editor: Toggle Inlay Hints", "Render LSP inlay hints (type annotations, param names) as dim virtual text", Wrap(ToggleCommands.cmdEditorToggleInlayHints).run, null);
 
         try R.register("mode.insert", "Mode: Insert", "Switch to insert mode", Wrap(SystemCommands.cmdModeInsert).run, null);
         try R.register("mode.visual", "Mode: Visual", "Switch to visual mode", Wrap(SystemCommands.cmdModeVisual).run, null);
@@ -1488,6 +1466,19 @@ pub const Core = struct {
         self.core_inbox = inbox;
         self.core_bus = bus;
         self.plugin_manager.core_inbox = inbox;
+
+        // Install the editor edit-hook now that `self` has a stable
+        // address. The trampoline forwards every insert/delete event
+        // into `SyntaxManager.recordEdit`, so tree-sitter's next
+        // parse can use `ts_tree_edit` against the prior tree and
+        // reuse subtrees outside the changed range. Set it on the
+        // factory so every buffer created from here on inherits it,
+        // and refresh any buffers opened during Core.init.
+        self.buffer_manager.default_edit_hook = .{
+            .ctx = @ptrCast(self),
+            .call = coreEditHookTrampoline,
+        };
+        self.buffer_manager.refreshEditHooks();
         // Editor hooks so wasm plugins can synchronously read the
         // active buffer's content/path via `stem_get_buffer_*`.
         self.plugin_manager.setHostHooks(.{
@@ -4584,9 +4575,9 @@ pub const Core = struct {
                 Keys.lsp_diagnostics => self.openDiagnosticsPicker(),
                 Keys.lsp_document_symbols => try cmdDocumentSymbols(self, null),
                 Keys.lsp_workspace_symbols => try cmdWorkspaceSymbols(self, null),
-                Keys.lsp_toggle_inline_diagnostics => try cmdEditorToggleInlineDiagnostics(self, null),
-                Keys.lsp_toggle_inlay_hints => try cmdEditorToggleInlayHints(self, null),
-                Keys.lsp_toggle_format_on_save => try cmdLspToggleFormatOnSave(self, null),
+                Keys.lsp_toggle_inline_diagnostics => try ToggleCommands.cmdEditorToggleInlineDiagnostics(self),
+                Keys.lsp_toggle_inlay_hints => try ToggleCommands.cmdEditorToggleInlayHints(self),
+                Keys.lsp_toggle_format_on_save => try ToggleCommands.cmdLspToggleFormatOnSave(self),
                 else => {},
             },
             Keys.chord_git => switch (key.codepoint) {
@@ -4604,9 +4595,9 @@ pub const Core = struct {
                 else => {},
             },
             Keys.chord_toggle => switch (key.codepoint) {
-                Keys.toggle_inline_diagnostics => try cmdEditorToggleInlineDiagnostics(self, null),
-                Keys.toggle_inlay_hints => try cmdEditorToggleInlayHints(self, null),
-                Keys.toggle_format_on_save => try cmdLspToggleFormatOnSave(self, null),
+                Keys.toggle_inline_diagnostics => try ToggleCommands.cmdEditorToggleInlineDiagnostics(self),
+                Keys.toggle_inlay_hints => try ToggleCommands.cmdEditorToggleInlayHints(self),
+                Keys.toggle_format_on_save => try ToggleCommands.cmdLspToggleFormatOnSave(self),
                 // Other toggles (line_numbers, wrap, whitespace,
                 // cursor_line) don't have command wrappers yet — wire
                 // them up here as their setters land in config.
@@ -4692,7 +4683,13 @@ pub const Core = struct {
                 self.split_manager = null;
             }
         } else {
-            _ = self.buffer_manager.closeActive();
+            // Track which id is going away so we can evict its
+            // parked syntax tree from the SyntaxManager cache —
+            // otherwise closed-but-reopened-from-cwd buffers would
+            // keep the cache growing across the session.
+            if (self.buffer_manager.closeActiveReturningId()) |closed_id| {
+                self.syntax_manager.dropBuffer(closed_id);
+            }
         }
 
         // Pull the successor buffer's content if it's still lazy.
@@ -6251,6 +6248,30 @@ pub const Core = struct {
         self.requestRender();
     }
 
+    /// Trampoline installed on every buffer's `EditorState.edit_hook`.
+    /// Translates the state-layer `EditEvent` into a
+    /// `SyntaxManager.EditInfo` and queues it for the next parse
+    /// worker run. Lets tree-sitter do real incremental parsing
+    /// (`ts_tree_edit` against the prior tree + content-match
+    /// subtree reuse on the changed range only) instead of the
+    /// content-match-only fallback we get when no edits are
+    /// recorded. Cheap — just a struct copy onto a mutex-guarded
+    /// list.
+    fn coreEditHookTrampoline(ctx: *anyopaque, ev: EditorState.EditEvent) void {
+        const self: *Core = @ptrCast(@alignCast(ctx));
+        self.syntax_manager.recordEdit(.{
+            .start_byte = ev.start_byte,
+            .old_end_byte = ev.old_end_byte,
+            .new_end_byte = ev.new_end_byte,
+            .start_row = ev.start_row,
+            .start_col = ev.start_col,
+            .old_end_row = ev.old_end_row,
+            .old_end_col = ev.old_end_col,
+            .new_end_row = ev.new_end_row,
+            .new_end_col = ev.new_end_col,
+        });
+    }
+
     /// Hand a `PluginMessage` reply back to whichever process plugin
     /// originated the request. Encodes the payload as a JSON result
     /// and routes via `PluginManager.replyToProcessPlugin`.
@@ -6723,10 +6744,24 @@ pub const Core = struct {
             // `current_lang`/`current_resource_id`/`tree` races with
             // the parse worker that swaps them in under the same lock.
             const syn_state = self.syntax_manager.stateSnapshot();
+            const active_buffer_id = self.buffer_manager.getActive().id;
+            const buffer_changed = (syn_state.resource_id != active_buffer_id);
+
+            // Buffer switch: park the outgoing tree + try to
+            // restore a previously-parked tree for the incoming
+            // buffer. If the parked tree's content_len matches
+            // current content, it slots in instantly — no flash of
+            // unhighlighted text waiting on the async parse. If
+            // stale or absent, the tree is cleared and the normal
+            // submitParse path below populates it.
+            if (buffer_changed and syn_state.lang == lang) {
+                const cur_len: usize = if (active_content_opt) |c| c.len else 0;
+                self.syntax_manager.setActiveBuffer(active_buffer_id, lang, cur_len);
+            }
+
             if (!self.scroll_in_progress) {
-                const active_buffer_id = self.buffer_manager.getActive().id;
                 const needs_reparse = (syn_state.lang != lang) or
-                    (syn_state.resource_id != active_buffer_id) or
+                    buffer_changed or
                     (!syn_state.has_tree);
 
                 if (needs_reparse) {
@@ -6736,7 +6771,8 @@ pub const Core = struct {
                         };
                     }
                     // Async — render proceeds with whatever tree we
-                    // currently have (possibly none), and re-fires
+                    // currently have (possibly the parked one we
+                    // just restored, possibly none), and re-fires
                     // once the worker installs the new tree.
                     if (active_content_opt) |content| {
                         self.syntax_manager.submitParse(content, active_buffer_id) catch |err| {
@@ -6745,7 +6781,6 @@ pub const Core = struct {
                     }
                 }
             } else {
-                const active_buffer_id = self.buffer_manager.getActive().id;
                 if (!syn_state.has_tree or syn_state.lang != lang) {
                     if (syn_state.lang != lang) {
                         self.syntax_manager.setLanguageEnum(lang) catch |err| {

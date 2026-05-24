@@ -4,6 +4,33 @@ const Allocator = std.mem.Allocator;
 const unicode = @import("unicode.zig");
 const TestIo = @import("../test_utils.zig").TestIo;
 
+/// Convert a byte offset into a piece-table to a (row, col) pair.
+/// Walks the table once; cheap enough to call on each edit's
+/// start/end bounds. Returns (last_row, last_col) for offsets past
+/// the end — caller has already validated bounds.
+fn offsetToRowCol(buf: *const PieceTable, target_offset: usize) struct { row: usize, col: usize } {
+    var row: usize = 0;
+    var col: usize = 0;
+    var offset: usize = 0;
+    for (buf.pieces.items) |p| {
+        const data = switch (p.source) {
+            .Original => buf.original[p.start .. p.start + p.length],
+            .Add => buf.add.items[p.start .. p.start + p.length],
+        };
+        for (data) |c| {
+            if (offset >= target_offset) return .{ .row = row, .col = col };
+            if (c == '\n') {
+                row += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+            offset += 1;
+        }
+    }
+    return .{ .row = row, .col = col };
+}
+
 pub const EditorState = struct {
     allocator: Allocator,
     io: std.Io,
@@ -27,6 +54,37 @@ pub const EditorState = struct {
     /// deliberate horizontal motion or text edit.
     preferred_col: ?usize = null,
 
+    /// Optional callback fired after every successful insert/delete
+    /// primitive with the byte + row/col deltas. Used by Core to
+    /// forward edits into `SyntaxManager.recordEdit` so tree-sitter
+    /// can do real incremental parsing (subtree reuse against an
+    /// ts_tree_edit'd copy). `null` = no-op; tests and other callers
+    /// that don't need incremental parsing skip the indirection.
+    edit_hook: ?EditHook = null,
+
+    pub const EditEvent = struct {
+        start_byte: usize,
+        old_end_byte: usize,
+        new_end_byte: usize,
+        start_row: usize,
+        start_col: usize,
+        old_end_row: usize,
+        old_end_col: usize,
+        new_end_row: usize,
+        new_end_col: usize,
+    };
+
+    pub const EditHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque, ev: EditEvent) void,
+    };
+
+    /// Fire the edit hook (if installed) with the precomputed event.
+    /// Inline so the hook-free path costs a single null check.
+    inline fn fireEdit(self: *EditorState, ev: EditEvent) void {
+        if (self.edit_hook) |h| h.call(h.ctx, ev);
+    }
+
     pub fn init(allocator: Allocator, io: std.Io, content: []const u8) !EditorState {
         return EditorState{
             .allocator = allocator,
@@ -39,6 +97,7 @@ pub const EditorState = struct {
             .modified = false,
             .selection_anchor = null,
             .preferred_col = null,
+            .edit_hook = null,
         };
     }
 
@@ -157,6 +216,8 @@ pub const EditorState = struct {
 
     pub fn insertChar(self: *EditorState, char: u8) !void {
         const offset = self.getOffsetFromCursor();
+        const start_row = self.cursor_row;
+        const start_col = self.cursor_col;
 
         var buf: [1]u8 = undefined;
         buf[0] = char;
@@ -171,6 +232,18 @@ pub const EditorState = struct {
             self.cursor_col += 1;
         }
         self.preferred_col = null;
+
+        self.fireEdit(.{
+            .start_byte = offset,
+            .old_end_byte = offset,
+            .new_end_byte = offset + 1,
+            .start_row = start_row,
+            .start_col = start_col,
+            .old_end_row = start_row,
+            .old_end_col = start_col,
+            .new_end_row = self.cursor_row,
+            .new_end_col = self.cursor_col,
+        });
     }
 
     pub fn insertNewline(self: *EditorState) !void {
@@ -267,19 +340,59 @@ pub const EditorState = struct {
         const offset = self.getOffsetFromCursor();
         if (offset >= self.buffer.totalLength()) return;
 
+        // Snapshot the removed byte's row/col before mutation so the
+        // edit hook can hand tree-sitter accurate old_end coords.
+        const removed = self.getCharAtOffset(offset);
+        const start_row = self.cursor_row;
+        const start_col = self.cursor_col;
+        const old_end_row = if (removed == '\n') start_row + 1 else start_row;
+        const old_end_col: usize = if (removed == '\n') 0 else start_col + 1;
+
         try self.buffer.delete(offset, 1);
         self.markModified();
         self.preferred_col = null;
+
+        self.fireEdit(.{
+            .start_byte = offset,
+            .old_end_byte = offset + 1,
+            .new_end_byte = offset,
+            .start_row = start_row,
+            .start_col = start_col,
+            .old_end_row = old_end_row,
+            .old_end_col = old_end_col,
+            .new_end_row = start_row,
+            .new_end_col = start_col,
+        });
     }
 
     pub fn backspaceChar(self: *EditorState) !void {
         const offset = self.getOffsetFromCursor();
         if (offset == 0) return;
 
+        // The byte at offset-1 is what's about to go away. Snapshot
+        // its row/col first so the hook can hand tree-sitter the old
+        // span (start = pre-cursor, old_end = cursor, new_end = pre).
+        const removed = self.getCharAtOffset(offset - 1);
+        const old_end_row = self.cursor_row;
+        const old_end_col = self.cursor_col;
+
         try self.buffer.delete(offset - 1, 1);
         self.markModified();
         self.updateCursorFromOffset(offset - 1);
         self.preferred_col = null;
+
+        _ = removed; // (kept for clarity; we don't currently need to branch on it)
+        self.fireEdit(.{
+            .start_byte = offset - 1,
+            .old_end_byte = offset,
+            .new_end_byte = offset - 1,
+            .start_row = self.cursor_row,
+            .start_col = self.cursor_col,
+            .old_end_row = old_end_row,
+            .old_end_col = old_end_col,
+            .new_end_row = self.cursor_row,
+            .new_end_col = self.cursor_col,
+        });
     }
 
     pub fn getOffsetFor(self: *EditorState, target_row: usize, target_col: usize) usize {
@@ -311,10 +424,27 @@ pub const EditorState = struct {
     pub fn deleteRange(self: *EditorState, start_offset: usize, end_offset: usize) !void {
         if (end_offset <= start_offset) return;
         const len = end_offset - start_offset;
+
+        // Snapshot start + old_end row/col before mutation.
+        const start_rc = offsetToRowCol(&self.buffer, start_offset);
+        const old_end_rc = offsetToRowCol(&self.buffer, end_offset);
+
         try self.buffer.delete(start_offset, len);
         self.markModified();
         self.updateCursorFromOffset(start_offset);
         self.preferred_col = null;
+
+        self.fireEdit(.{
+            .start_byte = start_offset,
+            .old_end_byte = end_offset,
+            .new_end_byte = start_offset,
+            .start_row = start_rc.row,
+            .start_col = start_rc.col,
+            .old_end_row = old_end_rc.row,
+            .old_end_col = old_end_rc.col,
+            .new_end_row = start_rc.row,
+            .new_end_col = start_rc.col,
+        });
     }
 
     pub fn updateCursorFromOffset(self: *EditorState, target_offset: usize) void {
@@ -555,6 +685,9 @@ pub const EditorState = struct {
 
     pub fn insertTextAtCursor(self: *EditorState, text: []const u8) !void {
         const offset = self.getOffsetFromCursor();
+        const start_row = self.cursor_row;
+        const start_col = self.cursor_col;
+
         try self.buffer.insert(offset, text);
         self.markModified();
 
@@ -567,6 +700,18 @@ pub const EditorState = struct {
             }
         }
         self.preferred_col = null;
+
+        self.fireEdit(.{
+            .start_byte = offset,
+            .old_end_byte = offset,
+            .new_end_byte = offset + text.len,
+            .start_row = start_row,
+            .start_col = start_col,
+            .old_end_row = start_row,
+            .old_end_col = start_col,
+            .new_end_row = self.cursor_row,
+            .new_end_col = self.cursor_col,
+        });
     }
 
     pub fn getLineLength(self: *EditorState, row: usize) usize {
