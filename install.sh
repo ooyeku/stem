@@ -39,6 +39,36 @@ if ! command -v zig >/dev/null 2>&1; then
     exit 1
 fi
 
+# WSL-on-Windows-filesystem guard.
+#
+# When the repo is checked out under /mnt/c (or any /mnt/<drive>)
+# and we're inside WSL, Zig's per-build cache lives at .zig-cache/
+# next to build.zig — i.e. on the Windows NTFS volume reached via
+# the 9P/DrvFs translation layer. DrvFs does not honor POSIX
+# rename(2) the way ext4 does (cross-mount renames return EACCES,
+# and Defender real-time scanning grabs freshly-written .o/.lib
+# files long enough to block the rename), which is why the build
+# fails with:
+#
+#   failed to rename compilation results into local cache: AccessDenied
+#
+# Redirect ZIG_LOCAL_CACHE_DIR onto the WSL ext4 home dir so the
+# cache lives on a real Linux filesystem. The downloaded-deps
+# cache (ZIG_GLOBAL_CACHE_DIR, default ~/.cache/zig) is already on
+# ext4, so we leave it alone.
+case "$(pwd -P)" in
+    /mnt/*)
+        if [ -z "${ZIG_LOCAL_CACHE_DIR:-}" ] && \
+           grep -qiE 'microsoft|wsl' /proc/sys/kernel/osrelease 2>/dev/null; then
+            export ZIG_LOCAL_CACHE_DIR="$HOME/.cache/stem-build"
+            mkdir -p "$ZIG_LOCAL_CACHE_DIR"
+            echo "Note: WSL on a Windows-mounted path detected."
+            echo "      Redirecting Zig build cache to $ZIG_LOCAL_CACHE_DIR"
+            echo "      (DrvFs rename(2) is unreliable; cache must live on ext4.)"
+        fi
+        ;;
+esac
+
 echo "Building stem (ReleaseFast)..."
 zig build -Doptimize=ReleaseFast
 
