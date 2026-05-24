@@ -13,7 +13,7 @@ fn fuzzCursorPositions(ctx: FuzzContext, input: []const u8) anyerror!void {
     const content = input[0..content_len];
     const ops = input[content_len..];
 
-    var state = try EditorState.init(ctx.allocator,content);
+    var state = try EditorState.init(ctx.allocator, content);
     defer state.deinit();
 
     var i: usize = 0;
@@ -32,7 +32,7 @@ fn fuzzCursorPositions(ctx: FuzzContext, input: []const u8) anyerror!void {
 }
 
 fn fuzzCharacterInsertion(ctx: FuzzContext, input: []const u8) anyerror!void {
-    var state = try EditorState.init(ctx.allocator,"");
+    var state = try EditorState.init(ctx.allocator, "");
     defer state.deinit();
 
     const max_inserts = @min(input.len, 500);
@@ -57,7 +57,7 @@ fn fuzzCharacterInsertion(ctx: FuzzContext, input: []const u8) anyerror!void {
 fn fuzzDeletions(ctx: FuzzContext, input: []const u8) anyerror!void {
     if (input.len < 2) return;
 
-    var state = try EditorState.init(ctx.allocator,input);
+    var state = try EditorState.init(ctx.allocator, input);
     defer state.deinit();
 
     for (input) |op| {
@@ -90,7 +90,7 @@ fn fuzzLineCounting(ctx: FuzzContext, input: []const u8) anyerror!void {
         content_len += 1;
     }
 
-    var state = try EditorState.init(ctx.allocator,content_buf[0..content_len]);
+    var state = try EditorState.init(ctx.allocator, content_buf[0..content_len]);
     defer state.deinit();
 
     const line_count = state.buffer.lineCount();

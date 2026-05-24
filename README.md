@@ -15,63 +15,9 @@ works with no setup; other language servers install on request via
 
 ## Install
 
-### Prebuilt binary (macOS / Linux)
-
-Download the install script, review it, and run it:
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/ooyeku/stem/main/scripts/install.sh
-less install.sh                  # review what it does
-sh install.sh                    # run it once you're satisfied
-```
-
-The script downloads the latest release archive for your platform,
-verifies its SHA-256 against the published `.sha256`, and installs
-`stem` to `/usr/local/bin` (or `~/.local/bin` if `/usr/local` isn't
-writable).
-
-Pin a specific release with `STEM_VERSION` and the install prefix
-with `STEM_PREFIX`:
-
-```bash
-STEM_VERSION=v0.4.0 STEM_PREFIX=$HOME/.local sh install.sh
-```
-
-### Prebuilt binary (Windows)
-
-Open PowerShell (5.1+ — built into every modern Windows) and run:
-
-```powershell
-# Review then install
-iwr https://raw.githubusercontent.com/ooyeku/stem/main/scripts/install.ps1 -UseBasicParsing | Set-Content install.ps1
-notepad install.ps1                          # review what it does
-.\install.ps1                                 # run it once you're satisfied
-```
-
-…or the one-liner if you're feeling confident:
-
-```powershell
-irm https://raw.githubusercontent.com/ooyeku/stem/main/scripts/install.ps1 | iex
-```
-
-The script downloads the matching `stem-vX.Y.Z-x86_64-windows.tar.gz`
-release, verifies its SHA-256, installs `stem.exe` to
-`%LOCALAPPDATA%\Programs\stem\bin\`, copies bundled plugins to
-`%LOCALAPPDATA%\Programs\stem\lib\stem\plugins\`, and adds the bin
-directory to your user `PATH`. No admin rights needed.
-
-Override the install prefix with `-Prefix`:
-
-```powershell
-.\install.ps1 -Prefix C:\tools\stem
-.\install.ps1 -Version v0.6.0 -NoPath        # pinned + skip PATH update
-```
-
-If PowerShell blocks the script with an execution-policy error,
-launch the session with `powershell -ExecutionPolicy Bypass -File .\install.ps1`.
-
-Requires `tar.exe` (built-in on Windows 10 1803 and later). For
-older systems use WSL and run `install.sh` instead.
+> Prebuilt binaries and one-line install scripts will land with the
+> first tagged release. For now, build from source — `zig build` does
+> everything end-to-end.
 
 ### From source
 

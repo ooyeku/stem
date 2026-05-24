@@ -2553,7 +2553,7 @@ pub const LSPManager = struct {
 
     fn shouldSkipDir(name: []const u8) bool {
         const skip = [_][]const u8{
-            ".git",        ".hg",          ".svn",
+            ".git",         ".hg",         ".svn",
             "node_modules", "vendor",      "target",
             "build",        "dist",        "out",
             ".zig-cache",   "zig-cache",   "zig-out",

@@ -92,13 +92,12 @@ const Verb = enum {
 
 fn resolveVerb(arg: [:0]const u8) ?Verb {
     const table = .{
-        .{ "find", Verb.find },       .{ "--find", Verb.find },   .{ "-f", Verb.find },
-        .{ "vfind", Verb.vfind },     .{ "--vfind", Verb.vfind }, .{ "scope", Verb.scope },
-        .{ "--scope", Verb.scope },   .{ "config", Verb.config }, .{ "logs", Verb.logs },
-        .{ "log", Verb.logs },        .{ "lsp", Verb.lsp },       .{ "help", Verb.help },
-        .{ "plugin", Verb.plugin },   .{ "plugins", Verb.plugin },
-        .{ "doctor", Verb.doctor },   .{ "check", Verb.doctor },
-        .{ "version", Verb.version },
+        .{ "find", Verb.find },     .{ "--find", Verb.find },     .{ "-f", Verb.find },
+        .{ "vfind", Verb.vfind },   .{ "--vfind", Verb.vfind },   .{ "scope", Verb.scope },
+        .{ "--scope", Verb.scope }, .{ "config", Verb.config },   .{ "logs", Verb.logs },
+        .{ "log", Verb.logs },      .{ "lsp", Verb.lsp },         .{ "help", Verb.help },
+        .{ "plugin", Verb.plugin }, .{ "plugins", Verb.plugin },  .{ "doctor", Verb.doctor },
+        .{ "check", Verb.doctor },  .{ "version", Verb.version },
     };
     inline for (table) |entry| {
         if (std.mem.eql(u8, arg, entry[0])) return entry[1];

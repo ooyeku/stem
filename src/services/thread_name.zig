@@ -23,5 +23,5 @@ pub fn set(name: [*:0]const u8) void {
 pub var last_step: std.atomic.Value(?[*]const u8) = .{ .raw = null };
 
 pub fn markStep(comptime tag: [:0]const u8) void {
-    last_step.store(@constCast(@ptrCast(tag.ptr)), .release);
+    last_step.store(@ptrCast(@constCast(tag.ptr)), .release);
 }

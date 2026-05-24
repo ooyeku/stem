@@ -1762,9 +1762,11 @@ test "br depth>0 walks past multiple end bytes (regression)" {
         // ---- type section: one type, () -> i32 ----
         0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
         // ---- function section: 1 function, type 0 ----
-        0x03, 0x02, 0x01, 0x00,
+        0x03,
+        0x02, 0x01, 0x00,
         // ---- export section: one func "f" idx 0 ----
-        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00,
+        0x07, 0x05, 0x01, 0x01, 0x66,
+        0x00, 0x00,
         // ---- code section ----
         // section size = 1 (count) + 1 (body-size LEB) + body bytes (14)
         0x0A, 0x10,
@@ -1772,19 +1774,24 @@ test "br depth>0 walks past multiple end bytes (regression)" {
         0x0E, // body size = 14 bytes that follow:
         0x00, // 0 local decls
         // (block
-        0x02, 0x40,
+        0x02,
+        0x40,
         //   (loop
-        0x03, 0x40,
+        0x03,
+        0x40,
         //     i32.const 1
-        0x41, 0x01,
+        0x41,
+        0x01,
         //     br_if 1  -- target = outer block
-        0x0D, 0x01,
+        0x0D,
+        0x01,
         //   end loop)  -- never reached after the branch
         0x0B,
         // end block)
         0x0B,
         // i32.const 42
-        0x41, 0x2A,
+        0x41,
+        0x2A,
         // end function
         0x0B,
     };

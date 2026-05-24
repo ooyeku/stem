@@ -318,15 +318,15 @@ fn walkWorkspace(self: *SearchIndex, root: []const u8, out: *std.ArrayListUnmana
 
 fn shouldSkip(name: []const u8) bool {
     const skip = [_][]const u8{
-        ".git",         ".hg",          ".svn",
-        "node_modules", "vendor",       "target",
-        "build",        "dist",         "out",
-        ".zig-cache",   "zig-cache",    "zig-out",
-        "zig-pkg",      ".cache",       ".idea",
-        ".vscode",      "__pycache__",  ".venv",
-        "venv",         ".tox",         ".mypy_cache",
+        ".git",          ".hg",         ".svn",
+        "node_modules",  "vendor",      "target",
+        "build",         "dist",        "out",
+        ".zig-cache",    "zig-cache",   "zig-out",
+        "zig-pkg",       ".cache",      ".idea",
+        ".vscode",       "__pycache__", ".venv",
+        "venv",          ".tox",        ".mypy_cache",
         ".pytest_cache", ".next",       ".nuxt",
-        ".gradle",      "DerivedData",
+        ".gradle",       "DerivedData",
     };
     for (skip) |s| {
         if (std.mem.eql(u8, s, name)) return true;

@@ -11,14 +11,14 @@ pub fn main() !void {
     const alloc = gpa.allocator();
 
     const langs = [_][]const u8{
-        "zig",   "python", "javascript", "typescript", "tsx",
-        "json",  "bash",   "go",         "html",       "css",
-        "rust",  "c",      "cpp",        "java",       "ruby",
+        "zig",    "python", "javascript", "typescript", "tsx",
+        "json",   "bash",   "go",         "html",       "css",
+        "rust",   "c",      "cpp",        "java",       "ruby",
         "csharp",
         // Tier 2
-        "php",   "swift",  "kotlin", "lua",   "dart",
-        "elixir", "haskell", "ocaml", "scala", "r",
-        "perl",  "erlang",
+        "php",    "swift",      "kotlin",     "lua",
+        "dart",   "elixir", "haskell",    "ocaml",      "scala",
+        "r",      "perl",   "erlang",
     };
 
     var fail_count: usize = 0;

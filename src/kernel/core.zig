@@ -2366,7 +2366,6 @@ pub const Core = struct {
 
     // handleSelectInput → kernel/input/select.zig
 
-
     pub fn enterIncrementalSearch(self: *Core, prev_mode: protocol.Mode, direction: enum { forward, backward }) !void {
         self.previous_mode = prev_mode;
         self.mode = .visual_search;

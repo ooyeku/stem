@@ -2205,9 +2205,9 @@ test "message all modes encode decode" {
     const allocator = std.testing.allocator;
 
     const modes = [_]Mode{
-        .select,       .insert,          .visual,      .visual_search,
-        .view,         .terminal,        .file_picker, .buffer_picker,
-        .save_as_mode, .command_palette, .go_to_line,  .symbol_picker,
+        .select,                  .insert,          .visual,      .visual_search,
+        .view,                    .terminal,        .file_picker, .buffer_picker,
+        .save_as_mode,            .command_palette, .go_to_line,  .symbol_picker,
         .workspace_symbol_picker,
     };
 
