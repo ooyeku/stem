@@ -1,0 +1,42 @@
+# Force consistent line endings across platforms so a Windows clone
+# of this repo can still run the POSIX shell installers under WSL /
+# Git Bash. Without this, Windows git defaults (autocrlf=true) would
+# rewrite every \n to \r\n on checkout, and bash refuses to execute
+# scripts whose shebang line ends in \r.
+
+# Default: let git auto-detect text vs. binary, but normalize text to LF in the repo.
+* text=auto eol=lf
+
+# POSIX scripts: always LF, no exceptions. The kernel reads the
+# shebang byte-for-byte, so a CRLF here breaks `./install.sh` under
+# WSL with "file uses windows line endings" / bad interpreter.
+*.sh        text eol=lf
+*.bash      text eol=lf
+install.sh  text eol=lf
+uninstall.sh text eol=lf
+
+# Windows-native scripts: CRLF. PowerShell + cmd.exe handle both,
+# but CRLF is the platform convention and what Notepad expects.
+*.ps1       text eol=crlf
+*.psm1      text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Zig source + config: LF (Zig fmt enforces LF anyway).
+*.zig       text eol=lf
+*.zon       text eol=lf
+
+# Markdown / YAML / TOML / JSON: LF (CI runs on Linux).
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.toml      text eol=lf
+*.json      text eol=lf
+
+# Binaries: never touch.
+*.wasm      binary
+*.png       binary
+*.jpg       binary
+*.ico       binary
+*.tar.gz    binary
+*.zip       binary
