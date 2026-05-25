@@ -541,7 +541,9 @@ test "Tempdir: writeFile + fileExists + joinPath" {
 
     const path = try tmp.joinPath(std.testing.allocator, "hello.txt");
     defer std.testing.allocator.free(path);
-    try std.testing.expect(std.mem.endsWith(u8, path, "/hello.txt"));
+    // Assert via basename rather than `endsWith(.., "/hello.txt")`
+    // so the test passes on Windows where joinPath uses `\`.
+    try std.testing.expectEqualStrings("hello.txt", std.fs.path.basename(path));
 
     const content = try std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(content);
