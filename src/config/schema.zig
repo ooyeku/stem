@@ -382,7 +382,12 @@ test "setByPath leaf enum" {
     const a = std.testing.allocator;
     var cfg = Config{};
     try std.testing.expectEqual(true, try cfg.setByPath("editor.line_numbers", "absolute", a));
-    try std.testing.expectEqual(@as([]const u8, "absolute"), @tagName(cfg.editor.line_numbers));
+    // expectEqual on `[]const u8` compares pointer+length, which only
+    // happens to match across compilation units when the linker
+    // dedupes string literals — true on macOS, false on Linux. Use
+    // expectEqualStrings for content equality so the test works on
+    // both platforms.
+    try std.testing.expectEqualStrings("absolute", @tagName(cfg.editor.line_numbers));
 }
 
 test "setByPath rejects unknown path" {

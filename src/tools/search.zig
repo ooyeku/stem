@@ -55,7 +55,11 @@ pub const SearchOptions = struct {
                 {
                     normalized_prefix = normalized_prefix[0 .. normalized_prefix.len - 1];
                 }
-                if (std.mem.startsWith(u8, file_path, normalized_prefix)) {
+                // Separator-agnostic prefix check: callers pass forward
+                // slashes (cross-platform convention) but the directory
+                // walker may hand us backslashes on Windows. Compare
+                // byte-by-byte treating `/` and `\` as equivalent.
+                if (startsWithPathPrefix(file_path, normalized_prefix)) {
                     if (file_path.len == normalized_prefix.len) return true;
                     const c = file_path[normalized_prefix.len];
                     if (c == '/' or c == sep) return true;
@@ -83,6 +87,21 @@ pub const SearchOptions = struct {
         return false;
     }
 };
+
+/// Path-aware variant of `std.mem.startsWith` that treats `/` and `\`
+/// as the same separator. Necessary on Windows because callers express
+/// paths with forward slashes (portable convention) but the dir walker
+/// emits them with backslashes.
+fn startsWithPathPrefix(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len < needle.len) return false;
+    for (needle, 0..) |n, i| {
+        const h = haystack[i];
+        const h_norm: u8 = if (h == '\\') '/' else h;
+        const n_norm: u8 = if (n == '\\') '/' else n;
+        if (h_norm != n_norm) return false;
+    }
+    return true;
+}
 
 /// Find every byte-offset where `needle` occurs in `haystack`. Caller
 /// owns the returned slice (allocator-managed). Empty result on no match.

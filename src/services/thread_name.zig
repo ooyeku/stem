@@ -1,15 +1,41 @@
 const std = @import("std");
 
-extern "c" fn pthread_setname_np(name: [*:0]const u8) c_int;
+// pthread_setname_np has *different signatures* on macOS vs Linux —
+// a single-arg form on darwin (the calling thread is implicit) and
+// a two-arg form on glibc/musl (thread handle + name, both required).
+// Calling the macOS variant on Linux passes the name pointer into
+// the `thread` slot, which glibc then dereferences as a pthread
+// handle → SIGSEGV at libpthread.so. Branch the extern declaration
+// so each platform sees the right ABI.
+const setname_impl = switch (@import("builtin").os.tag) {
+    .macos, .ios, .tvos, .watchos, .visionos => struct {
+        extern "c" fn pthread_setname_np(name: [*:0]const u8) c_int;
+        fn call(name: [*:0]const u8) void {
+            _ = pthread_setname_np(name);
+        }
+    },
+    .linux => struct {
+        extern "c" fn pthread_self() ?*anyopaque;
+        extern "c" fn pthread_setname_np(thread: ?*anyopaque, name: [*:0]const u8) c_int;
+        fn call(name: [*:0]const u8) void {
+            _ = pthread_setname_np(pthread_self(), name);
+        }
+    },
+    else => struct {
+        fn call(_: [*:0]const u8) void {}
+    },
+};
 
 /// Set the calling thread's name. Best-effort; on macOS the name
 /// shows up in the crash log (via pthread_getname_np in the signal
-/// handler), in `lldb thread list`, and in `ps -M`. Workers call
-/// this on entry so a SIGSEGV from a worker is still identifiable
-/// when the user's closure was inlined into Thread.entryFn.
+/// handler), in `lldb thread list`, and in `ps -M`. On Linux it
+/// shows up in `/proc/<pid>/task/<tid>/comm` and `ps -L`. Workers
+/// call this on entry so a SIGSEGV from a worker is still
+/// identifiable when the user's closure was inlined into
+/// Thread.entryFn.
 pub fn set(name: [*:0]const u8) void {
     if (@import("builtin").os.tag == .windows) return;
-    _ = pthread_setname_np(name);
+    setname_impl.call(name);
 }
 
 /// Last "step" tag a worker passed through, read by the crash handler

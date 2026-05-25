@@ -199,7 +199,15 @@ pub fn pathToUri(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    if (@import("builtin").os.tag == .windows) {
+    // Pick the prefix from the *path shape*, not the build target:
+    //   POSIX absolute (`/usr/foo`)  → `file://` + path  → file:///usr/foo
+    //   Windows drive (`C:\foo`)     → `file:///` + path → file:///C:/foo
+    // Picking by OS instead double-slashed POSIX paths on Windows
+    // (`file:////home/...`), which is what the cross-OS tests caught.
+    const is_drive_letter = absolute_path.len >= 2 and
+        std.ascii.isAlphabetic(absolute_path[0]) and
+        absolute_path[1] == ':';
+    if (is_drive_letter) {
         try out.appendSlice(allocator, "file:///");
     } else {
         try out.appendSlice(allocator, "file://");

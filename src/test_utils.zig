@@ -71,16 +71,57 @@ pub const Tempdir = struct {
     var tempdir_seq: std.atomic.Value(u64) = .{ .raw = 0 };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) !Tempdir {
-        // /tmp is reliable on macOS and Linux runners.
-        const tmp_root: []const u8 = "/tmp";
+        // Pick a platform-appropriate tmp root. POSIX: $TMPDIR or /tmp.
+        // Windows: %TEMP% or %TMP%. The fallback chain matches what
+        // most language runtimes (CPython's tempfile, Go's os.TempDir,
+        // Rust's env::temp_dir) settle on.
+        const tmp_root = try pickTmpRoot(allocator);
+        defer allocator.free(tmp_root);
+
         const seq = tempdir_seq.fetchAdd(1, .monotonic);
         const tag: u32 = @intCast(@as(usize, @bitCast(@intFromPtr(&tempdir_seq))) & 0xffffffff);
 
-        const path = try std.fmt.allocPrint(allocator, "{s}/stem-test-{x}-{x}", .{ tmp_root, tag, seq });
+        const leaf = try std.fmt.allocPrint(allocator, "stem-test-{x}-{x}", .{ tag, seq });
+        defer allocator.free(leaf);
+
+        const path = try std.fs.path.join(allocator, &.{ tmp_root, leaf });
         errdefer allocator.free(path);
 
         try std.Io.Dir.createDirAbsolute(io, path, .default_dir);
         return .{ .allocator = allocator, .io = io, .path = path };
+    }
+
+    /// Returns an allocator-owned path to the OS tmp root.
+    /// Caller is responsible for freeing.
+    fn pickTmpRoot(allocator: std.mem.Allocator) ![]u8 {
+        const builtin = @import("builtin");
+        // Zig 0.16 dropped the cross-platform `std.process.getEnvVarOwned`
+        // helper. `std.process.Environ.Block.global` is Windows-only
+        // (POSIX uses `PosixBlock` which has no global sentinel). Plain
+        // libc `getenv` works on every libc-linked OS we care about
+        // (Windows includes MSVC libc, macOS / Linux glibc / musl all
+        // provide it), so use that and dupe the result.
+        const get = struct {
+            fn lookup(gpa: std.mem.Allocator, key: [:0]const u8) ?[]u8 {
+                const raw = std.c.getenv(key.ptr) orelse return null;
+                const slice = std.mem.span(raw);
+                if (slice.len == 0) return null;
+                return gpa.dupe(u8, slice) catch null;
+            }
+        }.lookup;
+
+        if (builtin.os.tag == .windows) {
+            if (get(allocator, "TEMP")) |v| return v;
+            if (get(allocator, "TMP")) |v| return v;
+            // Last-resort fallback: per-user local app data temp dir.
+            if (get(allocator, "LOCALAPPDATA")) |v| {
+                defer allocator.free(v);
+                return std.fs.path.join(allocator, &.{ v, "Temp" });
+            }
+            return allocator.dupe(u8, "C:\\Windows\\Temp");
+        }
+        if (get(allocator, "TMPDIR")) |v| return v;
+        return allocator.dupe(u8, "/tmp");
     }
 
     pub fn deinit(self: *Tempdir) void {
