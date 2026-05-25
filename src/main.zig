@@ -125,9 +125,19 @@ fn handleCrashSignal(sig: std.c.SIG, info: *const std.c.siginfo_t, _: ?*anyopaqu
     // small offset from a NULL base pointer (struct field through a
     // null *T), 0x7f… range = heap or stack (likely UAF), high
     // canonical addresses = stack overflow / code corruption.
+    //
+    // POSIX agrees the address is reachable from siginfo_t, but the
+    // *layout* diverges: Linux glibc tucks it inside a tagged
+    // `fields` union (`fields.sigfault.addr` for SIGSEGV/SIGBUS/
+    // SIGFPE/SIGILL), while macOS/BSD expose `addr` at the top
+    // level. Switch on the build target so the wrong-shape field
+    // access doesn't fail compilation on the *other* platform.
     {
         var addr_buf: [48]u8 = undefined;
-        const addr_val: usize = @intFromPtr(info.addr);
+        const addr_val: usize = switch (@import("builtin").os.tag) {
+            .linux => @intFromPtr(info.fields.sigfault.addr),
+            else => @intFromPtr(info.addr),
+        };
         const addr_str = std.fmt.bufPrint(&addr_buf, "fault addr: 0x{x}\n", .{addr_val}) catch "fault addr: ?\n";
         if (crash_log_fd >= 0) _ = std.c.write(crash_log_fd, addr_str.ptr, addr_str.len);
         _ = std.c.write(stderr_fd, addr_str.ptr, addr_str.len);

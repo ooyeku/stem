@@ -16,8 +16,8 @@
             .hash = "vaxis-0.6.0-BWNV_D7wCQBc96pX3enYqw-uqOTDuzbvRbozo4qIGwnr",
         },
         .vigil = .{
-            .url = "git+https://github.com/ooyeku/vigil#e1f6157b8c67dae956ad98793b9e526964581115",
-            .hash = "vigil-1.3.0-0NlCVF7-BAAMne4_4LUIOJLgr4NYc4GXiFmwwb3Zn3vh",
+            .url = "git+https://github.com/ooyeku/vigil#a520834333cf6be4ea8c24b83cf3bf312eddef95",
+            .hash = "vigil-1.3.0-0NlCVFsFBQAJ-e9J39slI-h6kFKpGSEFQU-vIr2G2oIB",
         },
         .zls = .{
             .url = "https://github.com/zigtools/zls/archive/refs/tags/0.16.0.tar.gz",
