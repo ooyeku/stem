@@ -207,6 +207,11 @@ pub const Cursor = struct {
         var shift: u5 = 0;
         while (true) {
             const byte = try self.readByte();
+            // At the final group (shift 28) only the low 4 bits fit in a
+            // u32; bits 4-6 would shift past bit 31 and trip the left-
+            // shift-overflow safety check (a panic / DoS on malformed
+            // input). Reject the bad LEB128 with a typed error instead.
+            if (shift == 28 and (byte & 0x70) != 0) return error.InvalidModule;
             result |= (@as(u32, byte & 0x7F)) << shift;
             if ((byte & 0x80) == 0) return result;
             if (shift >= 28) return error.InvalidModule;
@@ -312,16 +317,35 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) !Module {
     return module;
 }
 
-fn decodeTypeSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void {
+/// Read a LEB128 element count and reject it if it exceeds the bytes
+/// left in the section. Every element costs at least one byte, so a
+/// count larger than `remaining()` is necessarily malformed. This is
+/// the guard that stops a forged count (e.g. 0xFFFFFFFF) from driving a
+/// multi-gigabyte `alloc` before a single element is read — without it
+/// a hostile plugin `.wasm` OOM-kills the host at load time.
+fn readBoundedCount(sc: *Cursor) !u32 {
     const count = try sc.readU32();
+    if (count > sc.remaining()) return error.InvalidSection;
+    return count;
+}
+
+/// Upper bound on a single function's flattened local count. A local
+/// declaration is `(count, type)`, where `count` is a virtual LEB128
+/// value *not* backed by section bytes — so one entry can claim
+/// billions. Far beyond any real function; exists only to bound that
+/// allocation. See `decodeCodeSection`.
+const MAX_FUNCTION_LOCALS: u32 = 1 << 20;
+
+fn decodeTypeSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void {
+    const count = try readBoundedCount(sc);
     const types = try aa.alloc(FuncType, count);
     for (types) |*ft| {
         const form = try sc.readByte();
         if (form != 0x60) return error.InvalidModule;
-        const n_params = try sc.readU32();
+        const n_params = try readBoundedCount(sc);
         const params = try aa.alloc(ValueType, n_params);
         for (params) |*p| p.* = try sc.readValueType();
-        const n_results = try sc.readU32();
+        const n_results = try readBoundedCount(sc);
         const results = try aa.alloc(ValueType, n_results);
         for (results) |*r| r.* = try sc.readValueType();
         ft.* = .{ .params = params, .results = results };
@@ -330,7 +354,7 @@ fn decodeTypeSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void 
 }
 
 fn decodeImportSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void {
-    const count = try sc.readU32();
+    const count = try readBoundedCount(sc);
     const imports = try aa.alloc(Import, count);
     var func_imports: u32 = 0;
     for (imports) |*imp| {
@@ -379,14 +403,14 @@ fn skipLimits(sc: *Cursor) !void {
 }
 
 fn decodeFunctionSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void {
-    const count = try sc.readU32();
+    const count = try readBoundedCount(sc);
     const ft = try aa.alloc(u32, count);
     for (ft) |*idx| idx.* = try sc.readU32();
     module.function_types = ft;
 }
 
 fn decodeMemorySection(sc: *Cursor, module: *Module) !void {
-    const count = try sc.readU32();
+    const count = try readBoundedCount(sc);
     if (count == 0) return;
     // Read the first; ignore extras.
     const flag = try sc.readByte();
@@ -403,7 +427,7 @@ fn decodeMemorySection(sc: *Cursor, module: *Module) !void {
 }
 
 fn decodeGlobalSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void {
-    const count = try sc.readU32();
+    const count = try readBoundedCount(sc);
     const gs = try aa.alloc(Global, count);
     for (gs) |*g| {
         const vt = try sc.readValueType();
@@ -430,7 +454,7 @@ fn decodeGlobalSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !voi
 }
 
 fn decodeExportSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void {
-    const count = try sc.readU32();
+    const count = try readBoundedCount(sc);
     const exports = try aa.alloc(Export, count);
     for (exports) |*e| {
         const name = try sc.readName();
@@ -449,7 +473,7 @@ fn decodeExportSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !voi
 }
 
 fn decodeCodeSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void {
-    const count = try sc.readU32();
+    const count = try readBoundedCount(sc);
     const bodies = try aa.alloc(FunctionBody, count);
     for (bodies) |*body| {
         const body_size = try sc.readU32();
@@ -457,16 +481,19 @@ fn decodeCodeSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void 
         const body_end = body_start + body_size;
         if (body_end > sc.bytes.len) return error.InvalidModule;
 
-        const n_locals = try sc.readU32();
+        const n_locals = try readBoundedCount(sc);
         // Each local entry is (count, type). Flatten so the interpreter
-        // can just index by local position.
+        // can just index by local position. `count` is a virtual LEB128
+        // value, so the running total is checked for overflow and capped
+        // — otherwise one entry claiming billions drives a giant alloc.
         var total_locals: u32 = 0;
         const save_pos = sc.pos;
         var i: u32 = 0;
         while (i < n_locals) : (i += 1) {
             const c = try sc.readU32();
             _ = try sc.readByte();
-            total_locals += c;
+            total_locals = std.math.add(u32, total_locals, c) catch return error.InvalidModule;
+            if (total_locals > MAX_FUNCTION_LOCALS) return error.InvalidModule;
         }
         sc.pos = save_pos;
         const locals_flat = try aa.alloc(ValueType, total_locals);
@@ -492,7 +519,7 @@ fn decodeCodeSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void 
 }
 
 fn decodeDataSection(aa: std.mem.Allocator, sc: *Cursor, module: *Module) !void {
-    const count = try sc.readU32();
+    const count = try readBoundedCount(sc);
     const segs = try aa.alloc(DataSegment, count);
     for (segs) |*ds| {
         const flag = try sc.readU32();
