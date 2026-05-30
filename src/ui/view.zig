@@ -243,27 +243,34 @@ pub const View = struct {
     }
 
     fn styleForTokenType(t: protocol.SyntaxToken.TokenType) vaxis.Cell.Style {
+        // Each token type lists an RGB triple plus a nearest-match
+        // 16-colour palette index. theme.fg picks between them based
+        // on `theme.truecolor_enabled` (probed once at startup). The
+        // palette mappings keep the same hue family as the RGB values
+        // so the fallback look is recognisably the same theme, just
+        // chunkier. The palette indices come from theme.colors.palette.
+        const p = theme.colors.palette;
         return switch (t) {
-            .keyword => .{ .fg = .{ .rgb = theme.colors.syntax.keyword }, .bold = true },
-            .function => .{ .fg = .{ .rgb = theme.colors.syntax.function } },
-            .variable => .{ .fg = .{ .rgb = theme.colors.syntax.variable } },
-            .parameter => .{ .fg = .{ .rgb = theme.colors.syntax.parameter }, .italic = true },
-            .property => .{ .fg = .{ .rgb = theme.colors.syntax.property } },
-            .type_name => .{ .fg = .{ .rgb = theme.colors.syntax.type_name } },
-            .string => .{ .fg = .{ .rgb = theme.colors.syntax.string } },
-            .number => .{ .fg = .{ .rgb = theme.colors.syntax.number } },
-            .comment => .{ .fg = .{ .rgb = theme.colors.syntax.comment }, .italic = true },
-            .operator => .{ .fg = .{ .rgb = theme.colors.syntax.operator } },
-            .builtin => .{ .fg = .{ .rgb = theme.colors.syntax.builtin } },
-            .namespace => .{ .fg = .{ .rgb = theme.colors.syntax.namespace } },
-            .other => .{ .fg = .{ .rgb = theme.colors.syntax.other } },
-            .bracket_1 => .{ .fg = .{ .rgb = theme.colors.brackets.level_1 }, .bold = true },
-            .bracket_2 => .{ .fg = .{ .rgb = theme.colors.brackets.level_2 }, .bold = true },
-            .bracket_3 => .{ .fg = .{ .rgb = theme.colors.brackets.level_3 }, .bold = true },
-            .bracket_4 => .{ .fg = .{ .rgb = theme.colors.brackets.level_4 }, .bold = true },
-            .bracket_5 => .{ .fg = .{ .rgb = theme.colors.brackets.level_5 }, .bold = true },
-            .bracket_6 => .{ .fg = .{ .rgb = theme.colors.brackets.level_6 }, .bold = true },
-            .scope_bracket => .{ .fg = .{ .rgb = theme.colors.brackets.scope }, .bold = true },
+            .keyword => .{ .fg = theme.fg(theme.colors.syntax.keyword, p.bright_magenta), .bold = true },
+            .function => .{ .fg = theme.fg(theme.colors.syntax.function, p.bright_blue) },
+            .variable => .{ .fg = theme.fg(theme.colors.syntax.variable, p.bright_red) },
+            .parameter => .{ .fg = theme.fg(theme.colors.syntax.parameter, p.red), .italic = true },
+            .property => .{ .fg = theme.fg(theme.colors.syntax.property, p.bright_cyan) },
+            .type_name => .{ .fg = theme.fg(theme.colors.syntax.type_name, p.bright_yellow) },
+            .string => .{ .fg = theme.fg(theme.colors.syntax.string, p.bright_green) },
+            .number => .{ .fg = theme.fg(theme.colors.syntax.number, p.yellow) },
+            .comment => .{ .fg = theme.fg(theme.colors.syntax.comment, p.bright_black), .italic = true },
+            .operator => .{ .fg = theme.fg(theme.colors.syntax.operator, p.cyan) },
+            .builtin => .{ .fg = theme.fg(theme.colors.syntax.builtin, p.bright_magenta) },
+            .namespace => .{ .fg = theme.fg(theme.colors.syntax.namespace, p.bright_blue) },
+            .other => .{ .fg = theme.fg(theme.colors.syntax.other, p.white) },
+            .bracket_1 => .{ .fg = theme.fg(theme.colors.brackets.level_1, p.bright_red), .bold = true },
+            .bracket_2 => .{ .fg = theme.fg(theme.colors.brackets.level_2, p.yellow), .bold = true },
+            .bracket_3 => .{ .fg = theme.fg(theme.colors.brackets.level_3, p.bright_yellow), .bold = true },
+            .bracket_4 => .{ .fg = theme.fg(theme.colors.brackets.level_4, p.bright_green), .bold = true },
+            .bracket_5 => .{ .fg = theme.fg(theme.colors.brackets.level_5, p.bright_cyan), .bold = true },
+            .bracket_6 => .{ .fg = theme.fg(theme.colors.brackets.level_6, p.bright_magenta), .bold = true },
+            .scope_bracket => .{ .fg = theme.fg(theme.colors.brackets.scope, p.bright_yellow), .bold = true },
         };
     }
 
@@ -3497,3 +3504,177 @@ pub const View = struct {
         _ = allocator;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests — the snapshot-consumption layer the renderer runs every frame.
+//
+// These exercise the pure logic that turns a `RenderSnapshot`'s
+// `syntax_tokens` / `visible_lines` into styled output, without a TTY:
+// the per-line token index, the out-of-bounds token guard (bad LSP /
+// tree-sitter tokens must never index past a line), the token-type ->
+// style mapping (incl. the truecolor vs 16-colour fallback that the
+// Windows/conhost work just added), and ANSI SGR parsing for terminal
+// output. The last case writes a styled cell into an in-memory vaxis
+// Screen and reads it back, covering the theme -> vaxis.Cell boundary
+// against a real surface with no terminal attached.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn tok(line: u32, start_col: u32, length: u32, tt: protocol.SyntaxToken.TokenType) protocol.SyntaxToken {
+    return .{ .line = line, .start_col = start_col, .length = length, .token_type = tt };
+}
+
+fn expectIndexColor(expected: u8, color: vaxis.Cell.Color) !void {
+    switch (color) {
+        .index => |i| try testing.expectEqual(expected, i),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectRgbColor(expected: theme.RGB, color: vaxis.Cell.Color) !void {
+    switch (color) {
+        .rgb => |c| {
+            try testing.expectEqual(expected[0], c[0]);
+            try testing.expectEqual(expected[1], c[1]);
+            try testing.expectEqual(expected[2], c[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectDefaultColor(color: vaxis.Cell.Color) !void {
+    switch (color) {
+        .default => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "TokenIndex: buckets tokens per line and sorts each line by column" {
+    var idx = TokenIndex.init(testing.allocator);
+    defer idx.deinit();
+
+    // Line 0 is given out of column order on purpose.
+    const tokens = [_]protocol.SyntaxToken{
+        tok(0, 10, 2, .number),
+        tok(0, 0, 3, .keyword),
+        tok(2, 4, 5, .string),
+    };
+    try idx.buildFromTokens(&tokens);
+
+    const l0 = idx.getLineTokens(0) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), l0.len);
+    try testing.expectEqual(@as(u32, 0), l0[0].start_col); // sorted ascending
+    try testing.expectEqual(@as(u32, 10), l0[1].start_col);
+
+    try testing.expect(idx.getLineTokens(1) == null); // no tokens on line 1
+    try testing.expect(idx.getLineTokens(2) != null);
+}
+
+test "TokenIndex.findTokenAt: binary search over hits, gaps, and boundaries" {
+    var idx = TokenIndex.init(testing.allocator);
+    defer idx.deinit();
+    // keyword at [0,3), gap [3,5), number at [5,7)
+    const tokens = [_]protocol.SyntaxToken{
+        tok(0, 0, 3, .keyword),
+        tok(0, 5, 2, .number),
+    };
+    try idx.buildFromTokens(&tokens);
+
+    try testing.expectEqual(protocol.SyntaxToken.TokenType.keyword, idx.findTokenAt(0, 0).?.token_type);
+    try testing.expectEqual(protocol.SyntaxToken.TokenType.keyword, idx.findTokenAt(0, 2).?.token_type);
+    try testing.expect(idx.findTokenAt(0, 3) == null); // exclusive end of keyword
+    try testing.expect(idx.findTokenAt(0, 4) == null); // gap between tokens
+    try testing.expectEqual(protocol.SyntaxToken.TokenType.number, idx.findTokenAt(0, 5).?.token_type);
+    try testing.expect(idx.findTokenAt(0, 7) == null); // past the last token
+    try testing.expect(idx.findTokenAt(9, 0) == null); // unknown line
+}
+
+test "TokenIndex: empty token list is a no-op" {
+    var idx = TokenIndex.init(testing.allocator);
+    defer idx.deinit();
+    try idx.buildFromTokens(&.{});
+    try testing.expect(idx.getLineTokens(0) == null);
+    try testing.expect(idx.findTokenAt(0, 0) == null);
+}
+
+test "TokenValidator.filterValid drops tokens that run past their line or window" {
+    const a = testing.allocator;
+    const lines = [_][]const u8{ "fn main", "    x" }; // len 7, len 5
+    const tokens = [_]protocol.SyntaxToken{
+        tok(0, 0, 2, .keyword), // ok: "fn"
+        tok(0, 3, 4, .function), // ok: "main"
+        tok(0, 5, 5, .other), // bad: 5+5 > 7, runs past end of line
+        tok(0, 9, 1, .other), // bad: starts past end of line
+        tok(1, 4, 1, .variable), // ok: "x"
+        tok(5, 0, 1, .other), // bad: line beyond the visible window
+    };
+    const valid = try TokenValidator.filterValid(a, &tokens, &lines, 0);
+    defer a.free(valid);
+    try testing.expectEqual(@as(usize, 3), valid.len);
+}
+
+test "TokenValidator.filterCritical keeps only keyword/string/comment" {
+    const a = testing.allocator;
+    const tokens = [_]protocol.SyntaxToken{
+        tok(0, 0, 1, .keyword),
+        tok(0, 1, 1, .function),
+        tok(0, 2, 1, .string),
+        tok(0, 3, 1, .number),
+        tok(0, 4, 1, .comment),
+    };
+    const crit = try TokenValidator.filterCritical(a, &tokens);
+    defer a.free(crit);
+    try testing.expectEqual(@as(usize, 3), crit.len);
+}
+
+test "styleForTokenType: truecolor uses RGB, fallback uses the palette index" {
+    const saved = theme.truecolor_enabled;
+    defer theme.truecolor_enabled = saved;
+
+    theme.truecolor_enabled = true;
+    const kw_rgb = View.styleForTokenType(.keyword);
+    try testing.expect(kw_rgb.bold);
+    try expectRgbColor(theme.colors.syntax.keyword, kw_rgb.fg);
+
+    theme.truecolor_enabled = false;
+    const kw_idx = View.styleForTokenType(.keyword);
+    try testing.expect(kw_idx.bold); // bold is independent of the colour mode
+    try expectIndexColor(theme.colors.palette.bright_magenta, kw_idx.fg);
+}
+
+test "applyAnsiSgr: bold, 16-colour fg, combined params, and reset" {
+    const base: vaxis.Cell.Style = .{};
+
+    try testing.expect(View.applyAnsiSgr(base, "1").bold);
+    try expectIndexColor(1, View.applyAnsiSgr(base, "31").fg); // 30..37 -> 0..7
+    try expectIndexColor(9, View.applyAnsiSgr(base, "91").fg); // 90..97 -> 8..15
+
+    const combined = View.applyAnsiSgr(base, "1;32");
+    try testing.expect(combined.bold);
+    try expectIndexColor(2, combined.fg);
+
+    // SGR 0 resets attributes and colours.
+    const reset = View.applyAnsiSgr(combined, "0");
+    try testing.expect(!reset.bold);
+    try expectDefaultColor(reset.fg);
+
+    // An empty parameter string is an implicit reset (ESC[m).
+    try testing.expect(!View.applyAnsiSgr(combined, "").bold);
+}
+
+test "styleForTokenType round-trips through an in-memory vaxis Screen" {
+    const saved = theme.truecolor_enabled;
+    defer theme.truecolor_enabled = saved;
+    theme.truecolor_enabled = true;
+
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 3, .cols = 8, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+
+    // Write a keyword-styled cell, read it back: the renderer's
+    // theme -> vaxis.Cell path against a real (off-screen) buffer.
+    screen.writeCell(2, 1, .{ .style = View.styleForTokenType(.keyword) });
+    const got = screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
+    try testing.expect(got.style.bold);
+    try expectRgbColor(theme.colors.syntax.keyword, got.style.fg);
+}

@@ -1,7 +1,74 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
+const builtin = @import("builtin");
+const platform = @import("../kernel/platform.zig");
 
 pub const RGB = struct { u8, u8, u8 };
+
+// Runtime truecolor capability flag. Set by `detectTruecolor()` once
+// at startup. Default chosen so the binary still produces usable
+// (16-colour) output if detection is never called.
+//
+// Why this exists: most syntax/decoration colours are 24-bit RGB,
+// which is fine on every modern terminal *except* the classic Windows
+// conhost (cmd.exe in the legacy console host). conhost silently
+// drops 24-bit SGR codes, leaving the buffer text rendered with the
+// terminal default foreground — exactly the "status bar is colourful,
+// buffer is flat" symptom that prompted this. Index/palette colours
+// (16-colour) work everywhere including legacy conhost.
+pub var truecolor_enabled: bool = builtin.os.tag != .windows;
+
+/// Probe the environment for truecolor support and set
+/// `truecolor_enabled` accordingly. Call once at startup, before any
+/// rendering happens. The heuristic, in order:
+///   1. COLORTERM == "truecolor" / "24bit"           → yes
+///   2. WT_SESSION is set (Microsoft Windows Terminal) → yes
+///   3. TERM_PROGRAM != Apple_Terminal* (iTerm, ghostty, vscode,
+///      WezTerm, alacritty, etc.)                    → yes
+///   4. Otherwise default to platform tradition: yes on POSIX, no on
+///      Windows (covers classic conhost / cmd.exe).
+///
+/// "Apple_Terminal*" is excluded because macOS Terminal.app is
+/// 256-colour only, not truecolor — falls through to step 4.
+pub fn detectTruecolor(
+    allocator: std.mem.Allocator,
+    environ_block: std.process.Environ.Block,
+) void {
+    if (platform.getEnv(allocator, environ_block, "COLORTERM") catch null) |val| {
+        defer allocator.free(val);
+        if (std.mem.eql(u8, val, "truecolor") or std.mem.eql(u8, val, "24bit")) {
+            truecolor_enabled = true;
+            return;
+        }
+    }
+
+    if (platform.getEnv(allocator, environ_block, "WT_SESSION") catch null) |val| {
+        defer allocator.free(val);
+        truecolor_enabled = true;
+        return;
+    }
+
+    if (platform.getEnv(allocator, environ_block, "TERM_PROGRAM") catch null) |val| {
+        defer allocator.free(val);
+        if (!std.mem.startsWith(u8, val, "Apple_Terminal")) {
+            truecolor_enabled = true;
+            return;
+        }
+    }
+
+    truecolor_enabled = builtin.os.tag != .windows;
+}
+
+/// Return a vaxis color that uses 24-bit RGB if the terminal can
+/// render it, otherwise the supplied 16-colour palette index fallback.
+/// Centralising the choice here means each call site stays a one-liner
+/// instead of branching on `truecolor_enabled` everywhere.
+pub fn fg(rgb_color: RGB, palette_index: u8) vaxis.Cell.Color {
+    return if (truecolor_enabled)
+        .{ .rgb = .{ rgb_color[0], rgb_color[1], rgb_color[2] } }
+    else
+        .{ .index = palette_index };
+}
 
 pub const colors = struct {
     pub const syntax = struct {

@@ -387,6 +387,29 @@ pub fn build(b: *std.Build) void {
     const query_check_step = b.step("query-check", "Verify every shipped tree-sitter query compiles");
     query_check_step.dependOn(&run_query_check.step);
 
+    // Benchmark harness: `zig build bench -Doptimize=ReleaseFast` runs
+    // the piece-table microbenchmarks in src/bench/main.zig. Uses the
+    // C allocator, so it links libc and needs the tree-sitter headers
+    // the `stem` module's C sources pull in (same as query-check).
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "stem", .module = mod },
+            },
+        }),
+    });
+    bench_exe.root_module.link_libc = true;
+    bench_exe.root_module.addIncludePath(ts_dep.path("lib/include"));
+    bench_exe.root_module.addIncludePath(ts_dep.path("lib/src"));
+    const run_bench = b.addRunArtifact(bench_exe);
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Run microbenchmarks (build -Doptimize=ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);

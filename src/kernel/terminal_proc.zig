@@ -223,9 +223,19 @@ pub fn completeTerminalInput(core: anytype) !void {
     const full_partial = core.terminal_input.items[last_word_start..];
     if (full_partial.len == 0) return;
 
-    const last_slash = std.mem.lastIndexOfScalar(u8, full_partial, '/');
-    const dir_part = if (last_slash) |idx| full_partial[0 .. idx + 1] else "";
-    const partial = if (last_slash) |idx| full_partial[idx + 1 ..] else full_partial;
+    // Accept either separator on Windows so tab-complete works
+    // whether the user typed `path/to/foo` (cross-platform habit) or
+    // `path\to\foo` (native cmd.exe style). On POSIX `\` is a legal
+    // filename byte so we only split on `/` there.
+    const last_sep: ?usize = blk: {
+        const slash = std.mem.lastIndexOfScalar(u8, full_partial, '/');
+        if (@import("builtin").os.tag != .windows) break :blk slash;
+        const back = std.mem.lastIndexOfScalar(u8, full_partial, '\\');
+        if (slash) |s| break :blk if (back) |b| @max(s, b) else s;
+        break :blk back;
+    };
+    const dir_part = if (last_sep) |idx| full_partial[0 .. idx + 1] else "";
+    const partial = if (last_sep) |idx| full_partial[idx + 1 ..] else full_partial;
 
     var search_path_joined: []const u8 = undefined;
     if (dir_part.len > 0) {

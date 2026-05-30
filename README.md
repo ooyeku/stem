@@ -8,7 +8,6 @@ leader, and a discoverable command palette. ZLS is embedded so Zig
 works with no setup; other language servers install on request via
 `stem lsp install`.
 
-![Version](https://img.shields.io/badge/version-0.4.0-blue)
 ![Zig](https://img.shields.io/badge/zig-0.16%2B-orange)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-green)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)

@@ -53,6 +53,7 @@ test {
     _ = @import("tools/plugin_cli.zig");
     _ = @import("lsp/transport.zig");
     _ = @import("ui/width.zig");
+    _ = @import("ui/view.zig");
 
     _ = @import("syntax/tree_sitter.zig");
     // NOTE: syntax/manager.zig has ~25 latent tests that were never wired
@@ -82,4 +83,5 @@ test {
     // test` too.
     _ = @import("fuzz/lsp_json_fuzz.zig");
     _ = @import("fuzz/config_setbypath_fuzz.zig");
+    _ = @import("fuzz/wasm_loader_fuzz.zig");
 }

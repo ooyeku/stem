@@ -1,6 +1,6 @@
 .{
     .name = .stem,
-    .version = "0.6.5",
+    .version = "0.6.7",
     .fingerprint = 0x20bf92e5730ad4ee, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     // IMPORTANT: every dependency URL must reference a fixed commit SHA

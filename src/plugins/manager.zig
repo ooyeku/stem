@@ -297,21 +297,38 @@ pub const PluginManager = struct {
         // 2. Common system install dirs. `install.sh` writes to
         // `~/.local/lib/stem/plugins` (no /usr/local access) or
         // `/usr/local/lib/stem/plugins`; the Nix derivation lands in
-        // `<store>/lib/stem/plugins`. We can't ask the binary where
-        // it lives in Zig 0.16, so we just probe the well-known paths
-        // and silently skip anything that doesn't exist.
+        // `<store>/lib/stem/plugins`; `install.ps1` writes to
+        // `%LOCALAPPDATA%\Programs\stem\lib\stem\plugins`. We can't
+        // ask the binary where it lives in Zig 0.16, so we just probe
+        // the well-known paths and silently skip anything that
+        // doesn't exist.
         if (home_owned) |home| {
             const local_dir = try std.fs.path.join(self.allocator, &.{ home, ".local", "lib", "stem", "plugins" });
             try out.append(self.allocator, local_dir);
         }
-        const system_dirs = [_][]const u8{
-            "/usr/local/lib/stem/plugins",
-            "/usr/lib/stem/plugins",
-            "/opt/stem/plugins",
-        };
-        for (system_dirs) |sd| {
-            const dup = try self.allocator.dupe(u8, sd);
-            try out.append(self.allocator, dup);
+        if (@import("builtin").os.tag == .windows) {
+            // Per-user install (no admin) — what install.ps1 uses by default.
+            if (try platform.getEnv(self.allocator, self.environ_block, "LOCALAPPDATA")) |lad| {
+                defer self.allocator.free(lad);
+                const dir = try std.fs.path.join(self.allocator, &.{ lad, "Programs", "stem", "lib", "stem", "plugins" });
+                try out.append(self.allocator, dir);
+            }
+            // System-wide install (admin) — Program Files.
+            if (try platform.getEnv(self.allocator, self.environ_block, "ProgramFiles")) |pf| {
+                defer self.allocator.free(pf);
+                const dir = try std.fs.path.join(self.allocator, &.{ pf, "stem", "lib", "stem", "plugins" });
+                try out.append(self.allocator, dir);
+            }
+        } else {
+            const system_dirs = [_][]const u8{
+                "/usr/local/lib/stem/plugins",
+                "/usr/lib/stem/plugins",
+                "/opt/stem/plugins",
+            };
+            for (system_dirs) |sd| {
+                const dup = try self.allocator.dupe(u8, sd);
+                try out.append(self.allocator, dup);
+            }
         }
 
         // 3. Anything on `STEM_PLUGIN_PATH`. Split on `:` on POSIX,
@@ -2110,10 +2127,38 @@ pub const PluginManager = struct {
             .read => "read:",
             .write => "write:",
         };
-        for (stored.filesystem) |entry| {
+        return filesystemListAllows(stored.filesystem, prefix, path);
+    }
+
+    /// Pure filesystem-permission decision, split out from
+    /// `filesystemAllows` so the traversal guard and glob matching are
+    /// unit-testable without standing up a live PluginManager.
+    ///
+    /// Denies outright any path containing a `..` component. Grants
+    /// glob-match the *raw* request string, so a `read:src/*` grant
+    /// would otherwise allow `src/../../etc/passwd` — the glob sees the
+    /// `src/` prefix and passes, then the host resolves the `..` and
+    /// reads outside the intended scope. Rejecting parent refs closes
+    /// that class without touching the filesystem (write targets may
+    /// not exist yet). Symlink-based escapes are out of scope; defending
+    /// those needs realpath resolution at access time.
+    fn filesystemListAllows(filesystem: []const []const u8, prefix: []const u8, path: []const u8) bool {
+        if (pathHasParentRef(path)) return false;
+        for (filesystem) |entry| {
             if (!std.mem.startsWith(u8, entry, prefix)) continue;
             const pattern = entry[prefix.len..];
             if (matchesPermissionEntry(pattern, path)) return true;
+        }
+        return false;
+    }
+
+    /// True if `path` has a `..` path component under either separator.
+    /// A filename that merely *contains* ".." (e.g. `a..b`) is fine —
+    /// only a whole component counts.
+    fn pathHasParentRef(path: []const u8) bool {
+        var it = std.mem.splitAny(u8, path, "/\\");
+        while (it.next()) |comp| {
+            if (std.mem.eql(u8, comp, "..")) return true;
         }
         return false;
     }
@@ -2307,3 +2352,39 @@ pub const PluginManager = struct {
         registry_description: []const u8,
     };
 };
+
+test "filesystemListAllows: exact and glob grants gate per-op" {
+    const grants = [_][]const u8{ "read:src/*", "write:out.txt" };
+    try std.testing.expect(PluginManager.filesystemListAllows(&grants, "read:", "src/main.zig"));
+    try std.testing.expect(!PluginManager.filesystemListAllows(&grants, "read:", "lib/x.zig"));
+    try std.testing.expect(PluginManager.filesystemListAllows(&grants, "write:", "out.txt"));
+    // A read grant must not satisfy a write op, and vice-versa.
+    try std.testing.expect(!PluginManager.filesystemListAllows(&grants, "write:", "src/main.zig"));
+    try std.testing.expect(!PluginManager.filesystemListAllows(&grants, "read:", "out.txt"));
+    // No grant at all => deny.
+    try std.testing.expect(!PluginManager.filesystemListAllows(&.{}, "read:", "src/main.zig"));
+}
+
+test "filesystemListAllows: rejects parent-dir traversal even when the glob would match" {
+    const scoped = [_][]const u8{"read:src/*"};
+    try std.testing.expect(!PluginManager.filesystemListAllows(&scoped, "read:", "src/../../etc/passwd"));
+    try std.testing.expect(!PluginManager.filesystemListAllows(&scoped, "read:", "src/../secret"));
+    // Windows separator is covered too.
+    try std.testing.expect(!PluginManager.filesystemListAllows(&scoped, "read:", "src\\..\\..\\secret"));
+    // A wildcard-everything grant still cannot be turned into traversal.
+    const wild = [_][]const u8{"read:*"};
+    try std.testing.expect(!PluginManager.filesystemListAllows(&wild, "read:", "../../etc/passwd"));
+    // ...but a clean path under the same wildcard is still allowed.
+    try std.testing.expect(PluginManager.filesystemListAllows(&wild, "read:", "src/deep/main.zig"));
+}
+
+test "pathHasParentRef: flags only whole `..` components" {
+    try std.testing.expect(PluginManager.pathHasParentRef(".."));
+    try std.testing.expect(PluginManager.pathHasParentRef("a/../b"));
+    try std.testing.expect(PluginManager.pathHasParentRef("a\\..\\b"));
+    try std.testing.expect(PluginManager.pathHasParentRef("../x"));
+    try std.testing.expect(!PluginManager.pathHasParentRef("a/b/c"));
+    // A name that merely contains ".." is not a parent ref.
+    try std.testing.expect(!PluginManager.pathHasParentRef("a..b"));
+    try std.testing.expect(!PluginManager.pathHasParentRef("..foo/bar"));
+}

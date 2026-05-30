@@ -43,7 +43,12 @@ pub const SearchOptions = struct {
     pub fn shouldIncludePath(self: SearchOptions, file_path: []const u8) bool {
         const sep = std.fs.path.sep;
         for (self.excludes) |exclude| {
-            if (std.mem.indexOf(u8, file_path, exclude) != null) return false;
+            // Separator-agnostic substring match: an exclude pattern
+            // like "/.git/" must also fire against a path containing
+            // "\.git\" on Windows. We can't pre-rewrite the excludes
+            // because we don't own them; instead pad+normalize both
+            // sides and use a byte-by-byte scan.
+            if (containsPathPattern(file_path, exclude)) return false;
         }
 
         if (self.paths.len > 0) {
@@ -101,6 +106,20 @@ fn startsWithPathPrefix(haystack: []const u8, needle: []const u8) bool {
         if (h_norm != n_norm) return false;
     }
     return true;
+}
+
+/// Path-aware variant of `std.mem.indexOf` that treats `/` and `\` as
+/// the same separator. Used for exclude-substring matching so a
+/// pattern like "/.git/" fires against both `src/.git/foo` (POSIX)
+/// and `src\.git\foo` (Windows).
+fn containsPathPattern(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (startsWithPathPrefix(haystack[i..], needle)) return true;
+    }
+    return false;
 }
 
 /// Find every byte-offset where `needle` occurs in `haystack`. Caller
@@ -206,14 +225,15 @@ const default_excludes = [_][]const u8{
 
 fn isDefaultExcluded(path: []const u8) bool {
     // Pad so we match boundary-anchored substrings like "/.git/" even at
-    // the start of a relative path.
+    // the start of a relative path. Substring matching is separator-
+    // agnostic so the pattern "/.git/" also fires against `\.git\` on
+    // Windows (where the dir walker uses backslashes).
     var buf: [512]u8 = undefined;
     if (path.len + 2 > buf.len) {
-        // Fall back to raw indexOf if the path is unusually long.
+        // Long-path fallback: same logic, no padding.
         for (default_excludes) |x| {
-            if (std.mem.indexOf(u8, path, x) != null) return true;
-            // Also catch the case where the prefix is at offset 0.
-            if (x.len > 1 and std.mem.startsWith(u8, path, x[1..])) return true;
+            if (containsPathPattern(path, x)) return true;
+            if (x.len > 1 and startsWithPathPrefix(path, x[1..])) return true;
         }
         return false;
     }
@@ -222,7 +242,7 @@ fn isDefaultExcluded(path: []const u8) bool {
     buf[1 + path.len] = '/';
     const padded = buf[0 .. path.len + 2];
     for (default_excludes) |x| {
-        if (std.mem.indexOf(u8, padded, x) != null) return true;
+        if (containsPathPattern(padded, x)) return true;
     }
     return false;
 }

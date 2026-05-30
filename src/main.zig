@@ -15,19 +15,60 @@ pub const std_options: std.Options = .{
     .logFn = logger.stdLogBridge,
 };
 
-/// Set by SIGINT / SIGTERM handlers. Polled by a monitor thread that wakes
-/// the main loop with a `.quit` message so we exit via the same teardown
-/// path the user would get from in-editor quit (Ctrl-C inside vaxis).
-/// Module-level because signal handlers can't carry context. Async-signal
-/// safe: only an atomic store happens in the handler itself.
+/// Set by SIGINT / SIGTERM handlers (POSIX) or the console-control
+/// callback (Windows). Polled by a monitor thread that wakes the main
+/// loop with a `.quit` message so we exit via the same teardown path
+/// the user would get from in-editor quit. Module-level because both
+/// signal handlers and the Windows ctrl-handler callback run without
+/// caller context. Async-signal safe: only an atomic store happens in
+/// the handler itself.
 var shutdown_requested: std.atomic.Value(bool) = .{ .raw = false };
 
 fn handleShutdownSignal(_: std.c.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
 }
 
+/// Windows console-control callback. Called by Windows on Ctrl+C,
+/// Ctrl+Break, console-window close, user logoff, or system shutdown.
+/// Runs on a Win32-managed thread, NOT the main thread — so we just
+/// flag the atomic and return TRUE ("handled"); the SignalMonitor
+/// thread observes the flag within ~200 ms and wakes the main loop,
+/// which runs the same teardown path POSIX does. For CTRL_CLOSE / -
+/// LOGOFF / -SHUTDOWN, Windows enforces a ~5–10 s grace window before
+/// it force-terminates the process; our fast-exit deinit (which
+/// SIGKILLs every LSP child in parallel and bounds every join) lands
+/// well inside that budget.
+///
+/// Without this handler, Ctrl+C on Windows kills stem instantly and
+/// every spawned LSP server becomes an orphan process — there's no
+/// SIGCHLD on Windows to reap them, and conhost cleanup is unreliable.
+fn handleWindowsCtrl(ctrl_type: u32) callconv(.winapi) c_int {
+    // CTRL_C_EVENT=0, CTRL_BREAK_EVENT=1, CTRL_CLOSE_EVENT=2,
+    // CTRL_LOGOFF_EVENT=5, CTRL_SHUTDOWN_EVENT=6.
+    switch (ctrl_type) {
+        0, 1, 2, 5, 6 => {
+            shutdown_requested.store(true, .release);
+            return 1; // TRUE — handled
+        },
+        else => return 0, // FALSE — let next handler run
+    }
+}
+
 fn installShutdownSignals() !void {
-    if (@import("builtin").os.tag == .windows) return; // POSIX-only for now.
+    if (@import("builtin").os.tag == .windows) {
+        const SetConsoleCtrlHandler = struct {
+            extern "kernel32" fn SetConsoleCtrlHandler(
+                handler: ?*const fn (u32) callconv(.winapi) c_int,
+                add: c_int,
+            ) c_int;
+        }.SetConsoleCtrlHandler;
+        // Returns 0 on failure; we ignore — startup must continue
+        // even if Windows refuses to install the handler (e.g.
+        // running detached from any console). The user can still
+        // exit cleanly via Space+Q in that case.
+        _ = SetConsoleCtrlHandler(handleWindowsCtrl, 1);
+        return;
+    }
     const sa: std.posix.Sigaction = .{
         .handler = .{ .handler = handleShutdownSignal },
         .mask = std.posix.sigemptyset(),
@@ -320,6 +361,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     try logger.init(allocator, io, storage.logs_dir, log_level);
     defer logger.deinit();
+
+    // Probe the terminal once at startup to decide whether to emit
+    // 24-bit RGB or 16-colour palette indices for syntax highlights.
+    // Classic Windows conhost (cmd.exe) silently drops 24-bit SGR
+    // codes, leaving the buffer text rendered with the terminal
+    // default foreground while palette-index UI chrome (status bar,
+    // tabs) renders fine. Detection lives in src/ui/theme.zig.
+    @import("ui/theme.zig").detectTruecolor(allocator, init.environ.block);
 
     // Install SIGSEGV / SIGBUS / etc. handlers. Best-effort: writes a
     // backtrace to `~/.stem/logs/crash.log` and re-raises with the

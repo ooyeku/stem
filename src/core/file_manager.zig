@@ -23,7 +23,16 @@ pub const FileManager = struct {
             // Convert sentinel-terminated slice to plain []u8 so deinit's free matches the alloc.
             defer allocator.free(z);
             break :blk try allocator.dupe(u8, z);
-        } else |_| try allocator.dupe(u8, "/");
+        } else |_| blk: {
+            // Last-resort fallback. POSIX has a single global root `/`;
+            // Windows has per-drive roots, so the closest equivalent of
+            // "I have no idea where I am" is the system drive root. Get
+            // there via `std.fs.path.sep_str` so the same code works on
+            // both. realPathFile failing in practice means the process
+            // has no usable cwd at all, so the user will see further
+            // errors immediately — we just need a non-null string here.
+            break :blk try allocator.dupe(u8, if (@import("builtin").os.tag == .windows) "C:\\" else "/");
+        };
 
         return .{
             .allocator = allocator,
@@ -32,6 +41,22 @@ pub const FileManager = struct {
             .entries = .empty,
             .selected_index = 0,
         };
+    }
+
+    /// Are we at a filesystem root? POSIX: cwd == "/". Windows: cwd is
+    /// of the shape `<drive>:\` or `<drive>:/` (length 3). Used by
+    /// `refresh` to decide whether to surface a `..` entry.
+    fn isAtRoot(cwd: []const u8) bool {
+        if (std.mem.eql(u8, cwd, "/")) return true;
+        if (@import("builtin").os.tag == .windows and
+            cwd.len == 3 and
+            std.ascii.isAlphabetic(cwd[0]) and
+            cwd[1] == ':' and
+            (cwd[2] == '\\' or cwd[2] == '/'))
+        {
+            return true;
+        }
+        return false;
     }
 
     pub fn deinit(self: *FileManager) void {
@@ -51,7 +76,7 @@ pub const FileManager = struct {
         self.clearEntries();
         self.selected_index = 0;
 
-        if (!std.mem.eql(u8, self.cwd, "/")) {
+        if (!isAtRoot(self.cwd)) {
             const dotdot = try self.allocator.dupe(u8, "..");
             errdefer self.allocator.free(dotdot);
             try self.entries.append(self.allocator, .{

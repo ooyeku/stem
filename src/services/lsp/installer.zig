@@ -534,12 +534,30 @@ pub const Installer = struct {
     }
 
     fn tryJoinFile(self: *Installer, dir: []const u8, name: []const u8) ?[]u8 {
+        // POSIX: just join + access. Windows: probe `name`, `name.exe`,
+        // `name.cmd`, `name.bat` in that order — the bare name only
+        // exists for tools that ship cygwin/msys2 launchers, while the
+        // common case is `pylsp.exe`, `prettier.cmd` (npm-installed),
+        // etc. Callers that already hard-code `.exe` (gopls, clangd,
+        // rust-analyzer) still work because step 1 finds them.
         const candidate = std.fs.path.join(self.allocator, &.{ dir, name }) catch return null;
-        std.Io.Dir.accessAbsolute(self.io, candidate, .{}) catch {
-            self.allocator.free(candidate);
-            return null;
-        };
-        return candidate;
+        if (std.Io.Dir.accessAbsolute(self.io, candidate, .{})) |_| {
+            return candidate;
+        } else |_| {}
+        defer self.allocator.free(candidate);
+
+        if (builtin.os.tag != .windows) return null;
+
+        const win_exts = [_][]const u8{ ".exe", ".cmd", ".bat" };
+        for (win_exts) |ext| {
+            const full = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ candidate, ext }) catch continue;
+            if (std.Io.Dir.accessAbsolute(self.io, full, .{})) |_| {
+                return full;
+            } else |_| {
+                self.allocator.free(full);
+            }
+        }
+        return null;
     }
 
     /// Resolve a `~/`-prefixed directory against `$HOME` (or
@@ -565,7 +583,8 @@ pub const Installer = struct {
     /// `opam env`.
     fn findInOpamSwitches(self: *Installer, name: []const u8) ?[]u8 {
         const platform = @import("../../kernel/platform.zig");
-        const home = (platform.getEnv(self.allocator, self.environ_block, "HOME") catch null) orelse return null;
+        const home = (platform.getEnv(self.allocator, self.environ_block, "HOME") catch null) orelse
+            (platform.getEnv(self.allocator, self.environ_block, "USERPROFILE") catch null) orelse return null;
         defer self.allocator.free(home);
         const opam_root = std.fs.path.join(self.allocator, &.{ home, ".opam" }) catch return null;
         defer self.allocator.free(opam_root);
@@ -593,7 +612,8 @@ pub const Installer = struct {
     /// gradle, etc.) and creates `current/` symlinks per candidate.
     fn findInSdkmanCandidates(self: *Installer, name: []const u8) ?[]u8 {
         const platform = @import("../../kernel/platform.zig");
-        const home = (platform.getEnv(self.allocator, self.environ_block, "HOME") catch null) orelse return null;
+        const home = (platform.getEnv(self.allocator, self.environ_block, "HOME") catch null) orelse
+            (platform.getEnv(self.allocator, self.environ_block, "USERPROFILE") catch null) orelse return null;
         defer self.allocator.free(home);
         const root = std.fs.path.join(self.allocator, &.{ home, ".sdkman", "candidates" }) catch return null;
         defer self.allocator.free(root);
