@@ -1,7 +1,6 @@
 # Stem — Architecture Reference
 
-Long-form notes on how stem fits together. For the source-code map
-see the [Developer Guide](dev-guide.md). For the user-facing feature
+Long-form notes on how stem fits together. For the user-facing feature
 list see the [README](../README.md).
 
 ---

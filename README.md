@@ -557,7 +557,6 @@ access.
 
 ## Documentation
 
-- [Developer Guide](docs/dev-guide.md) — architecture and module map
 - [Plugins](docs/plugins.md) — author guide + host internals
 - [stem.md](docs/stem.md) — long-form reference
 
