@@ -225,6 +225,47 @@ pub fn pathToUri(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]
     return out.toOwnedSlice(allocator);
 }
 
+/// Decode a `file://...` URI to a filesystem path. Also accepts an already
+/// path-like string for older call sites that stored raw paths.
+pub fn fileUriToPath(allocator: std.mem.Allocator, uri: []const u8) ![]u8 {
+    var rest: []const u8 = uri;
+    if (std.mem.startsWith(u8, rest, "file://")) {
+        rest = rest["file://".len..];
+        if (@import("builtin").os.tag == .windows and rest.len >= 3 and rest[0] == '/' and rest[2] == ':') {
+            rest = rest[1..];
+        }
+    }
+
+    var out = try allocator.alloc(u8, rest.len);
+    errdefer allocator.free(out);
+    var oi: usize = 0;
+    var i: usize = 0;
+    while (i < rest.len) {
+        if (rest[i] == '%' and i + 2 < rest.len) {
+            const hi = std.fmt.charToDigit(rest[i + 1], 16) catch {
+                out[oi] = rest[i];
+                oi += 1;
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(rest[i + 2], 16) catch {
+                out[oi] = rest[i];
+                oi += 1;
+                i += 1;
+                continue;
+            };
+            out[oi] = @as(u8, hi) * 16 + @as(u8, lo);
+            oi += 1;
+            i += 3;
+        } else {
+            out[oi] = rest[i];
+            oi += 1;
+            i += 1;
+        }
+    }
+    return allocator.realloc(out, oi);
+}
+
 /// Characters allowed unescaped in the path component of a file URI
 /// (RFC 3986 unreserved + path separators).
 fn isUriPathSafe(b: u8) bool {
@@ -345,4 +386,18 @@ test "pathToUri non-ASCII unicode bytes are encoded" {
     const uri = try pathToUri(allocator, threaded.io(), "/tmp/café.zig");
     defer allocator.free(uri);
     try std.testing.expectEqualStrings("file:///tmp/caf%C3%A9.zig", uri);
+}
+
+test "fileUriToPath decodes percent escapes" {
+    const allocator = std.testing.allocator;
+    const path = try fileUriToPath(allocator, "file:///home/user/Code%20Projects/a%23b%3Fc%25d.zig");
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("/home/user/Code Projects/a#b?c%d.zig", path);
+}
+
+test "fileUriToPath preserves invalid percent escapes literally" {
+    const allocator = std.testing.allocator;
+    const path = try fileUriToPath(allocator, "file:///tmp/%not-hex.zig");
+    defer allocator.free(path);
+    try std.testing.expectEqualStrings("/tmp/%not-hex.zig", path);
 }

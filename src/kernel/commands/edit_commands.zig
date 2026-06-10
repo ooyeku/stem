@@ -30,12 +30,12 @@ pub const EditCommands = struct {
                 const action = txn.actions.items[i];
                 switch (action) {
                     .insert => |ins| {
-                        s.buffer.delete(ins.pos, ins.text.len) catch |err| {
+                        s.deleteRangeAtOffset(ins.pos, ins.pos + ins.text.len) catch |err| {
                             log.warn("Undo: failed to reverse insert at pos={d} len={d}: {}", .{ ins.pos, ins.text.len, err });
                         };
                     },
                     .delete => |del| {
-                        s.buffer.insert(del.pos, del.text) catch |err| {
+                        s.insertTextAtOffset(del.pos, del.text) catch |err| {
                             log.warn("Undo: failed to reverse delete at pos={d} len={d}: {}", .{ del.pos, del.text.len, err });
                         };
                     },
@@ -68,12 +68,12 @@ pub const EditCommands = struct {
             for (txn.actions.items) |action| {
                 switch (action) {
                     .insert => |ins| {
-                        s.buffer.insert(ins.pos, ins.text) catch |err| {
+                        s.insertTextAtOffset(ins.pos, ins.text) catch |err| {
                             log.warn("Redo: failed to re-apply insert at pos={d} len={d}: {}", .{ ins.pos, ins.text.len, err });
                         };
                     },
                     .delete => |del| {
-                        s.buffer.delete(del.pos, del.text.len) catch |err| {
+                        s.deleteRangeAtOffset(del.pos, del.pos + del.text.len) catch |err| {
                             log.warn("Redo: failed to re-apply delete at pos={d} len={d}: {}", .{ del.pos, del.text.len, err });
                         };
                     },

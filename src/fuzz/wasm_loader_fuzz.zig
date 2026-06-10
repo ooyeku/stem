@@ -20,7 +20,7 @@
 //! Out of scope: `instantiate` / `invoke` execution semantics.
 
 const std = @import("std");
-const interp = @import("../plugins/wasm/interpreter.zig");
+const interp = @import("stem").wasm_interpreter;
 
 /// `\0asm` magic + little-endian version 1 — the 8-byte preamble
 /// `decode` requires before it will look at any section.

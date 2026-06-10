@@ -74,8 +74,6 @@
   pattern: (identifier) @parameter)
 (optional_parameter
   pattern: (identifier) @parameter)
-(formal_parameters
-  (identifier) @parameter)
 
 ; Variables
 (identifier) @variable

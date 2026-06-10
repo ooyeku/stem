@@ -7,8 +7,9 @@
 //! produce a result, return a typed error, or silently ignore — never panic.
 
 const std = @import("std");
-const LSPServer = @import("../services/lsp/server.zig").LSPServer;
-const TestIo = @import("../test_utils.zig").TestIo;
+const stem = @import("stem");
+const LSPServer = stem.lsp_server.LSPServer;
+const TestIo = stem.test_utils.TestIo;
 
 fn newServer(a: std.mem.Allocator, io: std.Io) !*LSPServer {
     return LSPServer.init(a, io, "fuzz");

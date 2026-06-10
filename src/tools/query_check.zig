@@ -30,6 +30,11 @@ pub fn main() !void {
             fail_count += 1;
             continue;
         };
+        if (sm.queryWasTruncated()) {
+            std.debug.print("FAIL {s}: query truncated\n", .{l});
+            fail_count += 1;
+            continue;
+        }
         std.debug.print("ok   {s}\n", .{l});
     }
     if (fail_count > 0) std.process.exit(1);

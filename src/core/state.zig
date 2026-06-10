@@ -85,6 +85,66 @@ pub const EditorState = struct {
         if (self.edit_hook) |h| h.call(h.ctx, ev);
     }
 
+    fn rowColAfterText(start_row: usize, start_col: usize, text: []const u8) struct { row: usize, col: usize } {
+        var row = start_row;
+        var col = start_col;
+        for (text) |c| {
+            if (c == '\n') {
+                row += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+        }
+        return .{ .row = row, .col = col };
+    }
+
+    pub fn insertTextAtOffset(self: *EditorState, offset: usize, text: []const u8) !void {
+        if (text.len == 0) return;
+        const start_rc = offsetToRowCol(&self.buffer, offset);
+        const new_end_rc = rowColAfterText(start_rc.row, start_rc.col, text);
+
+        try self.buffer.insert(offset, text);
+        self.markModified();
+        self.preferred_col = null;
+
+        self.fireEdit(.{
+            .start_byte = offset,
+            .old_end_byte = offset,
+            .new_end_byte = offset + text.len,
+            .start_row = start_rc.row,
+            .start_col = start_rc.col,
+            .old_end_row = start_rc.row,
+            .old_end_col = start_rc.col,
+            .new_end_row = new_end_rc.row,
+            .new_end_col = new_end_rc.col,
+        });
+    }
+
+    pub fn deleteRangeAtOffset(self: *EditorState, start_offset: usize, end_offset: usize) !void {
+        if (end_offset <= start_offset) return;
+        const len = end_offset - start_offset;
+
+        const start_rc = offsetToRowCol(&self.buffer, start_offset);
+        const old_end_rc = offsetToRowCol(&self.buffer, end_offset);
+
+        try self.buffer.delete(start_offset, len);
+        self.markModified();
+        self.preferred_col = null;
+
+        self.fireEdit(.{
+            .start_byte = start_offset,
+            .old_end_byte = end_offset,
+            .new_end_byte = start_offset,
+            .start_row = start_rc.row,
+            .start_col = start_rc.col,
+            .old_end_row = old_end_rc.row,
+            .old_end_col = old_end_rc.col,
+            .new_end_row = start_rc.row,
+            .new_end_col = start_rc.col,
+        });
+    }
+
     pub fn init(allocator: Allocator, io: std.Io, content: []const u8) !EditorState {
         return EditorState{
             .allocator = allocator,
@@ -423,28 +483,8 @@ pub const EditorState = struct {
 
     pub fn deleteRange(self: *EditorState, start_offset: usize, end_offset: usize) !void {
         if (end_offset <= start_offset) return;
-        const len = end_offset - start_offset;
-
-        // Snapshot start + old_end row/col before mutation.
-        const start_rc = offsetToRowCol(&self.buffer, start_offset);
-        const old_end_rc = offsetToRowCol(&self.buffer, end_offset);
-
-        try self.buffer.delete(start_offset, len);
-        self.markModified();
+        try self.deleteRangeAtOffset(start_offset, end_offset);
         self.updateCursorFromOffset(start_offset);
-        self.preferred_col = null;
-
-        self.fireEdit(.{
-            .start_byte = start_offset,
-            .old_end_byte = end_offset,
-            .new_end_byte = start_offset,
-            .start_row = start_rc.row,
-            .start_col = start_rc.col,
-            .old_end_row = old_end_rc.row,
-            .old_end_col = old_end_rc.col,
-            .new_end_row = start_rc.row,
-            .new_end_col = start_rc.col,
-        });
     }
 
     pub fn updateCursorFromOffset(self: *EditorState, target_offset: usize) void {
@@ -591,8 +631,7 @@ pub const EditorState = struct {
             }
         }
 
-        try self.buffer.insert(insert_pos, insert_content);
-        self.markModified();
+        try self.insertTextAtOffset(insert_pos, insert_content);
         self.cursor_row += 1;
     }
 
@@ -633,8 +672,7 @@ pub const EditorState = struct {
         );
         defer self.allocator.free(new_content);
 
-        try self.buffer.insert(first_range.start, new_content);
-        self.markModified();
+        try self.insertTextAtOffset(first_range.start, new_content);
     }
 
     pub fn joinLines(self: *EditorState, target_row: usize) !void {
@@ -677,41 +715,16 @@ pub const EditorState = struct {
             next_line.len > leading_ws;
 
         if (needs_space) {
-            try self.buffer.insert(delete_start, " ");
+            try self.insertTextAtOffset(delete_start, " ");
         }
-
-        self.markModified();
     }
 
     pub fn insertTextAtCursor(self: *EditorState, text: []const u8) !void {
         const offset = self.getOffsetFromCursor();
-        const start_row = self.cursor_row;
-        const start_col = self.cursor_col;
-
-        try self.buffer.insert(offset, text);
-        self.markModified();
-
-        for (text) |c| {
-            if (c == '\n') {
-                self.cursor_row += 1;
-                self.cursor_col = 0;
-            } else {
-                self.cursor_col += 1;
-            }
-        }
-        self.preferred_col = null;
-
-        self.fireEdit(.{
-            .start_byte = offset,
-            .old_end_byte = offset,
-            .new_end_byte = offset + text.len,
-            .start_row = start_row,
-            .start_col = start_col,
-            .old_end_row = start_row,
-            .old_end_col = start_col,
-            .new_end_row = self.cursor_row,
-            .new_end_col = self.cursor_col,
-        });
+        const new_cursor = rowColAfterText(self.cursor_row, self.cursor_col, text);
+        try self.insertTextAtOffset(offset, text);
+        self.cursor_row = new_cursor.row;
+        self.cursor_col = new_cursor.col;
     }
 
     pub fn getLineLength(self: *EditorState, row: usize) usize {

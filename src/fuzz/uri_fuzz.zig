@@ -8,6 +8,11 @@ const FuzzContext = struct {
     allocator: std.mem.Allocator,
 };
 
+fn fuzzBytes(smith: *std.testing.Smith, buf: *[512]u8) []const u8 {
+    const len: usize = @intCast(smith.slice(buf));
+    return buf[0..len];
+}
+
 fn fuzzUriParsing(_: FuzzContext, input: []const u8) anyerror!void {
     const result = VirtualUri.parse(input);
 
@@ -86,32 +91,62 @@ fn fuzzDisplayName(ctx: FuzzContext, input: []const u8) anyerror!void {
     }
 }
 
+fn fuzzUriParsingSmith(ctx: FuzzContext, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    try fuzzUriParsing(ctx, fuzzBytes(smith, &buf));
+}
+
+fn fuzzSchemeVariationsSmith(ctx: FuzzContext, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    try fuzzSchemeVariations(ctx, fuzzBytes(smith, &buf));
+}
+
+fn fuzzBoundaryInputsSmith(ctx: FuzzContext, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    try fuzzBoundaryInputs(ctx, fuzzBytes(smith, &buf));
+}
+
+fn fuzzSchemeFromStringSmith(ctx: FuzzContext, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    try fuzzSchemeFromString(ctx, fuzzBytes(smith, &buf));
+}
+
+fn fuzzUriFormatSmith(ctx: FuzzContext, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    try fuzzUriFormat(ctx, fuzzBytes(smith, &buf));
+}
+
+fn fuzzDisplayNameSmith(ctx: FuzzContext, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    try fuzzDisplayName(ctx, fuzzBytes(smith, &buf));
+}
+
 test "fuzz: VirtualUri parsing" {
     const ctx = FuzzContext{ .allocator = std.testing.allocator };
-    try std.testing.fuzz(ctx, fuzzUriParsing, .{});
+    try std.testing.fuzz(ctx, fuzzUriParsingSmith, .{});
 }
 
 test "fuzz: VirtualUri scheme variations" {
     const ctx = FuzzContext{ .allocator = std.testing.allocator };
-    try std.testing.fuzz(ctx, fuzzSchemeVariations, .{});
+    try std.testing.fuzz(ctx, fuzzSchemeVariationsSmith, .{});
 }
 
 test "fuzz: VirtualUri boundary inputs" {
     const ctx = FuzzContext{ .allocator = std.testing.allocator };
-    try std.testing.fuzz(ctx, fuzzBoundaryInputs, .{});
+    try std.testing.fuzz(ctx, fuzzBoundaryInputsSmith, .{});
 }
 
 test "fuzz: UriScheme fromString" {
     const ctx = FuzzContext{ .allocator = std.testing.allocator };
-    try std.testing.fuzz(ctx, fuzzSchemeFromString, .{});
+    try std.testing.fuzz(ctx, fuzzSchemeFromStringSmith, .{});
 }
 
 test "fuzz: VirtualUri format" {
     const ctx = FuzzContext{ .allocator = std.testing.allocator };
-    try std.testing.fuzz(ctx, fuzzUriFormat, .{});
+    try std.testing.fuzz(ctx, fuzzUriFormatSmith, .{});
 }
 
 test "fuzz: VirtualUri displayName" {
     const ctx = FuzzContext{ .allocator = std.testing.allocator };
-    try std.testing.fuzz(ctx, fuzzDisplayName, .{});
+    try std.testing.fuzz(ctx, fuzzDisplayNameSmith, .{});
 }

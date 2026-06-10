@@ -2,7 +2,9 @@ const std = @import("std");
 const platform = @import("../../kernel/platform.zig");
 const Transport = @import("../../lsp/transport.zig");
 const protocol = @import("../../kernel/protocol.zig");
-const pathToUri = @import("../../lsp/client.zig").pathToUri;
+const lsp_client = @import("../../lsp/client.zig");
+const pathToUri = lsp_client.pathToUri;
+const fileUriToPath = lsp_client.fileUriToPath;
 const supervisor_mod = @import("supervisor.zig");
 const safe = @import("../../kernel/safe.zig");
 const log = std.log.scoped(.LSP);
@@ -1704,16 +1706,19 @@ pub const LSPServer = struct {
 
         const buf = self.allocator.alloc(u8, @intCast(size)) catch return false;
         defer self.allocator.free(buf);
-        _ = f.readPositionalAll(self.io, buf, 0) catch return false;
+        const read_n = f.readPositionalAll(self.io, buf, 0) catch return false;
+        const data = buf[0..read_n];
 
-        if (!std.mem.eql(u8, buf[0..4], &TOKEN_CACHE_MAGIC)) return false;
-        if (buf[4] != TOKEN_CACHE_VERSION) return false;
-        const cached_mtime = std.mem.readInt(i128, buf[5..21], .little);
+        if (data.len < 29) return false;
+        if (!std.mem.eql(u8, data[0..4], &TOKEN_CACHE_MAGIC)) return false;
+        if (data[4] != TOKEN_CACHE_VERSION) return false;
+        const cached_mtime = std.mem.readInt(i128, data[5..21], .little);
         if (cached_mtime != cur_mtime) return false;
-        const count = std.mem.readInt(u64, buf[21..29], .little);
+        const count = std.mem.readInt(u64, data[21..29], .little);
 
+        if (count > (std.math.maxInt(usize) - 29) / 13) return false;
         const expected_size: usize = 29 + count * 13;
-        if (buf.len < expected_size) return false;
+        if (data.len < expected_size) return false;
 
         // Same dupe-before-put pattern as the live-result handler.
         const key_dup = self.allocator.dupe(u8, uri) catch return false;
@@ -1740,13 +1745,13 @@ pub const LSPServer = struct {
         var off: usize = 29;
         var i: usize = 0;
         while (i < count) : (i += 1) {
-            const line = std.mem.readInt(u32, buf[off..][0..4], .little);
+            const line = std.mem.readInt(u32, data[off..][0..4], .little);
             off += 4;
-            const col = std.mem.readInt(u32, buf[off..][0..4], .little);
+            const col = std.mem.readInt(u32, data[off..][0..4], .little);
             off += 4;
-            const length = std.mem.readInt(u32, buf[off..][0..4], .little);
+            const length = std.mem.readInt(u32, data[off..][0..4], .little);
             off += 4;
-            const kind_u8 = buf[off];
+            const kind_u8 = data[off];
             off += 1;
             const token_type: protocol.SyntaxToken.TokenType = safe.intToEnum(protocol.SyntaxToken.TokenType, kind_u8) orelse continue;
             gop.value_ptr.tokens.append(self.allocator, .{
@@ -2407,6 +2412,8 @@ pub const LSPServer = struct {
                 const line_val = pos.object.get("line") orelse continue;
                 const char_val = pos.object.get("character") orelse continue;
                 if (line_val != .integer or char_val != .integer) continue;
+                const line = toU32(line_val) orelse continue;
+                const col = toU32(char_val) orelse continue;
 
                 const lbl_val = item.object.get("label") orelse continue;
                 var label_buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -2436,8 +2443,8 @@ pub const LSPServer = struct {
                 };
 
                 try owned.append(self.allocator, .{
-                    .line = @intCast(line_val.integer),
-                    .col = @intCast(char_val.integer),
+                    .line = line,
+                    .col = col,
                     .label = label_owned,
                     .kind = kind,
                     .padding_left = pl,
@@ -2555,49 +2562,6 @@ pub const LSPServer = struct {
             },
             else => null,
         };
-    }
-
-    /// Decode `file://...` URI to a filesystem path the OS can open. Strips
-    /// the scheme, normalizes Windows-style `/C:/foo`, and percent-decodes the
-    /// remainder. Returns an allocated path the caller owns.
-    fn fileUriToPath(allocator: std.mem.Allocator, uri: []const u8) ![]u8 {
-        var rest: []const u8 = uri;
-        if (std.mem.startsWith(u8, rest, "file://")) {
-            rest = rest[7..];
-            // On Windows we get `/C:/foo/bar` — strip the leading slash.
-            if (@import("builtin").os.tag == .windows and rest.len >= 3 and rest[0] == '/' and rest[2] == ':') {
-                rest = rest[1..];
-            }
-        }
-        // Percent-decode in place.
-        var out = try allocator.alloc(u8, rest.len);
-        errdefer allocator.free(out);
-        var oi: usize = 0;
-        var i: usize = 0;
-        while (i < rest.len) {
-            if (rest[i] == '%' and i + 2 < rest.len) {
-                const hi = std.fmt.charToDigit(rest[i + 1], 16) catch {
-                    out[oi] = rest[i];
-                    oi += 1;
-                    i += 1;
-                    continue;
-                };
-                const lo = std.fmt.charToDigit(rest[i + 2], 16) catch {
-                    out[oi] = rest[i];
-                    oi += 1;
-                    i += 1;
-                    continue;
-                };
-                out[oi] = @as(u8, hi) * 16 + @as(u8, lo);
-                oi += 1;
-                i += 3;
-            } else {
-                out[oi] = rest[i];
-                oi += 1;
-                i += 1;
-            }
-        }
-        return allocator.realloc(out, oi);
     }
 
     fn mapTokenType(idx: u32) protocol.SyntaxToken.TokenType {
@@ -2913,6 +2877,36 @@ test "handleDiagnostics tolerates malformed payloads" {
         const list = server.diagnostics.get("file:///x.zig").?;
         try std.testing.expectEqual(@as(usize, 1), list.len);
     }
+}
+
+test "handleInlayHintResult ignores invalid negative positions" {
+    const a = std.testing.allocator;
+    const TestIo = @import("../../test_utils.zig").TestIo;
+    var io_ctx = TestIo.init(a);
+    defer io_ctx.deinit();
+
+    const server = try LSPServer.init(a, io_ctx.io(), "test");
+    defer server.deinit();
+
+    const payload =
+        \\[
+        \\  {"position":{"line":-1,"character":0},"label":"bad-line"},
+        \\  {"position":{"line":0,"character":-1},"label":"bad-col"},
+        \\  {"position":{"line":1,"character":2},"label":"ok"}
+        \\]
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, payload, .{});
+    defer parsed.deinit();
+
+    try server.handleInlayHintResult(parsed.value, "file:///x.zig");
+
+    server.inlay_hints_mutex.lockUncancelable(io_ctx.io());
+    defer server.inlay_hints_mutex.unlock(io_ctx.io());
+    const hints = server.inlay_hints.get("file:///x.zig").?;
+    try std.testing.expectEqual(@as(usize, 1), hints.len);
+    try std.testing.expectEqual(@as(u32, 1), hints[0].line);
+    try std.testing.expectEqual(@as(u32, 2), hints[0].col);
+    try std.testing.expectEqualStrings("ok", hints[0].label);
 }
 
 // ---------- Property test ----------

@@ -6,6 +6,7 @@ pub const vfs = @import("kernel/vfs.zig");
 pub const schema = @import("config/schema.zig");
 pub const lsp_server = @import("services/lsp/server.zig");
 pub const test_utils = @import("test_utils.zig");
+pub const wasm_interpreter = @import("plugins/wasm/interpreter.zig");
 // Hidden from the test target: syntax/manager.zig has ~25 latent tests
 // that fail when run via `std.testing.refAllDecls` (see note below).
 // Tools like `zig build query-check` build with `is_test = false` so
@@ -77,11 +78,7 @@ test {
     _ = @import("kernel/request_reply.zig");
     _ = @import("services/telemetry.zig");
 
-    // Corpus-style regression tests for fuzz handlers. The `zig build fuzz`
-    // step runs them as proper fuzzers; these test blocks just exercise a
-    // small hardcoded corpus so we get regression coverage from `zig build
-    // test` too.
-    _ = @import("fuzz/lsp_json_fuzz.zig");
-    _ = @import("fuzz/config_setbypath_fuzz.zig");
-    _ = @import("fuzz/wasm_loader_fuzz.zig");
+    // Fuzz corpus tests live under `src/fuzz/mod.zig` and are wired through
+    // `zig build fuzz`. Importing them here as well makes that target compile
+    // `src/root.zig` twice, once as `root` and once as `stem`.
 }

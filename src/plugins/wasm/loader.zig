@@ -269,7 +269,8 @@ pub fn load(
     if (size > 16 * 1024 * 1024) return error.InvalidModule;
     const bytes = try allocator.alloc(u8, @intCast(size));
     defer allocator.free(bytes);
-    _ = try file.readPositionalAll(io, bytes, 0);
+    const read_n = try file.readPositionalAll(io, bytes, 0);
+    if (read_n != bytes.len) return error.InvalidModule;
 
     var module = try interp.decode(allocator, bytes);
     errdefer module.deinit();

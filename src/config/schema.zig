@@ -8,7 +8,9 @@ pub const Config = struct {
 
     pub fn writeConfig(self: Config, writer: anytype) !void {
         try writer.writeAll("{\n");
-        try writer.print("    \"theme\": \"{s}\",\n", .{self.theme});
+        try writer.writeAll("    \"theme\": ");
+        try writeJsonString(writer, self.theme);
+        try writer.writeAll(",\n");
         try writer.writeAll("    \"editor\": ");
         try self.editor.writeConfig(writer, 4);
         try writer.writeAll(",\n");
@@ -33,7 +35,7 @@ pub const Config = struct {
                     const T = @TypeOf(val);
 
                     if (T == []const u8) {
-                        try aw.writer.print("\"{s}\"", .{val});
+                        try writeJsonString(&aw.writer, val);
                     } else if (comptime std.mem.eql(u8, @tagName(@typeInfo(T)), "struct")) {
                         try val.writeConfig(&aw.writer, 0);
                     } else {
@@ -65,7 +67,7 @@ pub const Config = struct {
 
                     const T = @TypeOf(val);
                     if (T == []const u8) {
-                        try aw.writer.print("\"{s}\"", .{val});
+                        try writeJsonString(&aw.writer, val);
                     } else if (comptime std.mem.eql(u8, @tagName(@typeInfo(T)), "struct")) {
                         try aw.writer.print("{}", .{val});
                     } else if (comptime std.mem.eql(u8, @tagName(@typeInfo(T)), "enum")) {
@@ -356,6 +358,24 @@ fn printIndent(writer: anytype, indent: usize) !void {
     }
 }
 
+fn writeJsonString(writer: anytype, value: []const u8) !void {
+    try writer.writeByte('"');
+    for (value) |c| {
+        switch (c) {
+            '"' => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            0x08 => try writer.writeAll("\\b"),
+            0x0c => try writer.writeAll("\\f"),
+            0x00...0x07, 0x0b, 0x0e...0x1f => try writer.print("\\u{x:0>4}", .{c}),
+            else => try writer.writeByte(c),
+        }
+    }
+    try writer.writeByte('"');
+}
+
 // ---------- Tests for the reflection-based config API ----------
 // These tests exercise the schema-driven `setByPath` / `unsetByPath` /
 // `getByPath` functions across types (bool, int, enum, string) and across
@@ -424,6 +444,27 @@ test "getByPath returns current value" {
     const v = (try cfg.getByPath("editor.tab_size", a)).?;
     defer a.free(v);
     try std.testing.expectEqualStrings("2", v);
+}
+
+test "writeConfig and getByPath escape string values as JSON" {
+    const a = std.testing.allocator;
+    var cfg = Config{};
+    try std.testing.expectEqual(true, try cfg.setByPath("theme", "quote\"slash\\line\nnext", a));
+    defer a.free(cfg.theme);
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try cfg.writeConfig(&aw.writer);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, aw.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("quote\"slash\\line\nnext", parsed.value.object.get("theme").?.string);
+
+    const path_value = (try cfg.getByPath("theme", a)).?;
+    defer a.free(path_value);
+    var parsed_path_value = try std.json.parseFromSlice(std.json.Value, a, path_value, .{});
+    defer parsed_path_value.deinit();
+    try std.testing.expectEqualStrings("quote\"slash\\line\nnext", parsed_path_value.value.string);
 }
 
 test "unsetByPath restores default" {

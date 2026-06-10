@@ -64,61 +64,72 @@ pub const FileManager = struct {
         self.allocator.free(self.cwd);
     }
 
-    fn clearEntries(self: *FileManager) void {
-        for (self.entries.items) |entry| {
-            entry.deinit(self.allocator);
+    fn clearEntryList(allocator: Allocator, entries: *std.ArrayListUnmanaged(DirEntry)) void {
+        for (entries.items) |entry| {
+            entry.deinit(allocator);
         }
-        self.entries.deinit(self.allocator);
-        self.entries = .empty;
+        entries.deinit(allocator);
+        entries.* = .empty;
+    }
+
+    fn clearEntries(self: *FileManager) void {
+        clearEntryList(self.allocator, &self.entries);
     }
 
     pub fn refresh(self: *FileManager) !void {
-        self.clearEntries();
-        self.selected_index = 0;
+        var dir = try std.Io.Dir.openDirAbsolute(self.io, self.cwd, .{ .iterate = true });
+        defer dir.close(self.io);
+
+        var new_entries: std.ArrayListUnmanaged(DirEntry) = .empty;
+        errdefer clearEntryList(self.allocator, &new_entries);
 
         if (!isAtRoot(self.cwd)) {
             const dotdot = try self.allocator.dupe(u8, "..");
             errdefer self.allocator.free(dotdot);
-            try self.entries.append(self.allocator, .{
+            try new_entries.append(self.allocator, .{
                 .name = dotdot,
                 .is_dir = true,
             });
         }
-
-        var dir = std.Io.Dir.openDirAbsolute(self.io, self.cwd, .{ .iterate = true }) catch |err| {
-            std.debug.print("Failed to open dir {s}: {}\n", .{ self.cwd, err });
-            return;
-        };
-        defer dir.close(self.io);
 
         var iter = dir.iterate();
         while (try iter.next(self.io)) |entry| {
             if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
             const name = try self.allocator.dupe(u8, entry.name);
             errdefer self.allocator.free(name);
-            try self.entries.append(self.allocator, .{
+            try new_entries.append(self.allocator, .{
                 .name = name,
                 .is_dir = entry.kind == .directory,
             });
         }
 
-        std.mem.sort(DirEntry, self.entries.items, {}, struct {
+        std.mem.sort(DirEntry, new_entries.items, {}, struct {
             fn lessThan(_: void, a: DirEntry, b: DirEntry) bool {
                 if (a.is_dir and !b.is_dir) return true;
                 if (!a.is_dir and b.is_dir) return false;
                 return std.mem.lessThan(u8, a.name, b.name);
             }
         }.lessThan);
+
+        self.clearEntries();
+        self.entries = new_entries;
+        self.selected_index = 0;
+    }
+
+    fn switchCwdAndRefresh(self: *FileManager, new_cwd: []u8) !void {
+        const old_cwd = self.cwd;
+        self.cwd = new_cwd;
+        self.refresh() catch |err| {
+            self.cwd = old_cwd;
+            self.allocator.free(new_cwd);
+            return err;
+        };
+        self.allocator.free(old_cwd);
     }
 
     pub fn setCwd(self: *FileManager, path: []const u8) !void {
-        // Dupe first, then swap and free old — otherwise if dupe OOMs,
-        // self.cwd would point at freed memory.
         const new_cwd = try self.allocator.dupe(u8, path);
-        const old_cwd = self.cwd;
-        self.cwd = new_cwd;
-        self.allocator.free(old_cwd);
-        try self.refresh();
+        try self.switchCwdAndRefresh(new_cwd);
     }
 
     pub fn moveUp(self: *FileManager) void {
@@ -146,9 +157,7 @@ pub const FileManager = struct {
         const full_path = try std.fs.path.join(self.allocator, &.{ self.cwd, entry.name });
 
         if (entry.is_dir) {
-            self.allocator.free(self.cwd);
-            self.cwd = full_path;
-            try self.refresh();
+            try self.switchCwdAndRefresh(full_path);
             return null;
         } else {
             return full_path;
@@ -159,9 +168,7 @@ pub const FileManager = struct {
         const parent = std.fs.path.dirname(self.cwd);
         if (parent) |p| {
             const new_cwd = try self.allocator.dupe(u8, p);
-            self.allocator.free(self.cwd);
-            self.cwd = new_cwd;
-            try self.refresh();
+            try self.switchCwdAndRefresh(new_cwd);
         }
     }
 
@@ -320,6 +327,33 @@ test "FileManager setCwd" {
     try std.testing.expectEqualStrings("/", fm.cwd);
 }
 
+test "FileManager setCwd preserves state when refresh fails" {
+    const allocator = std.testing.allocator;
+
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var fm = try FileManager.init(allocator, io);
+    defer fm.deinit();
+
+    try fm.refresh();
+    const original_cwd = try allocator.dupe(u8, fm.cwd);
+    defer allocator.free(original_cwd);
+    const original_len = fm.entries.items.len;
+    const original_selected = fm.selected_index;
+
+    const missing = try std.fs.path.join(allocator, &.{ fm.cwd, "stem-definitely-missing-dir-994777cf" });
+    defer allocator.free(missing);
+
+    if (fm.setCwd(missing)) |_| {
+        return error.ExpectedSetCwdFailure;
+    } else |_| {}
+
+    try std.testing.expectEqualStrings(original_cwd, fm.cwd);
+    try std.testing.expectEqual(original_len, fm.entries.items.len);
+    try std.testing.expectEqual(original_selected, fm.selected_index);
+}
+
 test "FileManager entries sorted" {
     const allocator = std.testing.allocator;
 
@@ -365,6 +399,34 @@ test "FileManager enter directory" {
         const result = try fm.enter();
         try std.testing.expect(result == null);
     }
+}
+
+test "FileManager enter preserves cwd when selected directory cannot be refreshed" {
+    const allocator = std.testing.allocator;
+
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var fm = try FileManager.init(allocator, io);
+    defer fm.deinit();
+
+    try fm.refresh();
+    const original_cwd = try allocator.dupe(u8, fm.cwd);
+    defer allocator.free(original_cwd);
+
+    const bogus_name = try allocator.dupe(u8, "stem-missing-selected-dir-2a77f4c1");
+    errdefer allocator.free(bogus_name);
+    try fm.entries.append(allocator, .{
+        .name = bogus_name,
+        .is_dir = true,
+    });
+    fm.selected_index = fm.entries.items.len - 1;
+
+    if (fm.enter()) |_| {
+        return error.ExpectedEnterFailure;
+    } else |_| {}
+
+    try std.testing.expectEqualStrings(original_cwd, fm.cwd);
 }
 
 test "FileManager enter file returns path" {

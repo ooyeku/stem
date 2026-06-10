@@ -122,7 +122,10 @@ pub const PieceTable = struct {
 
     pub fn getVisibleLines(self: *PieceTable, allocator: Allocator, start_line: usize, count: usize) ![][]const u8 {
         var lines = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer lines.deinit(allocator);
+        errdefer {
+            for (lines.items) |line| allocator.free(line);
+            lines.deinit(allocator);
+        }
 
         var current_line: usize = 0;
         var line_start_offset: usize = 0;
@@ -173,8 +176,9 @@ pub const PieceTable = struct {
                 }
 
                 if (c == '\n') {
+                    try lines.ensureUnusedCapacity(allocator, 1);
                     const line_copy = try allocator.dupe(u8, line_buffer.items);
-                    try lines.append(allocator, line_copy);
+                    lines.appendAssumeCapacity(line_copy);
                     line_buffer.clearRetainingCapacity();
 
                     if (lines.items.len >= count) {
@@ -189,8 +193,9 @@ pub const PieceTable = struct {
         }
 
         if (collecting and lines.items.len < count) {
+            try lines.ensureUnusedCapacity(allocator, 1);
             const line_copy = try allocator.dupe(u8, line_buffer.items);
-            try lines.append(allocator, line_copy);
+            lines.appendAssumeCapacity(line_copy);
         }
 
         return lines.toOwnedSlice(allocator);
@@ -289,6 +294,7 @@ pub const PieceTable = struct {
 
     pub fn insert(self: *PieceTable, global_offset: usize, text: []const u8) !void {
         if (text.len == 0) return;
+        if (global_offset > self.totalLength()) return error.OffsetOutOfBounds;
         self.invalidateCache();
 
         const add_start = self.add.items.len;
@@ -363,6 +369,9 @@ pub const PieceTable = struct {
 
     pub fn delete(self: *PieceTable, global_offset: usize, length: usize) !void {
         if (length == 0) return;
+        if (global_offset >= self.totalLength()) return;
+        const del_start = global_offset;
+        const del_end = std.math.add(usize, global_offset, length) catch std.math.maxInt(usize);
         self.invalidateCache();
 
         var current_offset: usize = 0;
@@ -372,9 +381,6 @@ pub const PieceTable = struct {
             var p = &self.pieces.items[i];
             const original_len = p.length;
             const p_end = current_offset + original_len;
-
-            const del_start = global_offset;
-            const del_end = global_offset + length;
 
             const intersect_start = @max(current_offset, del_start);
             const intersect_end = @min(p_end, del_end);
@@ -1179,9 +1185,21 @@ test "PieceTable insert beyond buffer length behavior" {
     var pt = try PieceTable.init(allocator, "Hello");
     defer pt.deinit();
 
-    try pt.insert(100, " World");
+    try std.testing.expectError(error.OffsetOutOfBounds, pt.insert(100, " World"));
 
     try std.testing.expectEqual(@as(usize, 5), pt.totalLength());
+}
+
+test "PieceTable delete length overflow is clamped" {
+    const allocator = std.testing.allocator;
+    var pt = try PieceTable.init(allocator, "Hello");
+    defer pt.deinit();
+
+    try pt.delete(1, std.math.maxInt(usize));
+
+    const result = try pt.toString(allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("H", result);
 }
 
 test "PieceTable delete beyond buffer end is safe" {

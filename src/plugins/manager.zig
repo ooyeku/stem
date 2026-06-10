@@ -113,7 +113,7 @@ pub const PluginManager = struct {
     /// space-separated key sequence (e.g. `"Space g s"`); value is the
     /// command id to execute. The core input handler consults this
     /// after its own leader chord chain when `leader_pending` is set.
-    plugin_keybindings: std.StringHashMapUnmanaged([]u8) = .empty,
+    plugin_keybindings: std.StringHashMapUnmanaged(PluginKeybinding) = .empty,
 
     /// Editor-side hooks set by Core after construction. Lets the
     /// plugin manager pull data that lives on Core (active buffer
@@ -136,6 +136,16 @@ pub const PluginManager = struct {
         /// Owned dupe of the plugin name.
         name: []u8,
         due_ms: i64,
+    };
+
+    const PluginKeybinding = struct {
+        command_id: []u8,
+        plugin_id: []u8,
+
+        fn deinit(self: PluginKeybinding, allocator: std.mem.Allocator) void {
+            allocator.free(self.command_id);
+            allocator.free(self.plugin_id);
+        }
     };
 
     /// Backoff schedule: 1 s, 5 s, 30 s, then give up. Index is the
@@ -202,7 +212,7 @@ pub const PluginManager = struct {
         var kb_it = self.plugin_keybindings.iterator();
         while (kb_it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.free(entry.value_ptr.*);
+            entry.value_ptr.*.deinit(self.allocator);
         }
         self.plugin_keybindings.deinit(self.allocator);
 
@@ -403,6 +413,7 @@ pub const PluginManager = struct {
             kv.value.deinit();
             self.allocator.destroy(kv.value);
             self.dropStoredPermissions(name);
+            self.dropRestartPolicy(name);
             log.info("Unloaded wasm plugin: {s}", .{name});
             return;
         }
@@ -411,6 +422,7 @@ pub const PluginManager = struct {
             kv.value.deinit();
             self.allocator.destroy(kv.value);
             self.dropStoredPermissions(name);
+            self.dropRestartPolicy(name);
             log.info("Unloaded process plugin: {s}", .{name});
             return;
         }
@@ -422,6 +434,24 @@ pub const PluginManager = struct {
             self.allocator.free(kv.key);
             var v = kv.value;
             v.deinit(self.allocator);
+        }
+    }
+
+    fn dropRestartPolicy(self: *PluginManager, plugin_id: []const u8) void {
+        if (self.restart_policies.fetchRemove(plugin_id)) |kv| {
+            self.allocator.free(kv.key);
+        }
+        if (self.restart_state.fetchRemove(plugin_id)) |kv| {
+            self.allocator.free(kv.key);
+        }
+        var i: usize = 0;
+        while (i < self.pending_restarts.items.len) {
+            if (std.mem.eql(u8, self.pending_restarts.items[i].name, plugin_id)) {
+                self.allocator.free(self.pending_restarts.items[i].name);
+                _ = self.pending_restarts.swapRemove(i);
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -444,9 +474,9 @@ pub const PluginManager = struct {
 
         const bytes = try self.allocator.alloc(u8, @intCast(size));
         defer self.allocator.free(bytes);
-        _ = try file.readPositionalAll(self.io, bytes, 0);
+        const read_n = try file.readPositionalAll(self.io, bytes, 0);
 
-        var m = try manifest_mod.parse(self.allocator, bytes);
+        var m = try manifest_mod.parse(self.allocator, bytes[0..read_n]);
         defer m.deinit();
 
         switch (m.runtime) {
@@ -484,6 +514,13 @@ pub const PluginManager = struct {
         });
         errdefer pp.deinit();
 
+        var manifest_resources_installed = false;
+        errdefer if (manifest_resources_installed) {
+            self.cleanupPluginResources(m.name);
+            self.dropStoredPermissions(m.name);
+            self.dropRestartPolicy(m.name);
+        };
+
         // Manifest-driven palette registration runs BEFORE the plugin
         // starts so commands remain discoverable even if the child
         // fails to come up. The dispatcher no-ops when the
@@ -495,10 +532,16 @@ pub const PluginManager = struct {
         }
         try self.installPluginPermissions(m.name, m.permissions);
         try self.installRestartPolicy(m.name, m.restart);
+        manifest_resources_installed = true;
 
         try pp.start();
 
+        var inserted_in_map = false;
+        errdefer if (inserted_in_map) {
+            _ = self.process_plugins.fetchRemove(m.name);
+        };
         try self.process_plugins.put(self.allocator, name_dup, pp);
+        inserted_in_map = true;
         // Successful load — reset any prior crash backoff for this plugin.
         self.clearRestartState(m.name);
 
@@ -513,6 +556,8 @@ pub const PluginManager = struct {
         defer self.allocator.free(init_params);
         try pp.sendNotification("plugin/initialize", init_params);
 
+        manifest_resources_installed = false;
+        inserted_in_map = false;
         log.info("Loaded process plugin: {s} ({s})", .{ m.name, entry_path });
     }
 
@@ -1492,7 +1537,8 @@ pub const PluginManager = struct {
     /// sequence as written in the manifest). Returns null if no
     /// plugin claims that binding.
     pub fn lookupKeybind(self: *PluginManager, seq: []const u8) ?[]const u8 {
-        return self.plugin_keybindings.get(seq);
+        const binding = self.plugin_keybindings.get(seq) orelse return null;
+        return binding.command_id;
     }
 
     /// Return true if `seq` is a strict prefix of any registered
@@ -1558,14 +1604,19 @@ pub const PluginManager = struct {
             errdefer self.allocator.free(seq_dup);
             const cmd_dup = try self.allocator.dupe(u8, decl.id);
             errdefer self.allocator.free(cmd_dup);
+            const plugin_dup = try self.allocator.dupe(u8, plugin_id);
+            errdefer self.allocator.free(plugin_dup);
             // Replace any prior binding to keep the latest plugin to
             // claim a sequence as the winner — easier to reason about
             // than silent conflicts.
             if (self.plugin_keybindings.fetchRemove(seq_dup)) |kv| {
                 self.allocator.free(kv.key);
-                self.allocator.free(kv.value);
+                kv.value.deinit(self.allocator);
             }
-            try self.plugin_keybindings.put(self.allocator, seq_dup, cmd_dup);
+            try self.plugin_keybindings.put(self.allocator, seq_dup, .{
+                .command_id = cmd_dup,
+                .plugin_id = plugin_dup,
+            });
         }
     }
 
@@ -1584,6 +1635,13 @@ pub const PluginManager = struct {
         const wasm_path = try std.fs.path.join(self.allocator, &.{ plugin_dir, m.entry });
         defer self.allocator.free(wasm_path);
 
+        var manifest_resources_installed = false;
+        errdefer if (manifest_resources_installed) {
+            self.cleanupPluginResources(m.name);
+            self.dropStoredPermissions(m.name);
+            self.dropRestartPolicy(m.name);
+        };
+
         // Manifest-driven registration. Eagerly publish each declared
         // command before activate runs so the palette stays populated
         // even if activate later traps.
@@ -1594,6 +1652,7 @@ pub const PluginManager = struct {
         }
         try self.installPluginPermissions(m.name, m.permissions);
         try self.installRestartPolicy(m.name, m.restart);
+        manifest_resources_installed = true;
 
         const wp = wasm_loader.load(
             self.allocator,
@@ -1643,6 +1702,7 @@ pub const PluginManager = struct {
             return;
         };
 
+        manifest_resources_installed = false;
         log.info("Loaded wasm plugin: {s} ({s})", .{ m.name, wasm_path });
     }
 
@@ -1945,8 +2005,8 @@ pub const PluginManager = struct {
         defer file.close(self.io);
         const len = file.length(self.io) catch return -2;
         const cap = @min(@as(u64, @intCast(out_buf.len)), len);
-        _ = file.readPositionalAll(self.io, out_buf[0..@intCast(cap)], 0) catch return -2;
-        return @intCast(cap);
+        const read_n = file.readPositionalAll(self.io, out_buf[0..@intCast(cap)], 0) catch return -2;
+        return @intCast(read_n);
     }
 
     fn onWasmWriteFile(
@@ -2249,26 +2309,18 @@ pub const PluginManager = struct {
     }
 
     fn removePluginKeybindings(self: *PluginManager, plugin_id: []const u8) void {
-        // We don't track the plugin owner per-keybind, but command
-        // ids are conventionally prefixed with the plugin name
-        // (e.g. `git.status` owned by `git`). Strip every keybind
-        // whose target command id starts with `<plugin_id>.` —
-        // matches the convention without needing extra state.
         var stale: std.ArrayListUnmanaged([]const u8) = .empty;
         defer stale.deinit(self.allocator);
         var it = self.plugin_keybindings.iterator();
         while (it.next()) |entry| {
-            if (std.mem.startsWith(u8, entry.value_ptr.*, plugin_id) and
-                entry.value_ptr.*.len > plugin_id.len and
-                entry.value_ptr.*[plugin_id.len] == '.')
-            {
+            if (std.mem.eql(u8, entry.value_ptr.*.plugin_id, plugin_id)) {
                 stale.append(self.allocator, entry.key_ptr.*) catch break;
             }
         }
         for (stale.items) |k| {
             if (self.plugin_keybindings.fetchRemove(k)) |kv| {
                 self.allocator.free(kv.key);
-                self.allocator.free(kv.value);
+                kv.value.deinit(self.allocator);
             }
         }
     }

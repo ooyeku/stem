@@ -294,7 +294,7 @@ pub const TerminalService = struct {
             const bytes_read = stdout.readStreaming(io, &iovec) catch break;
             if (bytes_read == 0) break;
 
-            if (total_bytes + bytes_read > ctx.config.max_output_bytes) {
+            if (total_bytes >= ctx.config.max_output_bytes or bytes_read > ctx.config.max_output_bytes - total_bytes) {
                 was_truncated = true;
                 const remaining = ctx.config.max_output_bytes - total_bytes;
                 if (remaining > 0) {
@@ -306,6 +306,12 @@ pub const TerminalService = struct {
 
             total_bytes += bytes_read;
             sendOutputChunk(ctx.bus, chunk_buf[0..bytes_read], ctx.allocator) catch {};
+        }
+
+        if (was_truncated or ctx.cancelled.load(.acquire)) {
+            if (child.id) |id| {
+                platform.killProcessForce(id);
+            }
         }
 
         if (stderr_thread) |t| t.join();

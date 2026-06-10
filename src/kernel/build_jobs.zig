@@ -93,50 +93,36 @@ pub fn parseZigDiagnostics(output: []const u8, allocator: std.mem.Allocator) ![]
 }
 
 fn parseDiagnosticLine(line: []const u8, allocator: std.mem.Allocator) ?Diagnostic {
-    var colon_count: usize = 0;
-    var colon_positions: [4]usize = undefined;
-
-    for (line, 0..) |c, i| {
-        if (c == ':') {
-            if (colon_count < 4) {
-                colon_positions[colon_count] = i;
-                colon_count += 1;
-            }
-        }
-    }
-
-    if (colon_count < 4) return null;
-
-    const file_path = line[0..colon_positions[0]];
-    const line_str = line[colon_positions[0] + 1 .. colon_positions[1]];
-    const col_str = line[colon_positions[1] + 1 .. colon_positions[2]];
-    const rest = if (colon_positions[2] + 2 < line.len)
-        std.mem.trimStart(u8, line[colon_positions[2] + 2 ..], " ")
-    else
-        return null;
-
-    const line_num = std.fmt.parseInt(u32, line_str, 10) catch return null;
-    const col_num = std.fmt.parseInt(u32, col_str, 10) catch return null;
-
-    const kind: Diagnostic.DiagnosticKind = blk: {
-        if (std.mem.startsWith(u8, rest, "error:")) break :blk .@"error";
-        if (std.mem.startsWith(u8, rest, "warning:")) break :blk .warning;
-        if (std.mem.startsWith(u8, rest, "note:")) break :blk .note;
+    const Marker = struct {
+        idx: usize,
+        kind: Diagnostic.DiagnosticKind,
+        len: usize,
+    };
+    const marker: Marker = blk: {
+        if (std.mem.indexOf(u8, line, ": error:")) |idx| break :blk .{ .idx = idx, .kind = Diagnostic.DiagnosticKind.@"error", .len = ": error:".len };
+        if (std.mem.indexOf(u8, line, ": warning:")) |idx| break :blk .{ .idx = idx, .kind = Diagnostic.DiagnosticKind.warning, .len = ": warning:".len };
+        if (std.mem.indexOf(u8, line, ": note:")) |idx| break :blk .{ .idx = idx, .kind = Diagnostic.DiagnosticKind.note, .len = ": note:".len };
         return null;
     };
 
-    const kind_str = kind.toString();
-    const message_start = kind_str.len + 2;
-    const message = if (message_start < rest.len)
-        std.mem.trimStart(u8, rest[kind_str.len + 1 ..], " ")
-    else
-        "";
+    const prefix = line[0..marker.idx];
+    const col_sep = std.mem.lastIndexOfScalar(u8, prefix, ':') orelse return null;
+    const line_sep = std.mem.lastIndexOfScalar(u8, prefix[0..col_sep], ':') orelse return null;
+
+    const file_path = prefix[0..line_sep];
+    const line_str = prefix[line_sep + 1 .. col_sep];
+    const col_str = prefix[col_sep + 1 ..];
+    if (file_path.len == 0 or line_str.len == 0 or col_str.len == 0) return null;
+
+    const line_num = std.fmt.parseInt(u32, line_str, 10) catch return null;
+    const col_num = std.fmt.parseInt(u32, col_str, 10) catch return null;
+    const message = std.mem.trimStart(u8, line[marker.idx + marker.len ..], " ");
 
     return Diagnostic{
         .file_path = allocator.dupe(u8, file_path) catch return null,
         .line = line_num,
         .column = col_num,
-        .kind = kind,
+        .kind = marker.kind,
         .message = allocator.dupe(u8, message) catch return null,
     };
 }
@@ -155,18 +141,31 @@ pub fn runBuild(
         .stdout_limit = .limited(10 * 1024 * 1024),
         .stderr_limit = .limited(10 * 1024 * 1024),
     }) catch |err| {
-        const err_msg = std.fmt.allocPrint(allocator, "Failed to run {s}: {}", .{ command.displayName(), err }) catch "";
+        const err_msg = try std.fmt.allocPrint(allocator, "Failed to run {s}: {}", .{ command.displayName(), err });
+        errdefer allocator.free(err_msg);
+        const stdout = try allocator.dupe(u8, "");
+        errdefer allocator.free(stdout);
+        const diagnostics = try allocator.alloc(Diagnostic, 0);
         return BuildOutput{
             .success = false,
-            .stdout = try allocator.dupe(u8, ""),
+            .stdout = stdout,
             .stderr = err_msg,
             .exit_code = 1,
-            .diagnostics = try allocator.alloc(Diagnostic, 0),
+            .diagnostics = diagnostics,
             .duration_ms = std.Io.Clock.real.now(io).toMilliseconds() - start_time,
         };
     };
+    errdefer allocator.free(result.stdout);
+    errdefer allocator.free(result.stderr);
 
-    const success = result.term.exited == 0;
+    const success = switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    const exit_code: u8 = switch (result.term) {
+        .exited => |code| @intCast(@min(code, std.math.maxInt(u8))),
+        else => 255,
+    };
 
     const diagnostics = try parseZigDiagnostics(result.stderr, allocator);
 
@@ -174,7 +173,7 @@ pub fn runBuild(
         .success = success,
         .stdout = result.stdout,
         .stderr = result.stderr,
-        .exit_code = @intCast(result.term.exited),
+        .exit_code = exit_code,
         .diagnostics = diagnostics,
         .duration_ms = std.Io.Clock.real.now(io).toMilliseconds() - start_time,
     };
@@ -321,4 +320,26 @@ test "parse zig diagnostics" {
     try std.testing.expectEqualStrings("src/main.zig", diagnostics[0].file_path);
     try std.testing.expectEqual(@as(u32, 42), diagnostics[0].line);
     try std.testing.expectEqual(Diagnostic.DiagnosticKind.@"error", diagnostics[0].kind);
+}
+
+test "parse zig diagnostics with Windows drive paths" {
+    const allocator = std.testing.allocator;
+
+    const diagnostics = try parseZigDiagnostics(
+        "C:\\proj\\src\\main.zig:12:3: error: expected expression\n",
+        allocator,
+    );
+    defer {
+        for (diagnostics) |*d| {
+            var diag = d.*;
+            diag.deinit(allocator);
+        }
+        allocator.free(diagnostics);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try std.testing.expectEqualStrings("C:\\proj\\src\\main.zig", diagnostics[0].file_path);
+    try std.testing.expectEqual(@as(u32, 12), diagnostics[0].line);
+    try std.testing.expectEqual(@as(u32, 3), diagnostics[0].column);
+    try std.testing.expectEqualStrings("expected expression", diagnostics[0].message);
 }

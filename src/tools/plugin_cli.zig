@@ -108,8 +108,8 @@ fn readManifest(allocator: std.mem.Allocator, io: std.Io, plugin_dir: []const u8
     if (size > 1 * 1024 * 1024) return error.ManifestTooLarge;
     const bytes = try allocator.alloc(u8, @intCast(size));
     defer allocator.free(bytes);
-    _ = try file.readPositionalAll(io, bytes, 0);
-    return manifest_mod.parse(allocator, bytes);
+    const read_n = try file.readPositionalAll(io, bytes, 0);
+    return manifest_mod.parse(allocator, bytes[0..read_n]);
 }
 
 /// Walk `~/.stem/plugins/*` and return the directory whose

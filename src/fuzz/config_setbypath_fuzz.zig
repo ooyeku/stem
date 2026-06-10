@@ -3,7 +3,7 @@
 //! types that don't match, etc.). Catches: panics in the reflection logic.
 
 const std = @import("std");
-const Config = @import("../config/schema.zig").Config;
+const Config = @import("stem").schema.Config;
 
 const FuzzContext = struct {
     allocator: std.mem.Allocator,

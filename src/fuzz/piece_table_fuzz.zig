@@ -6,6 +6,11 @@ const FuzzContext = struct {
     allocator: std.mem.Allocator,
 };
 
+fn fuzzBytes(smith: *std.testing.Smith, buf: *[512]u8) []const u8 {
+    const len: usize = @intCast(smith.slice(buf));
+    return buf[0..len];
+}
+
 fn fuzzRandomInserts(ctx: FuzzContext, input: []const u8) anyerror!void {
     if (input.len < 2) return;
 
@@ -108,22 +113,42 @@ fn fuzzEdgeOffsets(ctx: FuzzContext, input: []const u8) anyerror!void {
     }
 }
 
+fn fuzzRandomInsertsSmith(ctx: FuzzContext, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    try fuzzRandomInserts(ctx, fuzzBytes(smith, &buf));
+}
+
+fn fuzzRandomDeletesSmith(ctx: FuzzContext, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    try fuzzRandomDeletes(ctx, fuzzBytes(smith, &buf));
+}
+
+fn fuzzInterleavedOpsSmith(ctx: FuzzContext, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    try fuzzInterleavedOps(ctx, fuzzBytes(smith, &buf));
+}
+
+fn fuzzEdgeOffsetsSmith(ctx: FuzzContext, smith: *std.testing.Smith) anyerror!void {
+    var buf: [512]u8 = undefined;
+    try fuzzEdgeOffsets(ctx, fuzzBytes(smith, &buf));
+}
+
 test "fuzz: PieceTable random insertions" {
     const ctx = FuzzContext{ .allocator = std.testing.allocator };
-    try std.testing.fuzz(ctx, fuzzRandomInserts, .{});
+    try std.testing.fuzz(ctx, fuzzRandomInsertsSmith, .{});
 }
 
 test "fuzz: PieceTable random deletions" {
     const ctx = FuzzContext{ .allocator = std.testing.allocator };
-    try std.testing.fuzz(ctx, fuzzRandomDeletes, .{});
+    try std.testing.fuzz(ctx, fuzzRandomDeletesSmith, .{});
 }
 
 test "fuzz: PieceTable interleaved operations" {
     const ctx = FuzzContext{ .allocator = std.testing.allocator };
-    try std.testing.fuzz(ctx, fuzzInterleavedOps, .{});
+    try std.testing.fuzz(ctx, fuzzInterleavedOpsSmith, .{});
 }
 
 test "fuzz: PieceTable edge offsets" {
     const ctx = FuzzContext{ .allocator = std.testing.allocator };
-    try std.testing.fuzz(ctx, fuzzEdgeOffsets, .{});
+    try std.testing.fuzz(ctx, fuzzEdgeOffsetsSmith, .{});
 }

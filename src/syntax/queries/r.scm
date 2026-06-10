@@ -70,28 +70,11 @@
     function: (namespace_operator rhs: (identifier) @function)
 )
 
-; Keywords
+(if_statement) @conditional
 
-(function_definition name: "function" @keyword.function)
-(function_definition name: "\\" @operator)
-
-[
-  "in"
-  (return)
-  (next)
-  (break)
-] @keyword
-
-[
-  "if"
-  "else"
-] @conditional
-
-[
-  "while"
-  "repeat"
-  "for"
-] @repeat
+(while_statement) @repeat
+(repeat_statement) @repeat
+(for_statement) @repeat
 
 [
   (true)

@@ -2417,7 +2417,11 @@ pub const LSPManager = struct {
             allocator.free(result.stderr);
         }
 
-        if (result.term.exited != 0) return null;
+        const ok = switch (result.term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (!ok) return null;
 
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{
             .ignore_unknown_fields = true,

@@ -28,6 +28,7 @@ pub const SyntaxManager = struct {
     tree: ?*c.TSTree,
     language: ?*const c.TSLanguage,
     query: ?*c.TSQuery,
+    query_truncated: bool = false,
     cursor: *c.TSQueryCursor,
     /// Guards `tree`, `current_lang`, `current_resource_id`. Brief locks
     /// only — readers hold it during one ts_* call, the worker holds it
@@ -652,8 +653,8 @@ pub const SyntaxManager = struct {
         const query_source: []const u8 = switch (lang_enum) {
             .zig => zig_query,
             .python => python_query,
-            .javascript, .tsx => javascript_query,
-            .typescript => typescript_query,
+            .javascript => javascript_query,
+            .typescript, .tsx => typescript_query,
             .json => json_query,
             .bash => bash_query,
             .go => go_query,
@@ -706,6 +707,7 @@ pub const SyntaxManager = struct {
 
             if (self.query) |q| c.ts_query_delete(q);
             self.query = null;
+            self.query_truncated = false;
             self.language = null;
             log.debug("SyntaxManager: {s} uses custom/LSP highlighting", .{@tagName(lang_enum)});
             return;
@@ -732,6 +734,7 @@ pub const SyntaxManager = struct {
 
         if (self.query) |q| c.ts_query_delete(q);
         self.query = null;
+        self.query_truncated = false;
 
         // Tree-sitter rejects the whole query if any single pattern
         // references a node type or anonymous token unknown to the
@@ -788,11 +791,16 @@ pub const SyntaxManager = struct {
             log.err("SyntaxManager: no usable query patterns for {s}", .{@tagName(lang_enum)});
             return error.InvalidQuery;
         } else if (src_len < query_source.len) {
+            self.query_truncated = true;
             log.warn(
                 "SyntaxManager: loaded {d}/{d} bytes of query for {s} (rest skipped due to unknown nodes in linked grammar)",
                 .{ src_len, query_source.len, @tagName(lang_enum) },
             );
         }
+    }
+
+    pub fn queryWasTruncated(self: *const SyntaxManager) bool {
+        return self.query_truncated;
     }
 
     pub fn setLanguage(self: *SyntaxManager, lang_name: []const u8) !void {

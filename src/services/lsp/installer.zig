@@ -23,6 +23,14 @@ pub fn findOnSystem(
     return inst.findBinary(name, &[_][]const u8{});
 }
 
+fn childExitCode(term: std.process.Child.Term) i32 {
+    return switch (term) {
+        .exited => |code| @intCast(code),
+        .signal => |sig| -@as(i32, @intCast(@intFromEnum(sig))),
+        else => -999,
+    };
+}
+
 pub const Installer = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -168,8 +176,9 @@ pub const Installer = struct {
             self.allocator.free(res.stdout);
             self.allocator.free(res.stderr);
         }
-        if (res.term.exited != 0) {
-            log.err("{s} failed (exit={d}): {s}", .{ argv[0], res.term.exited, res.stderr });
+        const exit_code = childExitCode(res.term);
+        if (exit_code != 0) {
+            log.err("{s} failed (exit={d}): {s}", .{ argv[0], exit_code, res.stderr });
             return error.InstallFailed;
         }
     }
@@ -178,7 +187,7 @@ pub const Installer = struct {
         const res = try std.process.run(self.allocator, self.io, .{
             .argv = argv,
         });
-        if (res.term.exited != 0) {
+        if (childExitCode(res.term) != 0) {
             self.allocator.free(res.stdout);
             self.allocator.free(res.stderr);
             return error.CommandFailed;
@@ -290,8 +299,9 @@ pub const Installer = struct {
             self.allocator.free(res.stdout);
             self.allocator.free(res.stderr);
         }
-        if (res.term.exited != 0) {
-            log.err("'go install' failed (exit={d}): {s}", .{ res.term.exited, res.stderr });
+        const exit_code = childExitCode(res.term);
+        if (exit_code != 0) {
+            log.err("'go install' failed (exit={d}): {s}", .{ exit_code, res.stderr });
             log.info("Note: gopls requires Go to be installed on your system.", .{});
             return error.InstallFailed;
         }
@@ -400,8 +410,9 @@ pub const Installer = struct {
                 self.allocator.free(res.stdout);
                 self.allocator.free(res.stderr);
             }
-            if (res.term.exited != 0) {
-                log.err("gunzip failed (exit={d}): {s}", .{ res.term.exited, res.stderr });
+            const exit_code = childExitCode(res.term);
+            if (exit_code != 0) {
+                log.err("gunzip failed (exit={d}): {s}", .{ exit_code, res.stderr });
                 return error.InstallFailed;
             }
 
@@ -664,8 +675,9 @@ pub const Installer = struct {
             self.allocator.free(res.stdout);
             self.allocator.free(res.stderr);
         }
-        if (res.term.exited != 0) {
-            log.err("gem install ruby-lsp failed (exit={d}): {s}", .{ res.term.exited, res.stderr });
+        const exit_code = childExitCode(res.term);
+        if (exit_code != 0) {
+            log.err("gem install ruby-lsp failed (exit={d}): {s}", .{ exit_code, res.stderr });
             return error.InstallFailed;
         }
 
@@ -1053,8 +1065,9 @@ pub const Installer = struct {
             self.allocator.free(install_res.stdout);
             self.allocator.free(install_res.stderr);
         }
-        if (install_res.term.exited != 0) {
-            log.err("R languageserver install failed (exit={d}): {s}", .{ install_res.term.exited, install_res.stderr });
+        const exit_code = childExitCode(install_res.term);
+        if (exit_code != 0) {
+            log.err("R languageserver install failed (exit={d}): {s}", .{ exit_code, install_res.stderr });
             self.allocator.free(r_path);
             return error.InstallFailed;
         }

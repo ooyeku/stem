@@ -82,7 +82,7 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
         };
 
         if (config.enabled and config.smart_deletion) {
-            const deleted_pair = try auto_pair.smartBackspace(s);
+            const deleted_pair = try core.smartAutoPairBackspaceWithHistory();
             if (!deleted_pair) {
                 try core.backspaceCharWithHistory();
             }
@@ -96,18 +96,10 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
         try core.updateCompletionFilter();
         core.markLspDirty();
     } else if (key.matches(vaxis.Key.enter, .{})) {
-        if (s.file_path) |path| {
-            if (std.mem.endsWith(u8, path, ".zig")) {
-                try s.insertNewlineWithIndent();
-            } else {
-                try s.insertNewline();
-            }
-        } else {
-            try s.insertNewline();
-        }
+        try core.insertNewlineWithHistory();
         core.markLspDirty();
     } else if (key.matches(vaxis.Key.tab, .{})) {
-        try s.insertTabWithSize(core.storage.config.editor.tab_size);
+        try core.insertTabWithHistory(core.storage.config.editor.tab_size);
         core.markLspDirty();
     } else if (key.text) |text| {
         if (text.len == 1) {
@@ -120,13 +112,13 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
                 .context_aware = false,
             };
 
-            const result = try auto_pair.handleCharInput(s, char, config);
+            const result = try core.autoPairCharWithHistory(char, config);
 
             switch (result) {
                 .wrapped => {},
                 .skipped => {},
                 .inserted => {
-                    if (auto_pair.isOpeningChar(char)) |_| {} else {
+                    if (config.enabled and auto_pair.isOpeningChar(char) != null) {} else {
                         try core.insertCharWithHistory(char);
                     }
                 },

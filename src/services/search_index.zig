@@ -132,9 +132,7 @@ pub const SearchIndex = struct {
 
         var rel: []const u8 = undefined;
         if (std.fs.path.isAbsolute(path)) {
-            if (!std.mem.startsWith(u8, path, root)) return;
-            rel = path[root.len..];
-            if (rel.len > 0 and (rel[0] == '/' or rel[0] == '\\')) rel = rel[1..];
+            rel = pathInsideRoot(path, root) orelse return;
         } else {
             // Treat as already-relative-to-root. Drop a leading
             // "./" so we don't accidentally store two entries for
@@ -182,14 +180,25 @@ pub const SearchIndex = struct {
     }
 };
 
+fn isPathSeparator(c: u8) bool {
+    return c == '/' or c == '\\';
+}
+
+fn pathInsideRoot(abs_path: []const u8, root: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, abs_path, root)) return null;
+    if (abs_path.len == root.len) return "";
+
+    if (root.len > 0 and isPathSeparator(root[root.len - 1])) {
+        return abs_path[root.len..];
+    }
+
+    if (!isPathSeparator(abs_path[root.len])) return null;
+    return abs_path[root.len + 1 ..];
+}
+
 fn indexerWorker(self: *SearchIndex, root_owned: []u8) void {
     @import("thread_name.zig").set("stem-index");
-    // The worker fully owns `root_owned`. On exit, hand it to the
-    // index (via `applyPaths`) so future `notePathSaved` calls can
-    // use it. If the swap fails or the index already had a root,
-    // free it here so we don't leak.
-    var root_handed_off = false;
-    defer if (!root_handed_off) self.allocator.free(root_owned);
+    defer self.allocator.free(root_owned);
 
     // Always clear the running flag last — `deinit` spin-waits on it
     // before freeing `self`. Releasing the flag must be the worker's
@@ -197,6 +206,7 @@ fn indexerWorker(self: *SearchIndex, root_owned: []u8) void {
     defer self.worker_running.store(false, .release);
 
     // Phase 1: try the on-disk cache for an instant first-query warm.
+    var cache_applied = false;
     if (readCacheFile(self, root_owned)) |cached| {
         defer {
             // `cached` is a slice of independently-duped strings;
@@ -205,9 +215,12 @@ fn indexerWorker(self: *SearchIndex, root_owned: []u8) void {
             for (cached) |s| self.allocator.free(s);
             self.allocator.free(cached);
         }
-        applyPaths(self, root_owned, cached) catch {};
-        root_handed_off = true;
-        log.info("SearchIndex: loaded {d} paths from cache for {s}", .{ cached.len, root_owned });
+        if (applyPaths(self, root_owned, cached)) {
+            cache_applied = true;
+            log.info("SearchIndex: loaded {d} paths from cache for {s}", .{ cached.len, root_owned });
+        } else |err| {
+            log.debug("SearchIndex: cached paths rejected for {s}: {}", .{ root_owned, err });
+        }
     } else |err| {
         log.debug("SearchIndex: cache miss for {s} ({})", .{ root_owned, err });
     }
@@ -228,9 +241,8 @@ fn indexerWorker(self: *SearchIndex, root_owned: []u8) void {
     if (self.shutdown_requested.load(.acquire)) return;
 
     // Move the freshly walked paths into the index.
-    if (!root_handed_off) {
+    if (!cache_applied) {
         applyPaths(self, root_owned, walked.items) catch return;
-        root_handed_off = true;
     } else {
         replacePaths(self, walked.items) catch return;
     }
@@ -331,8 +343,31 @@ fn shouldSkip(name: []const u8) bool {
     for (skip) |s| {
         if (std.mem.eql(u8, s, name)) return true;
     }
-    // Skip dot-files at any level — usually tooling state, not source.
-    return name.len > 0 and name[0] == '.';
+    return false;
+}
+
+test "SearchIndex notePathSaved rejects sibling roots with matching prefix" {
+    const allocator = std.testing.allocator;
+    const TestIo = @import("../test_utils.zig").TestIo;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var index = SearchIndex.init(allocator, io_ctx.io(), .empty);
+    defer index.deinit();
+    index.root = try allocator.dupe(u8, "/tmp/work");
+
+    index.notePathSaved("/tmp/workspace/file.zig");
+    try std.testing.expectEqual(@as(usize, 0), index.paths.items.len);
+
+    index.notePathSaved("/tmp/work/src/main.zig");
+    try std.testing.expectEqual(@as(usize, 1), index.paths.items.len);
+    try std.testing.expectEqualStrings("src/main.zig", index.paths.items[0]);
+}
+
+test "SearchIndex does not skip ordinary dotfiles" {
+    try std.testing.expect(!shouldSkip(".env.example"));
+    try std.testing.expect(!shouldSkip(".editorconfig"));
+    try std.testing.expect(shouldSkip(".git"));
 }
 
 // ---------------------------------------------------------------------------
@@ -372,9 +407,10 @@ fn readCacheFile(self: *SearchIndex, root_abs: []const u8) ![][]u8 {
     if (size == 0 or size > 16 * 1024 * 1024) return error.UnexpectedSize;
     const bytes = try self.allocator.alloc(u8, @intCast(size));
     defer self.allocator.free(bytes);
-    _ = try file.readPositionalAll(self.io, bytes, 0);
+    const read_n = try file.readPositionalAll(self.io, bytes, 0);
+    if (read_n == 0) return error.UnexpectedSize;
 
-    var it = std.mem.splitScalar(u8, bytes, '\n');
+    var it = std.mem.splitScalar(u8, bytes[0..read_n], '\n');
     const header = it.next() orelse return error.MissingHeader;
     if (!std.mem.startsWith(u8, header, cache_magic)) return error.BadHeader;
     const header_root = header[cache_magic.len..];

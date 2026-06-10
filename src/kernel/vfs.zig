@@ -108,6 +108,28 @@ pub const VfsProvider = struct {
     exists: *const fn (path: []const u8, io: std.Io) bool,
 };
 
+fn percentDecodePath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, path.len);
+
+    var i: usize = 0;
+    while (i < path.len) {
+        if (path[i] == '%' and i + 2 < path.len) {
+            const decoded = std.fmt.parseInt(u8, path[i + 1 .. i + 3], 16) catch null;
+            if (decoded) |byte| {
+                out.appendAssumeCapacity(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.appendAssumeCapacity(path[i]);
+        i += 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 pub const VirtualFileSystem = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -152,7 +174,9 @@ pub const VirtualFileSystem = struct {
         return switch (uri.scheme) {
             .file => {
                 if (self.providers.get(.file)) |provider| {
-                    return provider.read(uri.path, self.allocator, self.io);
+                    const path = try percentDecodePath(self.allocator, uri.path);
+                    defer self.allocator.free(path);
+                    return provider.read(path, self.allocator, self.io);
                 }
                 return error.NoProvider;
             },
@@ -181,7 +205,11 @@ pub const VirtualFileSystem = struct {
                     self.allocator.free(result.stderr);
                 }
 
-                if (result.term != .exited or result.term.exited != 0) {
+                const ok = switch (result.term) {
+                    .exited => |code| code == 0,
+                    else => false,
+                };
+                if (!ok) {
                     return error.NotFound;
                 }
 
@@ -195,7 +223,9 @@ pub const VirtualFileSystem = struct {
             .file => {
                 if (self.providers.get(.file)) |provider| {
                     if (provider.write) |write_fn| {
-                        return write_fn(uri.path, content, self.io);
+                        const path = try percentDecodePath(self.allocator, uri.path);
+                        defer self.allocator.free(path);
+                        return write_fn(path, content, self.io);
                     }
                 }
                 return error.ReadOnly;
@@ -258,7 +288,9 @@ pub const VirtualFileSystem = struct {
         return switch (uri.scheme) {
             .file => {
                 if (self.providers.get(.file)) |provider| {
-                    return provider.exists(uri.path, self.io);
+                    const path = percentDecodePath(self.allocator, uri.path) catch return false;
+                    defer self.allocator.free(path);
+                    return provider.exists(path, self.io);
                 }
                 return false;
             },
@@ -281,7 +313,10 @@ pub const VirtualFileSystem = struct {
                     self.allocator.free(result.stderr);
                 }
 
-                break :blk (result.term == .exited and result.term.exited == 0);
+                break :blk switch (result.term) {
+                    .exited => |code| code == 0,
+                    else => false,
+                };
             },
         };
     }
@@ -360,6 +395,30 @@ test "vfs memory buffer operations" {
 
     vfs.deleteMemoryBuffer(uri.path);
     try std.testing.expect(!vfs.exists(uri));
+}
+
+test "VirtualFileSystem decodes percent-encoded file URI paths" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var tmp = try test_utils.Tempdir.init(allocator, io_ctx.io());
+    defer tmp.deinit();
+
+    try tmp.writeFile("space file.txt", "hello");
+    const real_path = try tmp.joinPath(allocator, "space file.txt");
+    defer allocator.free(real_path);
+    const encoded_path = try std.mem.replaceOwned(u8, allocator, real_path, " ", "%20");
+    defer allocator.free(encoded_path);
+    const uri_text = try std.fmt.allocPrint(allocator, "file://{s}", .{encoded_path});
+    defer allocator.free(uri_text);
+
+    var vfs = VirtualFileSystem.init(allocator, io_ctx.io());
+    defer vfs.deinit();
+
+    const content = try vfs.read(VirtualUri.parse(uri_text).?);
+    defer allocator.free(content);
+    try std.testing.expectEqualStrings("hello", content);
 }
 
 test "vfs uri parsing edge cases" {

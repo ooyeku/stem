@@ -68,14 +68,12 @@ pub fn getSelectedText(state: *EditorState, allocator: std.mem.Allocator) !?[]u8
 pub fn wrapSelection(state: *EditorState, open: u8, close: u8) !bool {
     const range = getSelectionRange(state) orelse return false;
 
-    try state.buffer.insert(range.end, &[_]u8{close});
-
-    try state.buffer.insert(range.start, &[_]u8{open});
+    try state.insertTextAtOffset(range.end, &[_]u8{close});
+    try state.insertTextAtOffset(range.start, &[_]u8{open});
 
     state.updateCursorFromOffset(range.end + 2);
 
     state.selection_anchor = null;
-    state.markModified();
 
     return true;
 }
@@ -95,10 +93,7 @@ pub fn smartBackspace(state: *EditorState) !bool {
         if (char_before == pair.open and char_after == pair.close) {
             const offset = state.getOffsetFromCursor();
             if (offset > 0) {
-                try state.buffer.delete(offset, 1);
-                try state.buffer.delete(offset - 1, 1);
-                state.updateCursorFromOffset(offset - 1);
-                state.markModified();
+                try state.deleteRange(offset - 1, offset + 1);
                 return true;
             }
         }

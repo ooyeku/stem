@@ -3,6 +3,14 @@ const logger_service = @import("../../services/logger.zig");
 const log = logger_service.scoped("GitCommands");
 const protocol = @import("../protocol.zig");
 
+fn childExitCode(term: std.process.Child.Term) i32 {
+    return switch (term) {
+        .exited => |code| @intCast(code),
+        .signal => |sig| -@as(i32, @intCast(@intFromEnum(sig))),
+        else => -999,
+    };
+}
+
 pub const GitCommands = struct {
     pub fn cmdGitDiff(core: anytype) anyerror!void {
         core.decoration_manager.clearDiffDecorations();
@@ -146,7 +154,7 @@ pub const GitCommands = struct {
         };
         defer allocator.free(root_result.stderr);
 
-        if (root_result.term.exited != 0) {
+        if (childExitCode(root_result.term) != 0) {
             allocator.free(root_result.stdout);
             log.debug("Not in a git repository", .{});
             return error.GitCommandFailed;
@@ -183,10 +191,11 @@ pub const GitCommands = struct {
             return error.GitCommandFailed;
         };
 
-        if (result.term.exited != 0) {
+        const show_exit_code = childExitCode(result.term);
+        if (show_exit_code != 0) {
             allocator.free(result.stdout);
             defer allocator.free(result.stderr);
-            log.debug("Git show exited with {}: {s}", .{ result.term.exited, result.stderr });
+            log.debug("Git show exited with {}: {s}", .{ show_exit_code, result.stderr });
             return error.GitCommandFailed;
         }
 

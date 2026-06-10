@@ -16,6 +16,7 @@ const BookmarkStore = @import("bookmarks.zig").BookmarkStore;
 const protocol = @import("protocol.zig");
 const LSPManager = @import("../services/lsp_manager.zig").LSPManager;
 const LspServer = @import("../services/lsp/server.zig").LSPServer;
+const lsp_client = @import("../lsp/client.zig");
 const filetype = @import("filetype.zig");
 const SyntaxManager = @import("../syntax/manager.zig").SyntaxManager;
 const Help = @import("../ui/help.zig");
@@ -64,6 +65,18 @@ pub const CompletionDisplayItem = struct {
     detail: ?[]const u8,
     kind_category: protocol.CompletionEntry.KindCategory = .other,
 };
+
+fn jsonValueToU32(v: std.json.Value) ?u32 {
+    return switch (v) {
+        .integer => |iv| if (iv < 0 or iv > std.math.maxInt(u32)) null else @intCast(iv),
+        .float => |fv| blk: {
+            if (!std.math.isFinite(fv)) break :blk null;
+            if (fv < 0 or fv > @as(f64, std.math.maxInt(u32))) break :blk null;
+            break :blk @intFromFloat(fv);
+        },
+        else => null,
+    };
+}
 
 /// Comptime adapter that wraps a `fn(*Core) anyerror!void` (or any function
 /// whose first parameter accepts a `*Core` via `anytype`) into the
@@ -894,10 +907,9 @@ pub const Core = struct {
         var char_buf: [1]u8 = .{char};
         self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
         for (all.items) |po| {
-            try s.buffer.insert(po.off, &char_buf);
+            try s.insertTextAtOffset(po.off, &char_buf);
             try self.history_manager.recordInsert(po.off, &char_buf);
         }
-        s.markModified();
         self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
 
         // Compute each cursor's new column: self-advance by 1, plus +1
@@ -933,6 +945,150 @@ pub const Core = struct {
         try s.insertTextAtCursor(text);
         try self.history_manager.recordInsert(offset, text);
         self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+    }
+
+    fn buildNewlineInsertion(self: *Core) !struct { text: []u8, cursor_after_offset: usize } {
+        const s = self.state();
+        const offset = s.getOffsetFromCursor();
+
+        var base_indent: usize = 0;
+        var extra_indent: usize = 0;
+        var need_closing_line = false;
+
+        if (s.file_path) |path| {
+            if (std.mem.endsWith(u8, path, ".zig")) {
+                const line_content = try s.getLineContent(s.cursor_row);
+                defer self.allocator.free(line_content);
+
+                for (line_content) |c| {
+                    if (c == ' ') {
+                        base_indent += 1;
+                    } else if (c == '\t') {
+                        base_indent += 4;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (offset > 0) {
+                    const char_before = s.getCharAtOffset(offset - 1);
+                    if (char_before == '{' or char_before == '(' or char_before == '[') {
+                        extra_indent = 4;
+                    }
+                }
+
+                const char_after = s.getCharAtOffset(offset);
+                need_closing_line = (char_after == '}' or char_after == ')' or char_after == ']') and extra_indent > 0;
+            }
+        }
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+
+        try out.append(self.allocator, '\n');
+        var i: usize = 0;
+        while (i < base_indent + extra_indent) : (i += 1) {
+            try out.append(self.allocator, ' ');
+        }
+        const cursor_after_offset = offset + out.items.len;
+
+        if (need_closing_line) {
+            try out.append(self.allocator, '\n');
+            i = 0;
+            while (i < base_indent) : (i += 1) {
+                try out.append(self.allocator, ' ');
+            }
+        }
+
+        return .{
+            .text = try out.toOwnedSlice(self.allocator),
+            .cursor_after_offset = cursor_after_offset,
+        };
+    }
+
+    pub fn insertNewlineWithHistory(self: *Core) !void {
+        const s = self.state();
+        const offset = s.getOffsetFromCursor();
+        const insertion = try self.buildNewlineInsertion();
+        defer self.allocator.free(insertion.text);
+
+        self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+        try s.insertTextAtCursor(insertion.text);
+        s.updateCursorFromOffset(insertion.cursor_after_offset);
+        try self.history_manager.recordInsert(offset, insertion.text);
+        self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+    }
+
+    pub fn insertTabWithHistory(self: *Core, tab_size: u32) !void {
+        const count: usize = @intCast(tab_size);
+        const spaces = try self.allocator.alloc(u8, count);
+        defer self.allocator.free(spaces);
+        @memset(spaces, ' ');
+        try self.insertTextWithHistory(spaces);
+    }
+
+    pub fn smartAutoPairBackspaceWithHistory(self: *Core) !bool {
+        const s = self.state();
+        const char_before = s.getCharBeforeCursor();
+        const char_after = s.getCharAfterCursor();
+
+        for (auto_pair.STANDARD_PAIRS) |pair| {
+            if (char_before == pair.open and char_after == pair.close) {
+                const offset = s.getOffsetFromCursor();
+                if (offset == 0) return false;
+                const deleted = [_]u8{ char_before, char_after };
+                self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+                try self.history_manager.recordDelete(offset - 1, &deleted);
+                try s.deleteRange(offset - 1, offset + 1);
+                self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    pub fn autoPairCharWithHistory(
+        self: *Core,
+        char: u8,
+        config: auto_pair.AutoPairConfig,
+    ) !enum { inserted, skipped, wrapped } {
+        const s = self.state();
+        if (!config.enabled) return .inserted;
+
+        if (auto_pair.shouldSkipClosingChar(s, char)) {
+            try s.moveCursorRightGrapheme();
+            return .skipped;
+        }
+
+        if (auto_pair.isOpeningChar(char)) |pair| {
+            if (config.wrap_selection and s.selection_anchor != null) {
+                const range = auto_pair.getSelectionRange(s) orelse return .inserted;
+                const open_str = [_]u8{pair.open};
+                const close_str = [_]u8{pair.close};
+
+                self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+                try s.insertTextAtOffset(range.end, &close_str);
+                try self.history_manager.recordInsert(range.end, &close_str);
+                try s.insertTextAtOffset(range.start, &open_str);
+                try self.history_manager.recordInsert(range.start, &open_str);
+                s.updateCursorFromOffset(range.end + 2);
+                s.selection_anchor = null;
+                self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+                return .wrapped;
+            }
+
+            const offset = s.getOffsetFromCursor();
+            const pair_text = [_]u8{ pair.open, pair.close };
+            self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+            try s.insertTextAtCursor(&pair_text);
+            try self.history_manager.recordInsert(offset, &pair_text);
+            try s.moveCursorLeftGrapheme();
+            self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
+            return .inserted;
+        }
+
+        return .inserted;
     }
 
     pub fn deleteCharWithHistory(self: *Core) !void {
@@ -997,10 +1153,9 @@ pub const Core = struct {
             const deleted = s.buffer.getCharAt(po.off - 1) orelse continue;
             var char_buf: [1]u8 = .{deleted};
             try self.history_manager.recordDelete(po.off - 1, &char_buf);
-            try s.buffer.delete(po.off - 1, 1);
+            try s.deleteRangeAtOffset(po.off - 1, po.off);
             applied += 1;
         }
-        s.markModified();
         self.history_manager.commitTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
 
         // Update positions: each retreats by 1 col, plus -1 for every
@@ -2752,14 +2907,11 @@ pub const Core = struct {
         const prefix_len = s.cursor_col - self.completion_prefix_start;
         if (prefix_len > 0) {
             const start_offset = s.getOffsetFor(s.cursor_row, self.completion_prefix_start);
-            try s.buffer.delete(start_offset, prefix_len);
+            try s.deleteRangeAtOffset(start_offset, start_offset + prefix_len);
             s.cursor_col = self.completion_prefix_start;
         }
 
-        const insert_offset = s.getOffsetFor(s.cursor_row, s.cursor_col);
-        try s.buffer.insert(insert_offset, item.label);
-        s.cursor_col += item.label.len;
-        s.modified = true;
+        try s.insertTextAtCursor(item.label);
 
         // Send the didChange immediately. Resolve / signature-help
         // queries that fire right after accept (e.g. on the dot the
@@ -3673,10 +3825,10 @@ pub const Core = struct {
                     const end_off = s.getOffsetFor(edit.end_line, edit.end_col);
 
                     if (end_off > start_off) {
-                        try s.buffer.delete(start_off, end_off - start_off);
+                        try s.deleteRangeAtOffset(start_off, end_off);
                     }
 
-                    try s.buffer.insert(start_off, edit.new_text);
+                    try s.insertTextAtOffset(start_off, edit.new_text);
                 }
                 return edits.len > 0;
             }
@@ -3750,12 +3902,10 @@ pub const Core = struct {
     /// and applied in reverse so earlier offsets stay valid. Returns
     /// the number of edits applied (0 if no buffer matches).
     fn applyTextEditsForUri(self: *Core, uri: []const u8, edits_json: []const std.json.Value) !usize {
-        // Strip the `file://` prefix to get a local path. LSP URIs
-        // are always `file://` for textDocument operations on local
-        // disks — anything else (e.g. `untitled:`) we skip.
         const file_prefix = "file://";
         if (!std.mem.startsWith(u8, uri, file_prefix)) return 0;
-        const path = uri[file_prefix.len..];
+        const path = try lsp_client.fileUriToPath(self.allocator, uri);
+        defer self.allocator.free(path);
 
         // Find the buffer.
         var target: ?*@TypeOf(self.buffer_manager.buffers.items[0]) = null;
@@ -3790,14 +3940,17 @@ pub const Core = struct {
             const sc = start.object.get("character") orelse continue;
             const el = end.object.get("line") orelse continue;
             const ec = end.object.get("character") orelse continue;
-            if (sl != .integer or sc != .integer or el != .integer or ec != .integer) continue;
+            const start_line = jsonValueToU32(sl) orelse continue;
+            const start_col = jsonValueToU32(sc) orelse continue;
+            const end_line = jsonValueToU32(el) orelse continue;
+            const end_col = jsonValueToU32(ec) orelse continue;
             const nt = e.object.get("newText") orelse continue;
             if (nt != .string) continue;
             try list.append(self.allocator, .{
-                .start_line = @intCast(sl.integer),
-                .start_col = @intCast(sc.integer),
-                .end_line = @intCast(el.integer),
-                .end_col = @intCast(ec.integer),
+                .start_line = start_line,
+                .start_col = start_col,
+                .end_line = end_line,
+                .end_col = end_col,
                 .new_text = nt.string,
             });
         }
@@ -3816,11 +3969,10 @@ pub const Core = struct {
             const start_off = buf.state.getOffsetFor(edit.start_line, edit.start_col);
             const end_off = buf.state.getOffsetFor(edit.end_line, edit.end_col);
             if (end_off > start_off) {
-                try buf.state.buffer.delete(start_off, end_off - start_off);
+                try buf.state.deleteRangeAtOffset(start_off, end_off);
             }
-            try buf.state.buffer.insert(start_off, edit.new_text);
+            try buf.state.insertTextAtOffset(start_off, edit.new_text);
         }
-        buf.state.modified = true;
         return list.items.len;
     }
 
@@ -5245,13 +5397,13 @@ pub const Core = struct {
         const pair = surroundPair(ch);
         const end_off = s.getOffsetFor(end_row, end_col);
         const close_str = [_]u8{pair.close};
-        try s.buffer.insert(end_off, &close_str);
+        try s.insertTextAtOffset(end_off, &close_str);
         const start_off = s.getOffsetFor(start_row, start_col);
         const open_str = [_]u8{pair.open};
-        try s.buffer.insert(start_off, &open_str);
-        s.modified = true;
+        try s.insertTextAtOffset(start_off, &open_str);
 
         // Drop the selection; place cursor just after the closer.
+        s.updateCursorFromOffset(end_off + 2);
         s.selection_anchor = null;
         self.mode = .select;
         try self.sendUpdate();
@@ -5274,10 +5426,9 @@ pub const Core = struct {
         // Delete closer FIRST (later in buffer) so the opener's offset
         // remains valid for the second delete.
         const close_off = s.getOffsetFor(r.end_row, r.end_col);
-        try s.buffer.delete(close_off - 1, 1);
+        try s.deleteRangeAtOffset(close_off - 1, close_off);
         const open_off = s.getOffsetFor(r.start_row, r.start_col);
-        try s.buffer.delete(open_off, 1);
-        s.modified = true;
+        try s.deleteRangeAtOffset(open_off, open_off + 1);
         try self.sendUpdate();
     }
 
@@ -5298,14 +5449,13 @@ pub const Core = struct {
 
         // Replace closer FIRST so the opener offset survives.
         const close_off = s.getOffsetFor(r.end_row, r.end_col);
-        try s.buffer.delete(close_off - 1, 1);
+        try s.deleteRangeAtOffset(close_off - 1, close_off);
         const new_close = [_]u8{new_pair.close};
-        try s.buffer.insert(close_off - 1, &new_close);
+        try s.insertTextAtOffset(close_off - 1, &new_close);
         const open_off = s.getOffsetFor(r.start_row, r.start_col);
-        try s.buffer.delete(open_off, 1);
+        try s.deleteRangeAtOffset(open_off, open_off + 1);
         const new_open = [_]u8{new_pair.open};
-        try s.buffer.insert(open_off, &new_open);
-        s.modified = true;
+        try s.insertTextAtOffset(open_off, &new_open);
         try self.sendUpdate();
     }
 
@@ -5454,7 +5604,11 @@ pub const Core = struct {
             self.allocator.free(res.stdout);
             self.allocator.free(res.stderr);
         }
-        if (res.term.exited != 0) {
+        const branch_ok = switch (res.term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (!branch_ok) {
             if (self.git_branch) |b| self.allocator.free(b);
             self.git_branch = null;
             return;
