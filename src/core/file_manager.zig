@@ -1,5 +1,7 @@
 const std = @import("std");
-const TestIo = @import("../test_utils.zig").TestIo;
+const test_utils = @import("../test_utils.zig");
+const TestIo = test_utils.TestIo;
+const Tempdir = test_utils.Tempdir;
 const Allocator = std.mem.Allocator;
 
 pub const DirEntry = struct {
@@ -580,18 +582,23 @@ test "FileManager enter with parent directory entry" {
     var io_ctx = TestIo.init(allocator);
     defer io_ctx.deinit();
     const io = io_ctx.io();
+    var tmp = try Tempdir.init(allocator, io);
+    defer tmp.deinit();
     var fm = try FileManager.init(allocator, io);
     defer fm.deinit();
 
-    try fm.setCwd("/tmp");
+    try fm.setCwd(tmp.path);
     try fm.refresh();
 
+    var found_parent = false;
     for (fm.entries.items, 0..) |entry, i| {
         if (std.mem.eql(u8, entry.name, "..")) {
             fm.selected_index = i;
+            found_parent = true;
             break;
         }
     }
+    try std.testing.expect(found_parent);
 
     const result = try fm.enter();
 
