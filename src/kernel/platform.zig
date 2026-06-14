@@ -99,6 +99,24 @@ pub fn killProcessForce(pid: Pid) void {
     killProcessWith(pid, true);
 }
 
+/// Return the `std.process.spawn` process-group setting that makes a spawned
+/// POSIX child become the leader of a new process group. Its descendants then
+/// inherit that group, letting stem terminate the whole LSP subtree with one
+/// group signal. Windows has no equivalent here without Job Objects, so it
+/// leaves process-group handling disabled.
+pub fn childProcessGroupForSpawn() ?std.posix.pid_t {
+    if (builtin.os.tag == .windows) return null;
+    return 0;
+}
+
+pub fn killProcessTree(pid: Pid) void {
+    killProcessTreeWith(pid, false);
+}
+
+pub fn killProcessTreeForce(pid: Pid) void {
+    killProcessTreeWith(pid, true);
+}
+
 fn killProcessWith(pid: Pid, force: bool) void {
     if (builtin.os.tag == .windows) {
         const kernel32 = struct {
@@ -115,9 +133,30 @@ fn killProcessWith(pid: Pid, force: bool) void {
     }
 }
 
+fn killProcessTreeWith(pid: Pid, force: bool) void {
+    if (builtin.os.tag == .windows) {
+        killProcessWith(pid, force);
+        return;
+    }
+
+    if (pid <= 0) return;
+    const sig = if (force) std.posix.SIG.KILL else std.posix.SIG.INT;
+    _ = std.posix.kill(-pid, sig) catch {
+        _ = std.posix.kill(pid, sig) catch {};
+    };
+}
+
 test "getProcessId: returns a positive id that's stable within a process" {
     const a = getProcessId();
     const b = getProcessId();
     try std.testing.expect(a > 0);
     try std.testing.expectEqual(a, b);
+}
+
+test "childProcessGroupForSpawn requests an isolated process group on POSIX" {
+    if (builtin.os.tag == .windows) {
+        try std.testing.expectEqual(@as(?std.posix.pid_t, null), childProcessGroupForSpawn());
+    } else {
+        try std.testing.expectEqual(@as(?std.posix.pid_t, 0), childProcessGroupForSpawn());
+    }
 }

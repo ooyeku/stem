@@ -317,6 +317,22 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addIncludePath(ts_dep.path("lib/src"));
     b.installArtifact(exe);
 
+    const lsp_host_exe = b.addExecutable(.{
+        .name = "stem-lsp-host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lsp_host.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    lsp_host_exe.root_module.link_libc = true;
+    lsp_host_exe.root_module.addImport("zls", zls_dep.module("zls"));
+    b.installArtifact(lsp_host_exe);
+
+    b.getInstallStep().dependOn(&b.addInstallArtifact(lsp_host_exe, .{
+        .dest_sub_path = "stem-lsp-zig",
+    }).step);
+
     // ===== Bundled WebAssembly plugins =====
     // All bundled plugins target the wasm runtime. The host still
     // supports exec (out-of-process JSON-RPC) plugins, but nothing

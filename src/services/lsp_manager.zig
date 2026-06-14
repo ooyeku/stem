@@ -4,7 +4,6 @@ const server_mod = @import("lsp/server.zig");
 const LSPServer = server_mod.LSPServer;
 const DocumentSymbol = LSPServer.DocumentSymbol;
 const WorkspaceSymbol = LSPServer.WorkspaceSymbol;
-const zls_embedded = @import("lsp/zls_embedded.zig");
 const protocol = @import("../kernel/protocol.zig");
 const Installer = @import("lsp/installer.zig").Installer;
 const external = @import("lsp/external.zig");
@@ -1045,10 +1044,21 @@ pub const LSPManager = struct {
             server.current_root_path = try self.allocator.dupe(u8, p);
         }
 
-        try server.start(zls_embedded.runEmbeddedZLS, .{self.environ_block});
+        try server.start(runEmbeddedZLSHostThread, .{self.environ_block});
         self.manager_mutex.lockUncancelable(self.io);
         defer self.manager_mutex.unlock(self.io);
         try self.servers.put("zig", server);
+    }
+
+    fn runEmbeddedZLSHostThread(
+        allocator: std.mem.Allocator,
+        input: *Transport.MemPipe,
+        output: *Transport.MemPipe,
+        environ_block: std.process.Environ.Block,
+    ) void {
+        external.runEmbeddedZlsHost(allocator, input, output, environ_block) catch |err| {
+            log.info("Embedded ZLS host failed: {}", .{err});
+        };
     }
 
     fn startPyright(self: *LSPManager, root_path: ?[]const u8) !void {

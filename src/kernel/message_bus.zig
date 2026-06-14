@@ -69,6 +69,7 @@ pub const Stats = struct {
     sent: [5]usize = .{ 0, 0, 0, 0, 0 },
     dropped_full: [5]usize = .{ 0, 0, 0, 0, 0 },
     dropped_backpressure: [5]usize = .{ 0, 0, 0, 0, 0 },
+    dropped_rate_limited: [5]usize = .{ 0, 0, 0, 0, 0 },
     coalesced: usize = 0,
 
     pub fn totalSent(self: Stats) usize {
@@ -81,6 +82,7 @@ pub const Stats = struct {
         var n: usize = 0;
         for (self.dropped_full) |s| n += s;
         for (self.dropped_backpressure) |s| n += s;
+        for (self.dropped_rate_limited) |s| n += s;
         return n;
     }
 };
@@ -91,13 +93,19 @@ pub const Stats = struct {
 pub const BackpressureConfig = struct {
     bulk_high_watermark: usize = 256,
     background_high_watermark: usize = 128,
+    bulk_rate_per_second: ?u32 = null,
+    background_rate_per_second: ?u32 = null,
 };
+
+pub const FlowControlConfig = BackpressureConfig;
 
 pub const MessageBus = struct {
     allocator: std.mem.Allocator,
     inbox: *vigil.Inbox,
     name: []const u8,
     backpressure: BackpressureConfig,
+    bulk_rate_limiter: ?vigil.RateLimiter = null,
+    background_rate_limiter: ?vigil.RateLimiter = null,
     stats_mu: Mutex = .{},
     stats: Stats = .{},
     coalesce_mu: Mutex = .{},
@@ -121,8 +129,20 @@ pub const MessageBus = struct {
 
     pub fn withBackpressure(self: MessageBus, bp: BackpressureConfig) MessageBus {
         var copy = self;
-        copy.backpressure = bp;
+        copy.configureFlowControl(bp);
         return copy;
+    }
+
+    pub fn configureFlowControl(self: *MessageBus, config: FlowControlConfig) void {
+        self.backpressure = config;
+        self.bulk_rate_limiter = if (config.bulk_rate_per_second) |rate|
+            vigil.RateLimiter.init(rate)
+        else
+            null;
+        self.background_rate_limiter = if (config.background_rate_per_second) |rate|
+            vigil.RateLimiter.init(rate)
+        else
+            null;
     }
 
     /// Send a payload at the given QoS class. Constructs a Vigil `Message`
@@ -130,6 +150,22 @@ pub const MessageBus = struct {
     /// priority (`vigil.Inbox.send` would hardcode `.normal`).
     pub fn send(self: *MessageBus, class: Class, payload: []const u8) !void {
         if (self.inbox.isClosed()) return error.InboxClosed;
+
+        if (class == .bulk) {
+            if (self.bulk_rate_limiter) |*limiter| {
+                if (!limiter.allow()) {
+                    self.recordDroppedRateLimited(class, payload.len);
+                    return;
+                }
+            }
+        } else if (class == .background) {
+            if (self.background_rate_limiter) |*limiter| {
+                if (!limiter.allow()) {
+                    self.recordDroppedRateLimited(class, payload.len);
+                    return;
+                }
+            }
+        }
 
         // Backpressure: drop bulk / background traffic when the inbox is
         // backed up. Doing this BEFORE constructing the message saves an
@@ -255,6 +291,13 @@ pub const MessageBus = struct {
         self.stats_mu.unlock();
         telemetry_mod.recordMessageDropped(self.name, @tagName(class), size, "backpressure");
     }
+
+    fn recordDroppedRateLimited(self: *MessageBus, class: Class, size: usize) void {
+        self.stats_mu.lock();
+        self.stats.dropped_rate_limited[@intFromEnum(class)] += 1;
+        self.stats_mu.unlock();
+        telemetry_mod.recordMessageDropped(self.name, @tagName(class), size, "rate_limit");
+    }
 };
 
 /// Coalescing slots. The protocol-side decision of which messages
@@ -372,6 +415,32 @@ test "MessageBus: bulk backpressure drops over watermark" {
     const s = bus.snapshotStats();
     try std.testing.expectEqual(@as(usize, 2), s.sent[@intFromEnum(Class.bulk)]);
     try std.testing.expectEqual(@as(usize, 1), s.dropped_backpressure[@intFromEnum(Class.bulk)]);
+
+    while (true) {
+        const m = ib.mailbox.receive() catch break;
+        var mm = m;
+        mm.deinit();
+    }
+}
+
+test "MessageBus: Vigil rate limiter drops noisy bulk sends" {
+    const a = std.testing.allocator;
+    const ib = try vigil_api.standaloneInboxForTest(a);
+    defer ib.close();
+
+    var bus = MessageBus.init(a, ib, "test-bus");
+    bus.configureFlowControl(.{
+        .bulk_high_watermark = 100,
+        .background_high_watermark = 100,
+        .bulk_rate_per_second = 1,
+    });
+
+    try bus.sendBulk("a");
+    try bus.sendBulk("b");
+
+    const s = bus.snapshotStats();
+    try std.testing.expectEqual(@as(usize, 1), s.sent[@intFromEnum(Class.bulk)]);
+    try std.testing.expectEqual(@as(usize, 1), s.dropped_rate_limited[@intFromEnum(Class.bulk)]);
 
     while (true) {
         const m = ib.mailbox.receive() catch break;

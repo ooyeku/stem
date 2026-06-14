@@ -48,6 +48,7 @@ test {
     _ = @import("services/vigil_adapters.zig");
     _ = @import("services/vigil_supervision.zig");
     _ = @import("services/lsp/server.zig");
+    _ = @import("services/lsp/host_command.zig");
     _ = @import("kernel/safe.zig");
     _ = @import("config/schema.zig");
     _ = @import("plugins/manager.zig");
@@ -56,6 +57,7 @@ test {
     _ = @import("plugins/wasm/interpreter.zig");
     _ = @import("plugins/wasm/loader.zig");
     _ = @import("tools/plugin_cli.zig");
+    _ = @import("tools/lsp_host_args.zig");
     _ = @import("lsp/transport.zig");
     _ = @import("ui/width.zig");
     _ = @import("ui/view.zig");

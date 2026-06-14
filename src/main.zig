@@ -8,6 +8,7 @@ const logger = @import("services/logger.zig");
 const cli = @import("cli.zig");
 const MessageBus = @import("kernel/message_bus.zig").MessageBus;
 const StemRuntime = @import("services/runtime.zig").StemRuntime;
+const vigil_api = @import("services/vigil_adapters.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
@@ -404,9 +405,35 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // backpressure, telemetry). Consumers still read directly from the
     // underlying inboxes.
     var main_bus = MessageBus.init(inbox_allocator, main_inbox, "to-ui");
-    main_bus.backpressure = .{ .bulk_high_watermark = 512, .background_high_watermark = 256 };
+    main_bus.configureFlowControl(.{
+        .bulk_high_watermark = 512,
+        .background_high_watermark = 256,
+        .bulk_rate_per_second = 2000,
+        .background_rate_per_second = 500,
+    });
     var core_bus = MessageBus.init(inbox_allocator, core_inbox, "to-core");
-    core_bus.backpressure = .{ .bulk_high_watermark = 1024, .background_high_watermark = 256 };
+    core_bus.configureFlowControl(.{
+        .bulk_high_watermark = 1024,
+        .background_high_watermark = 256,
+        .bulk_rate_per_second = 4000,
+        .background_rate_per_second = 500,
+    });
+
+    const EditorShutdownContext = struct {
+        main: *vigil_api.Inbox,
+        core: *vigil_api.Inbox,
+
+        fn markClosed(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.main.closed.store(true, .release);
+            self.core.closed.store(true, .release);
+        }
+    };
+    var editor_shutdown_ctx = EditorShutdownContext{
+        .main = main_inbox,
+        .core = core_inbox,
+    };
+    try stem_runtime.addShutdownHook("editor.inboxes.closed", @ptrCast(&editor_shutdown_ctx), EditorShutdownContext.markClosed);
 
     const CoreContext = struct {
         core: Core,
@@ -470,6 +497,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // it into core.win_size.
     try loop.installResizeHandler();
 
+    const TerminalRestoreContext = struct {
+        vx: *vaxis.Vaxis,
+        tty: *vaxis.Tty,
+
+        fn restore(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.vx.resetState(self.tty.writer()) catch {};
+        }
+    };
+    var terminal_restore_ctx = TerminalRestoreContext{
+        .vx = &vx,
+        .tty = &tty,
+    };
+    try stem_runtime.addShutdownHook("terminal.restore", @ptrCast(&terminal_restore_ctx), TerminalRestoreContext.restore);
+    defer stem_runtime.shutdown();
+
     // Graceful signal handling: when the user `kill`s stem (SIGTERM) or
     // hits Ctrl-C in a way that doesn't route through vaxis (SIGINT from a
     // background tty operation), we want the same clean teardown we'd do
@@ -511,6 +554,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     const core_thread = try std.Thread.spawn(.{}, Runner.run, .{&core_ctx});
     defer core_thread.join();
+    defer stem_runtime.shutdown();
     const InputThread = struct {
         loop: *vaxis.Loop(vaxis.Event),
         bus: *MessageBus,
@@ -739,6 +783,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
     }
+    stem_runtime.shutdown();
     vx.setMouseMode(tty.writer(), false) catch {};
     vx.exitAltScreen(tty.writer()) catch {};
     std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};

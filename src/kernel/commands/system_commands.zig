@@ -141,6 +141,8 @@ pub const SystemCommands = struct {
         const plugin_health = core.plugin_manager.healthSnapshot();
         var lsp_health = try core.lsp_manager.healthSnapshot(allocator);
         defer lsp_health.deinit(allocator);
+        const timeline = try telemetry.snapshotTimeline(allocator);
+        defer telemetry.freeTimelineSnapshot(allocator, timeline);
 
         try w.print(
             \\# stem — Runtime Health
@@ -157,6 +159,11 @@ pub const SystemCommands = struct {
             try w.print(
                 \\- API version: {d}.{d}.{d}
                 \\- Telemetry bridge: {s}
+                \\- Runtime: {s}
+                \\- Registered services: {d}
+                \\- Shutdown hooks: {d}
+                \\- Shutdown started: {s}
+                \\- Timeline events retained: {d}
                 \\- Plugin supervisor: {d} crashes, {d} restarts scheduled
                 \\- LSP supervisor: {d} crashes, {d} restarts scheduled
                 \\
@@ -165,6 +172,11 @@ pub const SystemCommands = struct {
                 runtime_health.vigil_minor,
                 runtime_health.vigil_patch,
                 if (runtime_health.telemetry_initialized) "initialized" else "disabled",
+                if (runtime_health.runtime_running) "running" else "stopped",
+                runtime_health.registered_services,
+                runtime_health.shutdown_hooks,
+                if (runtime_health.shutdown_started) "yes" else "no",
+                timeline.len,
                 runtime_health.plugin_supervisor.crashes,
                 runtime_health.plugin_supervisor.restarts_scheduled,
                 runtime_health.lsp_supervisor.crashes,
@@ -197,12 +209,35 @@ pub const SystemCommands = struct {
         if (per_bus.len == 0) {
             try w.writeAll("- _No traffic yet._\n");
         } else {
-            try w.writeAll("| Bus | Sent | Dropped (full) | Dropped (backpressure) |\n");
-            try w.writeAll("|---|---:|---:|---:|\n");
+            try w.writeAll("| Bus | Sent | Dropped (full) | Dropped (backpressure) | Dropped (rate limit) |\n");
+            try w.writeAll("|---|---:|---:|---:|---:|\n");
             for (per_bus) |b| {
                 try w.print(
-                    "| `{s}` | {d} | {d} | {d} |\n",
-                    .{ b.bus_name, b.stats.sent, b.stats.dropped_full, b.stats.dropped_backpressure },
+                    "| `{s}` | {d} | {d} | {d} | {d} |\n",
+                    .{
+                        b.bus_name,
+                        b.stats.sent,
+                        b.stats.dropped_full,
+                        b.stats.dropped_backpressure,
+                        b.stats.dropped_rate_limited,
+                    },
+                );
+            }
+        }
+
+        try w.writeAll(
+            \\
+            \\## Recent Runtime Events
+            \\
+        );
+        if (timeline.len == 0) {
+            try w.writeAll("- _No events yet._\n");
+        } else {
+            const start = if (timeline.len > 12) timeline.len - 12 else 0;
+            for (timeline[start..]) |entry| {
+                try w.print(
+                    "- `{s}` `{s}`: {s}\n",
+                    .{ timelineKindLabel(entry.kind), entry.name, entry.detail },
                 );
             }
         }
@@ -279,6 +314,7 @@ pub const SystemCommands = struct {
             \\- `dropped (full)`: mailbox at capacity. Indicates a stuck consumer.
             \\- `dropped (backpressure)`: bulk/background producer outpacing consumer.
             \\  Common during heavy terminal output or scan results — desired.
+            \\- `dropped (rate limit)`: Vigil token bucket throttled a noisy producer.
             \\- `coalesce events`: renders or ticks superseded by a newer one
             \\  in the same slot. Higher = more redundant work avoided.
             \\
@@ -292,6 +328,18 @@ pub const SystemCommands = struct {
         if (!healthy) return "unhealthy";
         if (!initialized) return "initializing";
         return "ready";
+    }
+
+    fn timelineKindLabel(kind: telemetry.TimelineKind) []const u8 {
+        return switch (kind) {
+            .runtime => "runtime",
+            .shutdown => "shutdown",
+            .message => "message",
+            .flow_control => "flow",
+            .plugin => "plugin",
+            .lsp => "lsp",
+            .supervisor => "supervisor",
+        };
     }
 
     pub fn cmdJobList(core: anytype) anyerror!void {

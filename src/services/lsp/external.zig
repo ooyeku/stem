@@ -3,6 +3,7 @@ const vigil_api = @import("../vigil_adapters.zig");
 const Transport = @import("../../lsp/transport.zig");
 const platform = @import("../../kernel/platform.zig");
 const installer_mod = @import("installer.zig");
+const host_command = @import("host_command.zig");
 
 const log = std.log.scoped(.LSPExternal);
 const Mutex = vigil_api.Mutex;
@@ -81,7 +82,7 @@ pub fn requestGlobalShutdown() void {
     live.mu.unlock();
     defer std.heap.page_allocator.free(pids);
     for (pids) |pid| {
-        platform.killProcessForce(pid);
+        platform.killProcessTreeForce(pid);
     }
     log.info("requestGlobalShutdown: killed {d} LSP child(ren)", .{pids.len});
 }
@@ -154,16 +155,59 @@ pub fn runExternalServer(
         }
     }
 
+    const host_path = try host_command.hostPathFromCurrentExe(allocator, io, environ_block, null);
+    defer allocator.free(host_path);
+
+    const host_args = try host_command.externalArgv(allocator, host_path, "external", resolved_slice);
+    defer allocator.free(host_args);
+
+    return try runHostProcess(allocator, input_pipe, output_pipe, host_args, environ_block);
+}
+
+pub fn runEmbeddedZlsHost(
+    allocator: std.mem.Allocator,
+    input_pipe: *Transport.MemPipe,
+    output_pipe: *Transport.MemPipe,
+    environ_block: std.process.Environ.Block,
+) !void {
+    var threaded = std.Io.Threaded.init(allocator, .{
+        .environ = .{ .block = environ_block },
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const alias = try host_command.aliasBasename(allocator, "zig");
+    defer allocator.free(alias);
+    const host_path = try host_command.hostPathFromCurrentExe(allocator, io, environ_block, alias);
+    defer allocator.free(host_path);
+
+    const host_args = try host_command.embeddedZlsArgv(allocator, host_path);
+    defer allocator.free(host_args);
+
+    return try runHostProcess(allocator, input_pipe, output_pipe, host_args, environ_block);
+}
+
+fn runHostProcess(
+    allocator: std.mem.Allocator,
+    input_pipe: *Transport.MemPipe,
+    output_pipe: *Transport.MemPipe,
+    argv: []const []const u8,
+    environ_block: std.process.Environ.Block,
+) !void {
+    var threaded = std.Io.Threaded.init(allocator, .{
+        .environ = .{ .block = environ_block },
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var child = std.process.spawn(io, .{
-        .argv = resolved_slice,
+        .argv = argv,
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .pipe,
+        .pgid = platform.childProcessGroupForSpawn(),
     }) catch |err| {
-        // Same logic as the interpreter-not-found path: surface
-        // failure to the reader so we don't burn the full init
-        // timeout when the spawn itself never succeeds.
-        log.err("spawn '{s}' failed: {} — closing pipes so init can bail fast", .{ resolved_slice[0], err });
+        log.err("spawn '{s}' failed: {} — closing pipes so init can bail fast", .{ argv[0], err });
         output_pipe.close();
         return err;
     };
@@ -184,7 +228,7 @@ pub fn runExternalServer(
             // pidToDisplay helper that prints either the integer
             // PID (POSIX) or the handle's address (Windows).
             log.info("LSP child {d} spawned during shutdown; killing immediately", .{platform.pidToDisplay(pid)});
-            platform.killProcessForce(pid);
+            platform.killProcessTreeForce(pid);
             _ = child.wait(io) catch {};
             output_pipe.close();
             return error.ShutdownInProgress;
@@ -200,7 +244,7 @@ pub fn runExternalServer(
     // spawned (writer_thread) will see EOF on the pipe and exit on their
     // own, since the child's pipes close when it's killed.
     errdefer {
-        child.kill(io);
+        if (captured_pid) |pid| platform.killProcessTreeForce(pid) else child.kill(io);
         _ = child.wait(io) catch {};
     }
 
@@ -222,7 +266,10 @@ pub fn runExternalServer(
     // watchdog to bail rather than waiting forever for pump_done.
     errdefer if (watch) |w| w.cancelled.store(true, .release);
 
-    const writer_thread = try std.Thread.spawn(.{}, pumpInput, .{ input_pipe, child.stdin.?, environ_block, watch });
+    const host_stdin = child.stdin.?;
+    child.stdin = null;
+
+    const writer_thread = try std.Thread.spawn(.{}, pumpInput, .{ input_pipe, host_stdin, environ_block, watch });
     const reader_thread = try std.Thread.spawn(.{}, pumpOutput, .{ child.stdout.?, output_pipe, environ_block });
     var stderr_thread: ?std.Thread = null;
     if (child.stderr) |stderr| {
@@ -269,15 +316,11 @@ fn killWatchRun(watch: *KillWatch, io: std.Io, allocator: std.mem.Allocator) voi
     // Phase 3: still alive after the grace period — force kill.
     if (watch.cancelled.load(.acquire)) return;
     log.warn("LSP child PID {} ignored exit notification; sending SIGINT", .{watch.pid});
-    platform.killProcess(watch.pid);
+    platform.killProcessTree(watch.pid);
 }
 
 fn pumpInput(pipe: *Transport.MemPipe, child_stdin: std.Io.File, environ_block: std.process.Environ.Block, watch: ?*KillWatch) void {
     @import("../thread_name.zig").set("stem-lsp-in");
-    // Signal the watchdog when this pump exits (regardless of cause). The
-    // watchdog uses this as its "child should be exiting now" cue.
-    defer if (watch) |w| w.pump_done.store(true, .release);
-
     // Pump runs in its own std.Thread.spawn worker; needs its own Threaded io.
     // Forward the parent's environ block.
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{
@@ -285,6 +328,10 @@ fn pumpInput(pipe: *Transport.MemPipe, child_stdin: std.Io.File, environ_block: 
     });
     defer threaded.deinit();
     const io = threaded.io();
+    defer child_stdin.close(io);
+    // Signal the watchdog when this pump exits (regardless of cause). The
+    // watchdog uses this as its "child should be exiting now" cue.
+    defer if (watch) |w| w.pump_done.store(true, .release);
 
     var buf: [4096]u8 = undefined;
     while (true) {

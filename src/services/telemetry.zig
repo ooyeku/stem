@@ -23,6 +23,8 @@ const Mutex = vigil_api.Mutex;
 const State = struct {
     mu: Mutex = .{},
     sends_per_bus: std.StringHashMapUnmanaged(SendStats) = .empty,
+    timeline: std.ArrayListUnmanaged(TimelineEntry) = .empty,
+    timeline_capacity: usize = 256,
     /// Total bytes shipped through MessageBus.send. Cheap counter for
     /// sanity-checking producer throughput.
     bytes_sent: u64 = 0,
@@ -39,6 +41,24 @@ pub const SendStats = struct {
     sent: u64 = 0,
     dropped_full: u64 = 0,
     dropped_backpressure: u64 = 0,
+    dropped_rate_limited: u64 = 0,
+};
+
+pub const TimelineKind = enum {
+    runtime,
+    shutdown,
+    message,
+    flow_control,
+    plugin,
+    lsp,
+    supervisor,
+};
+
+pub const TimelineEntry = struct {
+    timestamp_ms: i64,
+    kind: TimelineKind,
+    name: []const u8,
+    detail: []const u8,
 };
 
 var state: State = .{};
@@ -77,6 +97,7 @@ pub fn deinit() void {
     }
     state.sends_per_bus.deinit(state.allocator);
     state.sends_per_bus = .empty;
+    clearTimelineLocked();
     vigil.telemetry.deinitGlobal();
     state.initialized = false;
     state.bytes_sent = 0;
@@ -96,6 +117,7 @@ pub fn recordMessageSent(bus_name: []const u8, class: []const u8, size: usize) v
     if (!state.initialized) return;
     bumpSend(bus_name, .sent);
     state.bytes_sent +%= size;
+    appendTimelineLocked(.message, bus_name, "sent");
 }
 
 pub fn recordMessageDropped(bus_name: []const u8, class: []const u8, size: usize, reason: []const u8) void {
@@ -106,26 +128,31 @@ pub fn recordMessageDropped(bus_name: []const u8, class: []const u8, size: usize
     if (!state.initialized) return;
     if (std.mem.eql(u8, reason, "backpressure")) {
         bumpSend(bus_name, .dropped_backpressure);
+        appendTimelineLocked(.flow_control, bus_name, "backpressure");
+    } else if (std.mem.eql(u8, reason, "rate_limit")) {
+        bumpSend(bus_name, .dropped_rate_limited);
+        appendTimelineLocked(.flow_control, bus_name, "rate_limit");
     } else {
         bumpSend(bus_name, .dropped_full);
+        appendTimelineLocked(.message, bus_name, "full");
     }
 }
 
 pub fn recordMessageCoalesced(bus_name: []const u8, slot: []const u8) void {
-    _ = bus_name;
     _ = slot;
     state.mu.lock();
     defer state.mu.unlock();
     if (!state.initialized) return;
     state.coalesce_events +%= 1;
+    appendTimelineLocked(.message, bus_name, "coalesced");
 }
 
 pub fn recordPluginCrash(plugin_id: []const u8) void {
-    _ = plugin_id;
     state.mu.lock();
     defer state.mu.unlock();
     if (!state.initialized) return;
     state.plugin_crashes +%= 1;
+    appendTimelineLocked(.plugin, plugin_id, "crashed");
 }
 
 pub fn recordSupervisorRestart() void {
@@ -133,6 +160,14 @@ pub fn recordSupervisorRestart() void {
     defer state.mu.unlock();
     if (!state.initialized) return;
     state.supervisor_restarts +%= 1;
+    appendTimelineLocked(.supervisor, "runtime", "restart");
+}
+
+pub fn recordTimeline(kind: TimelineKind, name: []const u8, detail: []const u8) void {
+    state.mu.lock();
+    defer state.mu.unlock();
+    if (!state.initialized) return;
+    appendTimelineLocked(kind, name, detail);
 }
 
 // -----------------------------------------------------------------------------
@@ -185,11 +220,48 @@ pub const BusSendStats = struct {
     stats: SendStats,
 };
 
+pub fn snapshotTimeline(allocator: std.mem.Allocator) ![]TimelineEntry {
+    state.mu.lock();
+    defer state.mu.unlock();
+    if (!state.initialized) return allocator.alloc(TimelineEntry, 0);
+
+    var list = std.ArrayListUnmanaged(TimelineEntry).empty;
+    errdefer {
+        for (list.items) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.detail);
+        }
+        list.deinit(allocator);
+    }
+
+    for (state.timeline.items) |entry| {
+        const name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(name);
+        const detail = try allocator.dupe(u8, entry.detail);
+        errdefer allocator.free(detail);
+        try list.append(allocator, .{
+            .timestamp_ms = entry.timestamp_ms,
+            .kind = entry.kind,
+            .name = name,
+            .detail = detail,
+        });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+pub fn freeTimelineSnapshot(allocator: std.mem.Allocator, timeline: []TimelineEntry) void {
+    for (timeline) |entry| {
+        allocator.free(entry.name);
+        allocator.free(entry.detail);
+    }
+    allocator.free(timeline);
+}
+
 // -----------------------------------------------------------------------------
 // Internals
 // -----------------------------------------------------------------------------
 
-const BumpKind = enum { sent, dropped_full, dropped_backpressure };
+const BumpKind = enum { sent, dropped_full, dropped_backpressure, dropped_rate_limited };
 
 fn bumpSend(bus_name: []const u8, kind: BumpKind) void {
     const gop = state.sends_per_bus.getOrPut(state.allocator, bus_name) catch return;
@@ -209,21 +281,57 @@ fn bumpSend(bus_name: []const u8, kind: BumpKind) void {
         .sent => gop.value_ptr.sent +%= 1,
         .dropped_full => gop.value_ptr.dropped_full +%= 1,
         .dropped_backpressure => gop.value_ptr.dropped_backpressure +%= 1,
+        .dropped_rate_limited => gop.value_ptr.dropped_rate_limited +%= 1,
     }
 }
 
+fn appendTimelineLocked(kind: TimelineKind, name: []const u8, detail: []const u8) void {
+    if (state.timeline_capacity == 0) return;
+
+    const name_copy = state.allocator.dupe(u8, name) catch return;
+    const detail_copy = state.allocator.dupe(u8, detail) catch {
+        state.allocator.free(name_copy);
+        return;
+    };
+
+    while (state.timeline.items.len >= state.timeline_capacity) {
+        const removed = state.timeline.orderedRemove(0);
+        state.allocator.free(removed.name);
+        state.allocator.free(removed.detail);
+    }
+
+    state.timeline.append(state.allocator, .{
+        .timestamp_ms = vigil_api.milliTimestamp(),
+        .kind = kind,
+        .name = name_copy,
+        .detail = detail_copy,
+    }) catch {
+        state.allocator.free(name_copy);
+        state.allocator.free(detail_copy);
+    };
+}
+
+fn clearTimelineLocked() void {
+    for (state.timeline.items) |entry| {
+        state.allocator.free(entry.name);
+        state.allocator.free(entry.detail);
+    }
+    state.timeline.deinit(state.allocator);
+    state.timeline = .empty;
+}
+
 fn onProcessCrashed(event: vigil.telemetry.Event) void {
-    _ = event;
     state.mu.lock();
     defer state.mu.unlock();
     state.plugin_crashes +%= 1;
+    appendTimelineLocked(.plugin, event.metadata orelse "process", "crashed");
 }
 
 fn onSupervisorRestart(event: vigil.telemetry.Event) void {
-    _ = event;
     state.mu.lock();
     defer state.mu.unlock();
     state.supervisor_restarts +%= 1;
+    appendTimelineLocked(.supervisor, event.metadata orelse "supervisor", "restart");
 }
 
 // -----------------------------------------------------------------------------
@@ -269,4 +377,21 @@ test "telemetry: init and deinit can repeat" {
     const s = Self.snapshot();
     try std.testing.expectEqual(@as(u64, 8), s.bytes_sent);
     Self.deinit();
+}
+
+test "telemetry: bounded timeline records runtime and flow-control events" {
+    try Self.init(std.testing.allocator);
+    defer Self.deinit();
+
+    Self.recordTimeline(.runtime, "shutdown", "begin");
+    Self.recordMessageDropped("test-bus", "bulk", 8, "rate_limit");
+
+    const timeline = try Self.snapshotTimeline(std.testing.allocator);
+    defer Self.freeTimelineSnapshot(std.testing.allocator, timeline);
+
+    try std.testing.expect(timeline.len >= 2);
+    try std.testing.expectEqual(TimelineKind.runtime, timeline[0].kind);
+    try std.testing.expectEqualStrings("shutdown", timeline[0].name);
+    try std.testing.expectEqualStrings("begin", timeline[0].detail);
+    try std.testing.expectEqual(TimelineKind.flow_control, timeline[1].kind);
 }
