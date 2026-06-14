@@ -24,7 +24,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const vigil = @import("vigil");
+const vigil_api = @import("vigil_adapters.zig");
 
 const log = std.log.scoped(.SearchIndex);
 
@@ -33,7 +33,7 @@ pub const SearchIndex = struct {
     io: std.Io,
     environ_block: std.process.Environ.Block,
 
-    mu: vigil.compat.Mutex = .{},
+    mu: vigil_api.Mutex = .{},
 
     /// Absolute workspace root the cached list is keyed against.
     /// `null` until `startIndexing` is called. Owned by the index.

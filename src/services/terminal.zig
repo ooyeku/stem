@@ -1,5 +1,4 @@
 const std = @import("std");
-const vigil = @import("vigil");
 const protocol = @import("../kernel/protocol.zig");
 const builtin = @import("builtin");
 const platform = @import("../kernel/platform.zig");

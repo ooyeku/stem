@@ -12,6 +12,8 @@ const LSPManager = @import("lsp_manager.zig").LSPManager;
 const LSPServer = @import("lsp/server.zig").LSPServer;
 const Transport = @import("../lsp/transport.zig");
 const TestIo = @import("../test_utils.zig").TestIo;
+const vigil_api = @import("vigil_adapters.zig");
+const vigil_supervision = @import("vigil_supervision.zig");
 
 fn mockRunFn(allocator: std.mem.Allocator, input_pipe: *Transport.MemPipe, output_pipe: *Transport.MemPipe) void {
     _ = allocator;
@@ -91,4 +93,38 @@ test "LSPManager: stop missing server is safe" {
 
     manager.stopServerLang("nonexistent");
     manager.stopServer();
+}
+
+test "LSPManager: health snapshot reports server and supervisor state" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var manager = LSPManager.init(allocator, io, .empty);
+    defer manager.deinit();
+
+    var runtime = try vigil_api.runtime(allocator, .{});
+    defer runtime.deinit();
+    var supervisor = vigil_supervision.ComponentSupervisor.init(allocator, &runtime, .lsp);
+    defer supervisor.deinit();
+    manager.setVigilSupervisor(&supervisor);
+
+    var zig_server = try LSPServer.init(allocator, io, "zig");
+    errdefer zig_server.deinit();
+    zig_server.server_running.store(true, .release);
+    zig_server.server_healthy.store(false, .release);
+    try manager.servers.put("zig", zig_server);
+    manager.recordLspRestartScheduledForTest("zig", 0, 1);
+
+    var snapshot = try manager.healthSnapshot(allocator);
+    defer snapshot.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), snapshot.servers.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.running_servers);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.unhealthy_servers);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.lifecycle.crashes);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.lifecycle.restarts_scheduled);
+    try std.testing.expectEqualStrings("zig", snapshot.servers[0].lang);
+    try std.testing.expect(snapshot.servers[0].running);
+    try std.testing.expect(!snapshot.servers[0].healthy);
 }

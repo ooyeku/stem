@@ -1,5 +1,6 @@
 const std = @import("std");
-const vigil = @import("vigil");
+const vigil_api = @import("vigil_adapters.zig");
+const vigil = vigil_api.raw;
 const event_topics = @import("event_topics.zig");
 
 pub const ComponentKind = enum {
@@ -17,7 +18,7 @@ pub const ComponentSupervisor = struct {
     kind: ComponentKind,
     supervisor: vigil.Supervisor,
     event_broker: ?*vigil.pubsub.PubSubBroker = null,
-    stats_mu: vigil.compat.Mutex = .{},
+    stats_mu: vigil_api.Mutex = .{},
     stats: Snapshot = .{},
 
     pub fn init(
@@ -52,7 +53,7 @@ pub const ComponentSupervisor = struct {
 
         vigil.telemetry.emit(.{
             .event_type = .process_crashed,
-            .timestamp_ms = vigil.compat.milliTimestamp(),
+            .timestamp_ms = vigil_api.milliTimestamp(),
             .metadata = component_id,
         });
 
@@ -78,7 +79,7 @@ pub const ComponentSupervisor = struct {
 
         vigil.telemetry.emit(.{
             .event_type = .supervisor_restart,
-            .timestamp_ms = vigil.compat.milliTimestamp(),
+            .timestamp_ms = vigil_api.milliTimestamp(),
             .metadata = component_id,
         });
 

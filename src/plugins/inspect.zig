@@ -34,6 +34,18 @@ pub fn writeReport(
     try out.print("=== Stem Plugin Inspector ===\n", .{});
     try out.print("Root: {s}\n\n", .{plugins_root});
 
+    if (manager) |m| {
+        const health = m.healthSnapshot();
+        try out.print("Runtime Health\n", .{});
+        try out.print("- loaded: {d} ({d} wasm, {d} exec)\n", .{ health.loaded_plugins, health.wasm_plugins, health.process_plugins });
+        try out.print("- vigil broker: {s}\n", .{if (health.vigil_broker_attached) "attached" else "missing"});
+        try out.print("- lifecycle supervisor: {s}\n", .{if (health.vigil_supervisor_attached) "attached" else "missing"});
+        try out.print("- crashes: {d}\n", .{health.lifecycle.crashes});
+        try out.print("- restarts scheduled: {d}\n", .{health.lifecycle.restarts_scheduled});
+        try out.print("- event subscribers: {d}\n", .{health.event_subscribers});
+        try out.print("- pending restarts: {d}\n\n", .{health.pending_restarts});
+    }
+
     var dir = std.Io.Dir.openDirAbsolute(io, plugins_root, .{ .iterate = true }) catch |err| {
         if (err == error.FileNotFound) {
             try out.print("No plugins installed yet.\n", .{});

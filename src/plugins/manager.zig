@@ -18,7 +18,6 @@
 
 const std = @import("std");
 const log = std.log.scoped(.PluginManager);
-const vigil = @import("vigil");
 const protocol = @import("../kernel/protocol.zig");
 const CommandRegistry = @import("../kernel/command.zig").CommandRegistry;
 const MessageBus = @import("../kernel/message_bus.zig").MessageBus;
@@ -31,6 +30,7 @@ const jsonrpc = @import("jsonrpc.zig");
 const logger_service = @import("../services/logger.zig");
 const telemetry = @import("../services/telemetry.zig");
 const event_topics = @import("../services/event_topics.zig");
+const vigil_api = @import("../services/vigil_adapters.zig");
 const vigil_supervision = @import("../services/vigil_supervision.zig");
 
 /// Wire-protocol version handed to exec plugins on `plugin/initialize`.
@@ -48,7 +48,7 @@ pub const PluginManager = struct {
     /// permission lookups must be serialised. Core's main thread takes
     /// the same lock when it mutates plugin state on tick / load /
     /// unload, which gives both sides a single ordering.
-    state_mu: vigil.compat.Mutex = .{},
+    state_mu: vigil_api.Mutex = .{},
 
     /// Plugins whose reader thread observed EOF/error. Populated from
     /// the reader thread (off-loop); drained by core on tick via
@@ -88,8 +88,8 @@ pub const PluginManager = struct {
     /// reply (or error) is dispatched back.
     pending_requests: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
 
-    core_inbox: ?*vigil.Inbox = null,
-    event_broker: ?*vigil.pubsub.PubSubBroker = null,
+    core_inbox: ?*vigil_api.Inbox = null,
+    event_broker: ?*vigil_api.PubSubBroker = null,
     lifecycle_supervisor: ?*vigil_supervision.ComponentSupervisor = null,
     ui_bus: *MessageBus,
 
@@ -142,6 +142,23 @@ pub const PluginManager = struct {
         due_ms: i64,
     };
 
+    pub const HealthSnapshot = struct {
+        loaded_plugins: usize = 0,
+        process_plugins: usize = 0,
+        wasm_plugins: usize = 0,
+        pending_exits: usize = 0,
+        pending_restarts: usize = 0,
+        pending_requests: usize = 0,
+        restart_policies: usize = 0,
+        event_subscribers: usize = 0,
+        status_items: usize = 0,
+        panels: usize = 0,
+        keybindings: usize = 0,
+        vigil_broker_attached: bool = false,
+        vigil_supervisor_attached: bool = false,
+        lifecycle: vigil_supervision.Snapshot = .{},
+    };
+
     const PluginKeybinding = struct {
         command_id: []u8,
         plugin_id: []u8,
@@ -183,11 +200,41 @@ pub const PluginManager = struct {
 
     pub fn setVigilServices(
         self: *PluginManager,
-        event_broker: *vigil.pubsub.PubSubBroker,
+        event_broker: *vigil_api.PubSubBroker,
         lifecycle_supervisor: *vigil_supervision.ComponentSupervisor,
     ) void {
         self.event_broker = event_broker;
         self.lifecycle_supervisor = lifecycle_supervisor;
+    }
+
+    pub fn healthSnapshot(self: *PluginManager) HealthSnapshot {
+        self.state_mu.lock();
+        var snapshot = HealthSnapshot{
+            .process_plugins = self.process_plugins.count(),
+            .wasm_plugins = self.wasm_plugins.count(),
+            .pending_exits = self.pending_exits.items.len,
+            .pending_restarts = self.pending_restarts.items.len,
+            .pending_requests = self.pending_requests.count(),
+            .restart_policies = self.restart_policies.count(),
+            .status_items = self.status_items.count(),
+            .panels = self.panels.count(),
+            .keybindings = self.plugin_keybindings.count(),
+            .vigil_broker_attached = self.event_broker != null,
+            .vigil_supervisor_attached = self.lifecycle_supervisor != null,
+        };
+        snapshot.loaded_plugins = snapshot.process_plugins + snapshot.wasm_plugins;
+
+        var ev_it = self.event_subscribers.valueIterator();
+        while (ev_it.next()) |subs| {
+            snapshot.event_subscribers += subs.items.len;
+        }
+        const supervisor = self.lifecycle_supervisor;
+        self.state_mu.unlock();
+
+        if (supervisor) |s| {
+            snapshot.lifecycle = s.snapshot();
+        }
+        return snapshot;
     }
 
     pub fn deinit(self: *PluginManager) void {
@@ -841,7 +888,7 @@ pub const PluginManager = struct {
     fn scheduleRestart(self: *PluginManager, name_owned: []u8) !void {
         // Snapshot a stable handle for the post-unlock inbox poke so
         // we never call into another subsystem with `state_mu` held.
-        var inbox_snapshot: ?*vigil.Inbox = null;
+        var inbox_snapshot: ?*vigil_api.Inbox = null;
         var restart_delay_ms: i64 = 0;
         var restart_attempt: u32 = 0;
 
@@ -1911,7 +1958,7 @@ pub const PluginManager = struct {
                 var elapsed: u32 = 0;
                 while (elapsed < ctx.timeout_ms) {
                     if (ctx.done.load(.acquire)) return;
-                    vigil.compat.sleep(step_ms * std.time.ns_per_ms);
+                    vigil_api.sleep(step_ms * std.time.ns_per_ms);
                     elapsed += step_ms;
                 }
                 if (ctx.done.load(.acquire)) return;
@@ -2373,7 +2420,7 @@ pub const PluginManager = struct {
             return;
         }
 
-        if (vigil.pubsub.getGlobal()) |broker| {
+        if (vigil_api.globalBroker()) |broker| {
             _ = broker.publish(topic, data) catch |err| {
                 log.warn("pubsub publish '{s}' failed: {}", .{ topic, err });
             };
@@ -2440,7 +2487,7 @@ test "broadcastEvent publishes legacy and editor topics through owned broker" {
     defer io_ctx.deinit();
     const io = io_ctx.io();
 
-    const ui_inbox = try vigil.inbox(allocator);
+    const ui_inbox = try vigil_api.standaloneInboxForTest(allocator);
     defer ui_inbox.close();
     var ui_bus = MessageBus.init(allocator, ui_inbox, "test-ui");
 
@@ -2450,9 +2497,9 @@ test "broadcastEvent publishes legacy and editor topics through owned broker" {
     var manager = PluginManager.init(allocator, io, .empty, &ui_bus, &registry);
     defer manager.deinit();
 
-    var runtime = try vigil.runtime(allocator, .{});
+    var runtime = try vigil_api.runtime(allocator, .{});
     defer runtime.deinit();
-    var broker = vigil.pubsub.PubSubBroker.init(allocator);
+    var broker = vigil_api.PubSubBroker.init(allocator);
     defer broker.deinit();
     var supervisor = vigil_supervision.ComponentSupervisor.init(allocator, &runtime, .plugins);
     defer supervisor.deinit();
@@ -2461,14 +2508,14 @@ test "broadcastEvent publishes legacy and editor topics through owned broker" {
 
     const legacy_inbox = try runtime.inbox(.{ .capacity = 4 });
     defer legacy_inbox.close();
-    var legacy_sub = vigil.pubsub.Subscriber.init(allocator, legacy_inbox);
+    var legacy_sub = vigil_api.Subscriber.init(allocator, legacy_inbox);
     defer legacy_sub.deinit();
     try legacy_sub.subscribe(&[_][]const u8{"buffer.changed"});
     try broker.subscribe(&legacy_sub);
 
     const editor_inbox = try runtime.inbox(.{ .capacity = 4 });
     defer editor_inbox.close();
-    var editor_sub = vigil.pubsub.Subscriber.init(allocator, editor_inbox);
+    var editor_sub = vigil_api.Subscriber.init(allocator, editor_inbox);
     defer editor_sub.deinit();
     try editor_sub.subscribe(&[_][]const u8{"editor.buffer.changed"});
     try broker.subscribe(&editor_sub);
@@ -2482,6 +2529,42 @@ test "broadcastEvent publishes legacy and editor topics through owned broker" {
     var editor_msg = try editor_inbox.recv();
     defer editor_msg.deinit();
     try std.testing.expectEqualStrings("main.zig", editor_msg.payload.?);
+}
+
+test "PluginManager health snapshot reports Vigil lifecycle wiring" {
+    const allocator = std.testing.allocator;
+    var io_ctx = @import("../test_utils.zig").TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+
+    const ui_inbox = try vigil_api.standaloneInboxForTest(allocator);
+    defer ui_inbox.close();
+    var ui_bus = MessageBus.init(allocator, ui_inbox, "test-ui");
+
+    var registry = CommandRegistry.init(allocator);
+    defer registry.deinit();
+
+    var manager = PluginManager.init(allocator, io, .empty, &ui_bus, &registry);
+    defer manager.deinit();
+
+    var runtime = try vigil_api.runtime(allocator, .{});
+    defer runtime.deinit();
+    var broker = vigil_api.PubSubBroker.init(allocator);
+    defer broker.deinit();
+    var supervisor = vigil_supervision.ComponentSupervisor.init(allocator, &runtime, .plugins);
+    defer supervisor.deinit();
+    supervisor.setEventBroker(&broker);
+    manager.setVigilServices(&broker, &supervisor);
+
+    supervisor.recordCrash("git");
+    supervisor.recordRestartScheduled("git", 1000, 1);
+
+    const snapshot = manager.healthSnapshot();
+    try std.testing.expect(snapshot.vigil_broker_attached);
+    try std.testing.expect(snapshot.vigil_supervisor_attached);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.loaded_plugins);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.lifecycle.crashes);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.lifecycle.restarts_scheduled);
 }
 
 test "filesystemListAllows: rejects parent-dir traversal even when the glob would match" {

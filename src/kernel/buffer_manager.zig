@@ -334,9 +334,20 @@ pub const BufferManager = struct {
     pub fn openVirtual(self: *BufferManager, name: []const u8, content: []const u8) !void {
         for (self.buffers.items, 0..) |*buf, i| {
             if (std.mem.eql(u8, buf.name, name)) {
+                const cursor_row = buf.state.cursor_row;
+                const cursor_col = buf.state.cursor_col;
+                const scroll_offset = buf.state.scroll_offset;
+                const opened_from = buf.opened_from;
+
                 buf.state.deinit();
                 buf.state = try self.newState(content);
                 buf.state.modified = false;
+                const line_count = buf.state.buffer.lineCount();
+                const max_row = if (line_count == 0) 0 else line_count - 1;
+                buf.state.cursor_row = @min(cursor_row, max_row);
+                buf.state.cursor_col = @min(cursor_col, buf.state.getLineLength(buf.state.cursor_row));
+                buf.state.scroll_offset = @min(scroll_offset, max_row);
+                buf.opened_from = opened_from;
                 self.active_index = i;
                 return;
             }
@@ -587,6 +598,28 @@ test "buffer manager open virtual updates existing" {
 
     const buf = mgr.getActive();
     try std.testing.expectEqualStrings("my-buffer", buf.name);
+}
+
+test "buffer manager open virtual update preserves viewport state" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var mgr = BufferManager.init(allocator, io);
+    defer mgr.deinit();
+
+    try mgr.openVirtual("[STATS]", "line 1\nline 2\nline 3\nline 4\nline 5\n");
+    mgr.getActive().state.cursor_row = 3;
+    mgr.getActive().state.cursor_col = 2;
+    mgr.getActive().state.scroll_offset = 2;
+
+    try mgr.openVirtual("[STATS]", "line 1 updated\nline 2 updated\nline 3 updated\nline 4 updated\nline 5 updated\n");
+
+    const buf = mgr.getActive();
+    try std.testing.expectEqualStrings("[STATS]", buf.name);
+    try std.testing.expectEqual(@as(usize, 3), buf.state.cursor_row);
+    try std.testing.expectEqual(@as(usize, 2), buf.state.cursor_col);
+    try std.testing.expectEqual(@as(usize, 2), buf.state.scroll_offset);
 }
 
 test "buffer manager switch to buffer" {

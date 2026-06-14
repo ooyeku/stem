@@ -392,6 +392,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // process-local telemetry bridge, the editor event broker, and
     // lifecycle supervisors for plugins/LSP.
     var stem_runtime = try StemRuntime.init(allocator);
+    stem_runtime.attachEventBroker();
     defer stem_runtime.deinit();
 
     const inbox_allocator = allocator;

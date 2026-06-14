@@ -1,5 +1,6 @@
 const std = @import("std");
-const vigil = @import("vigil");
+const vigil_api = @import("vigil_adapters.zig");
+const vigil = vigil_api.raw;
 const telemetry = @import("telemetry.zig");
 const vigil_supervision = @import("vigil_supervision.zig");
 
@@ -16,8 +17,17 @@ pub const StemRuntime = struct {
     lsp_supervisor: vigil_supervision.ComponentSupervisor,
     telemetry_initialized: bool = false,
 
+    pub const HealthSnapshot = struct {
+        vigil_major: u32,
+        vigil_minor: u32,
+        vigil_patch: u32,
+        telemetry_initialized: bool,
+        plugin_supervisor: vigil_supervision.Snapshot,
+        lsp_supervisor: vigil_supervision.Snapshot,
+    };
+
     pub fn init(allocator: std.mem.Allocator) !StemRuntime {
-        var vigil_runtime = try vigil.runtime(allocator, .{});
+        var vigil_runtime = try vigil_api.runtime(allocator, .{});
         errdefer vigil_runtime.deinit();
 
         var event_broker = vigil.pubsub.PubSubBroker.init(allocator);
@@ -30,11 +40,9 @@ pub const StemRuntime = struct {
 
         var plugin_supervisor = vigil_supervision.ComponentSupervisor.init(allocator, &vigil_runtime, .plugins);
         errdefer plugin_supervisor.deinit();
-        plugin_supervisor.setEventBroker(&event_broker);
 
         var lsp_supervisor = vigil_supervision.ComponentSupervisor.init(allocator, &vigil_runtime, .lsp);
         errdefer lsp_supervisor.deinit();
-        lsp_supervisor.setEventBroker(&event_broker);
 
         return .{
             .allocator = allocator,
@@ -44,6 +52,11 @@ pub const StemRuntime = struct {
             .lsp_supervisor = lsp_supervisor,
             .telemetry_initialized = telemetry_initialized,
         };
+    }
+
+    pub fn attachEventBroker(self: *StemRuntime) void {
+        self.plugin_supervisor.setEventBroker(&self.event_broker);
+        self.lsp_supervisor.setEventBroker(&self.event_broker);
     }
 
     pub fn deinit(self: *StemRuntime) void {
@@ -58,13 +71,25 @@ pub const StemRuntime = struct {
     }
 
     pub fn createEditorInboxes(self: *StemRuntime) !EditorInboxes {
-        const main_inbox = try self.vigil_runtime.inbox(.{});
+        const main_inbox = try vigil_api.createInbox(&self.vigil_runtime);
         errdefer main_inbox.close();
 
-        const core_inbox = try self.vigil_runtime.inbox(.{});
+        const core_inbox = try vigil_api.createInbox(&self.vigil_runtime);
         return .{
             .main = main_inbox,
             .core = core_inbox,
+        };
+    }
+
+    pub fn healthSnapshot(self: *StemRuntime) HealthSnapshot {
+        const version = vigil.getVersion();
+        return .{
+            .vigil_major = version.major,
+            .vigil_minor = version.minor,
+            .vigil_patch = version.patch,
+            .telemetry_initialized = self.telemetry_initialized,
+            .plugin_supervisor = self.plugin_supervisor.snapshot(),
+            .lsp_supervisor = self.lsp_supervisor.snapshot(),
         };
     }
 
@@ -75,6 +100,7 @@ pub const StemRuntime = struct {
 
 test "StemRuntime owns Vigil runtime inboxes and pubsub broker" {
     var runtime = try StemRuntime.init(std.testing.allocator);
+    runtime.attachEventBroker();
     defer runtime.deinit();
 
     const version = vigil.getVersion();
@@ -95,6 +121,7 @@ test "StemRuntime owns Vigil runtime inboxes and pubsub broker" {
 
 test "StemRuntime pubsub broker fans out editor topics" {
     var runtime = try StemRuntime.init(std.testing.allocator);
+    runtime.attachEventBroker();
     defer runtime.deinit();
 
     var inbox = try runtime.vigil_runtime.inbox(.{ .capacity = 4 });
@@ -110,4 +137,19 @@ test "StemRuntime pubsub broker fans out editor topics" {
     var msg = try inbox.recv();
     defer msg.deinit();
     try std.testing.expectEqualStrings("main.zig", msg.payload.?);
+}
+
+test "StemRuntime health snapshot includes Vigil version and supervisors" {
+    var runtime = try StemRuntime.init(std.testing.allocator);
+    runtime.attachEventBroker();
+    defer runtime.deinit();
+
+    runtime.plugin_supervisor.recordCrash("git");
+    runtime.lsp_supervisor.recordRestartScheduled("zig", 0, 1);
+
+    const snapshot = runtime.healthSnapshot();
+    try std.testing.expectEqual(@as(u32, 2), snapshot.vigil_major);
+    try std.testing.expect(snapshot.telemetry_initialized);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.plugin_supervisor.crashes);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.lsp_supervisor.restarts_scheduled);
 }

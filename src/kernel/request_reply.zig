@@ -22,8 +22,8 @@
 //! trampoline so the protocol decoder stays untouched.
 
 const std = @import("std");
-const vigil = @import("vigil");
-const Mutex = vigil.compat.Mutex;
+const vigil_api = @import("../services/vigil_adapters.zig");
+const Mutex = vigil_api.Mutex;
 
 /// Opaque callback. The trampoline interprets `payload` as the
 /// concrete reply type and forwards to the typed callback the caller
@@ -73,7 +73,7 @@ pub const RequestTracker = struct {
     ) !u64 {
         const id = self.next_id.fetchAdd(1, .acq_rel);
         const deadline: i64 = if (timeout_ms) |t|
-            vigil.compat.milliTimestamp() + @as(i64, t)
+            vigil_api.milliTimestamp() + @as(i64, t)
         else
             0;
         self.mu.lock();
@@ -106,7 +106,7 @@ pub const RequestTracker = struct {
     /// to invoke the trampoline with an "expired" payload, but that's
     /// orthogonal — keeping `sweep` side-effect-free here.
     pub fn sweepExpired(self: *RequestTracker) usize {
-        const now_ms = vigil.compat.milliTimestamp();
+        const now_ms = vigil_api.milliTimestamp();
         self.mu.lock();
         defer self.mu.unlock();
         var expired: usize = 0;
@@ -189,7 +189,7 @@ test "RequestTracker: timeout sweep" {
     var cb: u8 = 0;
     // 1 ms timeout — definitely expired by the time we sweep.
     _ = try tracker.register(@ptrCast(&u), @ptrCast(&cb), testTrampoline, 1);
-    vigil.compat.sleep(5 * std.time.ns_per_ms);
+    vigil_api.sleep(5 * std.time.ns_per_ms);
     const swept = tracker.sweepExpired();
     try std.testing.expectEqual(@as(usize, 1), swept);
     try std.testing.expectEqual(@as(usize, 0), tracker.pendingCount());
@@ -202,7 +202,7 @@ test "RequestTracker: no timeout means no sweep" {
     var u: TestUser = .{};
     var cb: u8 = 0;
     _ = try tracker.register(@ptrCast(&u), @ptrCast(&cb), testTrampoline, null);
-    vigil.compat.sleep(2 * std.time.ns_per_ms);
+    vigil_api.sleep(2 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(usize, 0), tracker.sweepExpired());
     try std.testing.expectEqual(@as(usize, 1), tracker.pendingCount());
 }

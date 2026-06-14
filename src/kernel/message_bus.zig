@@ -26,12 +26,13 @@
 //!      runaway producer.
 
 const std = @import("std");
-const vigil = @import("vigil");
+const vigil_api = @import("../services/vigil_adapters.zig");
+const vigil = vigil_api.raw;
 const telemetry_mod = @import("../services/telemetry.zig");
 
-const MessagePriority = vigil.MessagePriority;
-const Message = vigil.Message;
-const Mutex = vigil.compat.Mutex;
+const MessagePriority = vigil_api.MessagePriority;
+const Message = vigil_api.Message;
+const Mutex = vigil_api.Mutex;
 
 /// QoS class for an outgoing message. The class fixes both the Vigil
 /// priority and the backpressure policy.
@@ -284,7 +285,7 @@ test "MessageBus: classes map to expected Vigil priorities" {
 
 test "MessageBus: sends and counts" {
     const a = std.testing.allocator;
-    const ib = try vigil.inbox(a);
+    const ib = try vigil_api.standaloneInboxForTest(a);
     defer ib.close();
 
     var bus = MessageBus.init(a, ib, "test-bus");
@@ -308,7 +309,7 @@ test "MessageBus: sends and counts" {
 
 test "MessageBus: coalescing increments counter on subsequent sends" {
     const a = std.testing.allocator;
-    const ib = try vigil.inbox(a);
+    const ib = try vigil_api.standaloneInboxForTest(a);
     defer ib.close();
 
     var bus = MessageBus.init(a, ib, "test-bus");
@@ -332,7 +333,7 @@ test "MessageBus: coalescing increments counter on subsequent sends" {
 
 test "MessageBus: critical sends arrive before bulk on the priority queue" {
     const a = std.testing.allocator;
-    const ib = try vigil.inbox(a);
+    const ib = try vigil_api.standaloneInboxForTest(a);
     defer ib.close();
 
     var bus = MessageBus.init(a, ib, "test-bus");
@@ -358,7 +359,7 @@ test "MessageBus: critical sends arrive before bulk on the priority queue" {
 
 test "MessageBus: bulk backpressure drops over watermark" {
     const a = std.testing.allocator;
-    const ib = try vigil.inbox(a);
+    const ib = try vigil_api.standaloneInboxForTest(a);
     defer ib.close();
 
     var bus = MessageBus.init(a, ib, "test-bus");

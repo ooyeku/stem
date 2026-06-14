@@ -115,6 +115,62 @@ pub const LspCommands = struct {
         log.info("[LSP PREWARM] queued {d} new server(s) for {s}", .{ queued, cwd });
     }
 
+    pub fn cmdLspStatus(core: anytype) anyerror!void {
+        var snapshot = try core.lsp_manager.healthSnapshot(core.allocator);
+        defer snapshot.deinit(core.allocator);
+
+        var aw: std.Io.Writer.Allocating = .init(core.allocator);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+
+        try w.print(
+            \\# LSP Status
+            \\
+            \\- Servers: {d} running, {d} healthy, {d} unhealthy, {d} initializing
+            \\- Open documents: {d}
+            \\- Pending changes: {d}
+            \\- In-progress starts: {d}
+            \\- Restart-tracked languages: {d}
+            \\- Vigil lifecycle: {d} crashes, {d} restarts scheduled
+            \\
+        , .{
+            snapshot.running_servers,
+            snapshot.healthy_servers,
+            snapshot.unhealthy_servers,
+            snapshot.initializing_servers,
+            snapshot.open_documents,
+            snapshot.pending_changes,
+            snapshot.in_progress_starts,
+            snapshot.restart_tracked_languages,
+            snapshot.lifecycle.crashes,
+            snapshot.lifecycle.restarts_scheduled,
+        });
+
+        if (snapshot.servers.len == 0) {
+            try w.writeAll("\nNo LSP servers are registered yet.\n");
+        } else {
+            try w.writeAll("\n| Language | State | Restarts | Last Restart ms | Root |\n");
+            try w.writeAll("|---|---|---:|---:|---|\n");
+            for (snapshot.servers) |server| {
+                try w.print(
+                    "| `{s}` | {s} | {d} | {d} | {s} |\n",
+                    .{
+                        server.lang,
+                        lspStateLabel(server),
+                        server.restart_attempts,
+                        server.last_restart_attempt_ms,
+                        server.root_path orelse "-",
+                    },
+                );
+            }
+        }
+
+        const body = try aw.toOwnedSlice();
+        defer core.allocator.free(body);
+        try core.openVirtualBuffer("[LSP Status]", body);
+        try core.sendUpdate();
+    }
+
     pub fn cmdLspHover(core: anytype) anyerror!void {
         try core.ensureLspDocument();
 
@@ -424,5 +480,12 @@ pub const LspCommands = struct {
         try core.sendUpdate();
     }
 };
+
+fn lspStateLabel(server: lsp.LSPManager.ServerHealth) []const u8 {
+    if (!server.running) return "stopped";
+    if (!server.healthy) return "unhealthy";
+    if (!server.initialized) return "initializing";
+    return "ready";
+}
 
 const LspServerNS = @import("../../services/lsp/server.zig").LSPServer;

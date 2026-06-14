@@ -12,10 +12,11 @@
 //! observability surface easy to audit.
 
 const std = @import("std");
-const vigil = @import("vigil");
+const vigil_api = @import("vigil_adapters.zig");
+const vigil = vigil_api.raw;
 
 const Self = @This();
-const Mutex = vigil.compat.Mutex;
+const Mutex = vigil_api.Mutex;
 
 /// Process-local aggregate state. Initialized once in `init` and
 /// drained read-only via `snapshot()`.

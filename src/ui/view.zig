@@ -8,6 +8,7 @@ const LogView = @import("log_view.zig").LogView;
 const HelpView = @import("help_view.zig").HelpView;
 const protocol = @import("../kernel/protocol.zig");
 const theme = @import("theme.zig");
+const width_utils = @import("width.zig");
 
 const log = std.log.scoped(.ui_view);
 
@@ -21,6 +22,216 @@ fn logWarn(comptime fmt: []const u8, args: anytype) void {
 
 fn logDebug(comptime fmt: []const u8, args: anytype) void {
     log.debug(fmt, args);
+}
+
+const HoverLayoutInput = struct {
+    win_width: u16,
+    win_height: u16,
+    anchor_row: u16,
+    anchor_col: u16,
+    total_body_rows: usize,
+    scroll_offset: usize,
+    sticky: bool,
+    has_signature: bool,
+    loading: bool,
+};
+
+const HoverLayout = struct {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    body_visible_rows: u16,
+    body_start: usize,
+    body_end: usize,
+    show_signature: bool,
+    show_footer: bool,
+};
+
+const HoverBackdrop = struct {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+};
+
+fn hoverWidthFor(win_width: u16) u16 {
+    if (win_width <= 2) return win_width;
+
+    const desired = (@as(usize, win_width) * 55) / 100;
+    const clamped = std.math.clamp(desired, @as(usize, 40), @as(usize, 96));
+    const available = @as(usize, win_width -| 2);
+    const picked = @min(clamped, available);
+
+    if (picked < 12) return @intCast(picked);
+    return @intCast(picked);
+}
+
+fn hoverChromeRows(show_signature: bool, show_footer: bool) u16 {
+    const top_border: u16 = 1;
+    const header_lines: u16 = 1;
+    const header_divider: u16 = 1;
+    const signature_rows: u16 = if (show_signature) 2 else 0;
+    const footer_rows: u16 = if (show_footer) 2 else 0;
+    const bottom_border: u16 = 1;
+    return top_border + header_lines + header_divider + signature_rows + footer_rows + bottom_border;
+}
+
+fn boxXForDims(win_width: u16, width: u16, anchor_col: u16) u16 {
+    const margin: u16 = 1;
+    const max_x: u16 = if (win_width > width + margin) win_width - width - margin else 0;
+    return @min(anchor_col, max_x);
+}
+
+fn computeHoverLayout(input: HoverLayoutInput) ?HoverLayout {
+    if (input.win_width < 14 or input.win_height < 4) return null;
+
+    const width = hoverWidthFor(input.win_width);
+    if (width < 4) return null;
+
+    const max_height: u16 = @intCast(@min(@as(usize, input.win_height), @as(usize, 20)));
+    if (max_height < 4) return null;
+
+    const body_start = @min(input.scroll_offset, input.total_body_rows);
+    var natural_body_rows = input.total_body_rows - body_start;
+    if (natural_body_rows == 0 and input.loading) natural_body_rows = 1;
+    const body_min: u16 = if (natural_body_rows > 0) 1 else 0;
+
+    var show_signature = input.has_signature;
+    var show_footer = input.sticky;
+    while (hoverChromeRows(show_signature, show_footer) + body_min > max_height) {
+        if (show_footer) {
+            show_footer = false;
+        } else if (show_signature) {
+            show_signature = false;
+        } else {
+            return null;
+        }
+    }
+
+    const chrome_rows = hoverChromeRows(show_signature, show_footer);
+    if (chrome_rows > max_height) return null;
+
+    const body_capacity = max_height - chrome_rows;
+    const body_visible_rows: u16 = @intCast(@min(
+        natural_body_rows,
+        @as(usize, body_capacity),
+    ));
+    const height = chrome_rows + body_visible_rows;
+    if (height == 0 or height > input.win_height) return null;
+
+    const anchor_row = @min(input.anchor_row, input.win_height - 1);
+    const anchor_col = @min(input.anchor_col, input.win_width - 1);
+    const space_above = anchor_row;
+    const space_below = input.win_height -| (anchor_row + 1);
+
+    var y: u16 = 0;
+    if (space_below >= height) {
+        y = anchor_row + 1;
+    } else if (space_above >= height) {
+        y = anchor_row - height;
+    } else if (space_below >= space_above) {
+        y = @min(anchor_row + 1, input.win_height - height);
+    } else {
+        y = if (anchor_row >= height) anchor_row - height else 0;
+    }
+    if (y + height > input.win_height) y = input.win_height - height;
+
+    const body_end = @min(input.total_body_rows, body_start + @as(usize, body_visible_rows));
+
+    return .{
+        .x = boxXForDims(input.win_width, width, anchor_col),
+        .y = y,
+        .width = width,
+        .height = height,
+        .body_visible_rows = body_visible_rows,
+        .body_start = body_start,
+        .body_end = body_end,
+        .show_signature = show_signature,
+        .show_footer = show_footer,
+    };
+}
+
+fn computeHoverBackdrop(layout: HoverLayout) HoverBackdrop {
+    return .{
+        .x = layout.x,
+        .y = layout.y,
+        .width = layout.width,
+        .height = layout.height,
+    };
+}
+
+fn shouldDrawSignatureHelp(hover_visible: bool) bool {
+    return !hover_visible;
+}
+
+fn hoverFooterText(
+    frame_allocator: std.mem.Allocator,
+    body_start: usize,
+    visible_rows: usize,
+    body_total_rows: usize,
+) ![]const u8 {
+    const shown_end = @min(body_start + visible_rows, body_total_rows);
+    const scrollable = body_start > 0 or shown_end < body_total_rows;
+    if (!scrollable) return "Esc dismiss · j/k scroll";
+
+    const shown_start = if (body_total_rows == 0) 0 else @min(body_start + 1, body_total_rows);
+    return try std.fmt.allocPrint(frame_allocator, "Esc dismiss · j/k scroll · {d}-{d}/{d}", .{
+        shown_start,
+        shown_end,
+        body_total_rows,
+    });
+}
+
+/// Clip `text` to at most `max_cells` display columns for a *single*
+/// screen row, respecting UTF-8 and wide-character boundaries.
+///
+/// Stops at the first line break: vaxis prints in grapheme-wrap mode,
+/// where an embedded `\n` resets the cursor to column 0 and spills the
+/// remainder of the text outside the popup box (it bleeds into the
+/// gutter on the rows below). Callers that need multiple rows must
+/// split on `\n` themselves before clipping each line.
+fn clipTextToCells(text: []const u8, max_cells: usize) []const u8 {
+    if (max_cells == 0 or text.len == 0) return "";
+
+    var cells: usize = 0;
+    var i: usize = 0;
+    var end: usize = 0;
+
+    while (i < text.len) {
+        const byte = text[i];
+        var next = i + 1;
+        var cell_width: usize = 1;
+
+        // A newline would wrap to column 0 in the renderer, so a single
+        // multi-line signature/string can't be drawn as one segment.
+        // Truncate here and let the caller decide what to do with the
+        // rest.
+        if (byte == '\n' or byte == '\r') break;
+
+        if (byte == '\t') {
+            cell_width = 1;
+        } else if (byte < 0x80) {
+            cell_width = if (byte < 0x20 or byte == 0x7f) 0 else 1;
+        } else {
+            const seq_len = std.unicode.utf8ByteSequenceLength(byte) catch 1;
+            if (seq_len > 1 and i + seq_len <= text.len) {
+                if (std.unicode.utf8Decode(text[i .. i + seq_len])) |cp| {
+                    cell_width = width_utils.codepointWidth(cp);
+                    next = i + seq_len;
+                } else |_| {
+                    cell_width = 1;
+                }
+            }
+        }
+
+        if (cells + cell_width > max_cells) break;
+        cells += cell_width;
+        end = next;
+        i = next;
+    }
+
+    return text[0..end];
 }
 
 pub const TokenIndex = struct {
@@ -353,6 +564,7 @@ pub const View = struct {
                 snapshot.references_entries orelse &.{},
                 snapshot.references_selected,
                 snapshot.references_scroll_offset,
+                frame_allocator,
             );
             return;
         }
@@ -363,6 +575,7 @@ pub const View = struct {
                 snapshot.diagnostics_entries orelse &.{},
                 snapshot.diagnostics_picker_selected,
                 snapshot.diagnostics_picker_scroll_offset,
+                frame_allocator,
             );
             return;
         }
@@ -505,7 +718,7 @@ pub const View = struct {
                 .y_off = tab_height + text_height,
                 .height = terminal_output_height,
             });
-            try self.drawTerminalOutput(terminal_area, snapshot);
+            try self.drawTerminalOutput(terminal_area, snapshot, frame_allocator);
         }
 
         const is_help_buffer = blk: {
@@ -693,10 +906,10 @@ pub const View = struct {
                         current_col += 1;
                     }
                     const room = if (current_col < text_width) text_width - current_col else 0;
-                    const fit_len = @min(h.label.len, room);
-                    if (fit_len > 0) {
-                        _ = text_win.printSegment(.{ .text = h.label[0..fit_len], .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
-                        current_col += fit_len;
+                    const display = clipTextToCells(h.label, room);
+                    if (display.len > 0) {
+                        _ = text_win.printSegment(.{ .text = display, .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
+                        current_col += width_utils.displayWidth(display, 0);
                     }
                     if (h.padding_right and current_col < text_width) {
                         _ = text_win.printSegment(.{ .text = " ", .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
@@ -809,10 +1022,10 @@ pub const View = struct {
                     current_col += 1;
                 }
                 const room = if (current_col < text_width) text_width - current_col else 0;
-                const fit_len = @min(h.label.len, room);
-                if (fit_len > 0) {
-                    _ = text_win.printSegment(.{ .text = h.label[0..fit_len], .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
-                    current_col += fit_len;
+                const display = clipTextToCells(h.label, room);
+                if (display.len > 0) {
+                    _ = text_win.printSegment(.{ .text = display, .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
+                    current_col += width_utils.displayWidth(display, 0);
                 }
                 if (h.padding_right and current_col < text_width) {
                     _ = text_win.printSegment(.{ .text = " ", .style = inlay_style }, .{ .row_offset = @intCast(screen_row), .col_offset = @intCast(current_col) });
@@ -839,7 +1052,7 @@ pub const View = struct {
                     if (std.mem.indexOfScalar(u8, msg, '\n')) |nl| msg = msg[0..nl];
                     const remaining_cols = if (current_col + 4 < text_width) text_width - current_col - 4 else 0;
                     if (remaining_cols > 0 and msg.len > 0) {
-                        const display = if (msg.len > remaining_cols) msg[0..remaining_cols] else msg;
+                        const display = clipTextToCells(msg, remaining_cols);
                         const prefix = " » ";
                         _ = text_win.printSegment(.{
                             .text = prefix,
@@ -918,15 +1131,16 @@ pub const View = struct {
 
         self.drawScrollbar(text_area, total_lines, text_area.height, snapshot.scroll_offset);
 
-        if (!snapshot.completion_active and
-            (snapshot.hover_document != null or snapshot.hover_content != null or snapshot.hover_loading))
-        {
-            try self.drawHoverPopup(text_area, snapshot);
+        const hover_overlay_visible = !snapshot.completion_active and
+            (snapshot.hover_document != null or snapshot.hover_content != null or snapshot.hover_loading);
+
+        if (hover_overlay_visible) {
+            try self.drawHoverPopup(text_area, @intCast(gutter_width), snapshot, frame_allocator);
         }
 
         if (snapshot.completion_active) {
             if (snapshot.completion_items) |items| {
-                try self.drawCompletionPopup(text_area, items, snapshot.completion_selected, snapshot.cursor_row, snapshot.cursor_col, snapshot.scroll_offset);
+                try self.drawCompletionPopup(text_area, items, snapshot.completion_selected, snapshot.cursor_row, snapshot.cursor_col, snapshot.scroll_offset, frame_allocator);
             }
         }
 
@@ -934,15 +1148,17 @@ pub const View = struct {
         // mode change. Renders one-line above the cursor with the
         // active parameter underlined.
         if (snapshot.signature_help_label) |label| {
-            try self.drawSignatureHelp(
-                text_area,
-                label,
-                snapshot.signature_help_parameters orelse &.{},
-                snapshot.signature_help_active_parameter,
-                snapshot.cursor_row,
-                snapshot.cursor_col,
-                snapshot.scroll_offset,
-            );
+            if (shouldDrawSignatureHelp(hover_overlay_visible)) {
+                try self.drawSignatureHelp(
+                    text_area,
+                    label,
+                    snapshot.signature_help_parameters orelse &.{},
+                    snapshot.signature_help_active_parameter,
+                    snapshot.cursor_row,
+                    snapshot.cursor_col,
+                    snapshot.scroll_offset,
+                );
+            }
         }
 
         if (mode == .visual_search) {
@@ -1005,7 +1221,11 @@ pub const View = struct {
                     if (!snapshot.completion_active and
                         (snapshot.hover_document != null or snapshot.hover_content != null or snapshot.hover_loading))
                     {
-                        try self.drawHoverPopup(pane_win.child(.{ .y_off = 1, .height = height -| 1 }), snapshot);
+                        // Mirror the gutter width drawPaneContent uses so
+                        // the popup pins under the token, not left of it.
+                        const pane_digits = if (pane.total_lines > 0) std.math.log10_int(pane.total_lines) + 1 else 1;
+                        const pane_gutter: u16 = if (snapshot.editor_config.line_numbers != .none) @intCast(pane_digits + 1) else 0;
+                        try self.drawHoverPopup(pane_win.child(.{ .y_off = 1, .height = height -| 1 }), pane_gutter, snapshot, frame_allocator);
                     }
                 }
             }
@@ -1320,7 +1540,7 @@ pub const View = struct {
         }
     }
 
-    fn drawTerminalOutput(self: *View, win: vaxis.Window, snapshot: *const protocol.RenderSnapshot) !void {
+    fn drawTerminalOutput(self: *View, win: vaxis.Window, snapshot: *const protocol.RenderSnapshot, frame_allocator: std.mem.Allocator) !void {
         const output = snapshot.terminal_output orelse return;
         const scroll_offset = snapshot.terminal_scroll_offset;
         const is_running = snapshot.terminal_running;
@@ -1355,11 +1575,10 @@ pub const View = struct {
 
         const visible_height = if (win.height > 1) win.height - 1 else 1;
         if (total_lines > visible_height) {
-            var scroll_buf: [32]u8 = undefined;
-            const scroll_text = std.fmt.bufPrint(&scroll_buf, "[{d}/{d}] ", .{
+            const scroll_text = try std.fmt.allocPrint(frame_allocator, "[{d}/{d}] ", .{
                 @min(scroll_offset + 1, total_lines),
                 total_lines,
-            }) catch "";
+            });
 
             if (scroll_text.len > 0 and win.width > scroll_text.len + 2) {
                 const scroll_col: u16 = @intCast(win.width - scroll_text.len - 1);
@@ -1681,19 +1900,16 @@ pub const View = struct {
         };
     }
 
-    fn drawHoverPopup(self: *View, win: vaxis.Window, snapshot: *const protocol.RenderSnapshot) !void {
-        if (win.width < 14 or win.height < 6) {
+    fn drawHoverPopup(self: *View, win: vaxis.Window, gutter_width: u16, snapshot: *const protocol.RenderSnapshot, frame_allocator: std.mem.Allocator) !void {
+        if (win.width < 14 or win.height < 4) {
             logDebug("drawHoverPopup: Window too small ({}x{})", .{ win.width, win.height });
             return;
         }
 
         const styles = hoverStyles();
 
-        // Width: viewport-relative with sensible bounds so signatures
-        // breathe on wide screens but don't dominate narrow ones.
-        const desired = (@as(usize, win.width) * 55) / 100;
-        const width_usize = std.math.clamp(desired, @as(usize, 40), @as(usize, 96));
-        const width: u16 = @intCast(@min(width_usize, @as(usize, win.width -| 2)));
+        const width = hoverWidthFor(win.width);
+        if (width < 4) return;
         const inner_width: u16 = if (width > 4) width - 4 else 1;
         const text_width: usize = @intCast(inner_width);
 
@@ -1707,16 +1923,29 @@ pub const View = struct {
         var header_title: []const u8 = "Hover";
         var header_chip: ?[]const u8 = null;
         var signature_text: ?[]const u8 = null;
-        var has_doc = false;
 
         if (snapshot.hover_document) |doc| {
-            has_doc = true;
             if (doc.title) |t| header_title = t;
             if (doc.signature_language) |l| header_chip = l;
-            if (doc.signature) |sig| signature_text = sig;
+
+            // The signature panel is a single row. A one-line signature
+            // (typical for functions) goes there. A multi-line signature
+            // (a struct / enum body) can't: vaxis would wrap its embedded
+            // newlines to column 0 and bleed the fields outside the box,
+            // so render it as code rows in the scrollable body instead.
+            if (doc.signature) |sig| {
+                if (std.mem.indexOfScalar(u8, sig, '\n') == null) {
+                    signature_text = sig;
+                } else {
+                    var sig_it = std.mem.splitScalar(u8, sig, '\n');
+                    while (sig_it.next()) |line| {
+                        try wrapRows(self.allocator, &body_rows, line, styles.code, text_width, 0);
+                    }
+                }
+            }
 
             for (doc.sections, 0..) |sec, i| {
-                if (i > 0) {
+                if (i > 0 or body_rows.items.len > 0) {
                     try body_rows.append(self.allocator, .{ .text = "", .style = styles.bg });
                 }
                 switch (sec.kind) {
@@ -1740,118 +1969,71 @@ pub const View = struct {
             }
         }
 
-        // Signature panel takes 1 line plus a 1-line divider below it.
-        const has_signature = signature_text != null;
-        const sig_lines: u16 = if (has_signature) 1 else 0;
-        const sig_divider: u16 = if (has_signature) 1 else 0;
-
-        const header_lines: u16 = 1;
-        const header_divider: u16 = 1;
-        const footer_lines: u16 = if (snapshot.hover_sticky) 1 else 0;
-        const footer_divider: u16 = if (snapshot.hover_sticky) 1 else 0;
-        const top_border: u16 = 1;
-        const bottom_border: u16 = 1;
-
-        const chrome_rows: u16 =
-            top_border + header_lines + header_divider + sig_lines + sig_divider +
-            footer_divider + footer_lines + bottom_border;
-
-        // Apply scroll: scrolling drops rows off the top of the body.
-        const total_body_rows: u16 = @intCast(@min(body_rows.items.len, @as(usize, std.math.maxInt(u16))));
-        const scroll: u16 = @intCast(@min(snapshot.hover_scroll_offset, @as(usize, total_body_rows)));
-
-        // Pick popup height: prefer the natural body size, bound by
-        // viewport height. Always reserve space for chrome — and
-        // reserve at least one body row when we're in the loading
-        // state so the "Loading…" message has somewhere to land.
-        const natural_body_rows = blk: {
-            const raw = total_body_rows -| scroll;
-            if (raw == 0 and snapshot.hover_loading) break :blk 1;
-            break :blk raw;
-        };
-        const max_height: u16 = @intCast(@min(@as(usize, win.height -| 2), @as(usize, 20)));
-        const body_capacity = if (max_height > chrome_rows) max_height - chrome_rows else 1;
-        const body_visible_rows = @min(natural_body_rows, body_capacity);
-        const height: u16 = chrome_rows + body_visible_rows;
-
         // Placement. Anchor on the token (not the cursor) so the
         // popup stays put even if the cursor drifts mid-identifier.
         const anchor_screen_row: u16 = @intCast(@min(
             snapshot.hover_anchor_row -| snapshot.scroll_offset,
             @as(usize, std.math.maxInt(u16)),
         ));
+        // hover_anchor_col is a buffer-space column. The popup is
+        // drawn into the text area, whose interior is shifted right by
+        // the line-number gutter, so add the gutter width to convert to
+        // a screen column. Without this the box pins `gutter_width`
+        // cells to the left of the token and editor text bleeds against
+        // its left edge.
         const anchor_screen_col: u16 = @intCast(@min(
-            snapshot.hover_anchor_col,
+            snapshot.hover_anchor_col + @as(usize, gutter_width),
             @as(usize, std.math.maxInt(u16)),
         ));
 
-        const space_above: u16 = anchor_screen_row;
-        const space_below: u16 = win.height -| (anchor_screen_row + 1);
+        const layout = computeHoverLayout(.{
+            .win_width = win.width,
+            .win_height = win.height,
+            .anchor_row = anchor_screen_row,
+            .anchor_col = anchor_screen_col,
+            .total_body_rows = body_rows.items.len,
+            .scroll_offset = snapshot.hover_scroll_offset,
+            .sticky = snapshot.hover_sticky,
+            .has_signature = signature_text != null,
+            .loading = snapshot.hover_loading,
+        }) orelse return;
 
-        // Bias toward below-the-token (more natural reading flow),
-        // fall back to above when there's clearly more room there.
-        var box_y: u16 = 0;
-        if (space_below >= height + 1) {
-            box_y = anchor_screen_row + 1;
-        } else if (space_above >= height) {
-            box_y = anchor_screen_row -| height;
-        } else if (space_below >= 4) {
-            // Truncate body to fit below.
-            const fit_body = if (space_below > chrome_rows + 1) space_below - chrome_rows - 1 else 1;
-            const truncated_body = @min(body_visible_rows, fit_body);
-            box_y = anchor_screen_row + 1;
-            return self.renderHoverBox(
-                win,
-                box_x_for(win, width, anchor_screen_col),
-                box_y,
-                width,
-                chrome_rows + truncated_body,
-                truncated_body,
-                styles,
-                header_title,
-                header_chip,
-                signature_text,
-                body_rows.items[scroll..@min(body_rows.items.len, @as(usize, scroll) + truncated_body)],
-                snapshot,
-            );
-        } else if (space_above >= 4) {
-            const fit_body = if (space_above > chrome_rows) space_above - chrome_rows else 1;
-            const truncated_body = @min(body_visible_rows, fit_body);
-            box_y = anchor_screen_row -| (chrome_rows + truncated_body);
-            return self.renderHoverBox(
-                win,
-                box_x_for(win, width, anchor_screen_col),
-                box_y,
-                width,
-                chrome_rows + truncated_body,
-                truncated_body,
-                styles,
-                header_title,
-                header_chip,
-                signature_text,
-                body_rows.items[scroll..@min(body_rows.items.len, @as(usize, scroll) + truncated_body)],
-                snapshot,
-            );
-        } else {
-            // Last resort: pin to row 0.
-            box_y = 0;
-        }
+        clearHoverBackdrop(win, computeHoverBackdrop(layout), styles.bg);
 
-        const body_end_idx = @min(body_rows.items.len, @as(usize, scroll) + body_visible_rows);
         try self.renderHoverBox(
             win,
-            box_x_for(win, width, anchor_screen_col),
-            box_y,
-            width,
-            height,
-            body_visible_rows,
+            layout.x,
+            layout.y,
+            layout.width,
+            layout.height,
+            layout.body_visible_rows,
             styles,
             header_title,
             header_chip,
-            signature_text,
-            body_rows.items[scroll..body_end_idx],
+            if (layout.show_signature) signature_text else null,
+            body_rows.items[layout.body_start..layout.body_end],
+            body_rows.items.len,
+            layout.body_start,
+            layout.show_footer,
+            frame_allocator,
             snapshot,
         );
+    }
+
+    fn clearHoverBackdrop(win: vaxis.Window, backdrop: HoverBackdrop, style: vaxis.Cell.Style) void {
+        const y_end = @min(backdrop.y +| backdrop.height, win.height);
+        const x_end = @min(backdrop.x +| backdrop.width, win.width);
+
+        var row = backdrop.y;
+        while (row < y_end) : (row += 1) {
+            var col = backdrop.x;
+            while (col < x_end) : (col += 1) {
+                _ = win.printSegment(.{ .text = " ", .style = style }, .{
+                    .row_offset = row,
+                    .col_offset = col,
+                });
+            }
+        }
     }
 
     fn renderHoverBox(
@@ -1867,8 +2049,13 @@ pub const View = struct {
         chip: ?[]const u8,
         signature: ?[]const u8,
         body_rows: []const HoverRow,
+        body_total_rows: usize,
+        body_start: usize,
+        show_footer: bool,
+        frame_allocator: std.mem.Allocator,
         snapshot: *const protocol.RenderSnapshot,
     ) !void {
+        _ = self;
         const inner_left = box_x + 2;
         const inner_right_padding: u16 = 2;
         const inner_width: u16 = if (width > 4) width - 4 else 1;
@@ -1885,18 +2072,28 @@ pub const View = struct {
         // Header: title on the left, optional language chip + key hint
         // on the right.
         fillRow(win, box_x, row, width, styles.bg);
-        _ = win.printSegment(.{ .text = title, .style = styles.title }, .{ .row_offset = row, .col_offset = inner_left });
+        const hint = if (snapshot.hover_sticky) "esc · j/k" else "esc";
+        const hint_cells = width_utils.displayWidth(hint, 0);
+        const show_hint = @as(usize, inner_width) >= hint_cells + 1;
+        const left_limit = if (show_hint and @as(usize, inner_width) > hint_cells + 2)
+            @as(usize, inner_width) - hint_cells - 2
+        else
+            @as(usize, inner_width);
+
+        const title_text = clipTextToCells(title, left_limit);
+        _ = win.printSegment(.{ .text = title_text, .style = styles.title }, .{ .row_offset = row, .col_offset = inner_left });
+        const title_cells = width_utils.displayWidth(title_text, 0);
+
         if (chip) |c| {
-            const chip_text_buf = try std.fmt.allocPrint(self.allocator, "{s}", .{c});
-            defer self.allocator.free(chip_text_buf);
-            if (chip_text_buf.len + title.len + 4 < inner_width) {
-                const chip_col = inner_left + @as(u16, @intCast(title.len)) + 2;
-                _ = win.printSegment(.{ .text = chip_text_buf, .style = styles.chip }, .{ .row_offset = row, .col_offset = chip_col });
+            const chip_room = if (left_limit > title_cells + 2) left_limit - title_cells - 2 else 0;
+            const chip_text = clipTextToCells(c, chip_room);
+            if (chip_text.len > 0) {
+                const chip_col = inner_left + @as(u16, @intCast(title_cells + 2));
+                _ = win.printSegment(.{ .text = chip_text, .style = styles.chip }, .{ .row_offset = row, .col_offset = chip_col });
             }
         }
-        const hint = if (snapshot.hover_sticky) "esc · j/k" else "esc";
-        if (width > hint.len + 6) {
-            const hint_col = box_x + width - 1 - @as(u16, @intCast(hint.len)) - 1;
+        if (show_hint) {
+            const hint_col = box_x + width - 2 - @as(u16, @intCast(hint_cells));
             _ = win.printSegment(.{ .text = hint, .style = styles.hint }, .{ .row_offset = row, .col_offset = hint_col });
         }
         _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x });
@@ -1910,7 +2107,7 @@ pub const View = struct {
         // Signature panel
         if (signature) |sig| {
             fillRow(win, box_x, row, width, styles.bg);
-            const truncated = truncateText(sig, inner_width);
+            const truncated = clipTextToCells(sig, inner_width);
             _ = win.printSegment(.{ .text = truncated, .style = styles.signature }, .{ .row_offset = row, .col_offset = inner_left });
             _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x });
             _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
@@ -1922,7 +2119,8 @@ pub const View = struct {
         // Loading state takes precedence over an empty body.
         if (snapshot.hover_loading and body_rows.len == 0) {
             fillRow(win, box_x, row, width, styles.bg);
-            _ = win.printSegment(.{ .text = "Loading…", .style = styles.hint }, .{ .row_offset = row, .col_offset = inner_left });
+            const loading_text = clipTextToCells("Loading…", inner_width);
+            _ = win.printSegment(.{ .text = loading_text, .style = styles.hint }, .{ .row_offset = row, .col_offset = inner_left });
             _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x });
             _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
             row += 1;
@@ -1931,7 +2129,7 @@ pub const View = struct {
                 fillRow(win, box_x, row, width, styles.bg);
                 if (i < body_rows.len) {
                     const r = body_rows[i];
-                    const truncated = truncateText(r.text, inner_width -| r.indent);
+                    const truncated = clipTextToCells(r.text, inner_width -| r.indent);
                     const bullet_or_space: []const u8 = if (r.indent > 0 and !std.mem.eql(u8, truncated, "")) "•" else " ";
                     if (r.indent > 0) {
                         _ = win.printSegment(.{ .text = bullet_or_space, .style = r.style }, .{ .row_offset = row, .col_offset = inner_left });
@@ -1948,12 +2146,12 @@ pub const View = struct {
 
         // Footer — only on sticky hover, where the user is actively
         // reading and needs the scroll affordance.
-        if (snapshot.hover_sticky) {
+        if (show_footer) {
             drawDivider(win, box_x, row, width, styles);
             row += 1;
             fillRow(win, box_x, row, width, styles.bg);
-            const footer = "Esc dismiss   j/k or ↑/↓ scroll";
-            const truncated = truncateText(footer, inner_width);
+            const footer = try hoverFooterText(frame_allocator, body_start, body_rows.len, body_total_rows);
+            const truncated = clipTextToCells(footer, inner_width);
             _ = win.printSegment(.{ .text = truncated, .style = styles.hint }, .{ .row_offset = row, .col_offset = inner_left });
             _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x });
             _ = win.printSegment(.{ .text = "│", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
@@ -1990,16 +2188,23 @@ pub const View = struct {
         const usable = if (wrap_width > indent) wrap_width - indent else 1;
         var remaining = text;
         while (remaining.len > 0) {
-            if (remaining.len <= usable) {
+            if (width_utils.displayWidth(remaining, 0) <= usable) {
                 try out.append(allocator, .{ .text = remaining, .style = style, .indent = indent });
                 return;
             }
+
+            const visible = clipTextToCells(remaining, usable);
+            const hard_limit = if (visible.len > 0) visible.len else blk: {
+                const seq_len = std.unicode.utf8ByteSequenceLength(remaining[0]) catch 1;
+                break :blk @min(seq_len, remaining.len);
+            };
+
             // Walk back from the soft-wrap boundary to the last space
             // so we don't split a word. Hard-break if there's no
             // earlier space.
-            var split: usize = usable;
+            var split: usize = hard_limit;
             var found_space = false;
-            var i: usize = usable;
+            var i: usize = hard_limit;
             while (i > 0) : (i -= 1) {
                 if (remaining[i - 1] == ' ') {
                     split = i - 1;
@@ -2007,7 +2212,11 @@ pub const View = struct {
                     break;
                 }
             }
-            if (!found_space) split = usable;
+            if (found_space and split == 0) {
+                remaining = remaining[1..];
+                continue;
+            }
+            if (!found_space) split = hard_limit;
             const chunk = remaining[0..split];
             try out.append(allocator, .{ .text = chunk, .style = style, .indent = indent });
             // Skip the space we broke at, if any.
@@ -2257,14 +2466,15 @@ pub const View = struct {
         entries: []const protocol.ReferenceEntry,
         selected: usize,
         scroll_offset: usize,
+        allocator: std.mem.Allocator,
     ) !void {
-        var title_buf: [128]u8 = undefined;
         const title = if (symbol) |sym|
-            std.fmt.bufPrint(&title_buf, " References — {s} ({d})", .{ sym, entries.len }) catch " References "
+            try std.fmt.allocPrint(allocator, " References — {s} ({d})", .{ sym, entries.len })
         else
-            std.fmt.bufPrint(&title_buf, " References ({d})", .{entries.len}) catch " References ";
+            try std.fmt.allocPrint(allocator, " References ({d})", .{entries.len});
 
         const Ctx = struct {
+            frame_allocator: std.mem.Allocator,
             entries: []const protocol.ReferenceEntry,
             fn drawRow(self: @This(), w: vaxis.Window, row: u16, base_col: u16, max_w: u16, i: usize, is_sel: bool) !void {
                 const e = self.entries[i];
@@ -2282,8 +2492,7 @@ pub const View = struct {
                 else
                     panel_bg;
 
-                var line_buf: [16]u8 = undefined;
-                const linecol = std.fmt.bufPrint(&line_buf, "{d}:{d}", .{ e.line + 1, e.col + 1 }) catch "?";
+                const linecol = try std.fmt.allocPrint(self.frame_allocator, "{d}:{d}", .{ e.line + 1, e.col + 1 });
 
                 var col: u16 = base_col;
                 _ = w.printSegment(.{ .text = e.display_path, .style = path_style }, .{ .row_offset = row, .col_offset = col });
@@ -2299,7 +2508,7 @@ pub const View = struct {
                 _ = w.printSegment(.{ .text = snip_take, .style = snippet_style }, .{ .row_offset = row, .col_offset = col });
             }
         };
-        const ctx = Ctx{ .entries = entries };
+        const ctx = Ctx{ .frame_allocator = allocator, .entries = entries };
         try drawModalList(win, title, " j/k move · ⏎ open · g/G top/bottom · esc back ", entries.len, selected, scroll_offset, ctx);
     }
 
@@ -2308,11 +2517,12 @@ pub const View = struct {
         entries: []const protocol.DiagnosticPickerEntry,
         selected: usize,
         scroll_offset: usize,
+        allocator: std.mem.Allocator,
     ) !void {
-        var title_buf: [64]u8 = undefined;
-        const title = std.fmt.bufPrint(&title_buf, " Diagnostics ({d})", .{entries.len}) catch " Diagnostics ";
+        const title = try std.fmt.allocPrint(allocator, " Diagnostics ({d})", .{entries.len});
 
         const Ctx = struct {
+            frame_allocator: std.mem.Allocator,
             entries: []const protocol.DiagnosticPickerEntry,
             fn drawRow(self: @This(), w: vaxis.Window, row: u16, base_col: u16, max_w: u16, i: usize, is_sel: bool) !void {
                 const e = self.entries[i];
@@ -2341,8 +2551,7 @@ pub const View = struct {
                 else
                     panel_bg;
 
-                var line_buf: [16]u8 = undefined;
-                const linecol = std.fmt.bufPrint(&line_buf, "{d}:{d}", .{ e.line + 1, e.col + 1 }) catch "?";
+                const linecol = try std.fmt.allocPrint(self.frame_allocator, "{d}:{d}", .{ e.line + 1, e.col + 1 });
 
                 var col: u16 = base_col;
                 _ = w.printSegment(.{ .text = sev_glyph, .style = sev_style }, .{ .row_offset = row, .col_offset = col });
@@ -2356,7 +2565,7 @@ pub const View = struct {
                 _ = w.printSegment(.{ .text = msg_take, .style = msg_style }, .{ .row_offset = row, .col_offset = col });
             }
         };
-        const ctx = Ctx{ .entries = entries };
+        const ctx = Ctx{ .frame_allocator = allocator, .entries = entries };
         try drawModalList(win, title, " j/k move · ⏎ jump · g/G top/bottom · esc back ", entries.len, selected, scroll_offset, ctx);
     }
 
@@ -2378,29 +2587,6 @@ pub const View = struct {
             _ = win.printSegment(.{ .text = "─", .style = styles.divider }, .{ .row_offset = row, .col_offset = box_x + @as(u16, @intCast(i)) });
         }
         _ = win.printSegment(.{ .text = "┤", .style = styles.border }, .{ .row_offset = row, .col_offset = box_x + width - 1 });
-    }
-
-    /// Truncate `text` to at most `max` bytes — byte-accurate, with a
-    /// trailing `…` when truncated. Good enough for ASCII-heavy
-    /// signatures and the doc text we get from LSPs; non-ASCII gets a
-    /// conservative byte-budget that won't split a codepoint at the
-    /// expense of a few cells.
-    fn truncateText(text: []const u8, max: usize) []const u8 {
-        if (text.len <= max) return text;
-        if (max == 0) return "";
-        // Don't bother with a real width count — bytes are a close
-        // enough approximation for our hover content and the ellipsis
-        // makes truncation visible.
-        return text[0..@min(text.len, max)];
-    }
-
-    /// Compute the popup's `box_x` so it stays inside `win`. Prefers
-    /// the anchor column, slides left when the box would overflow,
-    /// always leaves a 1-cell right margin.
-    fn box_x_for(win: vaxis.Window, width: u16, anchor_col: u16) u16 {
-        const margin: u16 = 1;
-        const max_x: u16 = if (win.width > width + margin) win.width - width - margin else 0;
-        return @min(anchor_col, max_x);
     }
 
     // ---- Which-key popup -------------------------------------------------
@@ -2599,7 +2785,9 @@ pub const View = struct {
         var display = label;
         if (std.mem.indexOfScalar(u8, display, '\n')) |nl| display = display[0..nl];
 
-        const max_width: u16 = @min(@as(u16, @intCast(display.len + 4)), @as(u16, @intCast(@as(usize, win.width) -| 2)));
+        const display_cells = width_utils.displayWidth(display, 0);
+        const content_cells = @min(display_cells, @as(usize, win.width -| 2));
+        const max_width: u16 = @intCast(@min(content_cells + 2, @as(usize, win.width)));
         const screen_row: u16 = @intCast(cursor_row -| scroll_offset);
         // Prefer the row above the cursor; fall back below if there's no room.
         var box_y: u16 = if (screen_row >= 1) screen_row - 1 else screen_row + 1;
@@ -2616,10 +2804,10 @@ pub const View = struct {
         const base_style: vaxis.Cell.Style = .{ .fg = fg, .bg = bg };
 
         // Wipe the background.
-        var clear_buf: [128]u8 = undefined;
-        const clear_n = @min(@as(usize, max_width), clear_buf.len);
-        @memset(clear_buf[0..clear_n], ' ');
-        _ = win.printSegment(.{ .text = clear_buf[0..clear_n], .style = base_style }, .{ .row_offset = box_y, .col_offset = box_x });
+        var clear_col: u16 = 0;
+        while (clear_col < max_width) : (clear_col += 1) {
+            _ = win.printSegment(.{ .text = " ", .style = base_style }, .{ .row_offset = box_y, .col_offset = box_x + clear_col });
+        }
 
         // Find the active parameter's byte range in the label so we
         // can style just that span. If the param label appears
@@ -2637,8 +2825,8 @@ pub const View = struct {
             }
         }
 
-        const fits = @min(display.len, @as(usize, max_width) -| 2);
-        const truncated = display[0..fits];
+        const truncated = clipTextToCells(display, @as(usize, max_width) -| 2);
+        const fits = truncated.len;
         if (active_start) |st| {
             const en = @min(active_end, fits);
             const pre = truncated[0..@min(st, fits)];
@@ -2648,11 +2836,11 @@ pub const View = struct {
             var col: u16 = box_x + 1;
             if (pre.len > 0) {
                 _ = win.printSegment(.{ .text = pre, .style = base_style }, .{ .row_offset = box_y, .col_offset = col });
-                col += @intCast(pre.len);
+                col += @intCast(width_utils.displayWidth(pre, 0));
             }
             if (mid.len > 0) {
                 _ = win.printSegment(.{ .text = mid, .style = active_style }, .{ .row_offset = box_y, .col_offset = col });
-                col += @intCast(mid.len);
+                col += @intCast(width_utils.displayWidth(mid, 0));
             }
             if (post.len > 0) {
                 _ = win.printSegment(.{ .text = post, .style = base_style }, .{ .row_offset = box_y, .col_offset = col });
@@ -2671,7 +2859,9 @@ pub const View = struct {
         cursor_row: usize,
         cursor_col: usize,
         scroll_offset: usize,
+        frame_allocator: std.mem.Allocator,
     ) !void {
+        _ = self;
         if (items.len == 0) return;
         if (win.width < 15 or win.height < 5) {
             logDebug("drawCompletionPopup: Window too small ({}x{})", .{ win.width, win.height });
@@ -2738,8 +2928,7 @@ pub const View = struct {
         }
         const header_text = " Completions ";
         _ = win.printSegment(.{ .text = header_text, .style = header_style }, .{ .row_offset = header_row, .col_offset = box_x + 1 });
-        const count_text_buf = std.fmt.allocPrint(self.allocator, "{d}/{d}", .{ selected_index + 1, items.len }) catch "";
-        defer if (count_text_buf.len > 0) self.allocator.free(count_text_buf);
+        const count_text_buf = std.fmt.allocPrint(frame_allocator, "{d}/{d}", .{ selected_index + 1, items.len }) catch "";
         if (count_text_buf.len > 0 and count_text_buf.len < max_width - header_text.len - 3) {
             const count_pos = max_width - @as(u16, @intCast(count_text_buf.len)) - 2;
             _ = win.printSegment(.{ .text = count_text_buf, .style = .{ .fg = .{ .index = 8 }, .bg = .{ .index = 0 } } }, .{ .row_offset = header_row, .col_offset = box_x + count_pos });
@@ -2860,7 +3049,6 @@ pub const View = struct {
         });
         if (match_count > 0) {
             const count_text = try std.fmt.allocPrint(allocator, "[{d}/{d}] ", .{ match_index, match_count });
-            defer allocator.free(count_text);
             const count_len: u16 = @intCast(@min(count_text.len, @as(usize, box_width - 2)));
             const count_col = box_x + box_width - count_len - 1;
             _ = win.printSegment(.{ .text = count_text, .style = box_style }, .{
@@ -3405,19 +3593,17 @@ pub const View = struct {
             _ = win.printSegment(.{ .text = "─", .style = border_style }, .{ .row_offset = @intCast(start_y + 3), .col_offset = @intCast(start_x + i) });
         }
 
-        var stats_buf: [64]u8 = undefined;
         const stats = if (snapshot.global_search_results) |results| blk: {
             if (results.len == 0) {
                 break :blk if (snapshot.global_search_ran) "No matches" else "Type to search...";
             }
-            break :blk std.fmt.bufPrint(&stats_buf, "{d} matches in {d} files", .{ snapshot.global_search_total_matches, results.len }) catch "...";
+            break :blk try std.fmt.allocPrint(allocator, "{d} matches in {d} files", .{ snapshot.global_search_total_matches, results.len });
         } else "Type to search...";
 
         _ = win.printSegment(.{ .text = stats, .style = theme.styles.global_search.stats }, .{ .row_offset = @intCast(start_y + 4), .col_offset = @intCast(start_x + 2) });
 
         if (snapshot.global_search_results) |results| {
             if (results.len == 0) {
-                _ = allocator;
                 return;
             }
 
@@ -3458,8 +3644,7 @@ pub const View = struct {
                     else
                         group.file_path;
 
-                    var file_header_buf: [128]u8 = undefined;
-                    const file_header = std.fmt.bufPrint(&file_header_buf, "▼ {s} ({d})", .{ path_display, group.matches.len }) catch path_display;
+                    const file_header = try std.fmt.allocPrint(allocator, "▼ {s} ({d})", .{ path_display, group.matches.len });
 
                     _ = win.printSegment(.{ .text = file_header, .style = f_style }, .{ .row_offset = @intCast(start_y + row_offset), .col_offset = @intCast(start_x + 2) });
                     row_offset += 1;
@@ -3474,8 +3659,7 @@ pub const View = struct {
                         const is_match_selected = is_file_selected and match_idx == snapshot.global_search_selected_match;
                         const m_style = if (is_match_selected) selected_style else line_style;
 
-                        var line_num_buf: [8]u8 = undefined;
-                        const line_num_str = std.fmt.bufPrint(&line_num_buf, "{d:>4}:", .{match.line_num}) catch "    :";
+                        const line_num_str = try std.fmt.allocPrint(allocator, "{d:>4}:", .{match.line_num});
                         _ = win.printSegment(.{ .text = line_num_str, .style = if (is_match_selected) selected_style else line_num_style }, .{ .row_offset = @intCast(start_y + row_offset), .col_offset = @intCast(start_x + 4) });
 
                         const max_content_len = width -| 14;
@@ -3500,8 +3684,6 @@ pub const View = struct {
         const hints = "↑↓ Navigate  Enter Jump  Tab Field  Esc Close";
         const hints_style: vaxis.Cell.Style = .{ .fg = .{ .index = 8 } };
         _ = win.printSegment(.{ .text = hints, .style = hints_style }, .{ .row_offset = @intCast(start_y + height + 4), .col_offset = @intCast(start_x + 2) });
-
-        _ = allocator;
     }
 };
 
@@ -3677,4 +3859,250 @@ test "styleForTokenType round-trips through an in-memory vaxis Screen" {
     const got = screen.readCell(2, 1) orelse return error.TestUnexpectedResult;
     try testing.expect(got.style.bold);
     try expectRgbColor(theme.colors.syntax.keyword, got.style.fg);
+}
+
+test "hover layout remains inside small viewport with sticky signature" {
+    const layout = computeHoverLayout(.{
+        .win_width = 48,
+        .win_height = 7,
+        .anchor_row = 5,
+        .anchor_col = 44,
+        .total_body_rows = 12,
+        .scroll_offset = 0,
+        .sticky = true,
+        .has_signature = true,
+        .loading = false,
+    }) orelse return error.TestUnexpectedResult;
+
+    try testing.expect(layout.x + layout.width <= 48);
+    try testing.expect(layout.y + layout.height <= 7);
+    try testing.expect(layout.body_visible_rows <= layout.height);
+}
+
+test "hover layout clamps scroll and body range" {
+    const layout = computeHoverLayout(.{
+        .win_width = 100,
+        .win_height = 20,
+        .anchor_row = 2,
+        .anchor_col = 5,
+        .total_body_rows = 6,
+        .scroll_offset = 999,
+        .sticky = true,
+        .has_signature = false,
+        .loading = false,
+    }) orelse return error.TestUnexpectedResult;
+
+    try testing.expectEqual(@as(usize, 6), layout.body_start);
+    try testing.expectEqual(@as(usize, 6), layout.body_end);
+}
+
+test "hover clipped text respects display width and utf8 boundaries" {
+    const clipped = clipTextToCells("abc漢字def", 6);
+    try testing.expect(std.unicode.utf8ValidateSlice(clipped));
+    try testing.expect(@import("width.zig").displayWidth(clipped, 0) <= 6);
+
+    try testing.expectEqualStrings("", clipTextToCells("anything", 0));
+
+    // A newline must terminate the slice — vaxis would otherwise wrap
+    // the remainder to column 0 and bleed it outside the popup box.
+    try testing.expectEqualStrings("const Foo = struct {", clipTextToCells("const Foo = struct {\n    a: u8,\n}", 80));
+    try testing.expectEqualStrings("first", clipTextToCells("first\r\nsecond", 80));
+}
+
+test "hover backdrop is clipped to popup box" {
+    const layout = computeHoverLayout(.{
+        .win_width = 160,
+        .win_height = 48,
+        .anchor_row = 24,
+        .anchor_col = 18,
+        .total_body_rows = 8,
+        .scroll_offset = 0,
+        .sticky = true,
+        .has_signature = true,
+        .loading = false,
+    }) orelse return error.TestUnexpectedResult;
+
+    try testing.expect(layout.x > 0);
+
+    const backdrop = computeHoverBackdrop(layout);
+    try testing.expectEqual(layout.x, backdrop.x);
+    try testing.expectEqual(layout.width, backdrop.width);
+    try testing.expectEqual(layout.y, backdrop.y);
+    try testing.expectEqual(layout.height, backdrop.height);
+}
+
+test "hover render preserves editor text outside popup box" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 30, .cols = 120, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+
+    const win = vaxis.Window{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 120,
+        .height = 30,
+        .screen = &screen,
+    };
+
+    _ = win.printSegment(.{ .text = "should", .style = View.styleForTokenType(.string) }, .{
+        .row_offset = 21,
+        .col_offset = 4,
+    });
+
+    var view = View.init(testing.allocator);
+    var snapshot = protocol.RenderSnapshot{
+        .visible_lines = &.{},
+        .first_visible_line = 0,
+        .total_lines = 0,
+        .cursor_row = 17,
+        .cursor_col = 16,
+        .scroll_offset = 0,
+        .version = 0,
+        .mode = .view,
+        .terminal_output = null,
+        .terminal_input = null,
+        .file_path = null,
+        .file_modified = false,
+        .buffers = &.{},
+        .active_buffer_index = 0,
+        .buffer_picker_selected = 0,
+        .file_picker_cwd = null,
+        .file_picker_entries = null,
+        .file_picker_selected = 0,
+        .buffer_picker_scroll_offset = 0,
+        .save_as_input = null,
+        .search_input = null,
+        .hover_content = "Shared state for worker processes with thread-safe operations",
+        .hover_anchor_row = 17,
+        .hover_anchor_col = 16,
+        .hover_sticky = true,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const gutter_width: u16 = 5;
+    try view.drawHoverPopup(win, gutter_width, &snapshot, arena.allocator());
+
+    const outside = screen.readCell(4, 21) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("s", outside.char.grapheme);
+
+    // hover_anchor_col is a buffer column; the renderer must add the
+    // gutter width so the popup's left edge lands under the token
+    // instead of bleeding `gutter_width` cells to its left.
+    // anchor_col(16) + gutter(5) => box left border at column 21.
+    var corner_x: ?u16 = null;
+    var ry: u16 = 0;
+    outer: while (ry < 30) : (ry += 1) {
+        var rx: u16 = 0;
+        while (rx < 120) : (rx += 1) {
+            const cell = screen.readCell(rx, ry) orelse continue;
+            if (std.mem.eql(u8, cell.char.grapheme, "╭")) {
+                corner_x = rx;
+                break :outer;
+            }
+        }
+    }
+    try testing.expectEqual(@as(u16, 16 + gutter_width), corner_x orelse return error.TestUnexpectedResult);
+}
+
+test "hover render keeps a multi-line signature inside the popup box" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 30, .cols = 120, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+
+    const win = vaxis.Window{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 120,
+        .height = 30,
+        .screen = &screen,
+    };
+
+    // A struct hover: ZLS returns the whole definition as one code block,
+    // so the parsed signature carries embedded newlines.
+    const hover_doc = @import("../services/hover_doc.zig");
+    var doc = hover_doc.HoverDocument.empty(testing.allocator);
+    doc.signature = @constCast("const WorkerState = struct {\n    should_run: bool = true,\n    memory_usage: usize = 0,\n}");
+    doc.signature_language = @constCast("zig");
+
+    var view = View.init(testing.allocator);
+    var snapshot = protocol.RenderSnapshot{
+        .visible_lines = &.{},
+        .first_visible_line = 0,
+        .total_lines = 0,
+        .cursor_row = 5,
+        .cursor_col = 8,
+        .scroll_offset = 0,
+        .version = 0,
+        .mode = .view,
+        .terminal_output = null,
+        .terminal_input = null,
+        .file_path = null,
+        .file_modified = false,
+        .buffers = &.{},
+        .active_buffer_index = 0,
+        .buffer_picker_selected = 0,
+        .file_picker_cwd = null,
+        .file_picker_entries = null,
+        .file_picker_selected = 0,
+        .buffer_picker_scroll_offset = 0,
+        .save_as_input = null,
+        .search_input = null,
+        .hover_document = doc,
+        .hover_anchor_row = 5,
+        .hover_anchor_col = 8,
+        .hover_sticky = true,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try view.drawHoverPopup(win, 0, &snapshot, arena.allocator());
+
+    // Locate the popup's left border.
+    var box_x: ?u16 = null;
+    var ry: u16 = 0;
+    find: while (ry < 30) : (ry += 1) {
+        var rx: u16 = 0;
+        while (rx < 120) : (rx += 1) {
+            const cell = screen.readCell(rx, ry) orelse continue;
+            if (std.mem.eql(u8, cell.char.grapheme, "╭")) {
+                box_x = rx;
+                break :find;
+            }
+        }
+    }
+    const left = box_x orelse return error.TestUnexpectedResult;
+
+    // Underscores appear only in the struct field names. None may land
+    // left of the box (that would be the newline-bleed bug); at least
+    // one must land inside it (the fields render in the scrollable body).
+    var bled: usize = 0;
+    var inside: usize = 0;
+    var r: u16 = 0;
+    while (r < 30) : (r += 1) {
+        var c: u16 = 0;
+        while (c < 120) : (c += 1) {
+            const cell = screen.readCell(c, r) orelse continue;
+            if (std.mem.eql(u8, cell.char.grapheme, "_")) {
+                if (c < left) bled += 1 else inside += 1;
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bled);
+    try testing.expect(inside > 0);
+}
+
+test "signature help is suppressed while hover overlay is visible" {
+    try testing.expect(!shouldDrawSignatureHelp(true));
+    try testing.expect(shouldDrawSignatureHelp(false));
+}
+
+test "scrollable hover footer text is frame allocated" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const footer = try hoverFooterText(arena.allocator(), 4, 2, 18);
+    try testing.expectEqualStrings("Esc dismiss · j/k scroll · 5-6/18", footer);
 }

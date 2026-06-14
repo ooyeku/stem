@@ -32,13 +32,13 @@
 //! resources during unload/shutdown; automatic restart is not wired.
 
 const std = @import("std");
-const vigil = @import("vigil");
+const vigil_api = @import("../services/vigil_adapters.zig");
 
 const jsonrpc = @import("jsonrpc.zig");
 const manifest_mod = @import("manifest.zig");
 const protocol = @import("../kernel/protocol.zig");
 const RequestTracker = @import("../kernel/request_reply.zig").RequestTracker;
-const Mutex = vigil.compat.Mutex;
+const Mutex = vigil_api.Mutex;
 
 const log = std.log.scoped(.ProcessPlugin);
 
@@ -184,7 +184,7 @@ pub const ProcessPlugin = struct {
             // Yield briefly so the writer thread can flush the
             // shutdown frame before we yank stdin. 5 ms is plenty for
             // a single small frame.
-            vigil.compat.sleep(5 * std.time.ns_per_ms);
+            vigil_api.sleep(5 * std.time.ns_per_ms);
         }
 
         self.stop_flag.store(true, .release);
@@ -288,7 +288,7 @@ pub const ProcessPlugin = struct {
                 w.flush() catch return;
             } else {
                 // No work — sleep briefly.
-                vigil.compat.sleep(2 * std.time.ns_per_ms);
+                vigil_api.sleep(2 * std.time.ns_per_ms);
             }
         }
     }

@@ -3,7 +3,7 @@ const platform = @import("platform.zig");
 const logger_service = @import("../services/logger.zig");
 const log = logger_service.scoped("Core");
 const vaxis = @import("vaxis");
-const vigil = @import("vigil");
+const vigil_api = @import("../services/vigil_adapters.zig");
 const EditorState = @import("../core/state.zig").EditorState;
 const FileManager = @import("../core/file_manager.zig").FileManager;
 const auto_pair = @import("../core/auto_pair.zig");
@@ -129,12 +129,13 @@ pub const Core = struct {
     /// snapshot arrives. Avoids per-frame mmap churn.
     arena_pool: ArenaPool,
     storage: *StorageManager,
+    runtime_services: ?*StemRuntime = null,
     buffer_manager: BufferManager,
     /// Bus used by Core to send to the UI thread (renders, quit, etc.).
     /// Replaces a raw `*vigil.Inbox`; gives us priority routing,
     /// render-coalescing, and stats.
     ui_bus: *@import("message_bus.zig").MessageBus,
-    core_inbox: ?*vigil.Inbox = null,
+    core_inbox: ?*vigil_api.Inbox = null,
     /// Bus for sending TO Core's own inbox (used by terminal workers,
     /// plugin manager forwards, etc.). Set in `run()`.
     core_bus: ?*@import("message_bus.zig").MessageBus = null,
@@ -522,6 +523,7 @@ pub const Core = struct {
             .environ_block = environ_block,
             .arena_pool = ArenaPool.init(allocator, io),
             .storage = storage,
+            .runtime_services = runtime_services,
             .buffer_manager = BufferManager.init(allocator, io),
             .ui_bus = ui_bus,
             .file_manager = try FileManager.init(allocator, io),
@@ -1443,6 +1445,7 @@ pub const Core = struct {
         try R.register("lsp.diagnostics", "LSP: Show Diagnostics", "List all errors/warnings for current file", Wrap(LspCommands.cmdLspShowDiagnostics).run, null);
         try R.register("lsp.restart", "LSP: Restart Server", "Force restart the embedded zls instance", Wrap(LspCommands.cmdLspRestartServer).run, null);
         try R.register("lsp.prewarm", "LSP: Prewarm Workspace", "Scan the workspace and start servers for every detected language", Wrap(LspCommands.cmdLspPrewarm).run, null);
+        try R.register("lsp.status", "LSP: Status", "Show live LSP server health and restart state", Wrap(LspCommands.cmdLspStatus).run, null);
         try R.register("lsp.hover", "LSP: Hover", "Trigger hover information for symbol under cursor", Wrap(LspCommands.cmdLspHover).run, null);
         try R.register("lsp.references", "LSP: Find References", "Find all references to symbol under cursor", Wrap(LspCommands.cmdLspFindReferences).run, null);
         try R.register("lsp.workspace_symbols", "LSP: Workspace Symbols", "Fuzzy find symbols across the workspace via LSP", Wrap(LspCommands.cmdWorkspaceSymbols).run, null);

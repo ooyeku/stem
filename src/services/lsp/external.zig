@@ -1,11 +1,11 @@
 const std = @import("std");
-const vigil = @import("vigil");
+const vigil_api = @import("../vigil_adapters.zig");
 const Transport = @import("../../lsp/transport.zig");
 const platform = @import("../../kernel/platform.zig");
 const installer_mod = @import("installer.zig");
 
 const log = std.log.scoped(.LSPExternal);
-const Mutex = vigil.compat.Mutex;
+const Mutex = vigil_api.Mutex;
 
 /// Heap-allocated watchdog state for force-killing a stuck LSP child. The
 /// PID is captured as an integer (cheap, safe to copy across threads), so

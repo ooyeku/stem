@@ -11,6 +11,7 @@ const external = @import("lsp/external.zig");
 const Transport = @import("../lsp/transport.zig");
 const supervisor_mod = @import("lsp/supervisor.zig");
 const LSPSupervisor = supervisor_mod.LSPSupervisor;
+const vigil_api = @import("vigil_adapters.zig");
 const vigil_supervision = @import("vigil_supervision.zig");
 
 pub const LSPManager = struct {
@@ -107,6 +108,40 @@ pub const LSPManager = struct {
     pub const CompletionItem = LSPServer.CompletionItem;
     pub const TextEdit = LSPServer.TextEdit;
 
+    pub const ServerHealth = struct {
+        lang: []u8,
+        root_path: ?[]u8 = null,
+        running: bool = false,
+        healthy: bool = false,
+        initialized: bool = false,
+        restart_attempts: u32 = 0,
+        last_restart_attempt_ms: i64 = 0,
+
+        fn deinit(self: ServerHealth, allocator: std.mem.Allocator) void {
+            allocator.free(self.lang);
+            if (self.root_path) |root| allocator.free(root);
+        }
+    };
+
+    pub const HealthSnapshot = struct {
+        servers: []ServerHealth = &.{},
+        running_servers: usize = 0,
+        healthy_servers: usize = 0,
+        unhealthy_servers: usize = 0,
+        initializing_servers: usize = 0,
+        open_documents: usize = 0,
+        pending_changes: usize = 0,
+        in_progress_starts: usize = 0,
+        restart_tracked_languages: usize = 0,
+        lifecycle: vigil_supervision.Snapshot = .{},
+
+        pub fn deinit(self: *HealthSnapshot, allocator: std.mem.Allocator) void {
+            for (self.servers) |server| server.deinit(allocator);
+            allocator.free(self.servers);
+            self.servers = &.{};
+        }
+    };
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_block: std.process.Environ.Block) LSPManager {
         return .{
             .allocator = allocator,
@@ -139,6 +174,76 @@ pub const LSPManager = struct {
 
     pub fn setVigilSupervisor(self: *LSPManager, supervisor: *vigil_supervision.ComponentSupervisor) void {
         self.lifecycle_supervisor = supervisor;
+    }
+
+    pub fn healthSnapshot(self: *LSPManager, allocator: std.mem.Allocator) !HealthSnapshot {
+        var servers = std.ArrayListUnmanaged(ServerHealth).empty;
+        errdefer {
+            for (servers.items) |server| server.deinit(allocator);
+            servers.deinit(allocator);
+        }
+
+        var snapshot = HealthSnapshot{};
+
+        self.manager_mutex.lockUncancelable(self.io);
+        {
+            defer self.manager_mutex.unlock(self.io);
+            snapshot.open_documents = self.open_documents.count();
+
+            var it = self.servers.iterator();
+            while (it.next()) |entry| {
+                const server = entry.value_ptr.*;
+                const running = server.server_running.load(.acquire);
+                const healthy = server.server_healthy.load(.acquire);
+                const initialized = server.is_initialized.load(.acquire);
+                if (running) snapshot.running_servers += 1;
+                if (healthy and running) snapshot.healthy_servers += 1;
+                if (running and !healthy) snapshot.unhealthy_servers += 1;
+                if (running and healthy and !initialized) snapshot.initializing_servers += 1;
+
+                const lang = try allocator.dupe(u8, entry.key_ptr.*);
+                errdefer allocator.free(lang);
+                const root_path = if (server.current_root_path) |root|
+                    try allocator.dupe(u8, root)
+                else
+                    null;
+                errdefer if (root_path) |root| allocator.free(root);
+
+                try servers.append(allocator, .{
+                    .lang = lang,
+                    .root_path = root_path,
+                    .running = running,
+                    .healthy = healthy,
+                    .initialized = initialized,
+                });
+            }
+        }
+
+        self.restart_state_mutex.lockUncancelable(self.io);
+        {
+            defer self.restart_state_mutex.unlock(self.io);
+            snapshot.restart_tracked_languages = self.restart_state.count();
+            for (servers.items) |*server| {
+                if (self.restart_state.get(server.lang)) |state| {
+                    server.restart_attempts = state.attempts;
+                    server.last_restart_attempt_ms = state.last_attempt_ms;
+                }
+            }
+        }
+
+        self.pending_changes_mutex.lockUncancelable(self.io);
+        snapshot.pending_changes = self.pending_changes.count();
+        self.pending_changes_mutex.unlock(self.io);
+
+        self.in_progress_mutex.lockUncancelable(self.io);
+        snapshot.in_progress_starts = self.in_progress_starts.count();
+        self.in_progress_mutex.unlock(self.io);
+
+        if (self.lifecycle_supervisor) |supervisor| {
+            snapshot.lifecycle = supervisor.snapshot();
+        }
+        snapshot.servers = try servers.toOwnedSlice(allocator);
+        return snapshot;
     }
 
     /// Periodic health check. Every `watchdog_interval_ms` we scan each
@@ -230,6 +335,10 @@ pub const LSPManager = struct {
             supervisor.recordCrash(lang);
             supervisor.recordRestartScheduled(lang, delay_ms, attempt);
         }
+    }
+
+    pub fn recordLspRestartScheduledForTest(self: *LSPManager, lang: []const u8, delay_ms: i64, attempt: u32) void {
+        self.recordLspRestartScheduled(lang, delay_ms, attempt);
     }
 
     /// Returns true if we should attempt another restart for `lang`. Tracks
@@ -2734,7 +2843,7 @@ test "LSPManager records restart scheduling through Vigil lifecycle supervisor" 
     var manager = LSPManager.init(allocator, io, .empty);
     defer manager.deinit();
 
-    var runtime = try @import("vigil").runtime(allocator, .{});
+    var runtime = try vigil_api.runtime(allocator, .{});
     defer runtime.deinit();
 
     var supervisor = vigil_supervision.ComponentSupervisor.init(allocator, &runtime, .lsp);

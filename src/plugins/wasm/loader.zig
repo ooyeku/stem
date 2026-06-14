@@ -18,11 +18,11 @@
 //! logger, etc.) the exec plugins use.
 
 const std = @import("std");
-const vigil = @import("vigil");
+const vigil_api = @import("../../services/vigil_adapters.zig");
 const log = std.log.scoped(.WasmPlugin);
 
 const interp = @import("interpreter.zig");
-const Mutex = vigil.compat.Mutex;
+const Mutex = vigil_api.Mutex;
 
 /// Caller-supplied hooks. Mirror `process_loader.Callbacks` so the
 /// PluginManager can register either runtime through one code path.

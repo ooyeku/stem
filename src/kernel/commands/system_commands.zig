@@ -51,6 +51,22 @@ pub const SystemCommands = struct {
         defer core.allocator.free(count_line);
         try text.appendSlice(core.allocator, count_line);
 
+        const health = core.plugin_manager.healthSnapshot();
+        const health_line = try std.fmt.allocPrint(
+            core.allocator,
+            "- `Vigil Broker`: {s}\n- `Lifecycle Supervisor`: {s}\n- `Crashes`: {d}\n- `Restarts Scheduled`: {d}\n- `Event Subscribers`: {d}\n- `Pending Restarts`: {d}\n\n",
+            .{
+                if (health.vigil_broker_attached) "attached" else "missing",
+                if (health.vigil_supervisor_attached) "attached" else "missing",
+                health.lifecycle.crashes,
+                health.lifecycle.restarts_scheduled,
+                health.event_subscribers,
+                health.pending_restarts,
+            },
+        );
+        defer core.allocator.free(health_line);
+        try text.appendSlice(core.allocator, health_line);
+
         try text.appendSlice(core.allocator, "## Installed Plugins\n\n");
 
         if (total == 0) {
@@ -94,7 +110,7 @@ pub const SystemCommands = struct {
     /// the core tick handler so the numbers tick up while the buffer
     /// is the active view.
     pub fn cmdShowStats(core: anytype) anyerror!void {
-        const body = try renderStatsBuffer(core.allocator);
+        const body = try renderStatsBuffer(core);
         defer core.allocator.free(body);
         try core.openVirtualBuffer("[STATS]", body);
         try core.sendUpdate();
@@ -108,24 +124,57 @@ pub const SystemCommands = struct {
         const buf = &core.buffer_manager.buffers.items[idx];
         if (!std.mem.eql(u8, buf.name, "[STATS]")) return;
 
-        const body = renderStatsBuffer(core.allocator) catch return;
+        const body = renderStatsBuffer(core) catch return;
         defer core.allocator.free(body);
         // openVirtual replaces the existing buffer's content when the
         // name matches, so we route through it for a clean refresh.
         core.buffer_manager.openVirtual("[STATS]", body) catch {};
     }
 
-    fn renderStatsBuffer(allocator: std.mem.Allocator) ![]u8 {
+    fn renderStatsBuffer(core: anytype) ![]u8 {
+        const allocator = core.allocator;
         var aw: std.Io.Writer.Allocating = .init(allocator);
         errdefer aw.deinit();
         const w = &aw.writer;
 
         const snap = telemetry.snapshot();
+        const plugin_health = core.plugin_manager.healthSnapshot();
+        var lsp_health = try core.lsp_manager.healthSnapshot(allocator);
+        defer lsp_health.deinit(allocator);
+
         try w.print(
-            \\# stem — Message Bus Stats
+            \\# stem — Runtime Health
             \\
             \\Live snapshot of the Vigil-backed runtime messaging layer.
             \\Refreshes on each tick while this buffer is the active view.
+            \\
+            \\## Vigil
+            \\
+        , .{});
+
+        if (core.runtime_services) |runtime| {
+            const runtime_health = runtime.healthSnapshot();
+            try w.print(
+                \\- API version: {d}.{d}.{d}
+                \\- Telemetry bridge: {s}
+                \\- Plugin supervisor: {d} crashes, {d} restarts scheduled
+                \\- LSP supervisor: {d} crashes, {d} restarts scheduled
+                \\
+            , .{
+                runtime_health.vigil_major,
+                runtime_health.vigil_minor,
+                runtime_health.vigil_patch,
+                if (runtime_health.telemetry_initialized) "initialized" else "disabled",
+                runtime_health.plugin_supervisor.crashes,
+                runtime_health.plugin_supervisor.restarts_scheduled,
+                runtime_health.lsp_supervisor.crashes,
+                runtime_health.lsp_supervisor.restarts_scheduled,
+            });
+        } else {
+            try w.writeAll("- Runtime services are not attached.\n");
+        }
+
+        try w.print(
             \\
             \\## Global
             \\
@@ -158,6 +207,70 @@ pub const SystemCommands = struct {
             }
         }
 
+        try w.print(
+            \\
+            \\## Plugins
+            \\
+            \\- Loaded: {d} ({d} wasm, {d} exec)
+            \\- Vigil broker: {s}
+            \\- Lifecycle supervisor: {s}
+            \\- Pending exits: {d}
+            \\- Pending restarts: {d}
+            \\- Event subscribers: {d}
+            \\- Registered plugin keybindings: {d}
+            \\
+        , .{
+            plugin_health.loaded_plugins,
+            plugin_health.wasm_plugins,
+            plugin_health.process_plugins,
+            if (plugin_health.vigil_broker_attached) "attached" else "missing",
+            if (plugin_health.vigil_supervisor_attached) "attached" else "missing",
+            plugin_health.pending_exits,
+            plugin_health.pending_restarts,
+            plugin_health.event_subscribers,
+            plugin_health.keybindings,
+        });
+
+        try w.print(
+            \\
+            \\## LSP
+            \\
+            \\- Servers: {d} running, {d} healthy, {d} unhealthy, {d} initializing
+            \\- Open documents: {d}
+            \\- Pending changes: {d}
+            \\- In-progress starts: {d}
+            \\- Restart-tracked languages: {d}
+            \\- Lifecycle: {d} crashes, {d} restarts scheduled
+            \\
+        , .{
+            lsp_health.running_servers,
+            lsp_health.healthy_servers,
+            lsp_health.unhealthy_servers,
+            lsp_health.initializing_servers,
+            lsp_health.open_documents,
+            lsp_health.pending_changes,
+            lsp_health.in_progress_starts,
+            lsp_health.restart_tracked_languages,
+            lsp_health.lifecycle.crashes,
+            lsp_health.lifecycle.restarts_scheduled,
+        });
+
+        if (lsp_health.servers.len > 0) {
+            try w.writeAll("\n| Language | State | Restarts | Root |\n");
+            try w.writeAll("|---|---|---:|---|\n");
+            for (lsp_health.servers) |server| {
+                try w.print(
+                    "| `{s}` | {s} | {d} | {s} |\n",
+                    .{
+                        server.lang,
+                        lspStateLabel(server.running, server.healthy, server.initialized),
+                        server.restart_attempts,
+                        server.root_path orelse "-",
+                    },
+                );
+            }
+        }
+
         try w.writeAll(
             \\
             \\## How to read this
@@ -172,6 +285,13 @@ pub const SystemCommands = struct {
         );
 
         return aw.toOwnedSlice();
+    }
+
+    fn lspStateLabel(running: bool, healthy: bool, initialized: bool) []const u8 {
+        if (!running) return "stopped";
+        if (!healthy) return "unhealthy";
+        if (!initialized) return "initializing";
+        return "ready";
     }
 
     pub fn cmdJobList(core: anytype) anyerror!void {
