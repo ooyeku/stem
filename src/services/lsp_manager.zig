@@ -11,6 +11,7 @@ const external = @import("lsp/external.zig");
 const Transport = @import("../lsp/transport.zig");
 const supervisor_mod = @import("lsp/supervisor.zig");
 const LSPSupervisor = supervisor_mod.LSPSupervisor;
+const vigil_supervision = @import("vigil_supervision.zig");
 
 pub const LSPManager = struct {
     allocator: std.mem.Allocator,
@@ -39,6 +40,7 @@ pub const LSPManager = struct {
     environ_block: std.process.Environ.Block,
 
     supervisor: LSPSupervisor,
+    lifecycle_supervisor: ?*vigil_supervision.ComponentSupervisor = null,
 
     /// Watchdog thread that periodically checks each running server's health
     /// flags and queues a restart on the supervisor when one has died. Held
@@ -135,6 +137,10 @@ pub const LSPManager = struct {
         self.watchdog_thread = try std.Thread.spawn(.{}, watchdogMain, .{self});
     }
 
+    pub fn setVigilSupervisor(self: *LSPManager, supervisor: *vigil_supervision.ComponentSupervisor) void {
+        self.lifecycle_supervisor = supervisor;
+    }
+
     /// Periodic health check. Every `watchdog_interval_ms` we scan each
     /// running server; if its `server_healthy` is false and it's not in a
     /// backoff window, enqueue a restart on the supervisor.
@@ -207,6 +213,7 @@ pub const LSPManager = struct {
                     log.warn("[LSP WATCHDOG] {s} hit max restart attempts; giving up until user intervention", .{entry.lang});
                     continue;
                 }
+                self.recordLspRestartScheduled(entry.lang, 0, 0);
                 const lang_dup = self.allocator.dupe(u8, entry.lang) catch continue;
                 const root_dup: ?[]u8 = if (entry.root) |r| self.allocator.dupe(u8, r) catch null else null;
                 log.info("[LSP WATCHDOG] queueing restart of {s}", .{entry.lang});
@@ -215,6 +222,13 @@ pub const LSPManager = struct {
                     if (root_dup) |r| self.allocator.free(r);
                 };
             }
+        }
+    }
+
+    fn recordLspRestartScheduled(self: *LSPManager, lang: []const u8, delay_ms: i64, attempt: u32) void {
+        if (self.lifecycle_supervisor) |supervisor| {
+            supervisor.recordCrash(lang);
+            supervisor.recordRestartScheduled(lang, delay_ms, attempt);
         }
     }
 
@@ -2710,3 +2724,26 @@ pub const LSPManager = struct {
         return self.allocator.dupe(u8, start_dir);
     }
 };
+
+test "LSPManager records restart scheduling through Vigil lifecycle supervisor" {
+    const allocator = std.testing.allocator;
+    var io_ctx = @import("../test_utils.zig").TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+
+    var manager = LSPManager.init(allocator, io, .empty);
+    defer manager.deinit();
+
+    var runtime = try @import("vigil").runtime(allocator, .{});
+    defer runtime.deinit();
+
+    var supervisor = vigil_supervision.ComponentSupervisor.init(allocator, &runtime, .lsp);
+    defer supervisor.deinit();
+    manager.setVigilSupervisor(&supervisor);
+
+    manager.recordLspRestartScheduled("zig", 1000, 1);
+
+    const snapshot = supervisor.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), snapshot.crashes);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.restarts_scheduled);
+}

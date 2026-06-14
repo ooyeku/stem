@@ -1,6 +1,6 @@
 .{
     .name = .stem,
-    .version = "0.7.0",
+    .version = "0.8.0",
     .fingerprint = 0x20bf92e5730ad4ee, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     // IMPORTANT: every dependency URL must reference a fixed commit SHA
@@ -16,8 +16,8 @@
             .hash = "vaxis-0.6.0-BWNV_D7wCQBc96pX3enYqw-uqOTDuzbvRbozo4qIGwnr",
         },
         .vigil = .{
-            .url = "git+https://github.com/ooyeku/vigil#a520834333cf6be4ea8c24b83cf3bf312eddef95",
-            .hash = "vigil-1.3.0-0NlCVFsFBQAJ-e9J39slI-h6kFKpGSEFQU-vIr2G2oIB",
+            .url = "git+https://github.com/ooyeku/vigil#5cb4b9dab08564cdb3787b0e85d0e341aee1c2ef",
+            .hash = "vigil-2.0.0-0NlCVKrZBQD6KUVDHx6sjtvu9o6ZTxN16H2G83ik3DXn",
         },
         .zls = .{
             .url = "https://github.com/zigtools/zls/archive/refs/tags/0.16.0.tar.gz",

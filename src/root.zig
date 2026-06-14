@@ -43,6 +43,9 @@ test {
     _ = @import("services/global_search.zig");
     _ = @import("services/search_index.zig");
     _ = @import("services/hover_doc.zig");
+    _ = @import("services/runtime.zig");
+    _ = @import("services/event_topics.zig");
+    _ = @import("services/vigil_supervision.zig");
     _ = @import("services/lsp/server.zig");
     _ = @import("kernel/safe.zig");
     _ = @import("config/schema.zig");

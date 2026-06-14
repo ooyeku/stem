@@ -1,6 +1,5 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
-const vigil = @import("vigil");
 const EditorState = @import("core/state.zig").EditorState;
 const protocol = @import("kernel/protocol.zig");
 const Core = @import("kernel/core.zig").Core;
@@ -8,7 +7,7 @@ const StorageManager = @import("config/storage.zig").StorageManager;
 const logger = @import("services/logger.zig");
 const cli = @import("cli.zig");
 const MessageBus = @import("kernel/message_bus.zig").MessageBus;
-const telemetry = @import("services/telemetry.zig");
+const StemRuntime = @import("services/runtime.zig").StemRuntime;
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
@@ -389,25 +388,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.log.warn("Failed to install crash handler: {}", .{err});
     };
 
-    // Vigil-backed telemetry. Initialized once; the MessageBus + plugin
-    // manager + supervisor all write into the same rollup.
-    try telemetry.init(allocator);
-    defer telemetry.deinit();
+    // Vigil-backed runtime services. Owns the Vigil Runtime, Stem's
+    // process-local telemetry bridge, the editor event broker, and
+    // lifecycle supervisors for plugins/LSP.
+    var stem_runtime = try StemRuntime.init(allocator);
+    defer stem_runtime.deinit();
 
-    // Global pub/sub broker. Plugin events (buffer.changed,
-    // cursor.moved, etc.) are also re-published here so wildcard
-    // subscribers (the upcoming dashboard, external observers) can
-    // subscribe to topic patterns instead of going through the
-    // PluginManager's internal map.
-    try vigil.pubsub.initGlobal(allocator);
-    defer vigil.pubsub.deinitGlobal();
-
-    var app = try vigil.app(allocator);
-    defer app.shutdown();
-    var inbox_gpa = std.heap.DebugAllocator(.{}).init;
-    const inbox_allocator = inbox_gpa.allocator();
-    var main_inbox = try vigil.inbox(inbox_allocator);
-    var core_inbox = try vigil.inbox(inbox_allocator);
+    const inbox_allocator = allocator;
+    const runtime_inboxes = try stem_runtime.createEditorInboxes();
+    var main_inbox = runtime_inboxes.main;
+    var core_inbox = runtime_inboxes.core;
 
     // Producers send through these buses (priority routing, coalescing,
     // backpressure, telemetry). Consumers still read directly from the
@@ -494,7 +484,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     vx.caps.sgr_pixels = false;
     try vx.setMouseMode(tty.writer(), true);
     var core_ctx = CoreContext{
-        .core = try Core.init(allocator, io, init.environ.block, &main_bus, &storage, initial_files_to_open.items),
+        .core = try Core.init(allocator, io, init.environ.block, &main_bus, &storage, initial_files_to_open.items, &stem_runtime),
         .bus = &core_bus,
     };
     defer core_ctx.core.deinit();

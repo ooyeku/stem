@@ -34,6 +34,7 @@ const JobManager = @import("jobs.zig").JobManager;
 const WorkspaceManager = @import("workspace.zig").WorkspaceManager;
 const build_jobs = @import("build_jobs.zig");
 const PluginManager = @import("../plugins/manager.zig").PluginManager;
+const StemRuntime = @import("../services/runtime.zig").StemRuntime;
 const session = @import("session.zig");
 const global_search = @import("../services/global_search.zig");
 const SearchIndex = @import("../services/search_index.zig").SearchIndex;
@@ -496,7 +497,15 @@ pub const Core = struct {
     /// `deinit` waits briefly for this to reach zero.
     scan_workers_running: std.atomic.Value(u32) = .{ .raw = 0 },
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, environ_block: std.process.Environ.Block, ui_bus: *@import("message_bus.zig").MessageBus, storage: *StorageManager, initial_files: []const []const u8) !Core {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environ_block: std.process.Environ.Block,
+        ui_bus: *@import("message_bus.zig").MessageBus,
+        storage: *StorageManager,
+        initial_files: []const []const u8,
+        runtime_services: ?*StemRuntime,
+    ) !Core {
         var initial_terminal_output = std.ArrayListUnmanaged(u8).empty;
         try initial_terminal_output.appendSlice(allocator, "Terminal Ready\n");
         errdefer initial_terminal_output.deinit(allocator);
@@ -542,6 +551,10 @@ pub const Core = struct {
         };
 
         core.plugin_manager = PluginManager.init(allocator, io, environ_block, ui_bus, core.command_registry);
+        if (runtime_services) |runtime| {
+            core.plugin_manager.setVigilServices(&runtime.event_broker, &runtime.plugin_supervisor);
+            core.lsp_manager.setVigilSupervisor(&runtime.lsp_supervisor);
+        }
         core.search_index = SearchIndex.init(allocator, io, environ_block);
 
         // Push the user's configured thresholds into the buffer manager

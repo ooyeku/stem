@@ -30,6 +30,8 @@ const WasmPlugin = wasm_loader.WasmPlugin;
 const jsonrpc = @import("jsonrpc.zig");
 const logger_service = @import("../services/logger.zig");
 const telemetry = @import("../services/telemetry.zig");
+const event_topics = @import("../services/event_topics.zig");
+const vigil_supervision = @import("../services/vigil_supervision.zig");
 
 /// Wire-protocol version handed to exec plugins on `plugin/initialize`.
 /// Bumped only when the JSON-RPC envelope semantics change.
@@ -87,6 +89,8 @@ pub const PluginManager = struct {
     pending_requests: std.AutoHashMapUnmanaged(u64, []u8) = .empty,
 
     core_inbox: ?*vigil.Inbox = null,
+    event_broker: ?*vigil.pubsub.PubSubBroker = null,
+    lifecycle_supervisor: ?*vigil_supervision.ComponentSupervisor = null,
     ui_bus: *MessageBus,
 
     command_registry: *CommandRegistry,
@@ -175,6 +179,15 @@ pub const PluginManager = struct {
             .ui_bus = ui_bus,
             .command_registry = command_registry,
         };
+    }
+
+    pub fn setVigilServices(
+        self: *PluginManager,
+        event_broker: *vigil.pubsub.PubSubBroker,
+        lifecycle_supervisor: *vigil_supervision.ComponentSupervisor,
+    ) void {
+        self.event_broker = event_broker;
+        self.lifecycle_supervisor = lifecycle_supervisor;
     }
 
     pub fn deinit(self: *PluginManager) void {
@@ -794,6 +807,9 @@ pub const PluginManager = struct {
 
         for (names) |name| {
             telemetry.recordPluginCrash(name);
+            if (self.lifecycle_supervisor) |supervisor| {
+                supervisor.recordCrash(name);
+            }
             const policy: manifest_mod.Restart = blk: {
                 self.state_mu.lock();
                 defer self.state_mu.unlock();
@@ -826,6 +842,8 @@ pub const PluginManager = struct {
         // Snapshot a stable handle for the post-unlock inbox poke so
         // we never call into another subsystem with `state_mu` held.
         var inbox_snapshot: ?*vigil.Inbox = null;
+        var restart_delay_ms: i64 = 0;
+        var restart_attempt: u32 = 0;
 
         {
             self.state_mu.lock();
@@ -857,6 +875,8 @@ pub const PluginManager = struct {
             gop.value_ptr.attempts += 1;
             gop.value_ptr.last_attempt_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
             const due = gop.value_ptr.last_attempt_ms + delay;
+            restart_delay_ms = delay;
+            restart_attempt = gop.value_ptr.attempts;
 
             log.info("process plugin '{s}' crashed; restart scheduled in {d}ms (attempt {d})", .{
                 name_owned, delay, gop.value_ptr.attempts,
@@ -864,6 +884,10 @@ pub const PluginManager = struct {
             try self.pending_restarts.append(self.allocator, .{ .name = name_owned, .due_ms = due });
 
             inbox_snapshot = self.core_inbox;
+        }
+
+        if (self.lifecycle_supervisor) |supervisor| {
+            supervisor.recordRestartScheduled(name_owned, restart_delay_ms, restart_attempt);
         }
 
         // Wake core promptly so it ticks soon and notices the pending
@@ -1111,19 +1135,7 @@ pub const PluginManager = struct {
     /// manifest's `permissions.events` and used by exec subscribers)
     /// to a `PluginEvent`. Inverse of `pluginEventTopic`.
     fn eventFromTopic(topic: []const u8) ?protocol.PluginEvent {
-        const map = .{
-            .{ "buffer.changed", protocol.PluginEvent.buffer_changed },
-            .{ "cursor.moved", protocol.PluginEvent.cursor_moved },
-            .{ "mode.changed", protocol.PluginEvent.mode_changed },
-            .{ "file.saved", protocol.PluginEvent.file_saved },
-            .{ "file.opened", protocol.PluginEvent.file_opened },
-            .{ "buffer.switched", protocol.PluginEvent.buffer_switched },
-            .{ "custom", protocol.PluginEvent.custom_event },
-        };
-        inline for (map) |entry| {
-            if (std.mem.eql(u8, topic, entry[0])) return entry[1];
-        }
-        return null;
+        return event_topics.eventFromTopic(topic);
     }
 
     fn addEventSubscription(
@@ -2339,12 +2351,10 @@ pub const PluginManager = struct {
     ///      `handle_event` export.
     pub fn broadcastEvent(self: *PluginManager, event: protocol.PluginEvent, data: []const u8) void {
         const topic = pluginEventTopic(event);
+        const editor_topic = event_topics.editorEventTopic(event);
 
-        if (vigil.pubsub.getGlobal()) |broker| {
-            _ = broker.publish(topic, data) catch |err| {
-                log.warn("pubsub publish '{s}' failed: {}", .{ topic, err });
-            };
-        }
+        self.publishEventTopic(topic, data);
+        self.publishEventTopic(editor_topic, data);
 
         const subs = self.event_subscribers.get(event) orelse return;
         for (subs.items) |sub| {
@@ -2352,6 +2362,21 @@ pub const PluginManager = struct {
                 .exec => self.deliverExecEvent(sub.plugin_id, topic, data),
                 .wasm => self.deliverWasmEvent(sub.plugin_id, topic, data),
             }
+        }
+    }
+
+    fn publishEventTopic(self: *PluginManager, topic: []const u8, data: []const u8) void {
+        if (self.event_broker) |broker| {
+            _ = broker.publish(topic, data) catch |err| {
+                log.warn("pubsub publish '{s}' failed: {}", .{ topic, err });
+            };
+            return;
+        }
+
+        if (vigil.pubsub.getGlobal()) |broker| {
+            _ = broker.publish(topic, data) catch |err| {
+                log.warn("pubsub publish '{s}' failed: {}", .{ topic, err });
+            };
         }
     }
 
@@ -2384,15 +2409,7 @@ pub const PluginManager = struct {
     /// Stable topic names so external subscribers don't have to know
     /// the `protocol.PluginEvent` enum integer.
     fn pluginEventTopic(event: protocol.PluginEvent) []const u8 {
-        return switch (event) {
-            .buffer_changed => "buffer.changed",
-            .cursor_moved => "cursor.moved",
-            .mode_changed => "mode.changed",
-            .file_saved => "file.saved",
-            .file_opened => "file.opened",
-            .buffer_switched => "buffer.switched",
-            .custom_event => "custom",
-        };
+        return event_topics.pluginEventTopic(event);
     }
 
     const PluginCommandContext = struct {
@@ -2415,6 +2432,56 @@ test "filesystemListAllows: exact and glob grants gate per-op" {
     try std.testing.expect(!PluginManager.filesystemListAllows(&grants, "read:", "out.txt"));
     // No grant at all => deny.
     try std.testing.expect(!PluginManager.filesystemListAllows(&.{}, "read:", "src/main.zig"));
+}
+
+test "broadcastEvent publishes legacy and editor topics through owned broker" {
+    const allocator = std.testing.allocator;
+    var io_ctx = @import("../test_utils.zig").TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+
+    const ui_inbox = try vigil.inbox(allocator);
+    defer ui_inbox.close();
+    var ui_bus = MessageBus.init(allocator, ui_inbox, "test-ui");
+
+    var registry = CommandRegistry.init(allocator);
+    defer registry.deinit();
+
+    var manager = PluginManager.init(allocator, io, .empty, &ui_bus, &registry);
+    defer manager.deinit();
+
+    var runtime = try vigil.runtime(allocator, .{});
+    defer runtime.deinit();
+    var broker = vigil.pubsub.PubSubBroker.init(allocator);
+    defer broker.deinit();
+    var supervisor = vigil_supervision.ComponentSupervisor.init(allocator, &runtime, .plugins);
+    defer supervisor.deinit();
+    supervisor.setEventBroker(&broker);
+    manager.setVigilServices(&broker, &supervisor);
+
+    const legacy_inbox = try runtime.inbox(.{ .capacity = 4 });
+    defer legacy_inbox.close();
+    var legacy_sub = vigil.pubsub.Subscriber.init(allocator, legacy_inbox);
+    defer legacy_sub.deinit();
+    try legacy_sub.subscribe(&[_][]const u8{"buffer.changed"});
+    try broker.subscribe(&legacy_sub);
+
+    const editor_inbox = try runtime.inbox(.{ .capacity = 4 });
+    defer editor_inbox.close();
+    var editor_sub = vigil.pubsub.Subscriber.init(allocator, editor_inbox);
+    defer editor_sub.deinit();
+    try editor_sub.subscribe(&[_][]const u8{"editor.buffer.changed"});
+    try broker.subscribe(&editor_sub);
+
+    manager.broadcastEvent(.buffer_changed, "main.zig");
+
+    var legacy_msg = try legacy_inbox.recv();
+    defer legacy_msg.deinit();
+    try std.testing.expectEqualStrings("main.zig", legacy_msg.payload.?);
+
+    var editor_msg = try editor_inbox.recv();
+    defer editor_msg.deinit();
+    try std.testing.expectEqualStrings("main.zig", editor_msg.payload.?);
 }
 
 test "filesystemListAllows: rejects parent-dir traversal even when the glob would match" {

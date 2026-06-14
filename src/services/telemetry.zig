@@ -75,6 +75,7 @@ pub fn deinit() void {
         state.allocator.free(entry.key_ptr.*);
     }
     state.sends_per_bus.deinit(state.allocator);
+    state.sends_per_bus = .empty;
     vigil.telemetry.deinitGlobal();
     state.initialized = false;
     state.bytes_sent = 0;
@@ -255,4 +256,16 @@ test "telemetry: silent when not initialized" {
     Self.recordMessageSent("nothing", "interactive", 4);
     const s = Self.snapshot();
     try std.testing.expectEqual(@as(u64, 0), s.bytes_sent);
+}
+
+test "telemetry: init and deinit can repeat" {
+    try Self.init(std.testing.allocator);
+    Self.recordMessageSent("first", "interactive", 4);
+    Self.deinit();
+
+    try Self.init(std.testing.allocator);
+    Self.recordMessageSent("second", "interactive", 8);
+    const s = Self.snapshot();
+    try std.testing.expectEqual(@as(u64, 8), s.bytes_sent);
+    Self.deinit();
 }
