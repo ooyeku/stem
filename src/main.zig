@@ -555,17 +555,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const core_thread = try std.Thread.spawn(.{}, Runner.run, .{&core_ctx});
     defer core_thread.join();
     defer stem_runtime.shutdown();
+    var app_stop: std.atomic.Value(bool) = .init(false);
     const InputThread = struct {
         loop: *vaxis.Loop(vaxis.Event),
         bus: *MessageBus,
         allocator: std.mem.Allocator,
+        stop: *std.atomic.Value(bool),
         fn run(self: @This()) !void {
             setThreadName("stem-input");
             // Monotonic counter for coalesced sends (resize): each event
             // gets a fresh identity so the bus knows the slot was reused.
             var resize_seq: u64 = 0;
-            while (true) {
+            while (!self.stop.load(.acquire)) {
                 const event = self.loop.nextEvent() catch break;
+                if (self.stop.load(.acquire)) break;
                 var msg: protocol.Message = undefined;
                 var class: @import("kernel/message_bus.zig").Class = .interactive;
                 var is_resize = false;
@@ -605,18 +608,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .loop = &loop,
         .bus = &main_bus,
         .allocator = inbox_allocator,
+        .stop = &app_stop,
     }});
-    defer input_thread.detach();
 
     const HeartbeatThread = struct {
         bus: *MessageBus,
         allocator: std.mem.Allocator,
         io: std.Io,
+        stop: *std.atomic.Value(bool),
         fn run(self: @This()) !void {
             setThreadName("stem-heartbeat");
             var tick_seq: u64 = 0;
-            while (true) {
+            while (!self.stop.load(.acquire)) {
                 std.Io.sleep(self.io, .fromMilliseconds(100), .awake) catch break;
+                if (self.stop.load(.acquire)) break;
                 var tick_msg: protocol.Message = .tick;
                 const bytes = tick_msg.encode(self.allocator) catch continue;
                 defer self.allocator.free(bytes);
@@ -632,8 +637,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .bus = &core_bus,
         .allocator = inbox_allocator,
         .io = io,
+        .stop = &app_stop,
     }});
-    heartbeat_thread.detach();
 
     // Signal monitor: polls the `shutdown_requested` flag set by the
     // SIGINT/SIGTERM/SIGHUP handler. When set, injects a `.quit` into
@@ -643,10 +648,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         bus: *MessageBus,
         allocator: std.mem.Allocator,
         io: std.Io,
+        stop: *std.atomic.Value(bool),
         fn run(self: @This()) void {
             setThreadName("stem-sigmon");
-            while (true) {
+            while (!self.stop.load(.acquire)) {
                 std.Io.sleep(self.io, .fromMilliseconds(200), .awake) catch return;
+                if (self.stop.load(.acquire)) return;
                 if (shutdown_requested.load(.acquire)) {
                     const msg = (protocol.Message{ .quit = {} }).encode(self.allocator) catch return;
                     defer self.allocator.free(msg);
@@ -662,8 +669,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .bus = &main_bus,
         .allocator = inbox_allocator,
         .io = io,
+        .stop = &app_stop,
     }});
-    signal_monitor_thread.detach();
     const View = @import("ui/view.zig").View;
     var view = View.init(allocator);
     var loop_arena = std.heap.ArenaAllocator.init(allocator);
@@ -783,6 +790,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
     }
+    app_stop.store(true, .release);
+    loop.stop();
+    input_thread.join();
+    heartbeat_thread.join();
+    signal_monitor_thread.join();
+
     stem_runtime.shutdown();
     vx.setMouseMode(tty.writer(), false) catch {};
     vx.exitAltScreen(tty.writer()) catch {};

@@ -5,7 +5,6 @@ const protocol = @import("../../kernel/protocol.zig");
 const lsp_client = @import("../../lsp/client.zig");
 const pathToUri = lsp_client.pathToUri;
 const fileUriToPath = lsp_client.fileUriToPath;
-const supervisor_mod = @import("supervisor.zig");
 const safe = @import("../../kernel/safe.zig");
 const log = std.log.scoped(.LSP);
 
@@ -592,35 +591,17 @@ pub const LSPServer = struct {
         self.to_server.close();
         self.from_server.close();
 
-        // Bounded joins: closing the pipes should normally make the reader
-        // and server threads exit promptly, but a misbehaving external LSP
-        // child can refuse to terminate even after `exit` was sent. Don't
-        // let that hang the editor — give each join 2 s, then detach. The
-        // detached thread will continue until the LSP process actually
-        // dies (which happens at-latest when *our* process exits).
-        var leaked_threads = false;
         if (self.reader_thread) |t| {
-            if (!supervisor_mod.joinTimeout(self.allocator, self.io, t, 2000)) {
-                log.warn("[LSP STOP] {s} reader thread did not exit in 2s; detaching", .{self.lang});
-                leaked_threads = true;
-            }
+            t.join();
             self.reader_thread = null;
         }
         if (self.server_thread) |t| {
-            if (!supervisor_mod.joinTimeout(self.allocator, self.io, t, 2000)) {
-                log.warn("[LSP STOP] {s} server thread did not exit in 2s; detaching", .{self.lang});
-                leaked_threads = true;
-            }
+            t.join();
             self.server_thread = null;
         }
 
-        // If we detached threads, the old MemPipes are still being touched
-        // by them, so we cannot deinit-and-reuse. Allocate fresh pipes and
-        // leave the old ones to be cleaned up by the OS at process exit.
-        if (!leaked_threads) {
-            self.to_server.deinit();
-            self.from_server.deinit();
-        }
+        self.to_server.deinit();
+        self.from_server.deinit();
         self.to_server = Transport.MemPipe.init(self.allocator, self.io);
         self.from_server = Transport.MemPipe.init(self.allocator, self.io);
 
@@ -742,19 +723,16 @@ pub const LSPServer = struct {
         self.shutdown.store(true, .release);
         self.to_server.close();
         self.from_server.close();
-        var leaked_threads = false;
         if (self.reader_thread) |t| {
-            if (!supervisor_mod.joinTimeout(self.allocator, self.io, t, 2000)) leaked_threads = true;
+            t.join();
             self.reader_thread = null;
         }
         if (self.server_thread) |t| {
-            if (!supervisor_mod.joinTimeout(self.allocator, self.io, t, 2000)) leaked_threads = true;
+            t.join();
             self.server_thread = null;
         }
-        if (!leaked_threads) {
-            self.to_server.deinit();
-            self.from_server.deinit();
-        }
+        self.to_server.deinit();
+        self.from_server.deinit();
         self.to_server = Transport.MemPipe.init(self.allocator, self.io);
         self.from_server = Transport.MemPipe.init(self.allocator, self.io);
         self.server_running.store(false, .release);

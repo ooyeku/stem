@@ -87,6 +87,7 @@ pub const LSPManager = struct {
     pub const RestartState = struct {
         attempts: u32 = 0,
         last_attempt_ms: i64 = 0,
+        healthy_since_ms: i64 = 0,
     };
 
     pub const PendingChange = struct {
@@ -285,20 +286,24 @@ pub const LSPManager = struct {
             // restart enqueue (which itself takes locks).
             self.manager_mutex.lockUncancelable(self.io);
             var unhealthy: std.ArrayListUnmanaged(struct { lang: []u8, root: ?[]u8 }) = .empty;
+            var healthy: std.ArrayListUnmanaged([]u8) = .empty;
             defer {
                 for (unhealthy.items) |u| {
                     self.allocator.free(u.lang);
                     if (u.root) |r| self.allocator.free(r);
                 }
                 unhealthy.deinit(self.allocator);
+                for (healthy.items) |lang| self.allocator.free(lang);
+                healthy.deinit(self.allocator);
             }
 
             var it = self.servers.iterator();
             while (it.next()) |entry| {
                 const server = entry.value_ptr.*;
                 const running = server.server_running.load(.acquire);
-                const healthy = server.server_healthy.load(.acquire);
-                if (running and !healthy) {
+                const is_healthy = server.server_healthy.load(.acquire);
+                const initialized = server.is_initialized.load(.acquire);
+                if (running and !is_healthy) {
                     const lang = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
                     const root: ?[]u8 = if (server.current_root_path) |p|
                         self.allocator.dupe(u8, p) catch null
@@ -308,9 +313,15 @@ pub const LSPManager = struct {
                         self.allocator.free(lang);
                         if (root) |r| self.allocator.free(r);
                     };
+                } else if (running and is_healthy and initialized) {
+                    const lang = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                    healthy.append(self.allocator, lang) catch self.allocator.free(lang);
                 }
             }
             self.manager_mutex.unlock(self.io);
+
+            const now_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+            for (healthy.items) |lang| self.markHealthyRestartBudgetAt(lang, now_ms);
 
             for (unhealthy.items) |entry| {
                 if (!self.shouldRetryRestart(entry.lang)) {
@@ -346,6 +357,10 @@ pub const LSPManager = struct {
     /// `recovery_window_ms`.
     fn shouldRetryRestart(self: *LSPManager, lang: []const u8) bool {
         const now_ms = std.Io.Clock.real.now(self.io).toMilliseconds();
+        return self.shouldRetryRestartAt(lang, now_ms);
+    }
+
+    fn shouldRetryRestartAt(self: *LSPManager, lang: []const u8, now_ms: i64) bool {
         self.restart_state_mutex.lockUncancelable(self.io);
         defer self.restart_state_mutex.unlock(self.io);
 
@@ -359,14 +374,6 @@ pub const LSPManager = struct {
             gop.value_ptr.* = .{};
         }
 
-        // Recovery: if it's been healthy for a while since the last attempt,
-        // reset the counter so we get a fresh budget.
-        if (gop.value_ptr.last_attempt_ms != 0 and
-            (now_ms - gop.value_ptr.last_attempt_ms) > recovery_window_ms)
-        {
-            gop.value_ptr.attempts = 0;
-        }
-
         if (gop.value_ptr.attempts >= max_restart_attempts) return false;
 
         const since = now_ms - gop.value_ptr.last_attempt_ms;
@@ -376,7 +383,28 @@ pub const LSPManager = struct {
 
         gop.value_ptr.attempts += 1;
         gop.value_ptr.last_attempt_ms = now_ms;
+        gop.value_ptr.healthy_since_ms = 0;
         return true;
+    }
+
+    fn markHealthyRestartBudgetAt(self: *LSPManager, lang: []const u8, now_ms: i64) void {
+        self.restart_state_mutex.lockUncancelable(self.io);
+        defer self.restart_state_mutex.unlock(self.io);
+
+        const state = self.restart_state.getPtr(lang) orelse return;
+        if (state.attempts == 0) {
+            state.healthy_since_ms = 0;
+            return;
+        }
+        if (state.healthy_since_ms == 0) {
+            state.healthy_since_ms = now_ms;
+            return;
+        }
+        if (now_ms - state.healthy_since_ms >= recovery_window_ms) {
+            state.attempts = 0;
+            state.last_attempt_ms = 0;
+            state.healthy_since_ms = 0;
+        }
     }
 
     /// Mark `lang` as "currently starting". Returns true if we claimed the
@@ -482,13 +510,12 @@ pub const LSPManager = struct {
     /// has been processed (FIFO). The document is guaranteed to be opened
     /// on the server by this point, so the textDocument request can fire.
     fn runDeferredRequestSync(self: *LSPManager, lang: []const u8, file_path: []const u8, kind: supervisor_mod.Command.DeferredKind, line: u32, col: u32) !void {
-        self.manager_mutex.lockUncancelable(self.io);
-        const srv = self.servers.get(lang);
-        self.manager_mutex.unlock(self.io);
-        const server = srv orelse return; // server died between enqueue and exec
-
         const uri = try pathToUri(self.allocator, self.io, file_path);
         defer self.allocator.free(uri);
+
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        const server = self.servers.get(lang) orelse return; // server died between enqueue and exec
 
         switch (kind) {
             .hover => try server.requestHover(uri, line, col),
@@ -720,10 +747,11 @@ pub const LSPManager = struct {
             }
         }
 
-        // Send the didOpen + initial token request.
+        // Send the didOpen + initial token request. Keep the manager lock
+        // across the server calls so a concurrent stop cannot deinit `srv`.
         self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
         const srv = self.servers.get(lang) orelse {
-            self.manager_mutex.unlock(self.io);
             return;
         };
         const uri = try pathToUri(self.allocator, self.io, file_path);
@@ -731,12 +759,9 @@ pub const LSPManager = struct {
 
         if (self.open_documents.contains(uri)) {
             self.allocator.free(uri);
-            self.manager_mutex.unlock(self.io);
             return;
         }
         try self.open_documents.put(uri, {});
-        // Drop the lock before the (still fast but pipe-write) send.
-        self.manager_mutex.unlock(self.io);
 
         srv.sendDidOpen(uri, lang, 1, content) catch |err| {
             log.warn("[supervisor] sendDidOpen failed for {s}: {}", .{ file_path, err });
@@ -759,8 +784,8 @@ pub const LSPManager = struct {
     /// rust-analyzer, zls) accept this and avoid the cost of a restart.
     fn addWorkspaceFolderSync(self: *LSPManager, lang: []const u8, root: []const u8) !void {
         self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
         const srv = self.servers.get(lang);
-        self.manager_mutex.unlock(self.io);
         if (srv) |s| try s.sendDidChangeWorkspaceFolders(root, &.{});
     }
 
@@ -1802,11 +1827,15 @@ pub const LSPManager = struct {
                         self.allocator.free(uri);
                         return err;
                     };
-                    try self.open_documents.put(uri, {});
-                    self.manager_mutex.unlock(self.io);
+                    self.open_documents.put(uri, {}) catch |err| {
+                        self.manager_mutex.unlock(self.io);
+                        self.allocator.free(uri);
+                        return err;
+                    };
                     srv.requestSemanticTokens(uri) catch |err| {
                         log.warn("requestSemanticTokens on open failed: {}", .{err});
                     };
+                    self.manager_mutex.unlock(self.io);
                     return;
                 }
             }
@@ -1928,13 +1957,13 @@ pub const LSPManager = struct {
             defer self.allocator.free(entry.path);
             defer self.allocator.free(entry.content);
 
-            self.manager_mutex.lockUncancelable(self.io);
-            const server_opt = self.getServerForFile(entry.path);
-            self.manager_mutex.unlock(self.io);
-            const server = server_opt orelse continue;
-            if (!server.server_running.load(.acquire)) continue;
             const uri = pathToUri(self.allocator, self.io, entry.path) catch continue;
             defer self.allocator.free(uri);
+
+            self.manager_mutex.lockUncancelable(self.io);
+            defer self.manager_mutex.unlock(self.io);
+            const server = self.getServerForFile(entry.path) orelse continue;
+            if (!server.server_running.load(.acquire)) continue;
 
             server.sendDidChange(uri, entry.version, entry.content) catch |err| {
                 log.warn("debounced sendDidChange failed for {s}: {}", .{ entry.path, err });
@@ -1953,13 +1982,13 @@ pub const LSPManager = struct {
         // server formats / lints stale content.
         self.flushPendingChangesNow();
 
-        self.manager_mutex.lockUncancelable(self.io);
-        const server_opt = self.getServerForFile(file_path);
-        self.manager_mutex.unlock(self.io);
-        const server = server_opt orelse return;
-        if (!server.server_running.load(.acquire)) return;
         const uri = try pathToUri(self.allocator, self.io, file_path);
         defer self.allocator.free(uri);
+
+        self.manager_mutex.lockUncancelable(self.io);
+        defer self.manager_mutex.unlock(self.io);
+        const server = self.getServerForFile(file_path) orelse return;
+        if (!server.server_running.load(.acquire)) return;
         try server.sendDidSave(uri);
     }
 
@@ -2018,16 +2047,23 @@ pub const LSPManager = struct {
         } else false;
         if (ready and uri_in_open) {
             const server = maybe_srv.?;
-            const uri = try pathToUri(self.allocator, self.io, file_path);
+            const uri = pathToUri(self.allocator, self.io, file_path) catch |err| {
+                self.manager_mutex.unlock(self.io);
+                return err;
+            };
             defer self.allocator.free(uri);
-            switch (kind) {
-                .hover => try server.requestHover(uri, line, col),
-                .completion => try server.requestCompletion(uri, line, col),
-                .formatting => try server.requestFormatting(uri),
-                .definition => try server.requestDefinition(uri, line, col),
-                .references => try server.requestReferences(uri, line, col),
-                .document_symbols => try server.requestDocumentSymbols(uri),
-            }
+            const request_result = switch (kind) {
+                .hover => server.requestHover(uri, line, col),
+                .completion => server.requestCompletion(uri, line, col),
+                .formatting => server.requestFormatting(uri),
+                .definition => server.requestDefinition(uri, line, col),
+                .references => server.requestReferences(uri, line, col),
+                .document_symbols => server.requestDocumentSymbols(uri),
+            };
+            request_result catch |err| {
+                self.manager_mutex.unlock(self.io);
+                return err;
+            };
             self.manager_mutex.unlock(self.io);
             return;
         }
@@ -2370,15 +2406,12 @@ pub const LSPManager = struct {
     }
 
     pub fn copyVisibleTokens(self: *LSPManager, allocator: std.mem.Allocator, file_path: []const u8, first_line: usize, last_line: usize) ![]protocol.SyntaxToken {
-        // Hot path: called per pane per render. Hold the manager lock only
-        // for the lookup, then release before the token copy (which takes
-        // the server's own file_tokens_mutex). The supervisor can't deinit
-        // a server while we're using its pointer here because it would
-        // need this same mutex to remove it from the map first.
+        // Hot path: called per pane per render. Keep the manager lock while
+        // using the server pointer; stop/restart removes and deinitializes
+        // servers on the supervisor thread under this same lock.
         self.manager_mutex.lockUncancelable(self.io);
-        const server_opt = self.getServerForFile(file_path);
-        self.manager_mutex.unlock(self.io);
-        const server = server_opt orelse return &.{};
+        defer self.manager_mutex.unlock(self.io);
+        const server = self.getServerForFile(file_path) orelse return &.{};
 
         const uri = try pathToUri(allocator, self.io, file_path);
         defer allocator.free(uri);
@@ -2387,11 +2420,16 @@ pub const LSPManager = struct {
 
     pub fn refreshSemanticTokens(self: *LSPManager, file_path: []const u8) void {
         const lang = getLangFromPath(file_path) orelse return;
+        const uri = pathToUri(self.allocator, self.io, file_path) catch return;
+        defer self.allocator.free(uri);
 
         self.manager_mutex.lockUncancelable(self.io);
         const maybe_server = self.servers.get(lang);
-        self.manager_mutex.unlock(self.io);
-        const server = maybe_server orelse return;
+        if (maybe_server == null) {
+            self.manager_mutex.unlock(self.io);
+            return;
+        }
+        const server = maybe_server.?;
 
         if (!server.server_healthy.load(.acquire) and server.server_running.load(.acquire)) {
             // Hand off the recovery to the supervisor; this returns
@@ -2404,20 +2442,18 @@ pub const LSPManager = struct {
 
             const lang_owned = self.allocator.dupe(u8, lang) catch {
                 if (root) |r| self.allocator.free(r);
+                self.manager_mutex.unlock(self.io);
                 return;
             };
             self.supervisor.enqueueDedup(.{ .restart_server = .{ .lang = lang_owned, .root = root } }) catch {
                 self.allocator.free(lang_owned);
                 if (root) |r| self.allocator.free(r);
             };
+            self.manager_mutex.unlock(self.io);
             return;
         }
 
         if (server.server_running.load(.acquire) and server.is_initialized.load(.acquire)) {
-            const uri = pathToUri(self.allocator, self.io, file_path) catch return;
-            defer self.allocator.free(uri);
-
-            self.manager_mutex.lockUncancelable(self.io);
             const already_open = self.open_documents.contains(uri);
             self.manager_mutex.unlock(self.io);
 
@@ -2429,19 +2465,45 @@ pub const LSPManager = struct {
                 };
                 defer self.allocator.free(content);
 
-                server.sendDidOpen(uri, lang, 1, content) catch return;
                 const uri_dup = self.allocator.dupe(u8, uri) catch return;
                 self.manager_mutex.lockUncancelable(self.io);
                 defer self.manager_mutex.unlock(self.io);
-                self.open_documents.put(uri_dup, {}) catch {
+                const refreshed_server = self.servers.get(lang) orelse {
                     self.allocator.free(uri_dup);
                     return;
                 };
+                if (!refreshed_server.server_running.load(.acquire) or !refreshed_server.is_initialized.load(.acquire)) {
+                    self.allocator.free(uri_dup);
+                    return;
+                }
+                if (self.open_documents.contains(uri)) {
+                    self.allocator.free(uri_dup);
+                } else {
+                    refreshed_server.sendDidOpen(uri, lang, 1, content) catch {
+                        self.allocator.free(uri_dup);
+                        return;
+                    };
+                    self.open_documents.put(uri_dup, {}) catch {
+                        self.allocator.free(uri_dup);
+                        return;
+                    };
+                }
+                refreshed_server.requestSemanticTokens(uri) catch |err| {
+                    log.warn("Failed to request semantic tokens on refresh for {s}: {}", .{ uri, err });
+                };
+                return;
             }
 
-            server.requestSemanticTokens(uri) catch |err| {
-                log.warn("Failed to request semantic tokens on refresh for {s}: {}", .{ uri, err });
-            };
+            self.manager_mutex.lockUncancelable(self.io);
+            defer self.manager_mutex.unlock(self.io);
+            const refreshed_server = self.servers.get(lang) orelse return;
+            if (refreshed_server.server_running.load(.acquire) and refreshed_server.is_initialized.load(.acquire)) {
+                refreshed_server.requestSemanticTokens(uri) catch |err| {
+                    log.warn("Failed to request semantic tokens on refresh for {s}: {}", .{ uri, err });
+                };
+            }
+        } else {
+            self.manager_mutex.unlock(self.io);
         }
     }
 
@@ -2865,4 +2927,30 @@ test "LSPManager records restart scheduling through Vigil lifecycle supervisor" 
     const snapshot = supervisor.snapshot();
     try std.testing.expectEqual(@as(u64, 1), snapshot.crashes);
     try std.testing.expectEqual(@as(u64, 1), snapshot.restarts_scheduled);
+}
+
+test "LSPManager restart budget resets only after healthy recovery" {
+    const allocator = std.testing.allocator;
+    var io_ctx = @import("../test_utils.zig").TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+
+    var manager = LSPManager.init(allocator, io, .empty);
+    defer manager.deinit();
+
+    const lang = "zig";
+    var now: i64 = 1_000;
+    var attempts: u32 = 0;
+    while (attempts < LSPManager.max_restart_attempts) : (attempts += 1) {
+        try std.testing.expect(manager.shouldRetryRestartAt(lang, now));
+        now += LSPManager.max_backoff_ms + 1;
+    }
+
+    try std.testing.expect(!manager.shouldRetryRestartAt(lang, now + LSPManager.recovery_window_ms * 10));
+
+    manager.markHealthyRestartBudgetAt(lang, now);
+    try std.testing.expect(!manager.shouldRetryRestartAt(lang, now + LSPManager.recovery_window_ms / 2));
+
+    manager.markHealthyRestartBudgetAt(lang, now + LSPManager.recovery_window_ms + 1);
+    try std.testing.expect(manager.shouldRetryRestartAt(lang, now + LSPManager.recovery_window_ms + LSPManager.max_backoff_ms + 2));
 }

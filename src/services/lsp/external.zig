@@ -244,6 +244,8 @@ fn runHostProcess(
     // spawned (writer_thread) will see EOF on the pipe and exit on their
     // own, since the child's pipes close when it's killed.
     errdefer {
+        input_pipe.close();
+        output_pipe.close();
         if (captured_pid) |pid| platform.killProcessTreeForce(pid) else child.kill(io);
         _ = child.wait(io) catch {};
     }
@@ -255,7 +257,7 @@ fn runHostProcess(
     const watch: ?*KillWatch = blk: {
         const w = allocator.create(KillWatch) catch break :blk null;
         w.* = .{ .pid = child.id.? };
-        const t = std.Thread.spawn(.{}, killWatchRun, .{ w, io, allocator }) catch {
+        const t = std.Thread.spawn(.{}, killWatchRun, .{ w, allocator, environ_block }) catch {
             allocator.destroy(w);
             break :blk null;
         };
@@ -283,6 +285,8 @@ fn runHostProcess(
     // Child exited (either naturally or because the watchdog killed it).
     // Tell the watchdog to stop polling. It'll free itself on exit.
     if (watch) |w| w.cancelled.store(true, .release);
+    input_pipe.close();
+    output_pipe.close();
 
     // wait() returns once the process exits, which closes its stdio. The pumps
     // will see EOF / write error and exit on their own; join so we don't return
@@ -292,9 +296,15 @@ fn runHostProcess(
     if (stderr_thread) |t| t.join();
 }
 
-fn killWatchRun(watch: *KillWatch, io: std.Io, allocator: std.mem.Allocator) void {
+fn killWatchRun(watch: *KillWatch, allocator: std.mem.Allocator, environ_block: std.process.Environ.Block) void {
     @import("../thread_name.zig").set("stem-lsp-watch");
     defer allocator.destroy(watch);
+
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{
+        .environ = .{ .block = environ_block },
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
 
     // Phase 1: wait for the input pump to signal "shutdown started," or
     // bail out if `cancelled` is set (child exited naturally first).
@@ -351,6 +361,7 @@ fn pumpOutput(child_stdout: std.Io.File, pipe: *Transport.MemPipe, environ_block
     });
     defer threaded.deinit();
     const io = threaded.io();
+    defer pipe.close();
 
     var buf: [4096]u8 = undefined;
     while (true) {

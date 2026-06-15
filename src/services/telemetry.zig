@@ -31,6 +31,7 @@ const State = struct {
     /// Coalesce events, grouped by bus name+slot.
     coalesce_events: u64 = 0,
     plugin_crashes: u64 = 0,
+    lsp_crashes: u64 = 0,
     supervisor_restarts: u64 = 0,
     /// Allocator used for the hashmap; held until deinit.
     allocator: std.mem.Allocator = undefined,
@@ -103,6 +104,7 @@ pub fn deinit() void {
     state.bytes_sent = 0;
     state.coalesce_events = 0;
     state.plugin_crashes = 0;
+    state.lsp_crashes = 0;
     state.supervisor_restarts = 0;
 }
 
@@ -155,6 +157,14 @@ pub fn recordPluginCrash(plugin_id: []const u8) void {
     appendTimelineLocked(.plugin, plugin_id, "crashed");
 }
 
+pub fn recordLspCrash(lang: []const u8) void {
+    state.mu.lock();
+    defer state.mu.unlock();
+    if (!state.initialized) return;
+    state.lsp_crashes +%= 1;
+    appendTimelineLocked(.lsp, lang, "crashed");
+}
+
 pub fn recordSupervisorRestart() void {
     state.mu.lock();
     defer state.mu.unlock();
@@ -178,6 +188,7 @@ pub const Snapshot = struct {
     bytes_sent: u64,
     coalesce_events: u64,
     plugin_crashes: u64,
+    lsp_crashes: u64,
     supervisor_restarts: u64,
 };
 
@@ -188,6 +199,7 @@ pub fn snapshot() Snapshot {
         .bytes_sent = state.bytes_sent,
         .coalesce_events = state.coalesce_events,
         .plugin_crashes = state.plugin_crashes,
+        .lsp_crashes = state.lsp_crashes,
         .supervisor_restarts = state.supervisor_restarts,
     };
 }
@@ -323,8 +335,15 @@ fn clearTimelineLocked() void {
 fn onProcessCrashed(event: vigil.telemetry.Event) void {
     state.mu.lock();
     defer state.mu.unlock();
-    state.plugin_crashes +%= 1;
-    appendTimelineLocked(.plugin, event.metadata orelse "process", "crashed");
+    const metadata = event.metadata orelse "process";
+    if (std.mem.startsWith(u8, metadata, "lsp:")) {
+        const lang = metadata["lsp:".len..];
+        state.lsp_crashes +%= 1;
+        appendTimelineLocked(.lsp, lang, "crashed");
+    } else {
+        state.plugin_crashes +%= 1;
+        appendTimelineLocked(.plugin, metadata, "crashed");
+    }
 }
 
 fn onSupervisorRestart(event: vigil.telemetry.Event) void {
@@ -377,6 +396,26 @@ test "telemetry: init and deinit can repeat" {
     const s = Self.snapshot();
     try std.testing.expectEqual(@as(u64, 8), s.bytes_sent);
     Self.deinit();
+}
+
+test "telemetry: Vigil process crash metadata separates LSP from plugin crashes" {
+    try Self.init(std.testing.allocator);
+    defer Self.deinit();
+
+    vigil.telemetry.emit(.{
+        .event_type = .process_crashed,
+        .timestamp_ms = vigil_api.milliTimestamp(),
+        .metadata = "lsp:zig",
+    });
+    vigil.telemetry.emit(.{
+        .event_type = .process_crashed,
+        .timestamp_ms = vigil_api.milliTimestamp(),
+        .metadata = "git",
+    });
+
+    const s = Self.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), s.lsp_crashes);
+    try std.testing.expectEqual(@as(u64, 1), s.plugin_crashes);
 }
 
 test "telemetry: bounded timeline records runtime and flow-control events" {

@@ -2,6 +2,7 @@ const std = @import("std");
 const args_mod = @import("tools/lsp_host_args.zig");
 const Transport = @import("lsp/transport.zig");
 const zls_embedded = @import("services/lsp/zls_embedded.zig");
+const platform = @import("kernel/platform.zig");
 
 const log = std.log.scoped(.LSPHost);
 
@@ -36,40 +37,52 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     switch (mode) {
         .embedded_zls => try runEmbeddedZls(allocator, io, init.environ.block),
-        .external => |external| try runExternal(io, external.argv),
+        .external => |external| try runExternal(io, external.argv, init.environ.block),
     }
 }
 
 const FilePump = struct {
-    io: std.Io,
     input: std.Io.File,
     output: std.Io.File,
+    environ_block: std.process.Environ.Block,
     close_output: bool = false,
     done: std.atomic.Value(bool) = .{ .raw = false },
 
     fn run(self: *@This()) void {
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{
+            .environ = .{ .block = self.environ_block },
+        });
+        defer threaded.deinit();
+        const io = threaded.io();
+
         defer {
-            if (self.close_output) self.output.close(self.io);
+            if (self.close_output) self.output.close(io);
             self.done.store(true, .release);
         }
 
         var buf: [8192]u8 = undefined;
         while (true) {
             var iovec = [_][]u8{&buf};
-            const n = self.input.readStreaming(self.io, &iovec) catch break;
+            const n = self.input.readStreaming(io, &iovec) catch break;
             if (n == 0) break;
-            self.output.writeStreamingAll(self.io, buf[0..n]) catch break;
+            self.output.writeStreamingAll(io, buf[0..n]) catch break;
         }
     }
 };
 
 const FileToPipePump = struct {
-    io: std.Io,
     input: std.Io.File,
     output: *Transport.MemPipe,
+    environ_block: std.process.Environ.Block,
     done: std.atomic.Value(bool) = .{ .raw = false },
 
     fn run(self: *@This()) void {
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{
+            .environ = .{ .block = self.environ_block },
+        });
+        defer threaded.deinit();
+        const io = threaded.io();
+
         defer {
             self.output.close();
             self.done.store(true, .release);
@@ -78,7 +91,7 @@ const FileToPipePump = struct {
         var buf: [8192]u8 = undefined;
         while (true) {
             var iovec = [_][]u8{&buf};
-            const n = self.input.readStreaming(self.io, &iovec) catch break;
+            const n = self.input.readStreaming(io, &iovec) catch break;
             if (n == 0) break;
             _ = self.output.write(buf[0..n]) catch break;
         }
@@ -86,49 +99,61 @@ const FileToPipePump = struct {
 };
 
 const PipeToFilePump = struct {
-    io: std.Io,
     input: *Transport.MemPipe,
     output: std.Io.File,
+    environ_block: std.process.Environ.Block,
     done: std.atomic.Value(bool) = .{ .raw = false },
 
     fn run(self: *@This()) void {
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{
+            .environ = .{ .block = self.environ_block },
+        });
+        defer threaded.deinit();
+        const io = threaded.io();
+
         defer self.done.store(true, .release);
 
         var buf: [8192]u8 = undefined;
         while (true) {
             const n = self.input.read(&buf) catch break;
             if (n == 0) break;
-            self.output.writeStreamingAll(self.io, buf[0..n]) catch break;
+            self.output.writeStreamingAll(io, buf[0..n]) catch break;
         }
     }
 };
 
 const ChildWatch = struct {
-    io: std.Io,
-    child: *std.process.Child,
+    pid: platform.Pid,
+    environ_block: std.process.Environ.Block,
     input_done: *std.atomic.Value(bool),
     child_done: std.atomic.Value(bool) = .{ .raw = false },
 
     fn run(self: *@This()) void {
+        var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{
+            .environ = .{ .block = self.environ_block },
+        });
+        defer threaded.deinit();
+        const io = threaded.io();
+
         const poll_ms: u32 = 25;
         while (!self.input_done.load(.acquire)) {
             if (self.child_done.load(.acquire)) return;
-            std.Io.sleep(self.io, .fromMilliseconds(poll_ms), .awake) catch return;
+            std.Io.sleep(io, .fromMilliseconds(poll_ms), .awake) catch return;
         }
 
         var waited_ms: u32 = 0;
         while (waited_ms < 3000) : (waited_ms += poll_ms) {
             if (self.child_done.load(.acquire)) return;
-            std.Io.sleep(self.io, .fromMilliseconds(poll_ms), .awake) catch return;
+            std.Io.sleep(io, .fromMilliseconds(poll_ms), .awake) catch return;
         }
 
         if (!self.child_done.load(.acquire)) {
-            self.child.kill(self.io);
+            platform.killProcessTree(self.pid);
         }
     }
 };
 
-fn runExternal(io: std.Io, server_argv: []const []const u8) !void {
+fn runExternal(io: std.Io, server_argv: []const []const u8, environ_block: std.process.Environ.Block) !void {
     if (server_argv.len == 0) return error.MissingServerCommand;
 
     var child = try std.process.spawn(io, .{
@@ -136,9 +161,10 @@ fn runExternal(io: std.Io, server_argv: []const []const u8) !void {
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .inherit,
+        .pgid = platform.childProcessGroupForSpawn(),
     });
     errdefer {
-        child.kill(io);
+        if (child.id) |pid| platform.killProcessTreeForce(pid) else child.kill(io);
         _ = child.wait(io) catch {};
     }
 
@@ -146,19 +172,19 @@ fn runExternal(io: std.Io, server_argv: []const []const u8) !void {
     child.stdin = null;
 
     var input_pump = FilePump{
-        .io = io,
         .input = std.Io.File.stdin(),
         .output = server_stdin,
+        .environ_block = environ_block,
         .close_output = true,
     };
     var output_pump = FilePump{
-        .io = io,
         .input = child.stdout.?,
         .output = std.Io.File.stdout(),
+        .environ_block = environ_block,
     };
     var watch = ChildWatch{
-        .io = io,
-        .child = &child,
+        .pid = child.id.?,
+        .environ_block = environ_block,
         .input_done = &input_pump.done,
     };
 
@@ -193,14 +219,14 @@ fn runEmbeddedZls(
     defer from_zls.deinit();
 
     var input_pump = FileToPipePump{
-        .io = io,
         .input = std.Io.File.stdin(),
         .output = &to_zls,
+        .environ_block = environ_block,
     };
     var output_pump = PipeToFilePump{
-        .io = io,
         .input = &from_zls,
         .output = std.Io.File.stdout(),
+        .environ_block = environ_block,
     };
 
     const input_thread = try std.Thread.spawn(.{}, FileToPipePump.run, .{&input_pump});

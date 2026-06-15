@@ -193,12 +193,13 @@ pub const SystemCommands = struct {
             \\- Bytes shipped through MessageBus: {d}
             \\- Coalesce events (renders/ticks superseded): {d}
             \\- Plugin crashes (since startup): {d}
+            \\- LSP crashes (since startup): {d}
             \\- Supervisor restarts: {d}
             \\
             \\## Per-bus
             \\
             \\
-        , .{ snap.bytes_sent, snap.coalesce_events, snap.plugin_crashes, snap.supervisor_restarts });
+        , .{ snap.bytes_sent, snap.coalesce_events, snap.plugin_crashes, snap.lsp_crashes, snap.supervisor_restarts });
 
         const per_bus = try telemetry.snapshotPerBus(allocator);
         defer {

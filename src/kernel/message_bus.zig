@@ -145,10 +145,26 @@ pub const MessageBus = struct {
             null;
     }
 
+    pub fn send(self: *MessageBus, class: Class, payload: []const u8) !void {
+        return self.sendWithId(class, payload, "stem", null);
+    }
+
     /// Send a payload at the given QoS class. Constructs a Vigil `Message`
     /// directly so the underlying priority queue actually routes by
     /// priority (`vigil.Inbox.send` would hardcode `.normal`).
-    pub fn send(self: *MessageBus, class: Class, payload: []const u8) !void {
+    fn sendWithId(
+        self: *MessageBus,
+        class: Class,
+        payload: []const u8,
+        id: []const u8,
+        drop_existing_id: ?[]const u8,
+    ) !void {
+        if (self.inbox.isClosed()) return error.InboxClosed;
+        _ = self.inbox.active_ops.fetchAdd(1, .acq_rel);
+        defer _ = self.inbox.active_ops.fetchSub(1, .acq_rel);
+
+        // Mirror Vigil Inbox.send's double-check around active_ops so
+        // Inbox.close() can safely wait for direct priority sends too.
         if (self.inbox.isClosed()) return error.InboxClosed;
 
         if (class == .bulk) {
@@ -183,12 +199,16 @@ pub const MessageBus = struct {
             }
         }
 
+        if (drop_existing_id) |old_id| {
+            _ = self.dropQueuedById(old_id);
+        }
+
         // Build a Vigil message with the right priority. We pass `null`
         // ttl_ms — stem's threads drain quickly, and a TTL would silently
         // expire messages that arrive during a slow render.
-        var msg = Message.init(
+        const msg = Message.init(
             self.allocator,
-            "stem", // id; not used for routing
+            id,
             self.name,
             payload,
             null,
@@ -198,18 +218,52 @@ pub const MessageBus = struct {
             self.recordDroppedFull(class, payload.len);
             return err;
         };
-        errdefer msg.deinit();
 
         self.inbox.mailbox.send(msg) catch |err| switch (err) {
             error.MailboxFull => {
                 self.recordDroppedFull(class, payload.len);
-                msg.deinit();
                 return;
             },
             else => return err,
         };
 
         self.recordSent(class, payload.len);
+    }
+
+    fn dropQueuedById(self: *MessageBus, id: []const u8) usize {
+        const mailbox = self.inbox.mailbox;
+        mailbox.mutex.lock();
+        defer mailbox.mutex.unlock();
+
+        var dropped: usize = 0;
+        if (mailbox.priority_queues) |*queues| {
+            for (queues) |*queue| {
+                dropped += dropQueuedByIdInQueue(mailbox, queue, id);
+            }
+        } else {
+            dropped += dropQueuedByIdInQueue(mailbox, &mailbox.messages, id);
+        }
+        return dropped;
+    }
+
+    fn dropQueuedByIdInQueue(mailbox: *vigil.ProcessMailbox, queue: *std.ArrayList(Message), id: []const u8) usize {
+        var dropped: usize = 0;
+        var i: usize = 0;
+        while (i < queue.items.len) {
+            if (std.mem.eql(u8, queue.items[i].id, id)) {
+                var old = queue.orderedRemove(i);
+                mailbox.stats.total_size_bytes -|= old.metadata.size_bytes;
+                if (mailbox.stats.messages_received > mailbox.stats.messages_sent) {
+                    mailbox.stats.messages_received -= 1;
+                }
+                mailbox.stats.messages_dropped += 1;
+                old.deinit();
+                dropped += 1;
+                continue;
+            }
+            i += 1;
+        }
+        return dropped;
     }
 
     /// Convenience wrappers — naming each makes call sites self-documenting
@@ -245,11 +299,15 @@ pub const MessageBus = struct {
         payload: []const u8,
         identity: u64,
     ) !void {
+        const id = try std.fmt.allocPrint(self.allocator, "stem:coalesce:{s}", .{@tagName(slot)});
+        defer self.allocator.free(id);
+
         self.coalesce_mu.lock();
+        defer self.coalesce_mu.unlock();
+
         const idx = @intFromEnum(slot);
         const prev = self.coalesce_slots[idx];
         self.coalesce_slots[idx] = identity;
-        self.coalesce_mu.unlock();
 
         if (prev != null) {
             self.stats_mu.lock();
@@ -258,7 +316,7 @@ pub const MessageBus = struct {
             telemetry_mod.recordMessageCoalesced(self.name, @tagName(slot));
         }
 
-        return self.send(.coalescible, payload);
+        return self.sendWithId(.coalescible, payload, id, id);
     }
 
     pub fn close(self: *MessageBus) void {
@@ -350,7 +408,7 @@ test "MessageBus: sends and counts" {
     }
 }
 
-test "MessageBus: coalescing increments counter on subsequent sends" {
+test "MessageBus: coalescing keeps only the newest pending payload" {
     const a = std.testing.allocator;
     const ib = try vigil_api.standaloneInboxForTest(a);
     defer ib.close();
@@ -367,11 +425,10 @@ test "MessageBus: coalescing increments counter on subsequent sends" {
     try std.testing.expectEqual(@as(usize, 2), s.coalesced);
     try std.testing.expectEqual(@as(usize, 3), s.sent[@intFromEnum(Class.coalescible)]);
 
-    while (true) {
-        const m = ib.mailbox.receive() catch break;
-        var mm = m;
-        mm.deinit();
-    }
+    var latest = try ib.mailbox.receive();
+    defer latest.deinit();
+    try std.testing.expectEqualStrings("frame3", latest.payload.?);
+    try std.testing.expectError(error.EmptyMailbox, ib.mailbox.receive());
 }
 
 test "MessageBus: critical sends arrive before bulk on the priority queue" {

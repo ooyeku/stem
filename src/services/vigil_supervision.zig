@@ -51,10 +51,21 @@ pub const ComponentSupervisor = struct {
         self.stats.crashes +%= 1;
         self.stats_mu.unlock();
 
+        var metadata_owned = false;
+        const metadata = switch (self.kind) {
+            .plugins => component_id,
+            .lsp => blk: {
+                const m = std.fmt.allocPrint(self.allocator, "lsp:{s}", .{component_id}) catch break :blk component_id;
+                metadata_owned = true;
+                break :blk m;
+            },
+        };
+        defer if (metadata_owned) self.allocator.free(metadata);
+
         vigil.telemetry.emit(.{
             .event_type = .process_crashed,
             .timestamp_ms = vigil_api.milliTimestamp(),
-            .metadata = component_id,
+            .metadata = metadata,
         });
 
         const topic = switch (self.kind) {
