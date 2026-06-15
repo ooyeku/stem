@@ -9,6 +9,9 @@
 //!                       the entry artifact, and (for wasm) run `activate`
 //!                       against mocked host imports, reporting which
 //!                       commands the plugin registers.
+//!   - `validate <path>` Alias for `test`.
+//!   - `scaffold <name>` Create a minimal plugin directory.
+//!   - `pack <path>`     Validate and package a plugin directory as a tarball.
 //!
 //! Hermetic test mode is the most useful piece for plugin authors: they
 //! can run `stem plugin test path/to/plugin/` from anywhere and see
@@ -39,8 +42,11 @@ pub fn run(ctx: Context) !void {
     if (std.mem.eql(u8, ctx.sub, "install")) return runInstall(ctx);
     if (std.mem.eql(u8, ctx.sub, "remove")) return runRemove(ctx);
     if (std.mem.eql(u8, ctx.sub, "test")) return runTest(ctx);
+    if (std.mem.eql(u8, ctx.sub, "validate")) return runTest(ctx);
+    if (std.mem.eql(u8, ctx.sub, "scaffold")) return runScaffold(ctx);
+    if (std.mem.eql(u8, ctx.sub, "pack")) return runPack(ctx);
     if (std.mem.eql(u8, ctx.sub, "inspect")) return runInspect(ctx);
-    try ctx.err.print("error: unknown 'plugin' subcommand '{s}'. Try `list`, `info`, `inspect`, `install`, `remove`, or `test`.\n", .{ctx.sub});
+    try ctx.err.print("error: unknown 'plugin' subcommand '{s}'. Try `list`, `info`, `inspect`, `install`, `remove`, `test`, `validate`, `scaffold`, or `pack`.\n", .{ctx.sub});
 }
 
 fn runInspect(ctx: Context) !void {
@@ -408,6 +414,163 @@ fn copyTreeAbs(ctx: Context, src_abs: []const u8, dst_abs: []const u8, counter: 
             else => {
                 try ctx.err.print("warning: skipping non-regular file {s}\n", .{entry.name});
             },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// scaffold
+// ---------------------------------------------------------------------------
+
+fn runScaffold(ctx: Context) !void {
+    if (ctx.sub_args.len == 0) {
+        try ctx.err.print("usage: stem plugin scaffold <name-or-path>\n", .{});
+        return;
+    }
+    const raw = ctx.sub_args[0];
+    const abs_dir = try absolutize(ctx.allocator, ctx.io, raw);
+    defer ctx.allocator.free(abs_dir);
+    std.Io.Dir.cwd().createDirPath(ctx.io, abs_dir) catch |err| {
+        try ctx.err.print("error: could not create {s}: {s}\n", .{ abs_dir, @errorName(err) });
+        return;
+    };
+
+    const name = std.fs.path.basename(abs_dir);
+    const manifest_path = try std.fs.path.join(ctx.allocator, &.{ abs_dir, "plugin.json" });
+    defer ctx.allocator.free(manifest_path);
+    const readme_path = try std.fs.path.join(ctx.allocator, &.{ abs_dir, "README.md" });
+    defer ctx.allocator.free(readme_path);
+
+    if (std.Io.Dir.accessAbsolute(ctx.io, manifest_path, .{})) |_| {
+        try ctx.err.print("error: {s} already exists\n", .{manifest_path});
+        return;
+    } else |_| {}
+
+    const manifest = try std.fmt.allocPrint(ctx.allocator,
+        \\{{
+        \\  "name": "{s}",
+        \\  "version": "0.1.0",
+        \\  "description": "Stem plugin",
+        \\  "runtime": "wasm",
+        \\  "entry": "plugin.wasm",
+        \\  "commands": []
+        \\}}
+        \\
+    , .{name});
+    defer ctx.allocator.free(manifest);
+    {
+        const f = try std.Io.Dir.createFileAbsolute(ctx.io, manifest_path, .{ .exclusive = true });
+        defer f.close(ctx.io);
+        try f.writeStreamingAll(ctx.io, manifest);
+    }
+    {
+        const f = try std.Io.Dir.createFileAbsolute(ctx.io, readme_path, .{ .exclusive = true });
+        defer f.close(ctx.io);
+        try f.writeStreamingAll(ctx.io,
+            \\# Stem Plugin
+            \\
+            \\Build your plugin entry artifact as `plugin.wasm`, then run:
+            \\
+            \\```bash
+            \\stem plugin validate .
+            \\stem plugin pack .
+            \\stem plugin install .
+            \\```
+            \\
+        );
+    }
+    try ctx.out.print("Scaffolded plugin at {s}\n", .{abs_dir});
+}
+
+// ---------------------------------------------------------------------------
+// pack
+// ---------------------------------------------------------------------------
+
+fn runPack(ctx: Context) !void {
+    if (ctx.sub_args.len == 0) {
+        try ctx.err.print("usage: stem plugin pack <path>\n", .{});
+        return;
+    }
+    const raw = ctx.sub_args[0];
+    const abs_dir = try absolutize(ctx.allocator, ctx.io, raw);
+    defer ctx.allocator.free(abs_dir);
+    var m = readManifest(ctx.allocator, ctx.io, abs_dir) catch |err| {
+        try ctx.err.print("error: could not read manifest: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer m.deinit();
+
+    const entry_path = try std.fs.path.join(ctx.allocator, &.{ abs_dir, m.entry });
+    defer ctx.allocator.free(entry_path);
+    std.Io.Dir.accessAbsolute(ctx.io, entry_path, .{}) catch |err| {
+        try ctx.err.print("error: entry artifact missing: {s} ({s})\n", .{ entry_path, @errorName(err) });
+        return;
+    };
+
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io, ".", ctx.allocator);
+    defer ctx.allocator.free(cwd);
+    const archive_name = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}.tar", .{ m.name, m.version });
+    defer ctx.allocator.free(archive_name);
+    const archive_path = try std.fs.path.join(ctx.allocator, &.{ cwd, archive_name });
+    defer ctx.allocator.free(archive_path);
+
+    const out_file = try std.Io.Dir.createFileAbsolute(ctx.io, archive_path, .{ .truncate = true });
+    defer out_file.close(ctx.io);
+    var out_buf: [8192]u8 = undefined;
+    var out_writer = out_file.writerStreaming(ctx.io, &out_buf);
+    var tar_writer = std.tar.Writer{ .underlying_writer = &out_writer.interface };
+    const root_name = try std.fmt.allocPrint(ctx.allocator, "{s}-{s}", .{ m.name, m.version });
+    defer ctx.allocator.free(root_name);
+    try tar_writer.setRoot(root_name);
+    var packed_count: usize = 0;
+    try writeTarTree(ctx, &tar_writer, abs_dir, "", &packed_count);
+    try tar_writer.finishPedantically();
+    try out_writer.interface.flush();
+    try ctx.out.print("Packed {d} file(s): {s}\n", .{ packed_count, archive_path });
+}
+
+fn writeTarTree(
+    ctx: Context,
+    tar_writer: *std.tar.Writer,
+    root_abs: []const u8,
+    rel: []const u8,
+    packed_count: *usize,
+) !void {
+    const current_abs = if (rel.len == 0)
+        try ctx.allocator.dupe(u8, root_abs)
+    else
+        try std.fs.path.join(ctx.allocator, &.{ root_abs, rel });
+    defer ctx.allocator.free(current_abs);
+    var dir = try std.Io.Dir.openDirAbsolute(ctx.io, current_abs, .{ .iterate = true });
+    defer dir.close(ctx.io);
+    var it = dir.iterate();
+    while (it.next(ctx.io) catch null) |entry| {
+        if (std.mem.eql(u8, entry.name, ".git")) continue;
+        if (std.mem.endsWith(u8, entry.name, ".tar")) continue;
+        const child_rel = if (rel.len == 0)
+            try ctx.allocator.dupe(u8, entry.name)
+        else
+            try std.fs.path.join(ctx.allocator, &.{ rel, entry.name });
+        defer ctx.allocator.free(child_rel);
+        switch (entry.kind) {
+            .directory => {
+                try tar_writer.writeDir(child_rel, .{});
+                try writeTarTree(ctx, tar_writer, root_abs, child_rel, packed_count);
+            },
+            .file => {
+                const child_abs = try std.fs.path.join(ctx.allocator, &.{ root_abs, child_rel });
+                defer ctx.allocator.free(child_abs);
+                const file = try std.Io.Dir.openFileAbsolute(ctx.io, child_abs, .{});
+                defer file.close(ctx.io);
+                const len = try file.length(ctx.io);
+                if (len > 128 * 1024 * 1024) return error.FileTooLarge;
+                const bytes = try ctx.allocator.alloc(u8, @intCast(len));
+                defer ctx.allocator.free(bytes);
+                const n = try file.readPositionalAll(ctx.io, bytes, 0);
+                try tar_writer.writeFileBytes(child_rel, bytes[0..n], .{});
+                packed_count.* += 1;
+            },
+            else => {},
         }
     }
 }

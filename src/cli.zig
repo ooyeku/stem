@@ -4,9 +4,10 @@
 //!   - "this is a subcommand, run it and exit"   → `.handled`
 //!   - "these are paths, launch the editor"      → `.run_editor`
 //!
-//! Subcommands are bare verbs (`find`, `vfind`, `scope`, `config`, `logs`,
-//! `lsp`, `help`, `version`). Any unrecognized first arg is treated as a
-//! path to open. Long-form flag aliases (`--find`, `--vfind`, `--scope`)
+//! Subcommands are bare verbs (`find`, `vfind`, `scope`, `task`, `config`,
+//! `logs`, `lsp`, `plugin`, `recover`, `project`, `session`, `cache`,
+//! `doctor`, `help`, `version`). Any unrecognized first arg is treated as
+//! a path to open. Long-form flag aliases (`--find`, `--vfind`, `--scope`)
 //! are accepted for backwards compatibility and silently routed to the
 //! matching subcommand.
 //!
@@ -21,6 +22,8 @@ const search_tool = @import("tools/search.zig");
 const vfind_tool = @import("tools/vfind.zig");
 const scope_tool = @import("tools/scope.zig");
 const plugin_cli = @import("tools/plugin_cli.zig");
+const project_tasks = @import("kernel/project_tasks.zig");
+const SearchIndex = @import("services/search_index.zig").SearchIndex;
 const StorageManager = @import("config/storage.zig").StorageManager;
 const LSPManager = @import("services/lsp_manager.zig").LSPManager;
 const installer_mod = @import("services/lsp/installer.zig");
@@ -81,10 +84,15 @@ const Verb = enum {
     find,
     vfind,
     scope,
+    task,
     config,
     logs,
     lsp,
     plugin,
+    recover,
+    project,
+    session,
+    cache,
     doctor,
     help,
     version,
@@ -92,12 +100,15 @@ const Verb = enum {
 
 fn resolveVerb(arg: [:0]const u8) ?Verb {
     const table = .{
-        .{ "find", Verb.find },     .{ "--find", Verb.find },     .{ "-f", Verb.find },
-        .{ "vfind", Verb.vfind },   .{ "--vfind", Verb.vfind },   .{ "scope", Verb.scope },
-        .{ "--scope", Verb.scope }, .{ "config", Verb.config },   .{ "logs", Verb.logs },
-        .{ "log", Verb.logs },      .{ "lsp", Verb.lsp },         .{ "help", Verb.help },
-        .{ "plugin", Verb.plugin }, .{ "plugins", Verb.plugin },  .{ "doctor", Verb.doctor },
-        .{ "check", Verb.doctor },  .{ "version", Verb.version },
+        .{ "find", Verb.find },       .{ "--find", Verb.find },      .{ "-f", Verb.find },
+        .{ "vfind", Verb.vfind },     .{ "--vfind", Verb.vfind },    .{ "scope", Verb.scope },
+        .{ "--scope", Verb.scope },   .{ "task", Verb.task },        .{ "tasks", Verb.task },
+        .{ "config", Verb.config },   .{ "logs", Verb.logs },        .{ "log", Verb.logs },
+        .{ "lsp", Verb.lsp },         .{ "plugin", Verb.plugin },    .{ "plugins", Verb.plugin },
+        .{ "recover", Verb.recover }, .{ "recovery", Verb.recover }, .{ "project", Verb.project },
+        .{ "session", Verb.session }, .{ "sessions", Verb.session }, .{ "cache", Verb.cache },
+        .{ "doctor", Verb.doctor },   .{ "check", Verb.doctor },     .{ "help", Verb.help },
+        .{ "version", Verb.version },
     };
     inline for (table) |entry| {
         if (std.mem.eql(u8, arg, entry[0])) return entry[1];
@@ -118,10 +129,15 @@ fn dispatchVerb(ctx: Context, verb: Verb) !Action {
         .find => try runSearch(ctx, .grep),
         .vfind => try runSearch(ctx, .visual),
         .scope => try runScope(ctx),
+        .task => try runTask(ctx),
         .config => try runConfig(ctx),
         .logs => try runLogs(ctx),
         .lsp => try runLsp(ctx),
         .plugin => try runPlugin(ctx),
+        .recover => try runRecover(ctx),
+        .project => try runProject(ctx),
+        .session => try runSession(ctx),
+        .cache => try runCache(ctx),
         .doctor => try runDoctor(ctx),
     }
     return .handled;
@@ -555,12 +571,18 @@ fn runConfig(ctx: Context) !void {
         return;
     }
 
-    if (std.mem.eql(u8, action, "unset")) {
+    if (std.mem.eql(u8, action, "unset") or std.mem.eql(u8, action, "reset")) {
         if (ctx.args.len < 4) {
-            errPrint(ctx.io, "usage: stem config unset <key>\n", .{});
+            errPrint(ctx.io, "usage: stem config {s} <key|--all>\n", .{action});
             return;
         }
         const key = ctx.args[3];
+        if (std.mem.eql(u8, action, "reset") and std.mem.eql(u8, key, "--all")) {
+            ctx.storage.config = .{};
+            try ctx.storage.save();
+            errPrint(ctx.io, "reset all config to defaults\n", .{});
+            return;
+        }
         if (ctx.storage.config.unsetByPath(key)) {
             try ctx.storage.save();
             errPrint(ctx.io, "reset {s} to default\n", .{key});
@@ -580,17 +602,30 @@ fn runConfig(ctx: Context) !void {
 
 fn runLogs(ctx: Context) !void {
     // Default subverb is `view`. Accept legacy `--clear` for backwards compat.
-    var sub: enum { view, clear } = .view;
+    var sub: enum { view, clear, tail, bundle } = .view;
     if (ctx.args.len >= 3) {
         const s = ctx.args[2];
         if (std.mem.eql(u8, s, "clear") or std.mem.eql(u8, s, "--clear")) {
             sub = .clear;
         } else if (std.mem.eql(u8, s, "view")) {
             sub = .view;
+        } else if (std.mem.eql(u8, s, "tail")) {
+            sub = .tail;
+        } else if (std.mem.eql(u8, s, "bundle")) {
+            sub = .bundle;
         } else {
-            errPrint(ctx.io, "error: unknown logs sub-verb '{s}'. Try `view` or `clear`.\n", .{s});
+            errPrint(ctx.io, "error: unknown logs sub-verb '{s}'. Try `view`, `tail`, `bundle`, or `clear`.\n", .{s});
             return;
         }
+    }
+
+    if (sub == .tail) {
+        try tailLogs(ctx);
+        return;
+    }
+    if (sub == .bundle) {
+        try bundleLogs(ctx);
+        return;
     }
 
     var dir = std.Io.Dir.openDirAbsolute(ctx.io, ctx.storage.logs_dir, .{ .iterate = true }) catch |err| {
@@ -638,7 +673,546 @@ fn runLogs(ctx: Context) !void {
             }
             if (!found_any) errPrint(ctx.io, "no log files in {s}\n", .{ctx.storage.logs_dir});
         },
+        .tail, .bundle => unreachable,
     }
+}
+
+fn tailLogs(ctx: Context) !void {
+    var lines: usize = 200;
+    var i: usize = 3;
+    while (i < ctx.args.len) : (i += 1) {
+        const a = ctx.args[i];
+        if (std.mem.eql(u8, a, "-n") or std.mem.eql(u8, a, "--lines")) {
+            i += 1;
+            if (i >= ctx.args.len) {
+                errPrint(ctx.io, "usage: stem logs tail [--lines N]\n", .{});
+                return;
+            }
+            lines = std.fmt.parseInt(usize, ctx.args[i], 10) catch {
+                errPrint(ctx.io, "error: --lines must be a positive integer\n", .{});
+                return;
+            };
+        } else {
+            errPrint(ctx.io, "error: unknown logs tail flag '{s}'\n", .{a});
+            return;
+        }
+    }
+
+    const path = try latestLogPath(ctx) orelse {
+        errPrint(ctx.io, "no log files in {s}\n", .{ctx.storage.logs_dir});
+        return;
+    };
+    defer ctx.allocator.free(path);
+
+    const file = std.Io.Dir.openFileAbsolute(ctx.io, path, .{}) catch |err| {
+        errPrint(ctx.io, "failed to open {s}: {s}\n", .{ path, @errorName(err) });
+        return;
+    };
+    defer file.close(ctx.io);
+    const len = file.length(ctx.io) catch 0;
+    if (len == 0) return;
+    const max_read: u64 = 4 * 1024 * 1024;
+    const offset: u64 = if (len > max_read) len - max_read else 0;
+    const read_len: usize = @intCast(len - offset);
+    const buf = try ctx.allocator.alloc(u8, read_len);
+    defer ctx.allocator.free(buf);
+    const n = file.readPositionalAll(ctx.io, buf, offset) catch 0;
+    try outPrint(ctx.io, "==> {s} <==\n", .{path});
+    try printLastLines(ctx.io, buf[0..n], lines);
+}
+
+fn bundleLogs(ctx: Context) !void {
+    if (ctx.args.len > 3) {
+        errPrint(ctx.io, "usage: stem logs bundle\n", .{});
+        return;
+    }
+
+    const cwd = try cwdAbs(ctx);
+    defer ctx.allocator.free(cwd);
+    const filename = try std.fmt.allocPrint(ctx.allocator, "stem-debug-bundle-{d}.txt", .{platform.getProcessId()});
+    defer ctx.allocator.free(filename);
+    const out_path = try std.fs.path.join(ctx.allocator, &.{ cwd, filename });
+    defer ctx.allocator.free(out_path);
+
+    var aw: std.Io.Writer.Allocating = .init(ctx.allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    try w.print("stem debug bundle\nversion: {s} ({s})\nroot: {s}\n\n", .{ config_mod.version, config_mod.git_hash, cwd });
+    try w.print("[paths]\nconfig: {s}\nlogs: {s}\nplugins: {s}\nlsp: {s}\nsessions: {s}\n\n", .{
+        ctx.storage.config_file,
+        ctx.storage.logs_dir,
+        ctx.storage.plugins_dir,
+        ctx.storage.lsp_dir,
+        ctx.storage.sessions_dir,
+    });
+    try w.writeAll("[config]\n");
+    try ctx.storage.config.writeConfig(w);
+    try w.writeAll("\n\n[project tasks]\n");
+    var tasks = project_tasks.detectProjectTasks(ctx.allocator, ctx.io, cwd) catch project_tasks.ProjectTaskList{};
+    defer tasks.deinit(ctx.allocator);
+    if (tasks.tasks.len == 0) {
+        try w.writeAll("(none detected)\n");
+    } else {
+        for (tasks.tasks) |task| {
+            try w.print("{s}\t{s}\t{s}\t{s}\n", .{ task.id, task.kind.label(), task.source, task.command });
+        }
+    }
+    try w.writeAll("\n[latest log tail]\n");
+    if (try latestLogPath(ctx)) |path| {
+        defer ctx.allocator.free(path);
+        try w.print("file: {s}\n", .{path});
+        const file = std.Io.Dir.openFileAbsolute(ctx.io, path, .{}) catch null;
+        if (file) |f| {
+            defer f.close(ctx.io);
+            const len = f.length(ctx.io) catch 0;
+            const max_read: u64 = 256 * 1024;
+            const offset: u64 = if (len > max_read) len - max_read else 0;
+            const read_len: usize = @intCast(len - offset);
+            const buf = try ctx.allocator.alloc(u8, read_len);
+            defer ctx.allocator.free(buf);
+            const n = f.readPositionalAll(ctx.io, buf, offset) catch 0;
+            try w.writeAll(buf[0..n]);
+            if (n > 0 and buf[n - 1] != '\n') try w.writeByte('\n');
+        }
+    } else {
+        try w.writeAll("(no log files)\n");
+    }
+
+    const file = try std.Io.Dir.createFileAbsolute(ctx.io, out_path, .{ .truncate = true });
+    defer file.close(ctx.io);
+    try file.writeStreamingAll(ctx.io, aw.written());
+    try outPrint(ctx.io, "Wrote debug bundle: {s}\n", .{out_path});
+}
+
+fn latestLogPath(ctx: Context) !?[]u8 {
+    var dir = std.Io.Dir.openDirAbsolute(ctx.io, ctx.storage.logs_dir, .{ .iterate = true }) catch return null;
+    defer dir.close(ctx.io);
+    var best_name: ?[]u8 = null;
+    var best_mtime: i128 = std.math.minInt(i128);
+    var it = dir.iterate();
+    while (it.next(ctx.io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const is_log = (std.mem.startsWith(u8, entry.name, "stem-") and std.mem.endsWith(u8, entry.name, ".log")) or
+            std.mem.eql(u8, entry.name, "stem.log");
+        if (!is_log) continue;
+        const file = dir.openFile(ctx.io, entry.name, .{}) catch continue;
+        defer file.close(ctx.io);
+        const stat = file.stat(ctx.io) catch continue;
+        const mtime = stat.mtime.toNanoseconds();
+        if (best_name == null or mtime > best_mtime) {
+            if (best_name) |n| ctx.allocator.free(n);
+            best_name = try ctx.allocator.dupe(u8, entry.name);
+            best_mtime = mtime;
+        }
+    }
+    const name = best_name orelse return null;
+    defer ctx.allocator.free(name);
+    return try std.fs.path.join(ctx.allocator, &.{ ctx.storage.logs_dir, name });
+}
+
+fn printLastLines(io: std.Io, content: []const u8, line_count: usize) !void {
+    if (line_count == 0 or content.len == 0) return;
+    var seen: usize = 0;
+    var start: usize = content.len;
+    while (start > 0) {
+        start -= 1;
+        if (content[start] == '\n') {
+            if (start + 1 < content.len) seen += 1;
+            if (seen >= line_count) {
+                start += 1;
+                break;
+            }
+        }
+    }
+    if (start == 0 and seen < line_count) {
+        try outPrint(io, "{s}", .{content});
+    } else {
+        try outPrint(io, "{s}", .{content[start..]});
+    }
+    if (content[content.len - 1] != '\n') try outPrint(io, "\n", .{});
+}
+
+// ---------------------------------------------------------------------------
+// `task`
+// ---------------------------------------------------------------------------
+
+fn runTask(ctx: Context) !void {
+    if (ctx.args.len < 3) {
+        try printVerbHelp(ctx.io, .task);
+        return;
+    }
+    const sub = ctx.args[2];
+    const root = try cwdAbs(ctx);
+    defer ctx.allocator.free(root);
+    var tasks = try project_tasks.detectProjectTasks(ctx.allocator, ctx.io, root);
+    defer tasks.deinit(ctx.allocator);
+
+    if (std.mem.eql(u8, sub, "list")) {
+        try printTaskList(ctx, root, &tasks);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "doctor")) {
+        try taskDoctor(ctx, root, &tasks);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "run")) {
+        if (ctx.args.len < 4) {
+            errPrint(ctx.io, "usage: stem task run <id|kind>\n", .{});
+            return;
+        }
+        const want = ctx.args[3];
+        const task = tasks.findById(want) orelse blk: {
+            const kind = taskKindFromArg(want) orelse break :blk null;
+            break :blk tasks.findFirstByKind(kind);
+        } orelse {
+            errPrint(ctx.io, "no task found for '{s}'. Run `stem task list`.\n", .{want});
+            return;
+        };
+        try outPrint(ctx.io, "Running {s}: {s}\n\n", .{ task.id, task.command });
+        var result = try project_tasks.runTaskSync(ctx.allocator, ctx.io, task.*, root);
+        defer result.deinit(ctx.allocator);
+        if (result.stdout.len > 0) try outPrint(ctx.io, "{s}", .{result.stdout});
+        if (result.stderr.len > 0) errPrint(ctx.io, "{s}", .{result.stderr});
+        try outPrint(ctx.io, "\n{s} in {d}ms (exit {d})\n", .{
+            if (result.success) "succeeded" else "failed",
+            result.duration_ms,
+            result.exit_code,
+        });
+        return;
+    }
+
+    errPrint(ctx.io, "unknown task sub-verb: {s}\n", .{sub});
+    try printVerbHelp(ctx.io, .task);
+}
+
+fn printTaskList(ctx: Context, root: []const u8, tasks: *const project_tasks.ProjectTaskList) !void {
+    try outPrint(ctx.io, "Tasks for {s}\n", .{root});
+    if (tasks.tasks.len == 0) {
+        try outPrint(ctx.io, "  (none detected)\n", .{});
+        return;
+    }
+    for (tasks.tasks) |task| {
+        try outPrint(ctx.io, "  {s:<20} {s:<7} {s:<14} {s}\n", .{
+            task.id,
+            task.kind.label(),
+            task.source,
+            task.command,
+        });
+    }
+}
+
+fn taskDoctor(ctx: Context, root: []const u8, tasks: *const project_tasks.ProjectTaskList) !void {
+    try outPrint(ctx.io, "Project task doctor\nroot: {s}\n\n", .{root});
+    try outPrint(ctx.io, "detected: {d} task(s)\n", .{tasks.tasks.len});
+    const kinds = [_]project_tasks.TaskKind{ .build, .@"test", .run, .dev, .lint, .format };
+    for (kinds) |kind| {
+        if (tasks.findFirstByKind(kind)) |task| {
+            try outPrint(ctx.io, "  {s:<7} {s} ({s})\n", .{ kind.label(), task.id, task.source });
+        } else {
+            try outPrint(ctx.io, "  {s:<7} (none)\n", .{kind.label()});
+        }
+    }
+}
+
+fn taskKindFromArg(arg: []const u8) ?project_tasks.TaskKind {
+    if (std.mem.eql(u8, arg, "build")) return .build;
+    if (std.mem.eql(u8, arg, "test")) return .@"test";
+    if (std.mem.eql(u8, arg, "run")) return .run;
+    if (std.mem.eql(u8, arg, "dev")) return .dev;
+    if (std.mem.eql(u8, arg, "lint")) return .lint;
+    if (std.mem.eql(u8, arg, "format")) return .format;
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// `recover`
+// ---------------------------------------------------------------------------
+
+fn runRecover(ctx: Context) !void {
+    if (ctx.args.len < 3) {
+        try printVerbHelp(ctx.io, .recover);
+        return;
+    }
+    const sub = ctx.args[2];
+    if (std.mem.eql(u8, sub, "list")) {
+        try listRecovery(ctx);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "restore")) {
+        if (ctx.args.len < 4) {
+            errPrint(ctx.io, "usage: stem recover restore <id>\n", .{});
+            return;
+        }
+        try restoreRecovery(ctx, ctx.args[3]);
+        return;
+    }
+    errPrint(ctx.io, "unknown recover sub-verb: {s}\n", .{sub});
+    try printVerbHelp(ctx.io, .recover);
+}
+
+fn listRecovery(ctx: Context) !void {
+    try outPrint(ctx.io, "Recovery artefacts\n", .{});
+    var any = false;
+    const recovery_path = try ctx.storage.getRecoveryPath();
+    defer ctx.allocator.free(recovery_path);
+    if (fileSize(ctx, recovery_path)) |size| {
+        any = true;
+        try outPrint(ctx.io, "  session              {d} bytes  {s}\n", .{ size, recovery_path });
+    }
+
+    const recover_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.storage.config_dir, "recover" });
+    defer ctx.allocator.free(recover_dir);
+    var dir = std.Io.Dir.openDirAbsolute(ctx.io, recover_dir, .{ .iterate = true }) catch |err| {
+        if (err == error.FileNotFound) {
+            if (!any) try outPrint(ctx.io, "  (none)\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer dir.close(ctx.io);
+    var it = dir.iterate();
+    while (it.next(ctx.io) catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bak")) continue;
+        any = true;
+        const id = entry.name[0 .. entry.name.len - ".bak".len];
+        const bak_path = try std.fs.path.join(ctx.allocator, &.{ recover_dir, entry.name });
+        defer ctx.allocator.free(bak_path);
+        const original = try recoveryOriginalPath(ctx, bak_path);
+        defer if (original) |p| ctx.allocator.free(p);
+        try outPrint(ctx.io, "  {s:<20} buffer      {s}\n", .{ id, original orelse "(unknown original path)" });
+    }
+    if (!any) try outPrint(ctx.io, "  (none)\n", .{});
+}
+
+fn restoreRecovery(ctx: Context, id: []const u8) !void {
+    if (std.mem.eql(u8, id, "session")) {
+        const recovery_path = try ctx.storage.getRecoveryPath();
+        defer ctx.allocator.free(recovery_path);
+        copyFileContents(ctx, recovery_path, ctx.storage.session_file) catch |err| {
+            errPrint(ctx.io, "could not restore session recovery: {s}\n", .{@errorName(err)});
+            return;
+        };
+        try outPrint(ctx.io, "Restored session recovery to {s}\n", .{ctx.storage.session_file});
+        return;
+    }
+
+    const recover_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.storage.config_dir, "recover" });
+    defer ctx.allocator.free(recover_dir);
+    const bak_name = if (std.mem.endsWith(u8, id, ".bak"))
+        try ctx.allocator.dupe(u8, id)
+    else
+        try std.fmt.allocPrint(ctx.allocator, "{s}.bak", .{id});
+    defer ctx.allocator.free(bak_name);
+    const bak_path = try std.fs.path.join(ctx.allocator, &.{ recover_dir, bak_name });
+    defer ctx.allocator.free(bak_path);
+    if (std.Io.Dir.accessAbsolute(ctx.io, bak_path, .{})) |_| {} else |err| switch (err) {
+        error.FileNotFound => {
+            errPrint(ctx.io, "unknown recovery id: {s}\n", .{id});
+            return;
+        },
+        else => return err,
+    }
+    const original_raw = try recoveryOriginalPath(ctx, bak_path) orelse {
+        errPrint(ctx.io, "backup '{s}' has no .path sidecar; cannot choose a restore target\n", .{id});
+        return;
+    };
+    defer ctx.allocator.free(original_raw);
+    const original = std.mem.trim(u8, original_raw, " \t\r\n");
+    if (original.len == 0) {
+        errPrint(ctx.io, "backup '{s}' has an empty restore target\n", .{id});
+        return;
+    }
+    copyFileContents(ctx, bak_path, original) catch |err| {
+        errPrint(ctx.io, "could not restore '{s}': {s}\n", .{ id, @errorName(err) });
+        return;
+    };
+    try outPrint(ctx.io, "Restored {s} -> {s}\n", .{ bak_path, original });
+}
+
+fn recoveryOriginalPath(ctx: Context, bak_path: []const u8) !?[]u8 {
+    const sidecar = try std.fmt.allocPrint(ctx.allocator, "{s}.path", .{bak_path});
+    defer ctx.allocator.free(sidecar);
+    const file = std.Io.Dir.openFileAbsolute(ctx.io, sidecar, .{}) catch return null;
+    defer file.close(ctx.io);
+    const len = file.length(ctx.io) catch return null;
+    if (len == 0 or len > 16 * 1024) return null;
+    const buf = try ctx.allocator.alloc(u8, @intCast(len));
+    errdefer ctx.allocator.free(buf);
+    const n = file.readPositionalAll(ctx.io, buf, 0) catch 0;
+    return buf[0..n];
+}
+
+// ---------------------------------------------------------------------------
+// `project`
+// ---------------------------------------------------------------------------
+
+fn runProject(ctx: Context) !void {
+    if (ctx.args.len < 3) {
+        try printVerbHelp(ctx.io, .project);
+        return;
+    }
+    const sub = ctx.args[2];
+    const root = try cwdAbs(ctx);
+    defer ctx.allocator.free(root);
+    if (std.mem.eql(u8, sub, "inspect")) {
+        var tasks = try project_tasks.detectProjectTasks(ctx.allocator, ctx.io, root);
+        defer tasks.deinit(ctx.allocator);
+        try outPrint(ctx.io, "Project\nroot: {s}\n\n", .{root});
+        try printTaskList(ctx, root, &tasks);
+        const cache_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.storage.config_dir, "cache" });
+        defer ctx.allocator.free(cache_dir);
+        try outPrint(ctx.io, "\nCache: {s}\n", .{cache_dir});
+        return;
+    }
+    if (std.mem.eql(u8, sub, "warm")) {
+        var index = SearchIndex.init(ctx.allocator, ctx.io, ctx.environ_block);
+        defer index.deinit();
+        try index.startIndexing(root);
+        while (index.worker_running.load(.acquire)) {
+            std.Io.sleep(ctx.io, .fromMilliseconds(10), .awake) catch break;
+        }
+        var snapshot = try index.healthSnapshot(ctx.allocator);
+        defer snapshot.deinit(ctx.allocator);
+        try outPrint(ctx.io, "Warmed project index for {s}: {d} path(s)\n", .{ root, snapshot.path_count });
+        return;
+    }
+    errPrint(ctx.io, "unknown project sub-verb: {s}\n", .{sub});
+    try printVerbHelp(ctx.io, .project);
+}
+
+// ---------------------------------------------------------------------------
+// `session`
+// ---------------------------------------------------------------------------
+
+fn runSession(ctx: Context) !void {
+    if (ctx.args.len < 3) {
+        try printVerbHelp(ctx.io, .session);
+        return;
+    }
+    const sub = ctx.args[2];
+    if (std.mem.eql(u8, sub, "list")) {
+        try listSessions(ctx);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "clear")) {
+        try clearSessions(ctx);
+        return;
+    }
+    errPrint(ctx.io, "unknown session sub-verb: {s}\n", .{sub});
+    try printVerbHelp(ctx.io, .session);
+}
+
+fn listSessions(ctx: Context) !void {
+    try outPrint(ctx.io, "Sessions in {s}\n", .{ctx.storage.sessions_dir});
+    var dir = std.Io.Dir.openDirAbsolute(ctx.io, ctx.storage.sessions_dir, .{ .iterate = true }) catch |err| {
+        if (err == error.FileNotFound) {
+            try outPrint(ctx.io, "  (none)\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer dir.close(ctx.io);
+    var any = false;
+    var it = dir.iterate();
+    while (it.next(ctx.io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!(std.mem.endsWith(u8, entry.name, ".json") or std.mem.endsWith(u8, entry.name, ".recover"))) continue;
+        any = true;
+        const path = try std.fs.path.join(ctx.allocator, &.{ ctx.storage.sessions_dir, entry.name });
+        defer ctx.allocator.free(path);
+        const marker = if (std.mem.eql(u8, path, ctx.storage.session_file)) "*" else " ";
+        try outPrint(ctx.io, " {s} {s}\n", .{ marker, path });
+    }
+    if (!any) try outPrint(ctx.io, "  (none)\n", .{});
+}
+
+fn clearSessions(ctx: Context) !void {
+    var dir = std.Io.Dir.openDirAbsolute(ctx.io, ctx.storage.sessions_dir, .{ .iterate = true }) catch |err| {
+        if (err == error.FileNotFound) {
+            try outPrint(ctx.io, "cleared 0 session file(s)\n", .{});
+            return;
+        }
+        return err;
+    };
+    defer dir.close(ctx.io);
+    var cleared: usize = 0;
+    var it = dir.iterate();
+    while (it.next(ctx.io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!(std.mem.endsWith(u8, entry.name, ".json") or std.mem.endsWith(u8, entry.name, ".recover"))) continue;
+        dir.deleteFile(ctx.io, entry.name) catch continue;
+        cleared += 1;
+    }
+    try outPrint(ctx.io, "cleared {d} session file(s)\n", .{cleared});
+}
+
+// ---------------------------------------------------------------------------
+// `cache`
+// ---------------------------------------------------------------------------
+
+fn runCache(ctx: Context) !void {
+    if (ctx.args.len < 3) {
+        try printVerbHelp(ctx.io, .cache);
+        return;
+    }
+    const sub = ctx.args[2];
+    if (std.mem.eql(u8, sub, "status")) {
+        try cacheStatus(ctx);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "clear")) {
+        const target = if (ctx.args.len >= 4) ctx.args[3] else "search";
+        try cacheClear(ctx, target);
+        return;
+    }
+    errPrint(ctx.io, "unknown cache sub-verb: {s}\n", .{sub});
+    try printVerbHelp(ctx.io, .cache);
+}
+
+fn cacheStatus(ctx: Context) !void {
+    const cache_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.storage.config_dir, "cache" });
+    defer ctx.allocator.free(cache_dir);
+    const paths = [_]struct { label: []const u8, path: []const u8 }{
+        .{ .label = "cache", .path = cache_dir },
+        .{ .label = "plugins", .path = ctx.storage.plugins_dir },
+        .{ .label = "lsp", .path = ctx.storage.lsp_dir },
+    };
+    try outPrint(ctx.io, "Stem storage status\n", .{});
+    for (paths) |p| {
+        const stats = directoryStats(ctx, p.path) catch DirStats{};
+        const more = if (stats.truncated) "+" else "";
+        try outPrint(ctx.io, "  {s:<8} {d}{s} file(s), {d}{s} bytes  {s}\n", .{ p.label, stats.files, more, stats.bytes, more, p.path });
+    }
+}
+
+fn cacheClear(ctx: Context, target: []const u8) !void {
+    const cache_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.storage.config_dir, "cache" });
+    defer ctx.allocator.free(cache_dir);
+    if (std.mem.eql(u8, target, "search")) {
+        const search_dir = try std.fs.path.join(ctx.allocator, &.{ cache_dir, "search" });
+        defer ctx.allocator.free(search_dir);
+        try clearDirPath(ctx, search_dir);
+        try outPrint(ctx.io, "cleared search cache: {s}\n", .{search_dir});
+        return;
+    }
+    if (std.mem.eql(u8, target, "lsp")) {
+        try clearDirPath(ctx, ctx.storage.lsp_dir);
+        try outPrint(ctx.io, "cleared LSP installs/cache: {s}\n", .{ctx.storage.lsp_dir});
+        return;
+    }
+    if (std.mem.eql(u8, target, "plugins")) {
+        try clearDirPath(ctx, ctx.storage.plugins_dir);
+        try outPrint(ctx.io, "cleared installed plugins: {s}\n", .{ctx.storage.plugins_dir});
+        return;
+    }
+    if (std.mem.eql(u8, target, "all")) {
+        try clearDirPath(ctx, cache_dir);
+        try clearDirPath(ctx, ctx.storage.lsp_dir);
+        try clearDirPath(ctx, ctx.storage.plugins_dir);
+        try outPrint(ctx.io, "cleared cache, LSP installs, and installed plugins\n", .{});
+        return;
+    }
+    errPrint(ctx.io, "usage: stem cache clear [search|lsp|plugins|all]\n", .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -721,6 +1295,18 @@ fn runLsp(ctx: Context) !void {
         try listLspStatus(ctx);
         return;
     }
+    if (std.mem.eql(u8, sub, "doctor")) {
+        if (ctx.args.len < 4) {
+            errPrint(ctx.io, "usage: stem lsp doctor <language>\n", .{});
+            return;
+        }
+        try lspDoctor(ctx, ctx.args[3]);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "prune")) {
+        try pruneLspInstalls(ctx);
+        return;
+    }
     errPrint(ctx.io, "unknown lsp sub-verb: {s}\n", .{sub});
     try printVerbHelp(ctx.io, .lsp);
 }
@@ -791,6 +1377,106 @@ fn listLspStatus(ctx: Context) !void {
         try outPrint(ctx.io, "  {s:<32} {s}\n", .{ entry.display, path });
     }
     try outPrint(ctx.io, "\nInstall with: stem lsp install <name|all>\n", .{});
+}
+
+fn lspDoctor(ctx: Context, want: []const u8) !void {
+    const entry = findLspEntry(want) orelse {
+        errPrint(ctx.io, "unknown language: '{s}'. Run `stem lsp list` for supported servers.\n", .{want});
+        return;
+    };
+    try outPrint(ctx.io, "LSP doctor: {s}\n", .{entry.display});
+    try outPrint(ctx.io, "  aliases: ", .{});
+    for (entry.keys, 0..) |key, i| {
+        if (i > 0) try outPrint(ctx.io, ", ", .{});
+        try outPrint(ctx.io, "{s}", .{key});
+    }
+    try outPrint(ctx.io, "\n", .{});
+    if (entry.binary) |bin| {
+        try outPrint(ctx.io, "  binary:  {s}\n", .{bin});
+        if (installer_mod.findOnSystem(ctx.allocator, ctx.io, bin, ctx.environ_block)) |path| {
+            defer ctx.allocator.free(path);
+            try outPrint(ctx.io, "  PATH:    {s}\n", .{path});
+        } else {
+            try outPrint(ctx.io, "  PATH:    not found\n", .{});
+        }
+    } else {
+        try outPrint(ctx.io, "  binary:  (managed by runtime)\n", .{});
+    }
+    const install_dir_name = lspInstallDirName(entry);
+    if (install_dir_name) |name| {
+        const install_dir = try std.fs.path.join(ctx.allocator, &.{ ctx.storage.lsp_dir, name });
+        defer ctx.allocator.free(install_dir);
+        const stats = directoryStats(ctx, install_dir) catch DirStats{};
+        if (stats.files > 0) {
+            const more = if (stats.truncated) "+" else "";
+            try outPrint(ctx.io, "  stem:    {s} ({d}{s} file(s), {d}{s} bytes)\n", .{ install_dir, stats.files, more, stats.bytes, more });
+        } else {
+            try outPrint(ctx.io, "  stem:    not installed at {s}\n", .{install_dir});
+        }
+    }
+    if (entry.hint.len > 0) try outPrint(ctx.io, "  hint:    {s}\n", .{entry.hint});
+    try outPrint(ctx.io, "  install: stem lsp install {s}\n", .{entry.keys[0]});
+}
+
+fn pruneLspInstalls(ctx: Context) !void {
+    var dir = std.Io.Dir.openDirAbsolute(ctx.io, ctx.storage.lsp_dir, .{ .iterate = true }) catch |err| {
+        if (err == error.FileNotFound) {
+            try outPrint(ctx.io, "nothing to prune; {s} does not exist\n", .{ctx.storage.lsp_dir});
+            return;
+        }
+        return err;
+    };
+    defer dir.close(ctx.io);
+    var removed: usize = 0;
+    var kept: usize = 0;
+    var it = dir.iterate();
+    while (it.next(ctx.io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (isKnownLspInstallDir(entry.name)) {
+            kept += 1;
+            continue;
+        }
+        const path = try std.fs.path.join(ctx.allocator, &.{ ctx.storage.lsp_dir, entry.name });
+        defer ctx.allocator.free(path);
+        std.Io.Dir.cwd().deleteTree(ctx.io, path) catch |err| {
+            errPrint(ctx.io, "could not prune {s}: {s}\n", .{ path, @errorName(err) });
+            continue;
+        };
+        try outPrint(ctx.io, "pruned {s}\n", .{path});
+        removed += 1;
+    }
+    try outPrint(ctx.io, "LSP prune complete: {d} removed, {d} kept\n", .{ removed, kept });
+}
+
+fn findLspEntry(want: []const u8) ?LspEntry {
+    for (lsp_entries) |entry| {
+        if (matchLspKey(entry, want)) return entry;
+    }
+    return null;
+}
+
+fn lspInstallDirName(entry: LspEntry) ?[]const u8 {
+    if (std.mem.startsWith(u8, entry.display, "pyright")) return "pyright";
+    if (std.mem.eql(u8, entry.display, "typescript-language-server")) return "typescript-language-server";
+    if (std.mem.startsWith(u8, entry.display, "gopls")) return "gopls";
+    if (std.mem.eql(u8, entry.display, "rust-analyzer")) return "rust-analyzer";
+    if (std.mem.startsWith(u8, entry.display, "omnisharp")) return "omnisharp";
+    if (std.mem.startsWith(u8, entry.display, "jdtls")) return "jdtls";
+    if (std.mem.eql(u8, entry.display, "bash-language-server")) return "bash-language-server";
+    if (std.mem.eql(u8, entry.display, "lua-language-server")) return "lua-language-server";
+    if (std.mem.startsWith(u8, entry.display, "vscode-")) return "vscode-langservers-extracted";
+    if (std.mem.startsWith(u8, entry.display, "intelephense")) return "intelephense";
+    if (std.mem.startsWith(u8, entry.display, "perlnavigator")) return "perlnavigator";
+    return entry.binary;
+}
+
+fn isKnownLspInstallDir(name: []const u8) bool {
+    for (lsp_entries) |entry| {
+        if (lspInstallDirName(entry)) |dir| {
+            if (std.mem.eql(u8, name, dir)) return true;
+        }
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -990,6 +1676,97 @@ fn doctorLspServers(ctx: Context) !void {
 }
 
 // ---------------------------------------------------------------------------
+// Shared filesystem helpers
+// ---------------------------------------------------------------------------
+
+const DirStats = struct {
+    files: usize = 0,
+    dirs: usize = 0,
+    bytes: u64 = 0,
+    truncated: bool = false,
+};
+
+const max_dir_stat_entries = 2000;
+
+fn cwdAbs(ctx: Context) ![]u8 {
+    return std.Io.Dir.cwd().realPathFileAlloc(ctx.io, ".", ctx.allocator);
+}
+
+fn fileSize(ctx: Context, path: []const u8) ?u64 {
+    const file = std.Io.Dir.openFileAbsolute(ctx.io, path, .{}) catch return null;
+    defer file.close(ctx.io);
+    return file.length(ctx.io) catch null;
+}
+
+fn directoryStats(ctx: Context, path: []const u8) !DirStats {
+    var stats: DirStats = .{};
+    try directoryStatsInto(ctx, path, &stats);
+    return stats;
+}
+
+fn directoryStatsInto(ctx: Context, path: []const u8, stats: *DirStats) !void {
+    if (stats.files + stats.dirs >= max_dir_stat_entries) {
+        stats.truncated = true;
+        return;
+    }
+    var dir = std.Io.Dir.openDirAbsolute(ctx.io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close(ctx.io);
+    var it = dir.iterate();
+    while (it.next(ctx.io) catch null) |entry| {
+        const child = try std.fs.path.join(ctx.allocator, &.{ path, entry.name });
+        defer ctx.allocator.free(child);
+        switch (entry.kind) {
+            .file => {
+                stats.files += 1;
+                if (fileSize(ctx, child)) |size| stats.bytes += size;
+            },
+            .directory => {
+                stats.dirs += 1;
+                try directoryStatsInto(ctx, child, stats);
+            },
+            else => {},
+        }
+        if (stats.files + stats.dirs >= max_dir_stat_entries) {
+            stats.truncated = true;
+            return;
+        }
+    }
+}
+
+fn clearDirPath(ctx: Context, path: []const u8) !void {
+    if (std.Io.Dir.accessAbsolute(ctx.io, path, .{})) |_| {
+        try std.Io.Dir.cwd().deleteTree(ctx.io, path);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    std.Io.Dir.cwd().createDirPath(ctx.io, path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+}
+
+fn copyFileContents(ctx: Context, src_abs: []const u8, dst_abs: []const u8) !void {
+    const src = try std.Io.Dir.openFileAbsolute(ctx.io, src_abs, .{});
+    defer src.close(ctx.io);
+    const len = try src.length(ctx.io);
+    if (len > 128 * 1024 * 1024) return error.FileTooLarge;
+    const bytes = try ctx.allocator.alloc(u8, @intCast(len));
+    defer ctx.allocator.free(bytes);
+    const n = try src.readPositionalAll(ctx.io, bytes, 0);
+
+    if (std.fs.path.dirname(dst_abs)) |parent| {
+        std.Io.Dir.cwd().createDirPath(ctx.io, parent) catch {};
+    }
+    const dst = try std.Io.Dir.createFileAbsolute(ctx.io, dst_abs, .{ .truncate = true });
+    defer dst.close(ctx.io);
+    try dst.writeStreamingAll(ctx.io, bytes[0..n]);
+}
+
+// ---------------------------------------------------------------------------
 // Help / version
 // ---------------------------------------------------------------------------
 
@@ -1053,22 +1830,42 @@ const verb_specs = [_]VerbSpec{
         .name = "config <action>",
         .summary = "Read or modify configuration",
         .detail =
-        \\Usage: stem config <list|get|set|unset> [args]
+        \\Usage: stem config <list|get|set|unset|reset> [args]
         \\
         \\  list                  Print the whole config
         \\  get [key]             Print one value, or all if no key
         \\  set <key> <value>     Update one key
         \\  unset <key>           Reset one key to its default
+        \\  reset <key|--all>     Reset one key, or every setting
+        ,
+    },
+    .{
+        .verb = .task,
+        .name = "task <action>",
+        .summary = "Detect and run project tasks",
+        .detail =
+        \\Usage: stem task <list|run|doctor> [args]
+        \\
+        \\  list                  Show detected build/test/run/dev/lint/format tasks
+        \\  run <id|kind>         Run an exact task id or preferred task kind
+        \\  doctor                Explain which common task kinds were detected
+        \\
+        \\Examples:
+        \\  stem task list
+        \\  stem task run test
+        \\  stem task run npm.build
         ,
     },
     .{
         .verb = .logs,
-        .name = "logs [view|clear]",
+        .name = "logs <action>",
         .summary = "Inspect or wipe editor logs",
         .detail =
-        \\Usage: stem logs [view|clear]
+        \\Usage: stem logs [view|tail|bundle|clear]
         \\
         \\  view (default)        Print every log file
+        \\  tail [--lines N]      Print the latest log's last lines (default: 200)
+        \\  bundle                Write a debug bundle in the current directory
         \\  clear                 Delete every log file
         ,
     },
@@ -1077,12 +1874,14 @@ const verb_specs = [_]VerbSpec{
         .name = "lsp <action>",
         .summary = "Install or list language servers",
         .detail =
-        \\Usage: stem lsp <install|list> [args]
+        \\Usage: stem lsp <install|list|doctor|prune> [args]
         \\
         \\  install <lang|all>    Install a language server. Supported:
         \\                        python, typescript, go, rust, cpp,
         \\                        ruby, csharp, java, all
         \\  list                  Show installed-server status
+        \\  doctor <language>     Explain PATH/stem install state for one server
+        \\  prune                 Remove stale ~/.stem/lsp directories unknown to stem
         ,
     },
     .{
@@ -1090,7 +1889,7 @@ const verb_specs = [_]VerbSpec{
         .name = "plugin <action>",
         .summary = "Manage installed plugins",
         .detail =
-        \\Usage: stem plugin <list|info|inspect|install|remove|test> [args]
+        \\Usage: stem plugin <list|info|inspect|install|remove|test|validate|scaffold|pack> [args]
         \\
         \\  list                  List installed plugins
         \\  info <name>           Show a plugin's manifest
@@ -1103,6 +1902,54 @@ const verb_specs = [_]VerbSpec{
         \\                        for wasm plugins, runs `activate` against
         \\                        mocked host imports and reports registered
         \\                        commands).
+        \\  validate <path>       Alias for `test`
+        \\  scaffold <name>       Create a minimal plugin directory
+        \\  pack <path>           Validate and package a plugin as .tar
+        ,
+    },
+    .{
+        .verb = .recover,
+        .name = "recover <action>",
+        .summary = "List or restore recovery artefacts",
+        .detail =
+        \\Usage: stem recover <list|restore> [args]
+        \\
+        \\  list                  Show session recovery and dirty-buffer backups
+        \\  restore <id>          Restore `session` or a listed buffer backup id
+        ,
+    },
+    .{
+        .verb = .project,
+        .name = "project <action>",
+        .summary = "Inspect or warm project intelligence",
+        .detail =
+        \\Usage: stem project <inspect|warm>
+        \\
+        \\  inspect               Show root, detected tasks, and cache location
+        \\  warm                  Build the persistent search index now
+        ,
+    },
+    .{
+        .verb = .session,
+        .name = "session <action>",
+        .summary = "Inspect or clear saved sessions",
+        .detail =
+        \\Usage: stem session <list|clear>
+        \\
+        \\  list                  Show per-workspace session files
+        \\  clear                 Delete saved session and recovery files
+        ,
+    },
+    .{
+        .verb = .cache,
+        .name = "cache <action>",
+        .summary = "Inspect or clear Stem caches",
+        .detail =
+        \\Usage: stem cache <status|clear> [target]
+        \\
+        \\  status                Show cache/plugin/LSP storage sizes
+        \\  clear [target]        Clear search, lsp, plugins, or all
+        \\                        Default target: search
         ,
     },
     .{
@@ -1259,6 +2106,16 @@ test "resolveVerb: bare, alias, and short forms" {
     try std.testing.expectEqual(@as(?Verb, null), resolveVerb("not-a-verb"));
     try std.testing.expectEqual(@as(?Verb, null), resolveVerb("src/main.zig"));
     try std.testing.expectEqual(@as(?Verb, null), resolveVerb("--open")); // dropped
+}
+
+test "resolveVerb includes operator command groups" {
+    try std.testing.expectEqual(@as(?Verb, .task), resolveVerb("task"));
+    try std.testing.expectEqual(@as(?Verb, .task), resolveVerb("tasks"));
+    try std.testing.expectEqual(@as(?Verb, .recover), resolveVerb("recover"));
+    try std.testing.expectEqual(@as(?Verb, .project), resolveVerb("project"));
+    try std.testing.expectEqual(@as(?Verb, .session), resolveVerb("session"));
+    try std.testing.expectEqual(@as(?Verb, .session), resolveVerb("sessions"));
+    try std.testing.expectEqual(@as(?Verb, .cache), resolveVerb("cache"));
 }
 
 test "isHelpFlag / isVersionFlag" {

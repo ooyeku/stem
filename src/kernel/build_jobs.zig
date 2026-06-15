@@ -199,6 +199,7 @@ pub fn zigBuildRunJob(ctx: *anyopaque, progress: *JobProgress, allocator: std.me
             output.stdout,
         });
     } else {
+        progress.markFailed();
         return try std.fmt.allocPrint(allocator, "Build failed in {d}ms\n\n{s}", .{
             output.duration_ms,
             output.stderr,
@@ -226,6 +227,7 @@ pub fn zigBuildTestJob(ctx: *anyopaque, progress: *JobProgress, allocator: std.m
             output.stdout,
         });
     } else {
+        progress.markFailed();
         return try std.fmt.allocPrint(allocator, "Tests failed in {d}ms\n\n{s}", .{
             output.duration_ms,
             output.stderr,

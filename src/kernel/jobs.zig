@@ -29,6 +29,7 @@ pub const JobProgress = struct {
     percent: u8,
     message: ?[]const u8,
     cancelled: *std.atomic.Value(bool),
+    failed: bool = false,
 
     pub fn update(self: *JobProgress, percent: u8, msg: ?[]const u8) void {
         self.percent = if (percent > 100) 100 else percent;
@@ -37,6 +38,10 @@ pub const JobProgress = struct {
 
     pub fn isCancelled(self: *JobProgress) bool {
         return self.cancelled.load(.acquire);
+    }
+
+    pub fn markFailed(self: *JobProgress) void {
+        self.failed = true;
     }
 };
 
@@ -52,6 +57,46 @@ pub const Job = struct {
     /// Heap-allocated so that ArrayList resizes don't invalidate the pointer
     /// held by an in-flight JobProgress.
     cancelled: *std.atomic.Value(bool),
+};
+
+pub const JobResultKind = enum { success, failure, cancelled };
+
+pub const JobSnapshot = struct {
+    id: u64,
+    name: []u8,
+    status: JobStatus,
+    progress: u8,
+    progress_message: ?[]u8 = null,
+    result: ?JobResultKind = null,
+    result_output: ?[]u8 = null,
+    start_time: i64,
+    end_time: ?i64,
+
+    pub fn deinit(self: *JobSnapshot, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.progress_message) |m| allocator.free(m);
+        if (self.result_output) |o| allocator.free(o);
+    }
+};
+
+pub const JobSummary = struct {
+    jobs: []JobSnapshot = &.{},
+    total: usize = 0,
+    pending: usize = 0,
+    running: usize = 0,
+    completed: usize = 0,
+    failed: usize = 0,
+    cancelled: usize = 0,
+
+    pub fn active(self: JobSummary) usize {
+        return self.pending + self.running;
+    }
+
+    pub fn deinit(self: *JobSummary, allocator: std.mem.Allocator) void {
+        for (self.jobs) |*job| job.deinit(allocator);
+        allocator.free(self.jobs);
+        self.jobs = &.{};
+    }
 };
 
 pub const JobFn = *const fn (ctx: *anyopaque, progress: *JobProgress, allocator: std.mem.Allocator) anyerror![]const u8;
@@ -210,6 +255,9 @@ pub const JobManager = struct {
             }
 
             const output = func(ctx, &progress, manager.allocator) catch |err| {
+                if (err == error.Cancelled) {
+                    break :blk .cancelled;
+                }
                 // On OOM we can't allocPrint a message; fall back to a duped
                 // static so the freeing code is uniform. If even that fails,
                 // surface as cancelled (consumer treats it as no-result).
@@ -218,15 +266,28 @@ pub const JobManager = struct {
                 break :blk JobResult{ .failure = err_msg };
             };
 
+            if (progress.failed) {
+                break :blk JobResult{ .failure = output };
+            }
             break :blk JobResult{ .success = output };
         };
+
+        const progress_message_copy = if (progress.message) |message|
+            manager.allocator.dupe(u8, message) catch null
+        else
+            null;
 
         manager.lock();
         defer manager.unlock();
 
+        var found_job = false;
         for (manager.jobs.items) |*job| {
             if (job.id == job_id) {
+                found_job = true;
                 job.end_time = std.Io.Clock.real.now(manager.io).toMilliseconds();
+                job.progress = progress.percent;
+                if (job.progress_message) |m| manager.allocator.free(m);
+                job.progress_message = progress_message_copy;
                 job.result = result;
 
                 const status: JobStatus = switch (result) {
@@ -255,6 +316,9 @@ pub const JobManager = struct {
                 }
                 break;
             }
+        }
+        if (!found_job) {
+            if (progress_message_copy) |m| manager.allocator.free(m);
         }
     }
 
@@ -321,6 +385,65 @@ pub const JobManager = struct {
             }
         }
         return count;
+    }
+
+    pub fn snapshot(self: *JobManager, allocator: std.mem.Allocator) !JobSummary {
+        self.lock();
+        defer self.unlock();
+
+        var jobs = std.ArrayListUnmanaged(JobSnapshot).empty;
+        errdefer {
+            for (jobs.items) |*job| job.deinit(allocator);
+            jobs.deinit(allocator);
+        }
+
+        var summary = JobSummary{};
+        for (self.jobs.items) |job| {
+            const status = job.status.load(.acquire);
+            summary.total += 1;
+            switch (status) {
+                .pending => summary.pending += 1,
+                .running => summary.running += 1,
+                .completed => summary.completed += 1,
+                .failed => summary.failed += 1,
+                .cancelled => summary.cancelled += 1,
+            }
+
+            const name = try allocator.dupe(u8, job.name);
+            errdefer allocator.free(name);
+            const progress_message = if (job.progress_message) |m|
+                try allocator.dupe(u8, m)
+            else
+                null;
+            errdefer if (progress_message) |m| allocator.free(m);
+
+            const result_kind: ?JobResultKind = if (job.result) |r| switch (r) {
+                .success => .success,
+                .failure => .failure,
+                .cancelled => .cancelled,
+            } else null;
+            const result_output: ?[]u8 = if (job.result) |r| switch (r) {
+                .success => |s| try allocator.dupe(u8, s),
+                .failure => |f| try allocator.dupe(u8, f),
+                .cancelled => null,
+            } else null;
+            errdefer if (result_output) |o| allocator.free(o);
+
+            try jobs.append(allocator, .{
+                .id = job.id,
+                .name = name,
+                .status = status,
+                .progress = job.progress,
+                .progress_message = progress_message,
+                .result = result_kind,
+                .result_output = result_output,
+                .start_time = job.start_time,
+                .end_time = job.end_time,
+            });
+        }
+
+        summary.jobs = try jobs.toOwnedSlice(allocator);
+        return summary;
     }
 
     pub fn popCompletedResults(self: *JobManager, allocator: std.mem.Allocator) ![]struct { id: u64, result: JobResult } {
@@ -413,4 +536,131 @@ test "job manager basic operations" {
 
     const status = jm.getStatus(id);
     try std.testing.expect(status != null);
+}
+
+test "job manager snapshot owns stable job summaries" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var jm = JobManager.init(allocator, io);
+    defer jm.deinit();
+
+    try appendSnapshotTestJob(&jm, 1, "Index Workspace", .running, 42);
+    try appendSnapshotTestJob(&jm, 2, "Run Tests", .completed, 100);
+    jm.jobs.items[1].result = .{ .success = try allocator.dupe(u8, "ok") };
+
+    var summary = try jm.snapshot(allocator);
+    defer summary.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), summary.total);
+    try std.testing.expectEqual(@as(usize, 1), summary.running);
+    try std.testing.expectEqual(@as(usize, 1), summary.completed);
+    try std.testing.expectEqual(@as(usize, 1), summary.active());
+    try std.testing.expectEqualStrings("Index Workspace", summary.jobs[0].name);
+    try std.testing.expectEqual(@as(u8, 42), summary.jobs[0].progress);
+    try std.testing.expectEqual(JobResultKind.success, summary.jobs[1].result.?);
+
+    jm.allocator.free(jm.jobs.items[0].name);
+    jm.jobs.items[0].name = try allocator.dupe(u8, "mutated");
+    try std.testing.expectEqualStrings("Index Workspace", summary.jobs[0].name);
+}
+
+test "job progress can mark returned output as failure" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var jm = JobManager.init(allocator, io);
+    defer jm.deinit();
+
+    const job_fn = struct {
+        fn run(ctx: *anyopaque, progress: *JobProgress, alloc: std.mem.Allocator) anyerror![]const u8 {
+            _ = ctx;
+            progress.markFailed();
+            return try alloc.dupe(u8, "task failed with useful output");
+        }
+    }.run;
+
+    const id = try jm.spawn("Task: Fail", job_fn, undefined);
+    std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+
+    try std.testing.expectEqual(JobStatus.failed, jm.getStatus(id).?);
+    var summary = try jm.snapshot(allocator);
+    defer summary.deinit(allocator);
+    try std.testing.expectEqual(JobResultKind.failure, summary.jobs[0].result.?);
+    try std.testing.expectEqualStrings("task failed with useful output", summary.jobs[0].result_output.?);
+}
+
+test "job manager persists final progress into snapshots" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var jm = JobManager.init(allocator, io);
+    defer jm.deinit();
+
+    const job_fn = struct {
+        fn run(ctx: *anyopaque, progress: *JobProgress, alloc: std.mem.Allocator) anyerror![]const u8 {
+            _ = ctx;
+            progress.update(73, "nearly there");
+            return try alloc.dupe(u8, "ok");
+        }
+    }.run;
+
+    const id = try jm.spawn("Progress Job", job_fn, undefined);
+    std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+
+    try std.testing.expectEqual(JobStatus.completed, jm.getStatus(id).?);
+    var summary = try jm.snapshot(allocator);
+    defer summary.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 73), summary.jobs[0].progress);
+    try std.testing.expectEqualStrings("nearly there", summary.jobs[0].progress_message.?);
+}
+
+test "job manager treats cooperative cancellation as cancelled" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var jm = JobManager.init(allocator, io);
+    defer jm.deinit();
+
+    const job_fn = struct {
+        fn run(ctx: *anyopaque, progress: *JobProgress, alloc: std.mem.Allocator) anyerror![]const u8 {
+            _ = ctx;
+            _ = progress;
+            _ = alloc;
+            return error.Cancelled;
+        }
+    }.run;
+
+    const id = try jm.spawn("Cancelled Job", job_fn, undefined);
+    std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+
+    try std.testing.expectEqual(JobStatus.cancelled, jm.getStatus(id).?);
+    var summary = try jm.snapshot(allocator);
+    defer summary.deinit(allocator);
+    try std.testing.expectEqual(JobResultKind.cancelled, summary.jobs[0].result.?);
+}
+
+fn appendSnapshotTestJob(jm: *JobManager, id: u64, name: []const u8, status: JobStatus, progress: u8) !void {
+    const cancelled_ptr = try jm.allocator.create(std.atomic.Value(bool));
+    errdefer jm.allocator.destroy(cancelled_ptr);
+    cancelled_ptr.* = std.atomic.Value(bool).init(false);
+
+    const name_copy = try jm.allocator.dupe(u8, name);
+    errdefer jm.allocator.free(name_copy);
+
+    try jm.jobs.append(jm.allocator, .{
+        .id = id,
+        .name = name_copy,
+        .status = std.atomic.Value(JobStatus).init(status),
+        .progress = progress,
+        .progress_message = null,
+        .result = null,
+        .start_time = 1,
+        .end_time = if (status.isTerminal()) 2 else null,
+        .cancelled = cancelled_ptr,
+    });
 }

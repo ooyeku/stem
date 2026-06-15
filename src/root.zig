@@ -30,6 +30,7 @@ test {
     _ = @import("kernel/decorations.zig");
     _ = @import("kernel/workspace.zig");
     _ = @import("kernel/build_jobs.zig");
+    _ = @import("kernel/project_tasks.zig");
     _ = @import("kernel/buffer_manager.zig");
     _ = @import("kernel/command.zig");
     _ = @import("kernel/protocol.zig");

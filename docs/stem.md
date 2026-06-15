@@ -364,9 +364,36 @@ by source).
 
 Cancellable background tasks with progress tracking. Each job runs
 on its own thread with atomic status updates the UI can observe.
+`JobManager.snapshot` returns an owned, stable summary for dashboard
+views so UI rendering never borrows live job storage.
 
 User binding: `Space j` opens the active-job list. Palette command:
 `job.list`.
+
+### Runtime cockpit — [`system_commands.zig`](../src/kernel/commands/system_commands.zig)
+
+`stem.control_center` opens `[CONTROL CENTER]`, a consolidated
+runtime health view for Vigil services, message-bus pressure, open
+buffers, project-index health, LSP state, diagnostics, jobs, plugins,
+terminal status, and recommended next actions.
+
+`project.brain` opens `[PROJECT BRAIN]`, focused on workspace root,
+index freshness, indexed-path capacity, open languages, diagnostics,
+per-LSP coverage, and detected project tasks.
+
+### Project tasks — [`project_tasks.zig`](../src/kernel/project_tasks.zig)
+
+Small task catalog for project-native commands. `task.list` opens
+`[TASKS]` with detected build/test/run commands from `build.zig`,
+`Cargo.toml`, `go.mod`, Python project markers, `package.json`
+scripts, and common Make targets. `task.run_build`, `task.run_test`,
+`task.run`, `task.run_dev`, `task.run_lint`, and `task.run_format` run
+the preferred detected task through the background job manager, and
+`task.output` reopens the latest retained stdout/stderr report. The
+detector returns an owned, sorted task list so dashboard views can render
+without borrowing filesystem-backed data.
+The shell uses the same detector through `stem task list`,
+`stem task run <id|kind>`, and `stem task doctor`.
 
 ### Workspace — [`workspace.zig`](../src/kernel/workspace.zig)
 
@@ -412,6 +439,7 @@ Palette commands:
 |---|---|
 | `Zig: Build` | `zig build` |
 | `Zig: Test` | `zig build test` |
+| `Zig: Run` | `zig build run` |
 | `Zig: Show Build Output` | view last result |
 
 ### Global search — [`global_search.zig`](../src/services/global_search.zig)
@@ -590,8 +618,8 @@ status bar, tab bar, picker, editor, split borders).
 ### Logger — [`logger.zig`](../src/services/logger.zig)
 
 Rolling file log under `~/.stem/logs/stem-*.log`. All `std.log`
-output is bridged into the file. CLI: `stem logs`, `stem logs
---clear`. In-editor view: `:logs`.
+output is bridged into the file. CLI: `stem logs`, `stem logs tail`,
+`stem logs bundle`, and `stem logs clear`. In-editor view: `:logs`.
 
 ---
 
@@ -790,9 +818,13 @@ graph TB
 ```bash
 stem plugin list
 stem plugin info <name>
+stem plugin inspect [name]
 stem plugin install <path>
 stem plugin remove <name>
 stem plugin test <path>
+stem plugin validate <path>
+stem plugin scaffold <name>
+stem plugin pack <path>
 ```
 
 ---
@@ -804,6 +836,20 @@ stem [filename]
 stem --find "query"  [options]
 stem --vfind "query" [options]
 stem --scope FILE QUERY
+stem task list
+stem task run <id|build|test|run|dev|lint|format>
+stem task doctor
+stem project inspect
+stem project warm
+stem lsp list
+stem lsp doctor <language>
+stem lsp prune
+stem recover list
+stem recover restore <id>
+stem session list
+stem session clear
+stem cache status
+stem cache clear [search|lsp|plugins|all]
 ```
 
 | Option | Short | Description |
@@ -824,6 +870,12 @@ Implementations:
 
 `--find` is the workhorse; `--vfind` is the interactive variant
 backed by an actor pipeline.
+
+The operator commands are intentionally plain stdout tools so they can
+be scripted in CI or used after a crash. `cache clear lsp` and
+`cache clear plugins` remove installed LSP/plugin directories and then
+recreate them; use the narrower `cache clear search` when you only want
+to drop the workspace index.
 
 ---
 
@@ -903,6 +955,10 @@ older than the snapshot; `buffer.restore_backups` (palette) opens
 the `[Recovery Backups]` index for selective restore. Disable
 entirely with `editor.auto_save_backup = false`.
 
+From a shell, `stem recover list` prints the same recovery IDs and
+`stem recover restore <id>` copies either the `session` recovery snapshot
+or a dirty-buffer `.bak` back to its recorded path.
+
 ### Crash dump
 
 The Zig panic handler installed in `main.zig` writes
@@ -971,9 +1027,19 @@ stem config set editor.tab_size 2
 stem config set ui.show_status_bar false
 stem config set editor.line_numbers absolute
 stem config set logging.level debug
+stem config reset editor.tab_size
+stem config reset --all
 
 stem logs
-stem logs --clear
+stem logs tail --lines 100
+stem logs bundle
+stem logs clear
+
+stem task list
+stem project inspect
+stem lsp doctor python
+stem recover list
+stem cache status
 
 stem help
 stem --help

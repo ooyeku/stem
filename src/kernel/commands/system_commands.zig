@@ -5,6 +5,9 @@ const std = @import("std");
 const protocol = @import("../protocol.zig");
 const logger_service = @import("../../services/logger.zig");
 const telemetry = @import("../../services/telemetry.zig");
+const LSPManager = @import("../../services/lsp_manager.zig").LSPManager;
+const project_tasks = @import("../project_tasks.zig");
+const JobProgress = @import("../jobs.zig").JobProgress;
 
 pub const SystemCommands = struct {
     pub fn cmdModeInsert(core: anytype) anyerror!void {
@@ -113,6 +116,99 @@ pub const SystemCommands = struct {
         const body = try renderStatsBuffer(core);
         defer core.allocator.free(body);
         try core.openVirtualBuffer("[STATS]", body);
+        try core.sendUpdate();
+    }
+
+    pub fn cmdShowControlCenter(core: anytype) anyerror!void {
+        const body = try renderControlCenterBuffer(core);
+        defer core.allocator.free(body);
+        try core.openVirtualBuffer("[CONTROL CENTER]", body);
+        core.mode = .view;
+        try core.sendUpdate();
+    }
+
+    pub fn cmdShowProjectBrain(core: anytype) anyerror!void {
+        const body = try renderProjectBrainBuffer(core);
+        defer core.allocator.free(body);
+        try core.openVirtualBuffer("[PROJECT BRAIN]", body);
+        core.mode = .view;
+        try core.sendUpdate();
+    }
+
+    pub fn cmdProjectTasks(core: anytype) anyerror!void {
+        const body = try renderProjectTasksBuffer(core);
+        defer core.allocator.free(body);
+        try core.openVirtualBuffer("[TASKS]", body);
+        core.mode = .view;
+        try core.sendUpdate();
+    }
+
+    pub fn cmdTaskRunBuild(core: anytype) anyerror!void {
+        try runDetectedTask(core, .build);
+    }
+
+    pub fn cmdTaskRunTest(core: anytype) anyerror!void {
+        try runDetectedTask(core, .@"test");
+    }
+
+    pub fn cmdTaskRun(core: anytype) anyerror!void {
+        try runDetectedTask(core, .run);
+    }
+
+    pub fn cmdTaskRunDev(core: anytype) anyerror!void {
+        try runDetectedTask(core, .dev);
+    }
+
+    pub fn cmdTaskRunLint(core: anytype) anyerror!void {
+        try runDetectedTask(core, .lint);
+    }
+
+    pub fn cmdTaskRunFormat(core: anytype) anyerror!void {
+        try runDetectedTask(core, .format);
+    }
+
+    pub fn cmdTaskOutput(core: anytype) anyerror!void {
+        var summary = try core.job_manager.snapshot(core.allocator);
+        defer summary.deinit(core.allocator);
+
+        var i: usize = summary.jobs.len;
+        while (i > 0) {
+            i -= 1;
+            const job = summary.jobs[i];
+            if (!std.mem.startsWith(u8, job.name, "Task: ")) continue;
+            if (job.result_output) |output| {
+                try core.openVirtualBuffer("[TASK OUTPUT]", output);
+                core.mode = .view;
+                try core.sendUpdate();
+                return;
+            }
+            var aw: std.Io.Writer.Allocating = .init(core.allocator);
+            defer aw.deinit();
+            const w = &aw.writer;
+            try w.writeAll("# Task Output\n\n");
+            if (!job.status.isTerminal()) {
+                try w.print("{s} is still running.\n\nRun `task.output` again after it finishes.\n", .{job.name});
+            } else {
+                try w.print("{s} finished with status `{s}` but did not retain output.\n", .{ job.name, jobStatusLabel(job.status) });
+            }
+            try core.openVirtualBuffer("[TASK OUTPUT]", aw.written());
+            core.mode = .view;
+            try core.sendUpdate();
+            return;
+        }
+
+        var aw: std.Io.Writer.Allocating = .init(core.allocator);
+        defer aw.deinit();
+        try aw.writer.writeAll(
+            \\# Task Output
+            \\
+            \\No task output available.
+            \\
+            \\Run `task.run_build`, `task.run_test`, or another `task.run_*` command first.
+            \\
+        );
+        try core.openVirtualBuffer("[TASK OUTPUT]", aw.written());
+        core.mode = .view;
         try core.sendUpdate();
     }
 
@@ -324,6 +420,381 @@ pub const SystemCommands = struct {
         return aw.toOwnedSlice();
     }
 
+    fn renderControlCenterBuffer(core: anytype) ![]u8 {
+        const allocator = core.allocator;
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+
+        const message_bus = telemetry.snapshot();
+        const bus_drops = try busDropTotals(allocator);
+        const plugin_health = core.plugin_manager.healthSnapshot();
+        var lsp_health = try core.lsp_manager.healthSnapshot(allocator);
+        defer lsp_health.deinit(allocator);
+        var index_health = try core.search_index.healthSnapshot(allocator);
+        defer index_health.deinit(allocator);
+        var job_summary = try core.job_manager.snapshot(allocator);
+        defer job_summary.deinit(allocator);
+        const buffers = bufferCounts(core);
+        const diagnostics = try diagnosticCounts(core, allocator);
+        const task_count = detectedTaskCount(core, allocator);
+
+        const runtime_label = blk: {
+            if (core.runtime_services) |runtime| {
+                break :blk if (runtime.healthSnapshot().runtime_running) "running" else "stopped";
+            }
+            break :blk "not attached";
+        };
+
+        const attention = lsp_health.unhealthy_servers +
+            diagnostics.errors +
+            job_summary.failed +
+            (if (index_health.at_capacity) @as(usize, 1) else 0);
+
+        const active = core.buffer_manager.getActive();
+        const ws = core.workspace_manager.getBufferWorkspace(active.id);
+        const workspace_name = if (ws) |workspace|
+            workspace.name
+        else
+            core.workspace_manager.getActiveWorkspaceName() orelse "No workspace";
+        const workspace_root = if (ws) |workspace|
+            workspace.root_path
+        else
+            core.workspace_manager.getActiveRootPath() orelse "-";
+
+        try w.print(
+            \\# Stem Control Center
+            \\
+            \\Status: {s}
+            \\Workspace: {s}
+            \\Root: {s}
+            \\
+            \\## Runtime
+            \\
+            \\- Runtime: {s}
+            \\- Commands: {d}
+            \\- Buffers: {d} open, {d} file-backed, {d} virtual, {d} dirty, {d} large-file
+            \\- Build status: {s}
+            \\- Terminal: {s}
+            \\
+        , .{
+            if (attention == 0) "healthy" else "needs attention",
+            workspace_name,
+            workspace_root,
+            runtime_label,
+            core.command_registry.commands.count(),
+            buffers.total,
+            buffers.file_backed,
+            buffers.virtual,
+            buffers.dirty,
+            buffers.large,
+            buildStatusLabel(core.build_status),
+            if (core.terminal_running) "running" else "idle",
+        });
+
+        try w.print(
+            \\## Project Brain
+            \\
+            \\- Indexed paths: {d}/{d}
+            \\- Index state: {s}
+            \\- Index root: {s}
+            \\- At capacity: {s}
+            \\
+        , .{
+            index_health.path_count,
+            index_health.max_paths,
+            indexStateLabel(index_health.indexing, index_health.fresh),
+            index_health.root orelse "-",
+            yesNo(index_health.at_capacity),
+        });
+
+        try w.print(
+            \\## Language Intelligence
+            \\
+            \\- LSP servers: {d} running, {d} ready, {d} unhealthy, {d} initializing
+            \\- Open LSP documents: {d}
+            \\- Pending LSP changes: {d}
+            \\- Diagnostics: {d} errors, {d} warnings, {d} info, {d} hints
+            \\- Lifecycle: {d} crashes, {d} restarts scheduled
+            \\
+        , .{
+            lsp_health.running_servers,
+            lsp_health.healthy_servers,
+            lsp_health.unhealthy_servers,
+            lsp_health.initializing_servers,
+            lsp_health.open_documents,
+            lsp_health.pending_changes,
+            diagnostics.errors,
+            diagnostics.warnings,
+            diagnostics.info,
+            diagnostics.hints,
+            lsp_health.lifecycle.crashes,
+            lsp_health.lifecycle.restarts_scheduled,
+        });
+
+        try w.print(
+            \\## Work
+            \\
+            \\- Jobs: {d} active, {d} total, {d} failed, {d} completed, {d} cancelled
+            \\- Detected project tasks: {d}
+            \\- Message bus: {d} bytes shipped, {d} coalesced updates
+            \\- Drops: {d} full, {d} backpressure, {d} rate-limited
+            \\
+        , .{
+            job_summary.active(),
+            job_summary.total,
+            job_summary.failed,
+            job_summary.completed,
+            job_summary.cancelled,
+            task_count,
+            message_bus.bytes_sent,
+            message_bus.coalesce_events,
+            bus_drops.full,
+            bus_drops.backpressure,
+            bus_drops.rate_limited,
+        });
+
+        try w.print(
+            \\## Plugins
+            \\
+            \\- Loaded: {d} ({d} wasm, {d} exec)
+            \\- Vigil broker: {s}
+            \\- Lifecycle supervisor: {s}
+            \\- Pending restarts: {d}
+            \\- Crashes: {d}
+            \\
+        , .{
+            plugin_health.loaded_plugins,
+            plugin_health.wasm_plugins,
+            plugin_health.process_plugins,
+            if (plugin_health.vigil_broker_attached) "attached" else "missing",
+            if (plugin_health.vigil_supervisor_attached) "attached" else "missing",
+            plugin_health.pending_restarts,
+            plugin_health.lifecycle.crashes,
+        });
+
+        try w.writeAll("## Recommended Actions\n\n");
+        var wrote_action = false;
+        if (index_health.at_capacity) {
+            wrote_action = true;
+            try w.writeAll("- Project index hit its safety cap. Narrow the workspace or raise the index limit before relying on whole-project search.\n");
+        }
+        if (lsp_health.unhealthy_servers > 0) {
+            wrote_action = true;
+            try w.writeAll("- Some LSP servers are unhealthy. Open `lsp.status`, then run `lsp.restart` for the active language if needed.\n");
+        }
+        if (diagnostics.errors > 0) {
+            wrote_action = true;
+            try w.writeAll("- LSP diagnostics contain errors. Open `lsp.diagnostics` to triage them.\n");
+        }
+        if (job_summary.failed > 0) {
+            wrote_action = true;
+            try w.writeAll("- A background job failed. Open `job.list` or `view.logs` for details.\n");
+        }
+        if (!wrote_action) {
+            try w.writeAll("- No urgent runtime issues detected.\n");
+        }
+
+        try w.writeAll(
+            \\
+            \\## Jump To
+            \\
+            \\- `stats.show`: raw Vigil/message-bus telemetry
+            \\- `project.brain`: workspace index, languages, and LSP coverage
+            \\- `task.list`: detected project build/test/run commands
+            \\- `task.run_build` / `task.run_test` / `task.run`: run preferred project tasks as jobs
+            \\- `lsp.status`: per-language LSP server state
+            \\- `plugin.inspect`: plugin manifests, permissions, and live state
+            \\- `job.list`: active background jobs
+            \\- `view.logs`: in-session logs
+            \\
+        );
+
+        return aw.toOwnedSlice();
+    }
+
+    fn renderProjectBrainBuffer(core: anytype) ![]u8 {
+        const allocator = core.allocator;
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+
+        var index_health = try core.search_index.healthSnapshot(allocator);
+        defer index_health.deinit(allocator);
+        var lsp_health = try core.lsp_manager.healthSnapshot(allocator);
+        defer lsp_health.deinit(allocator);
+        const diagnostics = try diagnosticCounts(core, allocator);
+        const active = core.buffer_manager.getActive();
+        const ws = core.workspace_manager.getBufferWorkspace(active.id);
+
+        try w.writeAll("# Project Brain\n\n");
+        if (ws) |workspace| {
+            try w.print(
+                \\## Workspace
+                \\
+                \\- Name: {s}
+                \\- Root: {s}
+                \\- build.zig: {s}
+                \\- build.zig.zon: {s}
+                \\
+            , .{
+                workspace.name,
+                workspace.root_path,
+                workspace.build_zig_path,
+                yesNo(workspace.has_zon),
+            });
+        } else {
+            try w.writeAll(
+                \\## Workspace
+                \\
+                \\- No Zig workspace is attached to the active buffer.
+                \\
+            );
+        }
+
+        try w.print(
+            \\## Index
+            \\
+            \\- State: {s}
+            \\- Root: {s}
+            \\- Paths: {d}/{d}
+            \\- Capacity reached: {s}
+            \\
+        , .{
+            indexStateLabel(index_health.indexing, index_health.fresh),
+            index_health.root orelse "-",
+            index_health.path_count,
+            index_health.max_paths,
+            yesNo(index_health.at_capacity),
+        });
+
+        try writeOpenLanguageTable(core, w);
+
+        try w.print(
+            \\
+            \\## LSP Coverage
+            \\
+            \\- Servers: {d} running, {d} ready, {d} unhealthy, {d} initializing
+            \\- Open documents: {d}
+            \\- Pending changes: {d}
+            \\- Diagnostics: {d} errors, {d} warnings, {d} info, {d} hints
+            \\
+        , .{
+            lsp_health.running_servers,
+            lsp_health.healthy_servers,
+            lsp_health.unhealthy_servers,
+            lsp_health.initializing_servers,
+            lsp_health.open_documents,
+            lsp_health.pending_changes,
+            diagnostics.errors,
+            diagnostics.warnings,
+            diagnostics.info,
+            diagnostics.hints,
+        });
+
+        if (lsp_health.servers.len > 0) {
+            try w.writeAll("\n| Language | State | Restarts | Root |\n");
+            try w.writeAll("|---|---|---:|---|\n");
+            for (lsp_health.servers) |server| {
+                try w.print(
+                    "| `{s}` | {s} | {d} | {s} |\n",
+                    .{
+                        server.lang,
+                        lspStateLabel(server.running, server.healthy, server.initialized),
+                        server.restart_attempts,
+                        server.root_path orelse "-",
+                    },
+                );
+            }
+        }
+
+        try writeProjectTaskTable(core, allocator, w);
+
+        try w.writeAll(
+            \\
+            \\## Useful Commands
+            \\
+            \\- `lsp.prewarm`: start servers for detected workspace languages
+            \\- `task.list`: show detected project tasks
+            \\- `task.run_build` / `task.run_test` / `task.run`: run preferred detected tasks
+            \\- `task.output`: reopen the latest retained task output
+            \\- `lsp.workspace_symbols`: search symbols across the workspace
+            \\- `search.find_in_buffer`: search within the active buffer
+            \\- `stats.show`: inspect runtime/message bus pressure
+            \\
+        );
+
+        return aw.toOwnedSlice();
+    }
+
+    fn renderProjectTasksBuffer(core: anytype) ![]u8 {
+        const allocator = core.allocator;
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+
+        const root = projectTaskRoot(core);
+        var tasks = try project_tasks.detectProjectTasks(allocator, core.io, root);
+        defer tasks.deinit(allocator);
+
+        try w.print(
+            \\# Project Tasks
+            \\
+            \\Root: {s}
+            \\Detected: {d}
+            \\
+        , .{ root, tasks.tasks.len });
+
+        if (tasks.tasks.len == 0) {
+            try w.writeAll(
+                \\No project tasks detected.
+                \\
+                \\Stem currently detects tasks from `build.zig`, `Cargo.toml`, `go.mod`,
+                \\Python project markers, `package.json` scripts, and common Make targets.
+                \\
+            );
+            return aw.toOwnedSlice();
+        }
+
+        try w.writeAll("| ID | Kind | Command | Source |\n");
+        try w.writeAll("|---|---|---|---|\n");
+        for (tasks.tasks) |task| {
+            try w.print("| `{s}` | {s} | `{s}` | {s} |\n", .{
+                task.id,
+                task.kind.label(),
+                task.command,
+                task.source,
+            });
+        }
+
+        try w.writeAll(
+            \\
+            \\## Notes
+            \\
+            \\- Commands are shown exactly as Stem would run them from the root above.
+            \\- `task.run_build`: run the preferred build task in the background.
+            \\- `task.run_test`: run the preferred test task in the background.
+            \\- `task.run`: run the preferred run/start task in the background.
+            \\- `task.run_dev` / `task.run_lint` / `task.run_format`: run matching project tasks.
+            \\- `task.output`: reopen the most recent retained task output.
+            \\
+        );
+
+        return aw.toOwnedSlice();
+    }
+
+    const TaskRunContext = struct {
+        allocator: std.mem.Allocator,
+        environ_block: std.process.Environ.Block,
+        root: []const u8,
+        task: project_tasks.ProjectTask,
+
+        fn deinit(self: *TaskRunContext) void {
+            self.allocator.free(self.root);
+            self.task.deinit(self.allocator);
+        }
+    };
+
     fn lspStateLabel(running: bool, healthy: bool, initialized: bool) []const u8 {
         if (!running) return "stopped";
         if (!healthy) return "unhealthy";
@@ -343,31 +814,308 @@ pub const SystemCommands = struct {
         };
     }
 
+    const BufferCounts = struct {
+        total: usize = 0,
+        file_backed: usize = 0,
+        virtual: usize = 0,
+        dirty: usize = 0,
+        large: usize = 0,
+    };
+
+    const DiagnosticCounts = struct {
+        errors: usize = 0,
+        warnings: usize = 0,
+        info: usize = 0,
+        hints: usize = 0,
+    };
+
+    const BusDropTotals = struct {
+        full: u64 = 0,
+        backpressure: u64 = 0,
+        rate_limited: u64 = 0,
+    };
+
+    fn bufferCounts(core: anytype) BufferCounts {
+        var counts = BufferCounts{};
+        counts.total = core.buffer_manager.buffers.items.len;
+        for (core.buffer_manager.buffers.items) |buf| {
+            if (buf.file_path == null) {
+                counts.virtual += 1;
+            } else {
+                counts.file_backed += 1;
+            }
+            if (buf.state.modified) counts.dirty += 1;
+            if (buf.is_large) counts.large += 1;
+        }
+        return counts;
+    }
+
+    fn diagnosticCounts(core: anytype, allocator: std.mem.Allocator) !DiagnosticCounts {
+        const diagnostics = core.lsp_manager.getDiagnostics(allocator) catch return .{};
+        defer LSPManager.freeDiagnostics(allocator, diagnostics);
+
+        var counts = DiagnosticCounts{};
+        for (diagnostics) |diag| {
+            switch (diag.severity) {
+                .err => counts.errors += 1,
+                .warning => counts.warnings += 1,
+                .info => counts.info += 1,
+                .hint => counts.hints += 1,
+            }
+        }
+        return counts;
+    }
+
+    fn busDropTotals(allocator: std.mem.Allocator) !BusDropTotals {
+        const per_bus = try telemetry.snapshotPerBus(allocator);
+        defer {
+            for (per_bus) |b| allocator.free(b.bus_name);
+            allocator.free(per_bus);
+        }
+
+        var totals = BusDropTotals{};
+        for (per_bus) |b| {
+            totals.full += b.stats.dropped_full;
+            totals.backpressure += b.stats.dropped_backpressure;
+            totals.rate_limited += b.stats.dropped_rate_limited;
+        }
+        return totals;
+    }
+
+    fn projectTaskRoot(core: anytype) []const u8 {
+        const active = core.buffer_manager.getActive();
+        if (core.workspace_manager.getBufferWorkspace(active.id)) |ws| return ws.root_path;
+        if (core.workspace_manager.getActiveRootPath()) |root| return root;
+        return core.file_manager.cwd;
+    }
+
+    fn detectedTaskCount(core: anytype, allocator: std.mem.Allocator) usize {
+        var tasks = project_tasks.detectProjectTasks(allocator, core.io, projectTaskRoot(core)) catch return 0;
+        defer tasks.deinit(allocator);
+        return tasks.tasks.len;
+    }
+
+    fn runDetectedTask(core: anytype, kind: project_tasks.TaskKind) !void {
+        const allocator = core.allocator;
+        const root = projectTaskRoot(core);
+        var tasks = try project_tasks.detectProjectTasks(allocator, core.io, root);
+        defer tasks.deinit(allocator);
+
+        const task = tasks.findFirstByKind(kind) orelse {
+            const body = try std.fmt.allocPrint(allocator,
+                \\# Task Output
+                \\
+                \\No {s} task was detected for:
+                \\
+                \\{s}
+                \\
+                \\Run `task.list` to inspect detected tasks.
+                \\
+            , .{ kind.label(), root });
+            defer allocator.free(body);
+            try core.openVirtualBuffer("[TASK OUTPUT]", body);
+            core.mode = .view;
+            try core.sendUpdate();
+            return;
+        };
+
+        const job_name = try std.fmt.allocPrint(allocator, "Task: {s}", .{task.label});
+        defer allocator.free(job_name);
+
+        const ctx = try makeTaskRunContext(allocator, core.environ_block, root, task);
+        const id = core.job_manager.spawn(job_name, runProjectTaskJob, ctx) catch |err| {
+            ctx.deinit();
+            allocator.destroy(ctx);
+            return err;
+        };
+
+        const body = try std.fmt.allocPrint(allocator,
+            \\# Task Output
+            \\
+            \\Started background task #{d}.
+            \\
+            \\- Task: {s}
+            \\- ID: `{s}`
+            \\- Command: `{s}`
+            \\- Root: {s}
+            \\
+            \\Open `job.list` to monitor status, or `task.output` to reopen the retained output after completion.
+            \\
+        , .{ id, task.label, task.id, task.command, root });
+        defer allocator.free(body);
+
+        try core.openVirtualBuffer("[TASK OUTPUT]", body);
+        core.mode = .view;
+        try core.sendUpdate();
+    }
+
+    fn makeTaskRunContext(
+        allocator: std.mem.Allocator,
+        environ_block: std.process.Environ.Block,
+        root: []const u8,
+        task: *const project_tasks.ProjectTask,
+    ) !*TaskRunContext {
+        const ctx = try allocator.create(TaskRunContext);
+        errdefer allocator.destroy(ctx);
+
+        const root_copy = try allocator.dupe(u8, root);
+        errdefer allocator.free(root_copy);
+        const task_id = try allocator.dupe(u8, task.id);
+        errdefer allocator.free(task_id);
+        const label = try allocator.dupe(u8, task.label);
+        errdefer allocator.free(label);
+        const command = try allocator.dupe(u8, task.command);
+        errdefer allocator.free(command);
+        const source = try allocator.dupe(u8, task.source);
+        errdefer allocator.free(source);
+
+        ctx.* = .{
+            .allocator = allocator,
+            .environ_block = environ_block,
+            .root = root_copy,
+            .task = .{
+                .id = task_id,
+                .label = label,
+                .command = command,
+                .kind = task.kind,
+                .source = source,
+                .priority = task.priority,
+            },
+        };
+        return ctx;
+    }
+
+    fn runProjectTaskJob(ctx_ptr: *anyopaque, progress: *JobProgress, allocator: std.mem.Allocator) anyerror![]const u8 {
+        const ctx: *TaskRunContext = @ptrCast(@alignCast(ctx_ptr));
+        defer {
+            ctx.deinit();
+            ctx.allocator.destroy(ctx);
+        }
+
+        progress.update(5, "Starting project task...");
+        if (progress.isCancelled()) return error.Cancelled;
+
+        var threaded = std.Io.Threaded.init(ctx.allocator, .{
+            .environ = .{ .block = ctx.environ_block },
+        });
+        defer threaded.deinit();
+
+        var result = try project_tasks.runTaskSync(allocator, threaded.io(), ctx.task, ctx.root);
+        defer result.deinit(allocator);
+
+        progress.update(100, null);
+        if (!result.success) progress.markFailed();
+        return try project_tasks.formatRunResult(allocator, &result);
+    }
+
+    fn writeProjectTaskTable(core: anytype, allocator: std.mem.Allocator, w: anytype) !void {
+        var tasks = try project_tasks.detectProjectTasks(allocator, core.io, projectTaskRoot(core));
+        defer tasks.deinit(allocator);
+
+        try w.writeAll(
+            \\
+            \\## Project Tasks
+            \\
+        );
+        if (tasks.tasks.len == 0) {
+            try w.writeAll("- No project tasks detected.\n");
+            return;
+        }
+
+        try w.writeAll("| ID | Kind | Command | Source |\n");
+        try w.writeAll("|---|---|---|---|\n");
+        for (tasks.tasks) |task| {
+            try w.print("| `{s}` | {s} | `{s}` | {s} |\n", .{
+                task.id,
+                task.kind.label(),
+                task.command,
+                task.source,
+            });
+        }
+    }
+
+    fn writeOpenLanguageTable(core: anytype, w: anytype) !void {
+        var langs = std.StringHashMapUnmanaged(usize).empty;
+        defer langs.deinit(core.allocator);
+
+        for (core.buffer_manager.buffers.items) |buf| {
+            const path = buf.file_path orelse continue;
+            const lang = LSPManager.getLangFromPath(path) orelse continue;
+            const gop = try langs.getOrPut(core.allocator, lang);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        }
+
+        try w.writeAll(
+            \\
+            \\## Open Languages
+            \\
+        );
+        if (langs.count() == 0) {
+            try w.writeAll("- No LSP-backed file types are open.\n");
+            return;
+        }
+
+        try w.writeAll("| Language | Open buffers |\n");
+        try w.writeAll("|---|---:|\n");
+        var it = langs.iterator();
+        while (it.next()) |entry| {
+            try w.print("| `{s}` | {d} |\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
+    }
+
+    fn yesNo(value: bool) []const u8 {
+        return if (value) "yes" else "no";
+    }
+
+    fn indexStateLabel(indexing: bool, fresh: bool) []const u8 {
+        if (indexing) return "indexing";
+        if (fresh) return "fresh";
+        return "warming";
+    }
+
+    fn buildStatusLabel(status: anytype) []const u8 {
+        return switch (status) {
+            .idle => "idle",
+            .building => "building",
+            .success => "success",
+            .failed => "failed",
+        };
+    }
+
     pub fn cmdJobList(core: anytype) anyerror!void {
-        const active_jobs = try core.job_manager.getActiveJobs(core.allocator);
-        defer core.allocator.free(active_jobs);
+        var summary = try core.job_manager.snapshot(core.allocator);
+        defer summary.deinit(core.allocator);
 
         var text = std.ArrayListUnmanaged(u8).empty;
         defer text.deinit(core.allocator);
 
-        try text.appendSlice(core.allocator, "=== Background Jobs ===\n\n");
+        try text.appendSlice(core.allocator, "# Background Jobs\n\n");
+        const summary_line = try std.fmt.allocPrint(
+            core.allocator,
+            "- Active: {d}\n- Total retained: {d}\n- Completed: {d}\n- Failed: {d}\n- Cancelled: {d}\n\n",
+            .{
+                summary.active(),
+                summary.total,
+                summary.completed,
+                summary.failed,
+                summary.cancelled,
+            },
+        );
+        defer core.allocator.free(summary_line);
+        try text.appendSlice(core.allocator, summary_line);
 
-        if (active_jobs.len == 0) {
-            try text.appendSlice(core.allocator, "No active jobs.\n");
+        if (summary.jobs.len == 0) {
+            try text.appendSlice(core.allocator, "No jobs have run in this session.\n");
         } else {
-            for (active_jobs, 0..) |job, i| {
-                const status_str = switch (job.status.load(.acquire)) {
-                    .pending => "Pending",
-                    .running => "Running",
-                    .completed => "Completed",
-                    .failed => "Failed",
-                    .cancelled => "Cancelled",
-                };
-                const line = try std.fmt.allocPrint(core.allocator, "{d}. [{s}] {s} ({d}%)\n", .{
-                    i + 1,
-                    status_str,
-                    job.name,
+            try text.appendSlice(core.allocator, "| ID | Status | Progress | Job |\n");
+            try text.appendSlice(core.allocator, "|---:|---|---:|---|\n");
+            for (summary.jobs) |job| {
+                const line = try std.fmt.allocPrint(core.allocator, "| {d} | {s} | {d}% | {s} |\n", .{
+                    job.id,
+                    jobStatusLabel(job.status),
                     job.progress,
+                    job.name,
                 });
                 defer core.allocator.free(line);
                 try text.appendSlice(core.allocator, line);
@@ -375,6 +1123,7 @@ pub const SystemCommands = struct {
         }
 
         try core.openVirtualBuffer("[Jobs]", text.items);
+        core.mode = .view;
         try core.sendUpdate();
     }
 
@@ -438,5 +1187,15 @@ pub const SystemCommands = struct {
             l.clear();
         }
         try core.sendUpdate();
+    }
+
+    fn jobStatusLabel(status: @import("../jobs.zig").JobStatus) []const u8 {
+        return switch (status) {
+            .pending => "pending",
+            .running => "running",
+            .completed => "completed",
+            .failed => "failed",
+            .cancelled => "cancelled",
+        };
     }
 };

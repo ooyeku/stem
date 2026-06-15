@@ -62,6 +62,20 @@ pub const SearchIndex = struct {
     /// in alongside node_modules). Matches `global_search.Options.max_files`.
     max_paths: usize = 5000,
 
+    pub const HealthSnapshot = struct {
+        root: ?[]u8 = null,
+        path_count: usize = 0,
+        fresh: bool = false,
+        indexing: bool = false,
+        max_paths: usize = 0,
+        at_capacity: bool = false,
+
+        pub fn deinit(self: *HealthSnapshot, allocator: std.mem.Allocator) void {
+            if (self.root) |r| allocator.free(r);
+            self.root = null;
+        }
+    };
+
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -177,6 +191,24 @@ pub const SearchIndex = struct {
     /// to wait for this if they want guaranteed-up-to-date results.
     pub fn isFresh(self: *SearchIndex) bool {
         return self.fresh.load(.acquire);
+    }
+
+    pub fn healthSnapshot(self: *SearchIndex, allocator: std.mem.Allocator) !HealthSnapshot {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const root = if (self.root) |r| try allocator.dupe(u8, r) else null;
+        errdefer if (root) |r| allocator.free(r);
+
+        const path_count = self.paths.items.len;
+        return .{
+            .root = root,
+            .path_count = path_count,
+            .fresh = self.fresh.load(.acquire),
+            .indexing = self.worker_running.load(.acquire),
+            .max_paths = self.max_paths,
+            .at_capacity = path_count >= self.max_paths,
+        };
     }
 };
 
@@ -368,6 +400,34 @@ test "SearchIndex does not skip ordinary dotfiles" {
     try std.testing.expect(!shouldSkip(".env.example"));
     try std.testing.expect(!shouldSkip(".editorconfig"));
     try std.testing.expect(shouldSkip(".git"));
+}
+
+test "SearchIndex health snapshot reports root freshness and capacity" {
+    const allocator = std.testing.allocator;
+    const TestIo = @import("../test_utils.zig").TestIo;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var index = SearchIndex.init(allocator, io_ctx.io(), .empty);
+    defer index.deinit();
+    index.root = try allocator.dupe(u8, "/tmp/work");
+    index.max_paths = 2;
+    try index.paths.append(allocator, try allocator.dupe(u8, "src/main.zig"));
+    try index.paths.append(allocator, try allocator.dupe(u8, "README.md"));
+    index.fresh.store(true, .release);
+
+    var snapshot = try index.healthSnapshot(allocator);
+    defer snapshot.deinit(allocator);
+
+    try std.testing.expectEqualStrings("/tmp/work", snapshot.root.?);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.path_count);
+    try std.testing.expect(snapshot.fresh);
+    try std.testing.expect(!snapshot.indexing);
+    try std.testing.expect(snapshot.at_capacity);
+
+    allocator.free(index.root.?);
+    index.root = try allocator.dupe(u8, "/tmp/other");
+    try std.testing.expectEqualStrings("/tmp/work", snapshot.root.?);
 }
 
 // ---------------------------------------------------------------------------

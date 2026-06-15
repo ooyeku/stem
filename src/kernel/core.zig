@@ -1461,7 +1461,17 @@ pub const Core = struct {
         try R.register("help.show", "Help: Show", "Show editor help", Wrap(SystemCommands.cmdShowHelp).run, null);
         try R.register("plugin.show", "Plugins: List Loaded", "Show plugins currently loaded in the running stem instance", Wrap(SystemCommands.cmdShowPlugins).run, null);
         try R.register("plugin.inspect", "Plugins: Inspect", "Open a capability inspector showing manifest, permissions, restart policy, and live state for every installed plugin", Wrap(PluginCommands.cmdPluginInspect).run, null);
+        try R.register("stem.control_center", "Stem: Control Center", "Open a live cockpit for runtime health, project brain, LSPs, jobs, plugins, and message-bus pressure", Wrap(SystemCommands.cmdShowControlCenter).run, null);
+        try R.register("project.brain", "Project: Brain", "Show workspace index health, open languages, diagnostics, and LSP coverage", Wrap(SystemCommands.cmdShowProjectBrain).run, null);
         try R.register("stats.show", "Stats: Message Bus", "Live view of stem's Vigil-backed message bus stats", Wrap(SystemCommands.cmdShowStats).run, null);
+        try R.register("task.list", "Tasks: List Detected", "Show detected project build/test/run commands for the current workspace", Wrap(SystemCommands.cmdProjectTasks).run, null);
+        try R.register("task.run_build", "Tasks: Run Build", "Run the preferred detected build task as a background job", Wrap(SystemCommands.cmdTaskRunBuild).run, null);
+        try R.register("task.run_test", "Tasks: Run Test", "Run the preferred detected test task as a background job", Wrap(SystemCommands.cmdTaskRunTest).run, null);
+        try R.register("task.run", "Tasks: Run App", "Run the preferred detected run/start task as a background job", Wrap(SystemCommands.cmdTaskRun).run, null);
+        try R.register("task.run_dev", "Tasks: Run Dev", "Run the preferred detected dev task as a background job", Wrap(SystemCommands.cmdTaskRunDev).run, null);
+        try R.register("task.run_lint", "Tasks: Run Lint", "Run the preferred detected lint task as a background job", Wrap(SystemCommands.cmdTaskRunLint).run, null);
+        try R.register("task.run_format", "Tasks: Run Format", "Run the preferred detected format task as a background job", Wrap(SystemCommands.cmdTaskRunFormat).run, null);
+        try R.register("task.output", "Tasks: Show Last Output", "Open the retained output from the latest project task job", Wrap(SystemCommands.cmdTaskOutput).run, null);
         try R.register("job.list", "Jobs: List Active", "Show all active background jobs (Space+j)", Wrap(SystemCommands.cmdJobList).run, null);
         try R.register("view.logs", "View: Logs", "Open log viewer", Wrap(SystemCommands.cmdViewLogs).run, null);
         try R.register("view.clear_logs", "View: Clear Logs", "Clear all logs", Wrap(SystemCommands.cmdClearLogs).run, null);
@@ -1480,6 +1490,7 @@ pub const Core = struct {
 
         try R.register("build.test", "Zig: Test", "Run 'zig build test' for current workspace", Wrap(BuildCommands.cmdBuildTest).run, null);
         try R.register("build.build", "Zig: Build", "Run 'zig build' for current workspace", Wrap(BuildCommands.cmdBuildOnly).run, null);
+        try R.register("build.run", "Zig: Run", "Run 'zig build run' for current workspace", Wrap(BuildCommands.cmdBuildRun).run, null);
         try R.register("build.output", "Zig: Show Build Output", "Show the last build output", Wrap(BuildCommands.cmdBuildOutput).run, null);
     }
 

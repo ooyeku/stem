@@ -265,8 +265,15 @@ pub const help_text = cli_help_text ++
     \\## Background Jobs
     \\
     \\- `Space j`: View active background jobs
+    \\- `job.list`: View active and recently completed jobs
+    \\- `task.list`: View detected project build/test/run commands
+    \\- `task.run_build`: Run the preferred detected build task
+    \\- `task.run_test`: Run the preferred detected test task
+    \\- `task.run`: Run the preferred detected run/start task
+    \\- `task.run_dev`, `task.run_lint`, `task.run_format`: Run matching tasks
+    \\- `task.output`: Reopen the latest retained project task output
     \\- Status bar shows a spinner when jobs are running
-    \\- Jobs include: file indexing, search operations, etc.
+    \\- Jobs include: file indexing, search operations, project tasks, etc.
     \\
     \\## Zig Build Commands
     \\
@@ -275,6 +282,7 @@ pub const help_text = cli_help_text ++
     \\
     \\- `Zig: Build`            : Run `zig build`
     \\- `Zig: Test`             : Run `zig build test`
+    \\- `Zig: Run`              : Run `zig build run`
     \\- `Zig: Show Build Output`: View last build result
     \\
     \\Build output appears in a dedicated [Build] buffer. Errors are
@@ -341,6 +349,8 @@ pub const help_text = cli_help_text ++
     \\### Modes / plugins / help
     \\- mode.insert / mode.visual / mode.terminal / mode.select
     \\- plugin.show
+    \\- stem.control_center / project.brain
+    \\- stats.show / task.list / task.run_build / task.run_test / task.run / task.output / job.list / view.logs
     \\- help.show
     \\
     \\## Configuration

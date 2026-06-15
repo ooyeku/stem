@@ -96,6 +96,15 @@ when it isn't already there.
 - Session restore with crash-recovery snapshots
 - Periodic auto-save backups of dirty buffers in `~/.stem/recover/`,
   surfaced at startup if any survived a crash
+- Stem Control Center (`stem.control_center`) for runtime, Vigil,
+  project-index, LSP, job, plugin, and message-bus health in one view
+- Project Brain (`project.brain`) for workspace index state, open
+  languages, diagnostics pressure, and LSP coverage
+- Project Tasks (`task.list`) detects common build/test/run commands
+  from Zig, Rust, Go, Python, npm, and Make projects; `task.run_build`
+  and `task.run_test` execute the preferred detected tasks as retained
+  background jobs, with `task.run`, `task.run_dev`, `task.run_lint`,
+  and `task.run_format` for matching project scripts
 - **Large-file mode**: files past 5 MB / 50k lines auto-degrade —
   tree-sitter, brackets, LSP, and auto-pair disabled so a multi-MB
   log stays responsive. `[LARGE]` badge in the status bar
@@ -152,6 +161,17 @@ stem ./src                 # open a directory
 stem --find "pattern"      # grep-like text search
 stem --vfind "pattern"     # interactive visual search
 stem --scope file.zig fn   # search within a specific file
+
+# Project/operator tools
+stem task list             # detected build/test/run/dev/lint/format tasks
+stem task run test         # run the preferred detected test task
+stem project inspect       # root, tasks, and cache location
+stem project warm          # pre-build the persistent search index
+stem logs tail             # latest log tail
+stem logs bundle           # write a local debug bundle
+stem lsp doctor python     # explain one language server's install state
+stem recover list          # session and dirty-buffer recovery artefacts
+stem cache status          # cache/plugin/LSP storage sizes
 
 stem --help                # all options
 stem --version             # version info
@@ -400,6 +420,8 @@ Manage settings from the CLI:
 stem config list
 stem config get editor.tab_size
 stem config set editor.tab_size 2
+stem config reset editor.tab_size
+stem config reset --all
 ```
 
 Or edit `~/.stem/config.json` directly:
@@ -439,6 +461,25 @@ Runtime toggles (via the command palette `Space a`, or `stem config set ...`):
 | `editor.inline_diagnostics` | `editor.toggle_inline_diagnostics` | "Error lens" — diagnostic message after every affected line, not just the cursor's |
 | `editor.inlay_hints` | `editor.toggle_inlay_hints` | LSP type / param-name hints rendered as dim virtual text |
 
+### Runtime cockpit
+
+The command palette includes `stem.control_center`, a single live
+cockpit for Stem's runtime health: Vigil-backed services, message-bus
+pressure, open buffers, project index freshness, LSP state, diagnostics,
+background jobs, plugins, terminal status, and recommended next actions.
+
+Use `project.brain` when you want a tighter project view: workspace
+root, index state, open languages, diagnostics pressure, and per-LSP
+coverage. Use `task.list` to see detected project commands from
+`build.zig`, `Cargo.toml`, `go.mod`, Python project markers,
+`package.json` scripts, and common Make targets. Use `task.run_build`
+or `task.run_test` to execute the preferred detected task under Stem's
+background job manager; `task.run`, `task.run_dev`, `task.run_lint`,
+and `task.run_format` cover run/start, dev, lint, and format tasks. Use
+`task.output` to reopen the latest retained stdout/stderr report.
+The same detector is available from the shell with `stem task list`,
+`stem task run <id|kind>`, and `stem task doctor`.
+
 ### Large-file mode
 
 When a buffer exceeds `large_file_threshold_bytes` (default 5 MB)
@@ -459,7 +500,9 @@ While stem is running, every `auto_save_interval_seconds` (default
 `~/.stem/recover/<hash>.bak` with a `.path` sidecar recording the
 original filename. On the next startup, if any backups survived,
 the status bar prompts you to run `buffer.restore_backups` to
-view them. Disable with `stem config set editor.auto_save_backup false`.
+view them. From a shell, `stem recover list` shows the same artefacts
+and `stem recover restore <id>` copies a snapshot back to its recorded
+path. Disable with `stem config set editor.auto_save_backup false`.
 
 ## Platform support
 
@@ -502,7 +545,7 @@ src/
 ├── lsp/               # LSP protocol client and transport
 ├── plugins/           # Manifest, wasm interpreter, exec runtime
 ├── config/            # Config schema, keys, persistent storage
-├── tools/             # CLI tools (find, vfind, scope, plugin)
+├── tools/             # CLI tools (find, vfind, scope, plugin, operator commands)
 └── fuzz/              # Fuzz targets (piece table, state, URIs)
 ```
 

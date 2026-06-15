@@ -352,6 +352,41 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var storage = try StorageManager.init(allocator, io, init.environ.block);
     defer storage.deinit();
 
+    // Collect args before initializing editor-only services. CLI subcommands
+    // should stay cheap and avoid terminal/logger teardown paths entirely.
+    var args_list = std.ArrayListUnmanaged([:0]const u8).empty;
+    defer args_list.deinit(allocator);
+    {
+        var args_it = try std.process.Args.Iterator.initAllocator(init.args, allocator);
+        defer args_it.deinit();
+        while (args_it.next()) |a| {
+            try args_list.append(allocator, try allocator.dupeZ(u8, a));
+        }
+    }
+    const args = args_list.items;
+    defer {
+        for (args) |a| allocator.free(a);
+    }
+    var initial_files_to_open = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (initial_files_to_open.items) |f| allocator.free(f);
+        initial_files_to_open.deinit(allocator);
+    }
+
+    switch (try cli.dispatch(.{
+        .allocator = allocator,
+        .io = io,
+        .args = args,
+        .storage = &storage,
+        .environ_block = init.environ.block,
+    })) {
+        .handled => return,
+        .run_editor => |paths| {
+            try initial_files_to_open.appendSlice(allocator, paths);
+            allocator.free(paths);
+        },
+    }
+
     const log_level: logger.LogLevel = switch (storage.config.logging.level) {
         .debug => .debug,
         .info => .info,
@@ -439,43 +474,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         core: Core,
         bus: *MessageBus,
     };
-
-    // Collect args into a slice for ergonomic indexing/iteration below.
-    var args_list = std.ArrayListUnmanaged([:0]const u8).empty;
-    defer args_list.deinit(allocator);
-    {
-        var args_it = try std.process.Args.Iterator.initAllocator(init.args, allocator);
-        defer args_it.deinit();
-        while (args_it.next()) |a| {
-            try args_list.append(allocator, try allocator.dupeZ(u8, a));
-        }
-    }
-    const args = args_list.items;
-    defer {
-        for (args) |a| allocator.free(a);
-    }
-    var initial_files_to_open = std.ArrayListUnmanaged([]const u8).empty;
-    defer {
-        for (initial_files_to_open.items) |f| allocator.free(f);
-        initial_files_to_open.deinit(allocator);
-    }
-
-    // One pass over argv decides whether we're running a CLI subcommand
-    // (config / logs / lsp / find / vfind / scope / help / version) or
-    // launching the editor with the given paths.
-    switch (try cli.dispatch(.{
-        .allocator = allocator,
-        .io = io,
-        .args = args,
-        .storage = &storage,
-        .environ_block = init.environ.block,
-    })) {
-        .handled => return,
-        .run_editor => |paths| {
-            try initial_files_to_open.appendSlice(allocator, paths);
-            allocator.free(paths);
-        },
-    }
 
     // Build env map for vaxis. TODO(zig-0.16): forward init.environ_map once
     // main() takes Init instead of Init.Minimal.
