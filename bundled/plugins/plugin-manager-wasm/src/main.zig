@@ -2,7 +2,8 @@
 //!
 //! Four commands:
 //!
-//!   - `plugin-manager.stats`     — render `stem plugin list` in a buffer.
+//!   - `plugin-manager.stats`     — render the structured host
+//!                                   plugin dashboard in a buffer.
 //!   - `plugin-manager.reload_all` — unload + reload every installed plugin
 //!                                   without restarting the editor.
 //!   - `plugin.load`              — show CLI install hint (wasm has no
@@ -41,11 +42,25 @@ extern "env" fn stem_spawn_capture(
     out_ptr: [*]u8,
     out_max: i32,
 ) i32;
+extern "env" fn stem_get_plugin_dashboard_report(out_ptr: [*]u8, out_max: i32) i32;
+extern "env" fn stem_get_plugin_dashboard_json(out_ptr: [*]u8, out_max: i32) i32;
+extern "env" fn stem_storage_read(
+    key_ptr: [*]const u8,
+    key_len: i32,
+    out_ptr: [*]u8,
+    out_max: i32,
+) i32;
+extern "env" fn stem_storage_write(
+    key_ptr: [*]const u8,
+    key_len: i32,
+    content_ptr: [*]const u8,
+    content_len: i32,
+) i32;
 extern "env" fn stem_load_plugin(name_ptr: [*]const u8, name_len: i32) i32;
 extern "env" fn stem_unload_plugin(name_ptr: [*]const u8, name_len: i32) i32;
 
-var scratch: [64 * 1024]u8 = undefined;
-var report_buf: [16 * 1024]u8 = undefined;
+var scratch: [256 * 1024]u8 = undefined;
+var report_buf: [256 * 1024]u8 = undefined;
 var report_len: usize = 0;
 
 // Host-dispatch scratch region — see echo-wasm for the protocol.
@@ -58,13 +73,15 @@ export fn __stem_scratch_size() i32 {
 }
 
 const CMD_STATS = "plugin-manager.stats";
+const CMD_JSON = "plugin-manager.json";
 const CMD_RELOAD = "plugin-manager.reload_all";
 const CMD_LOAD = "plugin.load";
 const CMD_UNLOAD = "plugin.unload";
 
 const Cmd = struct { id: []const u8, title: []const u8, desc: []const u8 };
 const COMMANDS = [_]Cmd{
-    .{ .id = CMD_STATS, .title = "[Plugin Manager] Show Stats", .desc = "Display the installed plugin list" },
+    .{ .id = CMD_STATS, .title = "[Plugin Manager] Dashboard", .desc = "Display plugin health, permissions, widgets, and denials" },
+    .{ .id = CMD_JSON, .title = "[Plugin Manager] Raw JSON", .desc = "Open the structured plugin dashboard JSON" },
     .{ .id = CMD_RELOAD, .title = "[Plugin Manager] Reload All", .desc = "Unload and reload every installed plugin" },
     .{ .id = CMD_LOAD, .title = "[Plugin] Load", .desc = "Reminder: install plugins via `stem plugin install <path>`" },
     .{ .id = CMD_UNLOAD, .title = "[Plugin] Unload", .desc = "Reminder: remove plugins via `stem plugin remove <name>`" },
@@ -113,6 +130,10 @@ export fn handle_command(id_ptr: [*]const u8, id_len: i32) void {
         runStats();
         return;
     }
+    if (std.mem.eql(u8, id, CMD_JSON)) {
+        runJson();
+        return;
+    }
     if (std.mem.eql(u8, id, CMD_RELOAD)) {
         runReloadAll();
         return;
@@ -138,14 +159,9 @@ export fn handle_command(id_ptr: [*]const u8, id_len: i32) void {
 }
 
 fn runStats() void {
-    const written = stem_spawn_capture(
-        "stem plugin list".ptr,
-        "stem plugin list".len,
-        &scratch,
-        @intCast(scratch.len),
-    );
+    const written = stem_get_plugin_dashboard_report(&scratch, @intCast(scratch.len));
     if (written <= 0) {
-        const fallback = "Run `stem plugin list` from your shell to see installed plugins.";
+        const fallback = "Plugin dashboard unavailable from host. Run `stem plugin list` from your shell to see installed plugins.";
         stem_open_buffer(
             "[Plugin Manager]".ptr,
             "[Plugin Manager]".len,
@@ -154,12 +170,46 @@ fn runStats() void {
         );
         return;
     }
+
+    const opens = incrementDashboardOpenCount();
+    report_len = 0;
+    appendReport(scratch[0..@intCast(written)]);
+    appendReport("\n---\n");
+    var tail: [96]u8 = undefined;
+    const tail_msg = std.fmt.bufPrint(&tail, "Dashboard opened {d} time(s) by plugin_manager.\n", .{opens}) catch "";
+    appendReport(tail_msg);
+
     stem_open_buffer(
         "[Plugin Manager]".ptr,
         "[Plugin Manager]".len,
-        &scratch,
-        written,
+        &report_buf,
+        @intCast(report_len),
     );
+}
+
+fn incrementDashboardOpenCount() u32 {
+    const key = "dashboard.opens";
+    var buf: [32]u8 = undefined;
+    const n = stem_storage_read(key.ptr, key.len, &buf, @intCast(buf.len));
+    var current: u32 = 0;
+    if (n > 0) {
+        current = std.fmt.parseInt(u32, std.mem.trim(u8, buf[0..@intCast(n)], " \t\r\n"), 10) catch 0;
+    }
+    const next = current +| 1;
+    var out: [32]u8 = undefined;
+    const text = std.fmt.bufPrint(&out, "{d}", .{next}) catch return next;
+    _ = stem_storage_write(key.ptr, key.len, text.ptr, @intCast(text.len));
+    return next;
+}
+
+fn runJson() void {
+    const written = stem_get_plugin_dashboard_json(&scratch, @intCast(scratch.len));
+    if (written <= 0) {
+        const fallback = "{}\n";
+        stem_open_buffer("[Plugin JSON]".ptr, "[Plugin JSON]".len, fallback.ptr, fallback.len);
+        return;
+    }
+    stem_open_buffer("[Plugin JSON]".ptr, "[Plugin JSON]".len, &scratch, written);
 }
 
 /// Walk `stem plugin list`, pull out each plugin name, then unload +

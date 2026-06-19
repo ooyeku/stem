@@ -811,7 +811,7 @@ graph TB
 |---|---|---|
 | `echo` | wasm | `echo.hello` |
 | `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` |
-| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` |
+| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.json`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` |
 
 ### Operator CLI
 

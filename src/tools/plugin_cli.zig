@@ -640,6 +640,18 @@ const TestHarness = struct {
     fn onGetBufPath(_: *anyopaque, _: []const u8, _: []u8) i32 {
         return -1;
     }
+    fn onGetPluginDashboardJson(_: *anyopaque, _: []const u8, _: []u8) i32 {
+        return -1;
+    }
+    fn onGetPluginDashboardReport(_: *anyopaque, _: []const u8, _: []u8) i32 {
+        return -1;
+    }
+    fn onStorageRead(_: *anyopaque, _: []const u8, _: []const u8, _: []u8) i32 {
+        return 0;
+    }
+    fn onStorageWrite(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) i32 {
+        return 0;
+    }
     fn onLoadPlugin(_: *anyopaque, _: []const u8, _: []const u8) i32 {
         return -1;
     }
@@ -733,6 +745,10 @@ fn runTest(ctx: Context) !void {
                     .on_clear_panel = TestHarness.onClearPanel,
                     .on_get_buffer_content = TestHarness.onGetBufContent,
                     .on_get_buffer_path = TestHarness.onGetBufPath,
+                    .on_get_plugin_dashboard_json = TestHarness.onGetPluginDashboardJson,
+                    .on_get_plugin_dashboard_report = TestHarness.onGetPluginDashboardReport,
+                    .on_storage_read = TestHarness.onStorageRead,
+                    .on_storage_write = TestHarness.onStorageWrite,
                     .on_load_plugin = TestHarness.onLoadPlugin,
                     .on_unload_plugin = TestHarness.onUnloadPlugin,
                 },

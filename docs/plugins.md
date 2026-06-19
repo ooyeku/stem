@@ -131,8 +131,8 @@ where the corresponding capability is wired. Plugins with no
 | Permission | Status | Description |
 |---|---|---|
 | `spawn` | enforced for wasm | Allowlist of executable names accepted by `stem_spawn_capture`. Plugins outside the list get an empty return so they can surface a clean error. |
-| `events` | checked on subscribe | Validates requested `protocol.PluginEvent` topic names. Broadcast delivery into plugins is still pending. |
-| `filesystem` | declared only | Reserved for future file-access gates. |
+| `events` | enforced on subscribe + delivered | Validates requested `protocol.PluginEvent` topic names and delivers broadcast events into exec and wasm runtimes. |
+| `filesystem` | enforced for wasm file APIs | Gates `stem_read_file` / `stem_write_file`; per-plugin storage uses a separate safe key namespace under `~/.stem/plugin-data/`. |
 | `manage_plugins` | enforced for wasm | Required to call `stem_load_plugin` / `stem_unload_plugin`. |
 
 Entries support a trailing `*` glob (`buffer.*`).
@@ -168,9 +168,17 @@ interpreter and never unwinds through stem.
 |---|---|---|
 | `stem_log` | `(level, ptr, len)` | Write a log line into stem's logger. |
 | `stem_register_command` | `(id, title, desc)` | Register a runtime-conditional command (manifest registration is the primary path). |
-| `stem_show_notification` | `(level, ptr, len)` | Host callback exists; visible UI presentation is still being wired. |
+| `stem_show_notification` | `(level, ptr, len)` | Show an in-editor status notification. |
 | `stem_open_buffer` | `(name, content)` | Open a virtual buffer in the editor. |
 | `stem_spawn_capture` | `(cmd, out_buf, out_max) → i32` | Run an allow-listed process and copy stdout into wasm memory; gated by `permissions.spawn`. |
+| `stem_subscribe_event` | `(topic) → i32` | Subscribe to editor events; delivered to `handle_event`. |
+| `stem_read_file` / `stem_write_file` | `(path, buffer/content) → i32` | Read or write files allowed by `permissions.filesystem`. |
+| `stem_set_status_item` / `stem_clear_status_item` | `(id, text, alignment, priority)` / `(id)` | Publish or remove a plugin-owned status item. |
+| `stem_set_panel` / `stem_clear_panel` | `(id, title, body, alignment, priority)` / `(id)` | Publish or remove a plugin-owned panel. |
+| `stem_get_buffer_content` / `stem_get_buffer_path` | `(out_buf, out_max) → i32` | Copy active-buffer content or path into wasm memory. |
+| `stem_get_plugin_dashboard_json` | `(out_buf, out_max) → i32` | Copy structured plugin runtime/permission/widget/denial data as JSON. |
+| `stem_get_plugin_dashboard_report` | `(out_buf, out_max) → i32` | Copy the same dashboard data as a Markdown report. |
+| `stem_storage_read` / `stem_storage_write` | `(key, out_buf)` / `(key, content)` | Read or write plugin-private state under `~/.stem/plugin-data/<plugin>/`. |
 | `stem_load_plugin` / `stem_unload_plugin` | `(name)` | Plugin management; requires `manage_plugins`. |
 
 ### Exports
@@ -244,8 +252,8 @@ Content-Length: <bytes>\r\n
 |---|---|
 | `plugin/log` | Write a log line. |
 | `plugin/registerCommand` | Register a runtime command. |
-| `plugin/subscribeEvent` | Subscribe to an event topic; permission is checked, broadcast delivery is still pending. |
-| `editor/showNotification` | Host accepts the message; visible UI presentation is still being wired. |
+| `plugin/subscribeEvent` | Subscribe to an event topic; permission is checked and matching broadcasts are delivered as `editor/event`. |
+| `editor/showNotification` | Show an in-editor status notification. |
 
 If your exec plugin sets `"restart": "on_crash"`, the host will
 re-spawn it with backoff after an unexpected exit (see
@@ -280,7 +288,7 @@ The CLI lives in
 |---|---|---|---|
 | `echo` | wasm | `echo.hello` | Reference wasm plugin; pops a notification |
 | `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` | Uses `stem_spawn_capture` for `git`; live `Git: <branch>` indicator via event subscriptions |
-| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` | Dashboard via `stem plugin list` shell-out plus `reload_all` over the load/unload host imports |
+| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.json`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` | Runtime dashboard with health, permissions, widgets, capability denials, raw JSON, and hot reload |
 
 ---
 
@@ -372,7 +380,7 @@ silently change behaviour on old hosts.
 
 [src/plugins/inspect.zig](../src/plugins/inspect.zig) provides the
 "introspect a loaded plugin" surface used by
-`stem plugin info <name>` and the future plugin-dashboard view.
+`stem plugin info <name>` and the plugin dashboard.
 
 ---
 
@@ -405,14 +413,10 @@ silently change behaviour on old hosts.
 
 ## Current limitations
 
-- **Broadcast event delivery into plugins is not complete.**
-  Subscription permission is checked, but the host doesn't yet
-  bridge events to exec or wasm runtimes.
-- **Notification rendering.** Notification callbacks exist in both
-  runtimes, but the main UI loop still needs to render them as
-  in-editor toasts.
-- **Panel and status-item host imports** are not yet exposed beyond
-  the bundled `git` plugin's status indicator.
-- **`filesystem` permissions** are stored but not enforced.
+- **Prompt/input host APIs** are not yet available, so interactive
+  plugins still use commands and virtual buffers instead of asking
+  for structured user input.
+- **Interactive virtual buffers** are view-only today; plugins can
+  open rich reports, but they cannot yet own a live editable surface.
 - **Remote plugin install, signing, and auto-update** are future
   registry work.

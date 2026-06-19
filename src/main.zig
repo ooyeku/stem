@@ -83,6 +83,32 @@ fn isQuitKey(key: vaxis.Key) bool {
     return key.matches('c', .{ .ctrl = true }) or key.codepoint == 0x03;
 }
 
+const ShutdownCause = enum {
+    ui_requested,
+    signal,
+};
+
+const ShutdownPlan = struct {
+    stop_vaxis_loop: bool,
+    join_input_thread: bool,
+    exit_process_directly: bool,
+};
+
+fn shutdownPlan(cause: ShutdownCause) ShutdownPlan {
+    return switch (cause) {
+        // The vaxis input reader can be blocked in a raw terminal read even
+        // after the UI loop has accepted a quit. Both user-requested quit and
+        // signal-driven shutdown restore the terminal, tear down Stem's core
+        // work directly, then exit the process instead of waiting on that
+        // reader.
+        .ui_requested, .signal => .{
+            .stop_vaxis_loop = false,
+            .join_input_thread = false,
+            .exit_process_directly = true,
+        },
+    };
+}
+
 /// Pre-opened crash-log file descriptor. Opened at startup so the signal
 /// handler doesn't need to allocate or call `open` (which isn't strictly
 /// async-signal-safe). -1 when no log is available.
@@ -818,32 +844,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
     const signal_shutdown = shutdown_requested.load(.acquire);
+    const plan = shutdownPlan(if (signal_shutdown) .signal else .ui_requested);
     app_stop.store(true, .release);
-    if (signal_shutdown) {
-        // OS-driven shutdown (terminal close, SIGTERM/SIGHUP/Ctrl-C delivered
-        // as a process signal) can leave vaxis' terminal reader blocked in a
-        // raw `readv()`. Waiting in `loop.stop()` then wedges teardown. Restore
-        // the terminal and stop Stem's supervised work directly, then exit the
-        // process without waiting on the blocked terminal reader.
-        vx.setMouseMode(tty.writer(), false) catch {};
-        vx.exitAltScreen(tty.writer()) catch {};
-        vx.resetState(tty.writer()) catch {};
 
-        main_inbox.closed.store(true, .release);
-        core_inbox.closed.store(true, .release);
-        core_thread.join();
-        core_ctx.core.deinit();
-        stem_runtime.shutdown();
-        std.process.exit(0);
-    }
-    loop.stop();
-    input_thread.join();
+    // The terminal reader may be blocked in raw input. Do not wait on it
+    // unless the shutdown policy explicitly says it is safe.
+    if (plan.stop_vaxis_loop) loop.stop();
+    if (plan.join_input_thread) input_thread.join();
     heartbeat_thread.join();
     signal_monitor_thread.join();
 
-    stem_runtime.shutdown();
     vx.setMouseMode(tty.writer(), false) catch {};
     vx.exitAltScreen(tty.writer()) catch {};
+    vx.resetState(tty.writer()) catch {};
     std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
     main_inbox.closed.store(true, .release);
     core_inbox.closed.store(true, .release);
@@ -874,6 +887,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
             break;
         }
     }
+    if (plan.exit_process_directly) {
+        core_thread.join();
+        core_ctx.core.deinit();
+        stem_runtime.shutdown();
+        std.process.exit(0);
+    }
 }
 
 test "isQuitKey recognizes normalized and raw Ctrl-C" {
@@ -887,4 +906,11 @@ test "isQuitKey recognizes normalized and raw Ctrl-C" {
     try std.testing.expect(!isQuitKey(.{
         .codepoint = 'c',
     }));
+}
+
+test "UI-requested quit does not wait on terminal input reader" {
+    const plan = shutdownPlan(.ui_requested);
+    try std.testing.expect(!plan.stop_vaxis_loop);
+    try std.testing.expect(!plan.join_input_thread);
+    try std.testing.expect(plan.exit_process_directly);
 }

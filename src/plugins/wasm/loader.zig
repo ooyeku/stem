@@ -80,6 +80,14 @@ pub const Callbacks = struct {
     /// active buffer's file path (or its virtual name) and returns
     /// the byte count.
     on_get_buffer_path: *const fn (user_data: *anyopaque, plugin_id: []const u8, out_buf: []u8) i32,
+    /// Plugin called `stem_get_plugin_dashboard_json(out_buf)`.
+    on_get_plugin_dashboard_json: *const fn (user_data: *anyopaque, plugin_id: []const u8, out_buf: []u8) i32,
+    /// Plugin called `stem_get_plugin_dashboard_report(out_buf)`.
+    on_get_plugin_dashboard_report: *const fn (user_data: *anyopaque, plugin_id: []const u8, out_buf: []u8) i32,
+    /// Plugin called `stem_storage_read(key, out_buf)`.
+    on_storage_read: *const fn (user_data: *anyopaque, plugin_id: []const u8, key: []const u8, out_buf: []u8) i32,
+    /// Plugin called `stem_storage_write(key, content)`.
+    on_storage_write: *const fn (user_data: *anyopaque, plugin_id: []const u8, key: []const u8, content: []const u8) i32,
     /// Plugin called `stem_load_plugin(name)`. Routes to
     /// `PluginManager.loadPluginByName`.
     on_load_plugin: *const fn (user_data: *anyopaque, plugin_id: []const u8, name: []const u8) i32,
@@ -308,6 +316,10 @@ pub fn load(
         .{ .module_name = "env", .field_name = "stem_clear_panel", .func = hostStemClearPanel },
         .{ .module_name = "env", .field_name = "stem_get_buffer_content", .func = hostStemGetBufferContent },
         .{ .module_name = "env", .field_name = "stem_get_buffer_path", .func = hostStemGetBufferPath },
+        .{ .module_name = "env", .field_name = "stem_get_plugin_dashboard_json", .func = hostStemGetPluginDashboardJson },
+        .{ .module_name = "env", .field_name = "stem_get_plugin_dashboard_report", .func = hostStemGetPluginDashboardReport },
+        .{ .module_name = "env", .field_name = "stem_storage_read", .func = hostStemStorageRead },
+        .{ .module_name = "env", .field_name = "stem_storage_write", .func = hostStemStorageWrite },
         .{ .module_name = "env", .field_name = "stem_load_plugin", .func = hostStemLoadPlugin },
         .{ .module_name = "env", .field_name = "stem_unload_plugin", .func = hostStemUnloadPlugin },
     };
@@ -528,6 +540,62 @@ fn hostStemGetBufferPath(instance: *interp.Instance, args: []const u64, result: 
     result.* = @as(u64, @bitCast(@as(i64, n)));
 }
 
+/// env.stem_get_plugin_dashboard_json(out_ptr, out_max) -> i32
+fn hostStemGetPluginDashboardJson(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 2) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const out_buf = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const n = wp.callbacks.on_get_plugin_dashboard_json(wp.callbacks.user_data, wp.plugin_id, out_buf);
+    result.* = @as(u64, @bitCast(@as(i64, n)));
+}
+
+/// env.stem_get_plugin_dashboard_report(out_ptr, out_max) -> i32
+fn hostStemGetPluginDashboardReport(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 2) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const out_buf = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const n = wp.callbacks.on_get_plugin_dashboard_report(wp.callbacks.user_data, wp.plugin_id, out_buf);
+    result.* = @as(u64, @bitCast(@as(i64, n)));
+}
+
+/// env.stem_storage_read(key_ptr, key_len, out_ptr, out_max) -> i32
+fn hostStemStorageRead(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 4) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const key = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const out_buf = instance.slice(@truncate(args[2]), @truncate(args[3])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const n = wp.callbacks.on_storage_read(wp.callbacks.user_data, wp.plugin_id, key, out_buf);
+    result.* = @as(u64, @bitCast(@as(i64, n)));
+}
+
+/// env.stem_storage_write(key_ptr, key_len, content_ptr, content_len) -> i32
+fn hostStemStorageWrite(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
+    if (args.len < 4) return error.UnknownImport;
+    const wp = pluginFromInstance(instance);
+    const key = instance.slice(@truncate(args[0]), @truncate(args[1])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const content = instance.slice(@truncate(args[2]), @truncate(args[3])) catch {
+        result.* = @as(u64, @bitCast(@as(i64, -1)));
+        return;
+    };
+    const rc = wp.callbacks.on_storage_write(wp.callbacks.user_data, wp.plugin_id, key, content);
+    result.* = @as(u64, @bitCast(@as(i64, rc)));
+}
+
 /// env.stem_load_plugin(name_ptr, name_len) -> i32
 fn hostStemLoadPlugin(instance: *interp.Instance, args: []const u64, result: *u64) interp.Error!void {
     if (args.len < 2) return error.UnknownImport;
@@ -595,6 +663,18 @@ const TestState = struct {
     fn onGetBufPath(_: *anyopaque, _: []const u8, _: []u8) i32 {
         return -1;
     }
+    fn onGetPluginDashboardJson(_: *anyopaque, _: []const u8, _: []u8) i32 {
+        return -1;
+    }
+    fn onGetPluginDashboardReport(_: *anyopaque, _: []const u8, _: []u8) i32 {
+        return -1;
+    }
+    fn onStorageRead(_: *anyopaque, _: []const u8, _: []const u8, _: []u8) i32 {
+        return -1;
+    }
+    fn onStorageWrite(_: *anyopaque, _: []const u8, _: []const u8, _: []const u8) i32 {
+        return -1;
+    }
     fn onLoadPlugin(_: *anyopaque, _: []const u8, _: []const u8) i32 {
         return -1;
     }
@@ -650,6 +730,10 @@ test "load + activate + dispatchCommand against the built echo.wasm" {
         .on_clear_panel = TestState.onClearPanel,
         .on_get_buffer_content = TestState.onGetBufContent,
         .on_get_buffer_path = TestState.onGetBufPath,
+        .on_get_plugin_dashboard_json = TestState.onGetPluginDashboardJson,
+        .on_get_plugin_dashboard_report = TestState.onGetPluginDashboardReport,
+        .on_storage_read = TestState.onStorageRead,
+        .on_storage_write = TestState.onStorageWrite,
         .on_load_plugin = TestState.onLoadPlugin,
         .on_unload_plugin = TestState.onUnloadPlugin,
     };

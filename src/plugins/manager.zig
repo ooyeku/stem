@@ -103,6 +103,9 @@ pub const PluginManager = struct {
     /// time. Host accessors consult this table before granting
     /// capability requests (event subscription, spawn, filesystem).
     plugin_permissions: std.StringHashMapUnmanaged(StoredPermissions) = .empty,
+    /// Capability denials keyed by `<plugin>:<capability>:<target>`.
+    /// This is the plugin audit trail surfaced in the dashboard.
+    capability_denials: std.StringHashMapUnmanaged(StoredCapabilityDenial) = .empty,
 
     /// Map of editor event → list of plugins subscribed to it.
     /// Populated by `plugin/subscribeEvent` (exec) and
@@ -296,6 +299,13 @@ pub const PluginManager = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.plugin_permissions.deinit(self.allocator);
+
+        var denial_it = self.capability_denials.iterator();
+        while (denial_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.capability_denials.deinit(self.allocator);
 
         for (self.pending_exits.items) |name| self.allocator.free(name);
         self.pending_exits.deinit(self.allocator);
@@ -1491,6 +1501,304 @@ pub const PluginManager = struct {
         }
     };
 
+    const StoredCapabilityDenial = struct {
+        plugin_id: []u8,
+        capability: CapabilityKind,
+        target: []u8,
+        count: u32 = 1,
+
+        fn deinit(self: *StoredCapabilityDenial, allocator: std.mem.Allocator) void {
+            allocator.free(self.plugin_id);
+            allocator.free(self.target);
+        }
+    };
+
+    pub fn recordCapabilityDenied(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        capability: CapabilityKind,
+        target: []const u8,
+    ) void {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+        self.recordCapabilityDeniedLocked(plugin_id, capability, target);
+    }
+
+    fn recordCapabilityDeniedLocked(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        capability: CapabilityKind,
+        target: []const u8,
+    ) void {
+        const key = std.fmt.allocPrint(
+            self.allocator,
+            "{s}:{s}:{s}",
+            .{ plugin_id, @tagName(capability), target },
+        ) catch return;
+        if (self.capability_denials.getPtr(key)) |existing| {
+            self.allocator.free(key);
+            existing.count +|= 1;
+            return;
+        }
+
+        const plugin_copy = self.allocator.dupe(u8, plugin_id) catch {
+            self.allocator.free(key);
+            return;
+        };
+        const target_copy = self.allocator.dupe(u8, target) catch {
+            self.allocator.free(plugin_copy);
+            self.allocator.free(key);
+            return;
+        };
+        const stored: StoredCapabilityDenial = .{
+            .plugin_id = plugin_copy,
+            .capability = capability,
+            .target = target_copy,
+        };
+        self.capability_denials.put(self.allocator, key, stored) catch {
+            var tmp = stored;
+            tmp.deinit(self.allocator);
+            self.allocator.free(key);
+        };
+    }
+
+    pub fn dashboardJson(self: *PluginManager, allocator: std.mem.Allocator) ![]u8 {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+
+        const names = try self.collectDashboardPluginNames(allocator);
+        defer allocator.free(names);
+
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+
+        try w.writeAll("{\"plugins\":[");
+        for (names, 0..) |name, i| {
+            if (i > 0) try w.writeByte(',');
+            try self.writeDashboardPluginJson(w, name);
+        }
+        try w.writeAll("],\"summary\":{");
+        try w.print("\"loaded\":{d},", .{self.process_plugins.count() + self.wasm_plugins.count()});
+        try w.print("\"status_items\":{d},", .{self.status_items.count()});
+        try w.print("\"panels\":{d},", .{self.panels.count()});
+        try w.print("\"denials\":{d}", .{self.capability_denials.count()});
+        try w.writeAll("}}");
+        return aw.toOwnedSlice();
+    }
+
+    pub fn dashboardReport(self: *PluginManager, allocator: std.mem.Allocator) ![]u8 {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+
+        const names = try self.collectDashboardPluginNames(allocator);
+        defer allocator.free(names);
+
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+
+        try w.writeAll("# Plugin Dashboard\n\n");
+        try w.print("- Loaded: {d} ({d} wasm, {d} exec)\n", .{
+            self.process_plugins.count() + self.wasm_plugins.count(),
+            self.wasm_plugins.count(),
+            self.process_plugins.count(),
+        });
+        try w.print("- Widgets: {d} status items, {d} panels\n", .{ self.status_items.count(), self.panels.count() });
+        try w.print("- Capability denials: {d}\n\n", .{self.capability_denials.count()});
+
+        if (names.len == 0) {
+            try w.writeAll("No plugins are known to this Stem session.\n");
+            return aw.toOwnedSlice();
+        }
+
+        for (names) |name| {
+            const runtime = self.dashboardRuntime(name);
+            const policy = self.restart_policies.get(name) orelse .never;
+            try w.print("## {s}\n", .{name});
+            try w.print("- Runtime: {s}\n", .{runtime});
+            try w.print("- Restart: {s}\n", .{@tagName(policy)});
+            try w.print("- Widgets: {d} status, {d} panels\n", .{
+                self.countStatusItemsFor(name),
+                self.countPanelsFor(name),
+            });
+            try w.print("- Subscriptions: {d}\n", .{self.countSubscriptionsFor(name)});
+
+            if (self.plugin_permissions.get(name)) |perms| {
+                try w.writeAll("- Permissions: ");
+                try self.writePermissionListText(w, "spawn", perms.spawn_allowlist);
+                try w.writeAll("; ");
+                try self.writePermissionListText(w, "events", perms.events);
+                try w.writeAll("; ");
+                try self.writePermissionListText(w, "filesystem", perms.filesystem);
+                if (perms.manage_plugins) try w.writeAll("; manage_plugins");
+                try w.writeByte('\n');
+            } else {
+                try w.writeAll("- Permissions: none recorded\n");
+            }
+
+            const denial_count = self.countDenialsFor(name);
+            if (denial_count > 0) {
+                try w.writeAll("- Recent denials:\n");
+                var it = self.capability_denials.valueIterator();
+                while (it.next()) |d| {
+                    if (!std.mem.eql(u8, d.plugin_id, name)) continue;
+                    try w.print("  - denied {s} {s} ({d}x)\n", .{
+                        @tagName(d.capability),
+                        d.target,
+                        d.count,
+                    });
+                }
+            }
+            try w.writeByte('\n');
+        }
+
+        return aw.toOwnedSlice();
+    }
+
+    fn writeDashboardPluginJson(self: *PluginManager, w: *std.Io.Writer, name: []const u8) !void {
+        const runtime = self.dashboardRuntime(name);
+        const policy = self.restart_policies.get(name) orelse .never;
+
+        try w.writeByte('{');
+        try jsonrpc.writeJsonStringKey(w, "name");
+        try jsonrpc.writeJsonString(w, name);
+        try w.writeByte(',');
+        try jsonrpc.writeJsonStringKey(w, "runtime");
+        try jsonrpc.writeJsonString(w, runtime);
+        try w.writeByte(',');
+        try jsonrpc.writeJsonStringKey(w, "restart_policy");
+        try jsonrpc.writeJsonString(w, @tagName(policy));
+        try w.writeByte(',');
+        try w.print("\"status_items\":{d},", .{self.countStatusItemsFor(name)});
+        try w.print("\"panels\":{d},", .{self.countPanelsFor(name)});
+        try w.print("\"subscriptions\":{d},", .{self.countSubscriptionsFor(name)});
+        try w.print("\"denials\":{d},", .{self.countDenialsFor(name)});
+        try w.writeAll("\"permissions\":{");
+        if (self.plugin_permissions.get(name)) |perms| {
+            try w.writeAll("\"spawn\":");
+            try writeStringArrayJson(w, perms.spawn_allowlist);
+            try w.writeAll(",\"events\":");
+            try writeStringArrayJson(w, perms.events);
+            try w.writeAll(",\"filesystem\":");
+            try writeStringArrayJson(w, perms.filesystem);
+            try w.print(",\"manage_plugins\":{}", .{perms.manage_plugins});
+        } else {
+            try w.writeAll("\"spawn\":[],\"events\":[],\"filesystem\":[],\"manage_plugins\":false");
+        }
+        try w.writeAll("}}");
+    }
+
+    fn writeStringArrayJson(w: *std.Io.Writer, xs: []const []const u8) !void {
+        try w.writeByte('[');
+        for (xs, 0..) |x, i| {
+            if (i > 0) try w.writeByte(',');
+            try jsonrpc.writeJsonString(w, x);
+        }
+        try w.writeByte(']');
+    }
+
+    fn writePermissionListText(
+        self: *PluginManager,
+        w: *std.Io.Writer,
+        label: []const u8,
+        xs: []const []const u8,
+    ) !void {
+        _ = self;
+        try w.print("{s}: ", .{label});
+        if (xs.len == 0) {
+            try w.writeAll("-");
+            return;
+        }
+        for (xs, 0..) |x, i| {
+            if (i > 0) try w.writeAll(", ");
+            try w.writeAll(x);
+        }
+    }
+
+    fn collectDashboardPluginNames(self: *PluginManager, allocator: std.mem.Allocator) ![][]const u8 {
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        var perm_it = self.plugin_permissions.keyIterator();
+        while (perm_it.next()) |name| try appendUniqueName(allocator, &out, name.*);
+        var process_it = self.process_plugins.keyIterator();
+        while (process_it.next()) |name| try appendUniqueName(allocator, &out, name.*);
+        var wasm_it = self.wasm_plugins.keyIterator();
+        while (wasm_it.next()) |name| try appendUniqueName(allocator, &out, name.*);
+        var denial_it = self.capability_denials.valueIterator();
+        while (denial_it.next()) |d| try appendUniqueName(allocator, &out, d.plugin_id);
+
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn appendUniqueName(
+        allocator: std.mem.Allocator,
+        out: *std.ArrayListUnmanaged([]const u8),
+        name: []const u8,
+    ) !void {
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, name)) return;
+        }
+        try out.append(allocator, name);
+    }
+
+    fn dashboardRuntime(self: *PluginManager, plugin_id: []const u8) []const u8 {
+        if (self.wasm_plugins.contains(plugin_id)) return "wasm";
+        if (self.process_plugins.contains(plugin_id)) return "exec";
+        return "none";
+    }
+
+    fn countStatusItemsFor(self: *PluginManager, plugin_id: []const u8) usize {
+        var n: usize = 0;
+        var it = self.status_items.valueIterator();
+        while (it.next()) |item| {
+            if (std.mem.eql(u8, item.plugin_id, plugin_id)) n += 1;
+        }
+        return n;
+    }
+
+    fn countPanelsFor(self: *PluginManager, plugin_id: []const u8) usize {
+        var n: usize = 0;
+        var it = self.panels.valueIterator();
+        while (it.next()) |panel| {
+            if (std.mem.eql(u8, panel.plugin_id, plugin_id)) n += 1;
+        }
+        return n;
+    }
+
+    fn countSubscriptionsFor(self: *PluginManager, plugin_id: []const u8) usize {
+        var n: usize = 0;
+        var it = self.event_subscribers.valueIterator();
+        while (it.next()) |subs| {
+            for (subs.items) |sub| {
+                if (std.mem.eql(u8, sub.plugin_id, plugin_id)) n += 1;
+            }
+        }
+        return n;
+    }
+
+    fn countDenialsFor(self: *PluginManager, plugin_id: []const u8) usize {
+        var n: usize = 0;
+        var it = self.capability_denials.valueIterator();
+        while (it.next()) |denial| {
+            if (std.mem.eql(u8, denial.plugin_id, plugin_id)) n += 1;
+        }
+        return n;
+    }
+
+    pub fn isSafeStorageKey(key: []const u8) bool {
+        if (key.len == 0) return false;
+        if (key[0] == '/') return false;
+        if (std.mem.indexOfScalar(u8, key, '\\') != null) return false;
+        if (pathHasParentRef(key)) return false;
+        var it = std.mem.splitScalar(u8, key, '/');
+        while (it.next()) |component| {
+            if (component.len == 0) return false;
+        }
+        return true;
+    }
+
     fn installPluginPermissions(
         self: *PluginManager,
         plugin_id: []const u8,
@@ -1555,7 +1863,34 @@ pub const PluginManager = struct {
         allocator.free(xs);
     }
 
-    pub const CapabilityKind = enum { event, spawn, filesystem };
+    pub const CapabilityKind = enum { event, spawn, filesystem, manage_plugins };
+    const FilePermissionOp = enum { read, write };
+
+    fn permissionAllowsOrRecordDenied(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        kind: CapabilityKind,
+        item: []const u8,
+    ) bool {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+        if (self.permissionAllows(plugin_id, kind, item)) return true;
+        self.recordCapabilityDeniedLocked(plugin_id, kind, item);
+        return false;
+    }
+
+    fn filesystemAllowsOrRecordDenied(
+        self: *PluginManager,
+        plugin_id: []const u8,
+        op: FilePermissionOp,
+        path: []const u8,
+    ) bool {
+        self.state_mu.lock();
+        defer self.state_mu.unlock();
+        if (self.filesystemAllows(plugin_id, op, path)) return true;
+        self.recordCapabilityDeniedLocked(plugin_id, .filesystem, path);
+        return false;
+    }
 
     /// Returns `true` if `plugin_id` declared a permission allowing
     /// `item` for `kind`. Plugins with no permissions entry get a
@@ -1567,10 +1902,12 @@ pub const PluginManager = struct {
         item: []const u8,
     ) bool {
         const stored = self.plugin_permissions.get(plugin_id) orelse return false;
+        if (kind == .manage_plugins) return stored.manage_plugins and std.mem.eql(u8, item, "manage_plugins");
         const list: []const []const u8 = switch (kind) {
             .event => stored.events,
             .spawn => stored.spawn_allowlist,
             .filesystem => stored.filesystem,
+            .manage_plugins => unreachable,
         };
         for (list) |entry| {
             if (matchesPermissionEntry(entry, item)) return true;
@@ -1734,6 +2071,10 @@ pub const PluginManager = struct {
                 .on_clear_panel = onWasmClearPanel,
                 .on_get_buffer_content = onWasmGetBufferContent,
                 .on_get_buffer_path = onWasmGetBufferPath,
+                .on_get_plugin_dashboard_json = onWasmGetPluginDashboardJson,
+                .on_get_plugin_dashboard_report = onWasmGetPluginDashboardReport,
+                .on_storage_read = onWasmStorageRead,
+                .on_storage_write = onWasmStorageWrite,
                 .on_load_plugin = onWasmLoadPlugin,
                 .on_unload_plugin = onWasmUnloadPlugin,
             },
@@ -1870,7 +2211,7 @@ pub const PluginManager = struct {
         if (argv.items.len == 0) return -2;
         const program = argv.items[0];
 
-        if (!self.permissionAllows(plugin_id, .spawn, program)) {
+        if (!self.permissionAllowsOrRecordDenied(plugin_id, .spawn, program)) {
             log.warn(
                 "wasm plugin '{s}' attempted unauthorized spawn: {s}",
                 .{ plugin_id, program },
@@ -2030,18 +2371,23 @@ pub const PluginManager = struct {
         topic: []const u8,
     ) i32 {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
-        if (!self.permissionAllows(plugin_id, .event, topic)) {
-            log.warn(
-                "wasm plugin '{s}' lacks event permission for '{s}'",
-                .{ plugin_id, topic },
-            );
-            return -1;
-        }
         const event = eventFromTopic(topic) orelse {
             log.warn("wasm plugin '{s}' subscribed to unknown event '{s}'", .{ plugin_id, topic });
             return -2;
         };
-        self.addEventSubscription(event, .wasm, plugin_id) catch return -3;
+        {
+            self.state_mu.lock();
+            defer self.state_mu.unlock();
+            if (!self.permissionAllows(plugin_id, .event, topic)) {
+                self.recordCapabilityDeniedLocked(plugin_id, .event, topic);
+                log.warn(
+                    "wasm plugin '{s}' lacks event permission for '{s}'",
+                    .{ plugin_id, topic },
+                );
+                return -1;
+            }
+            self.addEventSubscription(event, .wasm, plugin_id) catch return -3;
+        }
         log.info("wasm plugin '{s}' subscribed to event '{s}'", .{ plugin_id, topic });
         return 0;
     }
@@ -2053,7 +2399,7 @@ pub const PluginManager = struct {
         out_buf: []u8,
     ) i32 {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
-        if (!self.filesystemAllows(plugin_id, .read, path)) {
+        if (!self.filesystemAllowsOrRecordDenied(plugin_id, .read, path)) {
             log.warn("wasm plugin '{s}' lacks read permission for '{s}'", .{ plugin_id, path });
             return -1;
         }
@@ -2075,7 +2421,7 @@ pub const PluginManager = struct {
         content: []const u8,
     ) i32 {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
-        if (!self.filesystemAllows(plugin_id, .write, path)) {
+        if (!self.filesystemAllowsOrRecordDenied(plugin_id, .write, path)) {
             log.warn("wasm plugin '{s}' lacks write permission for '{s}'", .{ plugin_id, path });
             return -1;
         }
@@ -2095,9 +2441,13 @@ pub const PluginManager = struct {
         priority: i8,
     ) void {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.state_mu.lock();
         self.upsertStatusItem(plugin_id, id, text, alignment, priority) catch |err| {
+            self.state_mu.unlock();
             log.warn("wasm plugin '{s}' set_status_item failed: {s}", .{ plugin_id, @errorName(err) });
+            return;
         };
+        self.state_mu.unlock();
         self.requestUiRefresh();
     }
 
@@ -2107,7 +2457,9 @@ pub const PluginManager = struct {
         id: []const u8,
     ) void {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.state_mu.lock();
         self.removeStatusItem(plugin_id, id);
+        self.state_mu.unlock();
         self.requestUiRefresh();
     }
 
@@ -2121,9 +2473,13 @@ pub const PluginManager = struct {
         width_percent: u8,
     ) void {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.state_mu.lock();
         self.upsertPanel(plugin_id, id, title, content, position, width_percent) catch |err| {
+            self.state_mu.unlock();
             log.warn("wasm plugin '{s}' set_panel failed: {s}", .{ plugin_id, @errorName(err) });
+            return;
         };
+        self.state_mu.unlock();
         self.requestUiRefresh();
     }
 
@@ -2133,7 +2489,9 @@ pub const PluginManager = struct {
         id: []const u8,
     ) void {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        self.state_mu.lock();
         self.removePanel(plugin_id, id);
+        self.state_mu.unlock();
         self.requestUiRefresh();
     }
 
@@ -2163,6 +2521,96 @@ pub const PluginManager = struct {
         return fn_ptr(ud, out_buf);
     }
 
+    fn onWasmGetPluginDashboardJson(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        out_buf: []u8,
+    ) i32 {
+        _ = plugin_id;
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        const json = self.dashboardJson(self.allocator) catch return -2;
+        defer self.allocator.free(json);
+        return copyToPluginBuffer(json, out_buf);
+    }
+
+    fn onWasmGetPluginDashboardReport(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        out_buf: []u8,
+    ) i32 {
+        _ = plugin_id;
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        const report = self.dashboardReport(self.allocator) catch return -2;
+        defer self.allocator.free(report);
+        return copyToPluginBuffer(report, out_buf);
+    }
+
+    fn onWasmStorageRead(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        key: []const u8,
+        out_buf: []u8,
+    ) i32 {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        const path = self.pluginStoragePath(plugin_id, key) catch {
+            self.recordCapabilityDenied(plugin_id, .filesystem, key);
+            return -1;
+        };
+        defer self.allocator.free(path);
+
+        const file = std.Io.Dir.openFileAbsolute(self.io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return -2,
+        };
+        defer file.close(self.io);
+
+        const len = file.length(self.io) catch return -2;
+        const read_len: usize = @intCast(@min(@as(u64, @intCast(out_buf.len)), len));
+        const read_n = file.readPositionalAll(self.io, out_buf[0..read_len], 0) catch return -2;
+        return @intCast(read_n);
+    }
+
+    fn onWasmStorageWrite(
+        user_data: *anyopaque,
+        plugin_id: []const u8,
+        key: []const u8,
+        content: []const u8,
+    ) i32 {
+        const self: *PluginManager = @ptrCast(@alignCast(user_data));
+        const path = self.pluginStoragePath(plugin_id, key) catch {
+            self.recordCapabilityDenied(plugin_id, .filesystem, key);
+            return -1;
+        };
+        defer self.allocator.free(path);
+
+        if (std.fs.path.dirname(path)) |dir| {
+            std.Io.Dir.cwd().createDirPath(self.io, dir) catch return -2;
+        }
+        const file = std.Io.Dir.createFileAbsolute(self.io, path, .{ .truncate = true }) catch return -2;
+        defer file.close(self.io);
+        file.writeStreamingAll(self.io, content) catch return -2;
+        return 0;
+    }
+
+    fn copyToPluginBuffer(content: []const u8, out_buf: []u8) i32 {
+        const n = @min(content.len, out_buf.len);
+        @memcpy(out_buf[0..n], content[0..n]);
+        return @intCast(n);
+    }
+
+    fn pluginStoragePath(self: *PluginManager, plugin_id: []const u8, key: []const u8) ![]u8 {
+        if (!isSafeStorageKey(key)) return error.InvalidStorageKey;
+        if (!isSafeStorageKey(plugin_id)) return error.InvalidStorageKey;
+        const platform = @import("../kernel/platform.zig");
+        const home = (try platform.getEnv(self.allocator, self.environ_block, "HOME")) orelse
+            (try platform.getEnv(self.allocator, self.environ_block, "USERPROFILE")) orelse
+            return error.NoHome;
+        defer self.allocator.free(home);
+        const root = try std.fs.path.join(self.allocator, &.{ home, ".stem", "plugin-data", plugin_id });
+        defer self.allocator.free(root);
+        return std.fs.path.join(self.allocator, &.{ root, key });
+    }
+
     fn onWasmLoadPlugin(
         user_data: *anyopaque,
         plugin_id: []const u8,
@@ -2170,6 +2618,7 @@ pub const PluginManager = struct {
     ) i32 {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
         if (!self.canManagePlugins(plugin_id)) {
+            self.recordCapabilityDenied(plugin_id, .manage_plugins, "manage_plugins");
             log.warn(
                 "wasm plugin '{s}' attempted stem_load_plugin('{s}') without `manage_plugins` permission",
                 .{ plugin_id, name },
@@ -2190,6 +2639,7 @@ pub const PluginManager = struct {
     ) i32 {
         const self: *PluginManager = @ptrCast(@alignCast(user_data));
         if (!self.canManagePlugins(plugin_id)) {
+            self.recordCapabilityDenied(plugin_id, .manage_plugins, "manage_plugins");
             log.warn(
                 "wasm plugin '{s}' attempted stem_unload_plugin('{s}') without `manage_plugins` permission",
                 .{ plugin_id, name },
@@ -2238,7 +2688,7 @@ pub const PluginManager = struct {
     fn filesystemAllows(
         self: *PluginManager,
         plugin_id: []const u8,
-        op: enum { read, write },
+        op: FilePermissionOp,
         path: []const u8,
     ) bool {
         const stored = self.plugin_permissions.get(plugin_id) orelse return false;
@@ -2589,4 +3039,56 @@ test "pathHasParentRef: flags only whole `..` components" {
     // A name that merely contains ".." is not a parent ref.
     try std.testing.expect(!PluginManager.pathHasParentRef("a..b"));
     try std.testing.expect(!PluginManager.pathHasParentRef("..foo/bar"));
+}
+
+test "PluginManager dashboard report surfaces permissions widgets and denials" {
+    const allocator = std.testing.allocator;
+    var io_ctx = @import("../test_utils.zig").TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+
+    const ui_inbox = try vigil_api.standaloneInboxForTest(allocator);
+    defer ui_inbox.close();
+    var ui_bus = MessageBus.init(allocator, ui_inbox, "test-ui");
+
+    var registry = CommandRegistry.init(allocator);
+    defer registry.deinit();
+
+    var manager = PluginManager.init(allocator, io, .empty, &ui_bus, &registry);
+    defer manager.deinit();
+
+    try manager.installPluginPermissions("git", .{
+        .spawn_allowlist = &.{"git"},
+        .events = &.{ "buffer.*", "file.saved" },
+        .filesystem = &.{"read:."},
+    });
+    try manager.installRestartPolicy("git", .on_crash);
+    try manager.upsertStatusItem("git", "branch", "Git: main*", 2, 10);
+    try manager.upsertPanel("git", "summary", "Git", "dirty files: 2", 1, 30);
+    manager.recordCapabilityDenied("git", .spawn, "curl");
+
+    const json = try manager.dashboardJson(allocator);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"git\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"runtime\":\"none\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"restart_policy\":\"on_crash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"status_items\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"panels\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"denials\":1") != null);
+
+    const report = try manager.dashboardReport(allocator);
+    defer allocator.free(report);
+    try std.testing.expect(std.mem.indexOf(u8, report, "Plugin Dashboard") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "git") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "spawn: git") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "denied spawn curl") != null);
+}
+
+test "PluginManager storage keys reject traversal" {
+    try std.testing.expect(PluginManager.isSafeStorageKey("settings.json"));
+    try std.testing.expect(PluginManager.isSafeStorageKey("cache/state-v1"));
+    try std.testing.expect(!PluginManager.isSafeStorageKey("../settings.json"));
+    try std.testing.expect(!PluginManager.isSafeStorageKey("cache/../../secret"));
+    try std.testing.expect(!PluginManager.isSafeStorageKey("/absolute"));
+    try std.testing.expect(!PluginManager.isSafeStorageKey("nested\\windows"));
 }

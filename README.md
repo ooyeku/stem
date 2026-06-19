@@ -1,5 +1,5 @@
 # Stem
-
+ 
 A modal text editor for the terminal. Built in Zig, with tree-sitter
 syntax highlighting and built-in LSP integration for 20+ languages.
 
