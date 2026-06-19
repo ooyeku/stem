@@ -881,12 +881,16 @@ pub fn buildAndSend(core: anytype) !void {
         .diagnostic_warning_count = diagnostics_warn_count,
         .status_message = blk: {
             const current_time = std.Io.Clock.real.now(core.io).toMilliseconds();
-            if (core.status_message != null and current_time < core.status_message_expires) {
-                break :blk core.status_message;
-            } else {
+            const copied = try snapshotStatusMessage(
+                alloc,
+                core.status_message,
+                current_time,
+                core.status_message_expires,
+            );
+            if (copied == null) {
                 core.status_message = null;
-                break :blk null;
             }
+            break :blk copied;
         },
         .status_message_level = core.status_message_level,
     };
@@ -906,6 +910,17 @@ pub fn buildAndSend(core: anytype) !void {
     @import("../services/thread_name.zig").markStep("send:bus_send");
     try core.ui_bus.sendCoalesced(.render, bytes, core.version);
     @import("../services/thread_name.zig").markStep("send:done");
+}
+
+fn snapshotStatusMessage(
+    allocator: std.mem.Allocator,
+    message: ?[]const u8,
+    now_ms: i64,
+    expires_ms: i64,
+) !?[]const u8 {
+    const msg = message orelse return null;
+    if (now_ms >= expires_ms) return null;
+    return try allocator.dupe(u8, msg);
 }
 
 fn visualRowOfCursor(
@@ -970,4 +985,20 @@ fn wrappedRowsForLine(
         byte_idx += len;
     }
     return rows;
+}
+
+test "render snapshot status messages are owned by the frame arena" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var mutable: [16]u8 = undefined;
+    @memcpy(mutable[0..5], "ready");
+
+    const snap = try snapshotStatusMessage(alloc, mutable[0..5], 100, 200);
+    try std.testing.expect(snap != null);
+    try std.testing.expectEqualStrings("ready", snap.?);
+
+    @memcpy(mutable[0..5], "crash");
+    try std.testing.expectEqualStrings("ready", snap.?);
 }

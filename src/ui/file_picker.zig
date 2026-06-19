@@ -22,6 +22,8 @@ pub const FilePicker = struct {
             }
         }
 
+        if (win.width < 12 or win.height < 8) return;
+
         const width: usize = @min(win.width -| 4, 80);
         const height: usize = @min(win.height -| 6, 25);
 

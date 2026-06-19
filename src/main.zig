@@ -79,6 +79,10 @@ fn installShutdownSignals() !void {
     std.posix.sigaction(.HUP, &sa, null);
 }
 
+fn isQuitKey(key: vaxis.Key) bool {
+    return key.matches('c', .{ .ctrl = true }) or key.codepoint == 0x03;
+}
+
 /// Pre-opened crash-log file descriptor. Opened at startup so the signal
 /// handler doesn't need to allocate or call `open` (which isn't strictly
 /// async-signal-safe). -1 when no log is available.
@@ -387,6 +391,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
     }
 
+    try storage.setEditorWorkspaceFromInitialPaths(initial_files_to_open.items);
+
+    var workspace_lock = storage.acquireWorkspaceLock() catch |err| switch (err) {
+        error.AlreadyRunning => {
+            const stderr = std.Io.File.stderr();
+            stderr.writeStreamingAll(io, "stem is already running in this workspace.\n") catch {};
+            stderr.writeStreamingAll(io, "Close the existing instance before starting another one here.\n") catch {};
+            stderr.writeStreamingAll(io, "Lock: ") catch {};
+            stderr.writeStreamingAll(io, storage.getInstanceLockPath()) catch {};
+            stderr.writeStreamingAll(io, "\n") catch {};
+            std.process.exit(1);
+        },
+        else => return err,
+    };
+    defer workspace_lock.deinit();
+
     const log_level: logger.LogLevel = switch (storage.config.logging.level) {
         .debug => .debug,
         .info => .info,
@@ -650,7 +670,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         fn run(self: @This()) void {
             setThreadName("stem-sigmon");
             while (!self.stop.load(.acquire)) {
-                std.Io.sleep(self.io, .fromMilliseconds(200), .awake) catch return;
+                std.Io.sleep(self.io, .fromMilliseconds(200), .awake) catch {
+                    // Signals may interrupt the sleeping thread that is
+                    // responsible for observing them. Keep polling instead of
+                    // returning before `shutdown_requested` is checked.
+                    vigil_api.sleep(10 * std.time.ns_per_ms);
+                };
                 if (self.stop.load(.acquire)) return;
                 if (shutdown_requested.load(.acquire)) {
                     const msg = (protocol.Message{ .quit = {} }).encode(self.allocator) catch return;
@@ -658,6 +683,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     // .quit is the textbook critical message: it must
                     // not sit behind queued bulk traffic during shutdown.
                     self.bus.sendCritical(msg) catch {};
+                    // Backup wakeup: `Inbox.recv()` polls this flag directly.
+                    // Do not call `Inbox.close()` here; that deallocates the
+                    // inbox while the UI thread still owns its pointer.
+                    self.bus.inbox.closed.store(true, .release);
                     return;
                 }
             }
@@ -688,7 +717,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             };
             switch (decoded) {
                 .input => |key| {
-                    if (key.matches('c', .{ .ctrl = true })) {
+                    if (isQuitKey(key)) {
                         const quit_bytes = (protocol.Message{ .quit = {} }).encode(allocator) catch break;
                         defer allocator.free(quit_bytes);
                         core_bus.sendCritical(quit_bytes) catch {};
@@ -788,7 +817,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
     }
+    const signal_shutdown = shutdown_requested.load(.acquire);
     app_stop.store(true, .release);
+    if (signal_shutdown) {
+        // OS-driven shutdown (terminal close, SIGTERM/SIGHUP/Ctrl-C delivered
+        // as a process signal) can leave vaxis' terminal reader blocked in a
+        // raw `readv()`. Waiting in `loop.stop()` then wedges teardown. Restore
+        // the terminal and stop Stem's supervised work directly, then exit the
+        // process without waiting on the blocked terminal reader.
+        vx.setMouseMode(tty.writer(), false) catch {};
+        vx.exitAltScreen(tty.writer()) catch {};
+        vx.resetState(tty.writer()) catch {};
+
+        main_inbox.closed.store(true, .release);
+        core_inbox.closed.store(true, .release);
+        core_thread.join();
+        core_ctx.core.deinit();
+        stem_runtime.shutdown();
+        std.process.exit(0);
+    }
     loop.stop();
     input_thread.join();
     heartbeat_thread.join();
@@ -827,4 +874,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
             break;
         }
     }
+}
+
+test "isQuitKey recognizes normalized and raw Ctrl-C" {
+    try std.testing.expect(isQuitKey(.{
+        .codepoint = 'c',
+        .mods = .{ .ctrl = true },
+    }));
+    try std.testing.expect(isQuitKey(.{
+        .codepoint = 0x03,
+    }));
+    try std.testing.expect(!isQuitKey(.{
+        .codepoint = 'c',
+    }));
 }

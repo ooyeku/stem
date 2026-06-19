@@ -55,6 +55,69 @@ const HoverBackdrop = struct {
     height: u16,
 };
 
+const InputBoxGeometry = struct {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    input_width: u16,
+};
+
+fn centeredInputBox(
+    win_width: u16,
+    win_height: u16,
+    desired_width: u16,
+    desired_height: u16,
+    min_width: u16,
+) ?InputBoxGeometry {
+    if (win_height < desired_height or win_width < min_width) return null;
+
+    const width = @min(desired_width, win_width);
+    if (width < min_width or width < 4) return null;
+
+    return .{
+        .x = (win_width - width) / 2,
+        .y = (win_height - desired_height) / 2,
+        .width = width,
+        .height = desired_height,
+        .input_width = width - 4,
+    };
+}
+
+fn bottomInputBox(
+    win_width: u16,
+    win_height: u16,
+    desired_width: u16,
+    desired_height: u16,
+    min_width: u16,
+    bottom_margin: u16,
+) ?InputBoxGeometry {
+    const centered = centeredInputBox(win_width, win_height, desired_width, desired_height, min_width) orelse return null;
+    const preferred_y = if (win_height > desired_height + bottom_margin)
+        win_height - desired_height - bottom_margin
+    else
+        win_height - desired_height;
+
+    return .{
+        .x = centered.x,
+        .y = preferred_y,
+        .width = centered.width,
+        .height = centered.height,
+        .input_width = centered.input_width,
+    };
+}
+
+fn globalSearchInnerHeight(win_height: u16, start_y: usize) usize {
+    const chrome_rows: usize = 5;
+    if (@as(usize, win_height) <= start_y + chrome_rows) return 0;
+    return @min(@as(usize, win_height) - start_y - chrome_rows, 20);
+}
+
+fn scrollbarColumn(win_width: u16) ?u16 {
+    if (win_width == 0) return null;
+    return win_width - 1;
+}
+
 fn hoverWidthFor(win_width: u16) u16 {
     if (win_width <= 2) return win_width;
 
@@ -1512,6 +1575,7 @@ pub const View = struct {
 
         const track_height = win.height;
         if (track_height == 0) return;
+        const col = scrollbarColumn(win.width) orelse return;
 
         var thumb_height = (visible_lines * track_height) / total_lines;
         if (thumb_height < 1) thumb_height = 1;
@@ -1527,7 +1591,7 @@ pub const View = struct {
         };
 
         for (0..track_height) |y| {
-            _ = win.printSegment(.{ .text = "│", .style = style }, .{ .row_offset = @intCast(y), .col_offset = win.width - 1 });
+            _ = win.printSegment(.{ .text = "│", .style = style }, .{ .row_offset = @intCast(y), .col_offset = col });
         }
 
         const thumb_style: vaxis.Cell.Style = .{
@@ -1536,7 +1600,7 @@ pub const View = struct {
         };
 
         for (0..thumb_height) |i| {
-            _ = win.printSegment(.{ .text = " ", .style = thumb_style }, .{ .row_offset = @intCast(thumb_y + i), .col_offset = win.width - 1 });
+            _ = win.printSegment(.{ .text = " ", .style = thumb_style }, .{ .row_offset = @intCast(thumb_y + i), .col_offset = col });
         }
     }
 
@@ -1781,10 +1845,7 @@ pub const View = struct {
             }
         }
 
-        const box_width: u16 = 50;
-        const box_height: u16 = 3;
-        const box_x = (win.width - box_width) / 2;
-        const box_y = (win.height - box_height) / 2;
+        const box = centeredInputBox(win.width, win.height, 50, 3, 6) orelse return;
 
         const box_style: vaxis.Cell.Style = .{
             .fg = .{ .index = 0 },
@@ -1796,10 +1857,10 @@ pub const View = struct {
             .bg = .{ .index = 7 },
         };
 
-        for (0..box_height) |i| {
-            const row = box_y + @as(u16, @intCast(i));
-            for (0..box_width) |j| {
-                const col = box_x + @as(u16, @intCast(j));
+        for (0..box.height) |i| {
+            const row = box.y + @as(u16, @intCast(i));
+            for (0..box.width) |j| {
+                const col = box.x + @as(u16, @intCast(j));
                 _ = win.printSegment(.{ .text = " ", .style = box_style }, .{
                     .row_offset = row,
                     .col_offset = col,
@@ -1809,13 +1870,13 @@ pub const View = struct {
 
         const title = " Save As: ";
         _ = win.printSegment(.{ .text = title, .style = box_style }, .{
-            .row_offset = box_y,
-            .col_offset = box_x + 1,
+            .row_offset = box.y,
+            .col_offset = box.x + 1,
         });
 
-        const input_row = box_y + 1;
-        const input_col = box_x + 2;
-        const input_width = box_width - 4;
+        const input_row = box.y + 1;
+        const input_col = box.x + 2;
+        const input_width = box.input_width;
 
         for (0..input_width) |i| {
             _ = win.printSegment(.{ .text = " ", .style = input_style }, .{
@@ -3013,10 +3074,7 @@ pub const View = struct {
     ) !void {
         _ = self;
 
-        const box_width: u16 = 48;
-        const box_height: u16 = 3;
-        const box_x = (win.width - box_width) / 2;
-        const box_y = win.height - box_height - 2;
+        const box = bottomInputBox(win.width, win.height, 48, 3, 6, 2) orelse return;
 
         const box_style: vaxis.Cell.Style = .{
             .fg = .{ .index = 0 },
@@ -3028,10 +3086,10 @@ pub const View = struct {
             .bg = .{ .index = 7 },
         };
 
-        for (0..box_height) |i| {
-            const row = box_y + @as(u16, @intCast(i));
-            for (0..box_width) |j| {
-                const col = box_x + @as(u16, @intCast(j));
+        for (0..box.height) |i| {
+            const row = box.y + @as(u16, @intCast(i));
+            for (0..box.width) |j| {
+                const col = box.x + @as(u16, @intCast(j));
                 _ = win.printSegment(.{ .text = " ", .style = box_style }, .{
                     .row_offset = row,
                     .col_offset = col,
@@ -3044,30 +3102,32 @@ pub const View = struct {
         // the prompt while you type.
         const prefix = if (forward) " / Search:" else " ? Search:";
         _ = win.printSegment(.{ .text = prefix, .style = box_style }, .{
-            .row_offset = box_y,
-            .col_offset = box_x + 1,
+            .row_offset = box.y,
+            .col_offset = box.x + 1,
         });
         if (match_count > 0) {
             const count_text = try std.fmt.allocPrint(allocator, "[{d}/{d}] ", .{ match_index, match_count });
-            const count_len: u16 = @intCast(@min(count_text.len, @as(usize, box_width - 2)));
-            const count_col = box_x + box_width - count_len - 1;
+            const count_len: u16 = @intCast(@min(count_text.len, @as(usize, box.width - 2)));
+            const count_col = box.x + box.width - count_len - 1;
             _ = win.printSegment(.{ .text = count_text, .style = box_style }, .{
-                .row_offset = box_y,
+                .row_offset = box.y,
                 .col_offset = count_col,
             });
         } else if (input.len > 0) {
             const text = " [no matches] ";
             const text_len: u16 = @intCast(text.len);
-            const col = box_x + box_width - text_len - 1;
-            _ = win.printSegment(.{ .text = text, .style = box_style }, .{
-                .row_offset = box_y,
-                .col_offset = col,
-            });
+            if (box.width > text_len + 1) {
+                const col = box.x + box.width - text_len - 1;
+                _ = win.printSegment(.{ .text = text, .style = box_style }, .{
+                    .row_offset = box.y,
+                    .col_offset = col,
+                });
+            }
         }
 
-        const input_row = box_y + 1;
-        const input_col = box_x + 2;
-        const input_width = box_width - 4;
+        const input_row = box.y + 1;
+        const input_col = box.x + 2;
+        const input_width = box.input_width;
 
         for (0..input_width) |i| {
             _ = win.printSegment(.{ .text = " ", .style = input_style }, .{
@@ -3107,6 +3167,8 @@ pub const View = struct {
                 });
             }
         }
+
+        if (win.width < 12 or win.height < 9) return;
 
         const width: usize = @min(win.width -| 4, 80);
         const height: usize = @min(win.height -| 6, 25);
@@ -3216,10 +3278,7 @@ pub const View = struct {
             }
         }
 
-        const box_width: u16 = 35;
-        const box_height: u16 = 3;
-        const box_x = (win.width - box_width) / 2;
-        const box_y = (win.height - box_height) / 2;
+        const box = centeredInputBox(win.width, win.height, 35, 3, 6) orelse return;
 
         const box_style: vaxis.Cell.Style = .{
             .fg = .{ .index = 0 },
@@ -3231,10 +3290,10 @@ pub const View = struct {
             .bg = .{ .index = 7 },
         };
 
-        for (0..box_height) |i| {
-            const row = box_y + @as(u16, @intCast(i));
-            for (0..box_width) |j| {
-                const col = box_x + @as(u16, @intCast(j));
+        for (0..box.height) |i| {
+            const row = box.y + @as(u16, @intCast(i));
+            for (0..box.width) |j| {
+                const col = box.x + @as(u16, @intCast(j));
                 _ = win.printSegment(.{ .text = " ", .style = box_style }, .{
                     .row_offset = row,
                     .col_offset = col,
@@ -3244,14 +3303,14 @@ pub const View = struct {
 
         const title = " Go to Line: ";
         _ = win.printSegment(.{ .text = title, .style = box_style }, .{
-            .row_offset = box_y,
-            .col_offset = box_x + 1,
+            .row_offset = box.y,
+            .col_offset = box.x + 1,
         });
 
         const input = snapshot.go_to_line_input orelse "";
-        const input_row = box_y + 1;
-        const input_col = box_x + 2;
-        const input_width = box_width - 4;
+        const input_row = box.y + 1;
+        const input_col = box.x + 2;
+        const input_width = box.input_width;
 
         for (0..input_width) |i| {
             _ = win.printSegment(.{ .text = " ", .style = input_style }, .{
@@ -3294,6 +3353,8 @@ pub const View = struct {
                 });
             }
         }
+
+        if (win.width < 12 or win.height < 7) return;
 
         const width: usize = @min(win.width -| 4, 60);
         const height: usize = @min(win.height -| 4, 15);
@@ -3398,6 +3459,8 @@ pub const View = struct {
                 });
             }
         }
+
+        if (win.width < 12 or win.height < 7) return;
 
         const width: usize = @min(win.width -| 4, 90);
         const height: usize = @min(win.height -| 4, 20);
@@ -3535,11 +3598,13 @@ pub const View = struct {
             }
         }
 
-        const width: usize = @min(win.width -| 4, 80);
-        const height: usize = @min(win.height -| 4, 20);
+        if (win.width < 12 or win.height < 7) return;
 
+        const width: usize = @min(win.width -| 4, 80);
         const start_x: usize = (win.width - width) / 2;
         const start_y: usize = @max(win.height / 6, 2);
+        const height: usize = globalSearchInnerHeight(win.height, start_y);
+        if (height == 0) return;
 
         const box_style: vaxis.Cell.Style = .{
             .fg = .{ .index = 7 },
@@ -3751,6 +3816,46 @@ test "TokenIndex: buckets tokens per line and sorts each line by column" {
 
     try testing.expect(idx.getLineTokens(1) == null); // no tokens on line 1
     try testing.expect(idx.getLineTokens(2) != null);
+}
+
+test "centered input boxes clamp to the viewport" {
+    try testing.expect(centeredInputBox(5, 24, 50, 3, 6) == null);
+    try testing.expect(centeredInputBox(80, 2, 50, 3, 6) == null);
+
+    const narrow = centeredInputBox(20, 10, 50, 3, 6) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u16, 0), narrow.x);
+    try testing.expectEqual(@as(u16, 3), narrow.y);
+    try testing.expectEqual(@as(u16, 20), narrow.width);
+    try testing.expectEqual(@as(u16, 16), narrow.input_width);
+
+    const wide = centeredInputBox(80, 24, 50, 3, 6) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u16, 15), wide.x);
+    try testing.expectEqual(@as(u16, 10), wide.y);
+    try testing.expectEqual(@as(u16, 50), wide.width);
+}
+
+test "bottom input boxes avoid vertical underflow" {
+    try testing.expect(bottomInputBox(80, 2, 48, 3, 6, 2) == null);
+
+    const compact = bottomInputBox(20, 3, 48, 3, 6, 2) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u16, 0), compact.y);
+    try testing.expectEqual(@as(u16, 20), compact.width);
+
+    const normal = bottomInputBox(80, 24, 48, 3, 6, 2) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u16, 19), normal.y);
+    try testing.expectEqual(@as(u16, 48), normal.width);
+}
+
+test "global search height accounts for top offset and chrome rows" {
+    try testing.expectEqual(@as(usize, 0), globalSearchInnerHeight(6, 2));
+    try testing.expectEqual(@as(usize, 3), globalSearchInnerHeight(10, 2));
+    try testing.expectEqual(@as(usize, 20), globalSearchInnerHeight(40, 6));
+}
+
+test "scrollbar column is absent for zero-width child windows" {
+    try testing.expect(scrollbarColumn(0) == null);
+    try testing.expectEqual(@as(u16, 0), scrollbarColumn(1).?);
+    try testing.expectEqual(@as(u16, 9), scrollbarColumn(10).?);
 }
 
 test "TokenIndex.findTokenAt: binary search over hits, gaps, and boundaries" {

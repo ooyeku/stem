@@ -29,10 +29,12 @@ const std = @import("std");
 const vigil_api = @import("../services/vigil_adapters.zig");
 const vigil = vigil_api.raw;
 const telemetry_mod = @import("../services/telemetry.zig");
+const protocol = @import("protocol.zig");
 
 const MessagePriority = vigil_api.MessagePriority;
 const Message = vigil_api.Message;
 const Mutex = vigil_api.Mutex;
+const render_coalesce_id = "stem:coalesce:render";
 
 /// QoS class for an outgoing message. The class fixes both the Vigil
 /// priority and the backpressure policy.
@@ -252,6 +254,9 @@ pub const MessageBus = struct {
         while (i < queue.items.len) {
             if (std.mem.eql(u8, queue.items[i].id, id)) {
                 var old = queue.orderedRemove(i);
+                if (std.mem.eql(u8, id, render_coalesce_id)) {
+                    releaseRenderArenaFromPayload(old.payload);
+                }
                 mailbox.stats.total_size_bytes -|= old.metadata.size_bytes;
                 if (mailbox.stats.messages_received > mailbox.stats.messages_sent) {
                     mailbox.stats.messages_received -= 1;
@@ -264,6 +269,19 @@ pub const MessageBus = struct {
             i += 1;
         }
         return dropped;
+    }
+
+    fn releaseRenderArenaFromPayload(payload: ?[]const u8) void {
+        const bytes = payload orelse return;
+        const decoded = protocol.Message.decode(bytes) catch return;
+        if (decoded != .render_update) return;
+
+        const update = decoded.render_update;
+        if (update.pool_ptr == 0 or update.arena_ptr == 0) return;
+
+        const pool: *@import("arena_pool.zig").ArenaPool = @ptrFromInt(update.pool_ptr);
+        const arena: *std.heap.ArenaAllocator = @ptrFromInt(update.arena_ptr);
+        pool.release(arena);
     }
 
     /// Convenience wrappers — naming each makes call sites self-documenting
@@ -429,6 +447,50 @@ test "MessageBus: coalescing keeps only the newest pending payload" {
     defer latest.deinit();
     try std.testing.expectEqualStrings("frame3", latest.payload.?);
     try std.testing.expectError(error.EmptyMailbox, ib.mailbox.receive());
+}
+
+test "MessageBus: coalescing dropped render updates releases their arenas" {
+    const a = std.testing.allocator;
+    var io_ctx = @import("../test_utils.zig").TestIo.init(a);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+
+    const ib = try vigil_api.standaloneInboxForTest(a);
+    defer ib.close();
+
+    var pool = @import("arena_pool.zig").ArenaPool.init(a, io);
+    defer pool.deinit();
+
+    var bus = MessageBus.init(a, ib, "test-bus");
+
+    const arena1 = try pool.acquire();
+    const arena2 = try pool.acquire();
+
+    const payload1 = try (protocol.Message{ .render_update = .{
+        .snapshot_ptr = 0x1111,
+        .arena_ptr = @intFromPtr(arena1),
+        .pool_ptr = @intFromPtr(&pool),
+    } }).encode(a);
+    defer a.free(payload1);
+    const payload2 = try (protocol.Message{ .render_update = .{
+        .snapshot_ptr = 0x2222,
+        .arena_ptr = @intFromPtr(arena2),
+        .pool_ptr = @intFromPtr(&pool),
+    } }).encode(a);
+    defer a.free(payload2);
+
+    try bus.sendCoalesced(.render, payload1, 1);
+    try bus.sendCoalesced(.render, payload2, 2);
+
+    try std.testing.expectEqual(@as(usize, 1), pool.free_list.items.len);
+
+    var latest = try ib.mailbox.receive();
+    defer latest.deinit();
+    const decoded = try protocol.Message.decode(latest.payload.?);
+    const ru = decoded.render_update;
+    const latest_pool: *@import("arena_pool.zig").ArenaPool = @ptrFromInt(ru.pool_ptr);
+    const latest_arena: *std.heap.ArenaAllocator = @ptrFromInt(ru.arena_ptr);
+    latest_pool.release(latest_arena);
 }
 
 test "MessageBus: critical sends arrive before bulk on the priority queue" {

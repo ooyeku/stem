@@ -52,6 +52,7 @@ test {
     _ = @import("services/lsp/host_command.zig");
     _ = @import("kernel/safe.zig");
     _ = @import("config/schema.zig");
+    _ = @import("config/storage.zig");
     _ = @import("plugins/manager.zig");
     _ = @import("plugins/manifest.zig");
     _ = @import("plugins/process_loader.zig");

@@ -29,15 +29,19 @@ pub const BufferPicker = struct {
             }
         }
 
+        if (win.width < 4 or win.height < 2) return;
+
         const header = " Switch Buffer (Type # or Navigate) ";
         const header_col = (win.width -| @as(u16, @intCast(header.len))) / 2;
-        _ = win.printSegment(.{ .text = header, .style = header_style }, .{
-            .row_offset = 1,
-            .col_offset = header_col,
-        });
+        if (win.height > 1) {
+            _ = win.printSegment(.{ .text = header, .style = header_style }, .{
+                .row_offset = 1,
+                .col_offset = header_col,
+            });
+        }
 
         if (number_input) |num| {
-            if (num.len > 0) {
+            if (num.len > 0 and win.height > 2) {
                 const input_text = try std.fmt.allocPrint(allocator, " Go to: {s}_ ", .{num});
                 const input_col = (win.width -| @as(u16, @intCast(input_text.len))) / 2;
                 _ = win.printSegment(.{ .text = input_text, .style = input_style }, .{
@@ -49,22 +53,25 @@ pub const BufferPicker = struct {
 
         const list_start: u16 = if (number_input != null and number_input.?.len > 0) 4 else 3;
 
-        const visible_height = if (win.height > 5) win.height - 5 else 1;
+        const visible_height = pickerVisibleHeight(win.height, list_start);
         const start_index = scroll_offset;
         const end_index = @min(buffers.len, start_index + visible_height);
 
         for (start_index..end_index) |i| {
             const buf = buffers[i];
             const row = list_start + @as(u16, @intCast(i - start_index));
+            if (row >= win.height) break;
 
             const is_selected = i == selected_index;
             const style = if (is_selected) selected_style else item_style;
 
-            for (2..win.width - 2) |col| {
-                _ = win.printSegment(.{ .text = " ", .style = style }, .{
-                    .row_offset = row,
-                    .col_offset = @intCast(col),
-                });
+            if (win.width > 4) {
+                for (2..win.width - 2) |col| {
+                    _ = win.printSegment(.{ .text = " ", .style = style }, .{
+                        .row_offset = row,
+                        .col_offset = @intCast(col),
+                    });
+                }
             }
 
             var col: u16 = 4;
@@ -107,7 +114,7 @@ pub const BufferPicker = struct {
             }
         }
 
-        if (buffers.len > visible_height) {
+        if (visible_height > 0 and buffers.len > visible_height and win.width >= 2) {
             const track_height = visible_height;
             const track_start_row = list_start;
 
@@ -141,9 +148,23 @@ pub const BufferPicker = struct {
 
         const footer = " Enter=Select  #=Jump  Backspace=Clear  ESC=Cancel ";
         const footer_col = (win.width -| @as(u16, @intCast(footer.len))) / 2;
-        _ = win.printSegment(.{ .text = footer, .style = header_style }, .{
-            .row_offset = win.height - 2,
-            .col_offset = footer_col,
-        });
+        if (win.height >= 2) {
+            _ = win.printSegment(.{ .text = footer, .style = header_style }, .{
+                .row_offset = win.height - 2,
+                .col_offset = footer_col,
+            });
+        }
     }
 };
+
+fn pickerVisibleHeight(win_height: u16, list_start: u16) usize {
+    const bottom = win_height -| 2;
+    if (bottom <= list_start) return 0;
+    return bottom - list_start;
+}
+
+test "buffer picker visible height does not underflow in tiny terminals" {
+    try std.testing.expectEqual(@as(usize, 0), pickerVisibleHeight(1, 3));
+    try std.testing.expectEqual(@as(usize, 0), pickerVisibleHeight(4, 3));
+    try std.testing.expectEqual(@as(usize, 5), pickerVisibleHeight(10, 3));
+}
