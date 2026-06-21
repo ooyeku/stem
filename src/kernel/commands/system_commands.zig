@@ -7,6 +7,7 @@ const logger_service = @import("../../services/logger.zig");
 const telemetry = @import("../../services/telemetry.zig");
 const LSPManager = @import("../../services/lsp_manager.zig").LSPManager;
 const project_tasks = @import("../project_tasks.zig");
+const runtime_watchdog = @import("../runtime_watchdog.zig");
 const JobProgress = @import("../jobs.zig").JobProgress;
 
 pub const SystemCommands = struct {
@@ -123,6 +124,14 @@ pub const SystemCommands = struct {
         const body = try renderControlCenterBuffer(core);
         defer core.allocator.free(body);
         try core.openVirtualBuffer("[CONTROL CENTER]", body);
+        core.mode = .view;
+        try core.sendUpdate();
+    }
+
+    pub fn cmdStemHeal(core: anytype) anyerror!void {
+        const body = try renderHealingBuffer(core);
+        defer core.allocator.free(body);
+        try core.openVirtualBuffer("[HEAL]", body);
         core.mode = .view;
         try core.sendUpdate();
     }
@@ -599,32 +608,34 @@ pub const SystemCommands = struct {
             plugin_health.lifecycle.crashes,
         });
 
-        try w.writeAll("## Recommended Actions\n\n");
-        var wrote_action = false;
-        if (index_health.at_capacity) {
-            wrote_action = true;
-            try w.writeAll("- Project index hit its safety cap. Narrow the workspace or raise the index limit before relying on whole-project search.\n");
-        }
-        if (lsp_health.unhealthy_servers > 0) {
-            wrote_action = true;
-            try w.writeAll("- Some LSP servers are unhealthy. Open `lsp.status`, then run `lsp.restart` for the active language if needed.\n");
-        }
+        var recommendations = std.ArrayListUnmanaged(runtime_watchdog.HealingRecommendation).empty;
+        defer recommendations.deinit(allocator);
+        try runtime_watchdog.appendRecommendations(.{
+            .lsp_unhealthy_servers = lsp_health.unhealthy_servers,
+            .plugin_crashes = plugin_health.lifecycle.crashes,
+            .plugin_pending_restarts = plugin_health.pending_restarts,
+            .bus_drops_full = bus_drops.full,
+            .bus_drops_backpressure = bus_drops.backpressure,
+            .bus_drops_rate_limited = bus_drops.rate_limited,
+            .failed_jobs = job_summary.failed,
+            .index_at_capacity = index_health.at_capacity,
+            .has_last_task = core.task_history.last() != null,
+        }, &recommendations, allocator);
         if (diagnostics.errors > 0) {
-            wrote_action = true;
-            try w.writeAll("- LSP diagnostics contain errors. Open `lsp.diagnostics` to triage them.\n");
+            try recommendations.append(allocator, .{
+                .severity = .warning,
+                .title = "Diagnostics",
+                .detail = "LSP diagnostics contain errors in the current workspace.",
+                .command = "lsp.diagnostics",
+            });
         }
-        if (job_summary.failed > 0) {
-            wrote_action = true;
-            try w.writeAll("- A background job failed. Open `job.list` or `view.logs` for details.\n");
-        }
-        if (!wrote_action) {
-            try w.writeAll("- No urgent runtime issues detected.\n");
-        }
+        try writeHealingRecommendations(w, recommendations.items);
 
         try w.writeAll(
             \\
             \\## Jump To
             \\
+            \\- `stem.heal`: focused runtime recovery recommendations
             \\- `stats.show`: raw Vigil/message-bus telemetry
             \\- `project.brain`: workspace index, languages, and LSP coverage
             \\- `task.list`: detected project build/test/run commands
@@ -637,6 +648,95 @@ pub const SystemCommands = struct {
         );
 
         return aw.toOwnedSlice();
+    }
+
+    fn renderHealingBuffer(core: anytype) ![]u8 {
+        const allocator = core.allocator;
+        var aw: std.Io.Writer.Allocating = .init(allocator);
+        errdefer aw.deinit();
+        const w = &aw.writer;
+
+        const input = try buildHealingInput(core, allocator);
+        var recommendations = std.ArrayListUnmanaged(runtime_watchdog.HealingRecommendation).empty;
+        defer recommendations.deinit(allocator);
+        try runtime_watchdog.appendRecommendations(input, &recommendations, allocator);
+
+        const timeline = try telemetry.snapshotTimeline(allocator);
+        defer telemetry.freeTimelineSnapshot(allocator, timeline);
+
+        try w.writeAll(
+            \\# Stem Heal
+            \\
+            \\Vigil-backed recovery guidance for runtime health issues.
+            \\
+        );
+        try writeHealingRecommendations(w, recommendations.items);
+
+        try w.print(
+            \\
+            \\## Runtime Context
+            \\
+            \\- LSP unhealthy servers: {d}
+            \\- Plugin crashes: {d}
+            \\- Plugin pending restarts: {d}
+            \\- Message bus drops: {d} full, {d} backpressure, {d} rate-limited
+            \\- Failed jobs: {d}
+            \\- Project index at capacity: {s}
+            \\
+        , .{
+            input.lsp_unhealthy_servers,
+            input.plugin_crashes,
+            input.plugin_pending_restarts,
+            input.bus_drops_full,
+            input.bus_drops_backpressure,
+            input.bus_drops_rate_limited,
+            input.failed_jobs,
+            yesNo(input.index_at_capacity),
+        });
+
+        try w.writeAll(
+            \\
+            \\## Recent Runtime Events
+            \\
+        );
+        if (timeline.len == 0) {
+            try w.writeAll("- _No events yet._\n");
+        } else {
+            const start = if (timeline.len > 8) timeline.len - 8 else 0;
+            for (timeline[start..]) |entry| {
+                try w.print("- `{s}` `{s}`: {s}\n", .{ timelineKindLabel(entry.kind), entry.name, entry.detail });
+            }
+        }
+
+        return aw.toOwnedSlice();
+    }
+
+    pub fn writeHealingRecommendations(
+        w: anytype,
+        recommendations: []const runtime_watchdog.HealingRecommendation,
+    ) !void {
+        try w.writeAll(
+            \\## Recommended Actions
+            \\
+        );
+        if (recommendations.len == 0) {
+            try w.writeAll("- No urgent runtime issues detected.\n");
+            return;
+        }
+
+        try w.writeAll("| Severity | Issue | Action | Details |\n");
+        try w.writeAll("|---|---|---|---|\n");
+        for (recommendations) |rec| {
+            try w.print("| {s} | {s} | `{s}`", .{
+                healingSeverityLabel(rec.severity),
+                rec.title,
+                rec.command,
+            });
+            if (rec.alternate_command) |alternate| {
+                try w.print(" / `{s}`", .{alternate});
+            }
+            try w.print(" | {s} |\n", .{rec.detail});
+        }
     }
 
     fn renderProjectBrainBuffer(core: anytype) ![]u8 {
@@ -860,6 +960,37 @@ pub const SystemCommands = struct {
         backpressure: u64 = 0,
         rate_limited: u64 = 0,
     };
+
+    fn buildHealingInput(core: anytype, allocator: std.mem.Allocator) !runtime_watchdog.HealthInput {
+        const plugin_health = core.plugin_manager.healthSnapshot();
+        var lsp_health = try core.lsp_manager.healthSnapshot(allocator);
+        defer lsp_health.deinit(allocator);
+        var index_health = try core.search_index.healthSnapshot(allocator);
+        defer index_health.deinit(allocator);
+        var job_summary = try core.job_manager.snapshot(allocator);
+        defer job_summary.deinit(allocator);
+        const bus_drops = try busDropTotals(allocator);
+
+        return .{
+            .lsp_unhealthy_servers = lsp_health.unhealthy_servers,
+            .plugin_crashes = plugin_health.lifecycle.crashes,
+            .plugin_pending_restarts = plugin_health.pending_restarts,
+            .bus_drops_full = bus_drops.full,
+            .bus_drops_backpressure = bus_drops.backpressure,
+            .bus_drops_rate_limited = bus_drops.rate_limited,
+            .failed_jobs = job_summary.failed,
+            .index_at_capacity = index_health.at_capacity,
+            .has_last_task = core.task_history.last() != null,
+        };
+    }
+
+    fn healingSeverityLabel(severity: runtime_watchdog.Severity) []const u8 {
+        return switch (severity) {
+            .info => "info",
+            .warning => "warning",
+            .err => "error",
+        };
+    }
 
     fn bufferCounts(core: anytype) BufferCounts {
         var counts = BufferCounts{};
@@ -1242,4 +1373,23 @@ test "task rerun no-history message suggests task commands" {
     try std.testing.expect(std.mem.indexOf(u8, text, "No project task has been run") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "task.list") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "task.run_test") != null);
+}
+
+test "healing recommendations render command names" {
+    var list = std.ArrayListUnmanaged(runtime_watchdog.HealingRecommendation).empty;
+    defer list.deinit(std.testing.allocator);
+    try runtime_watchdog.appendRecommendations(.{
+        .lsp_unhealthy_servers = 1,
+        .failed_jobs = 1,
+        .has_last_task = true,
+    }, &list, std.testing.allocator);
+
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try SystemCommands.writeHealingRecommendations(&aw.writer, list.items);
+    const text = aw.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "lsp.status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "job.list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "task.rerun_last") != null);
 }

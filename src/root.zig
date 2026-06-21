@@ -33,6 +33,7 @@ test {
     _ = @import("kernel/project_tasks.zig");
     _ = @import("kernel/command_history.zig");
     _ = @import("kernel/task_history.zig");
+    _ = @import("kernel/runtime_watchdog.zig");
     _ = @import("kernel/buffer_manager.zig");
     _ = @import("kernel/command.zig");
     _ = @import("kernel/protocol.zig");

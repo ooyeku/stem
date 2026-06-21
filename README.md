@@ -99,6 +99,8 @@ when it isn't already there.
   surfaced at startup if any survived a crash
 - Stem Control Center (`stem.control_center`) for runtime, Vigil,
   project-index, LSP, job, plugin, and message-bus health in one view
+- Stem Heal (`stem.heal`) for Vigil-backed runtime recovery
+  recommendations and watchdog guidance
 - Project Brain (`project.brain`) for workspace index state, open
   languages, diagnostics pressure, and LSP coverage
 - Project Tasks (`task.list`) detects common build/test/run commands
@@ -469,6 +471,9 @@ The command palette includes `stem.control_center`, a single live
 cockpit for Stem's runtime health: Vigil-backed services, message-bus
 pressure, open buffers, project index freshness, LSP state, diagnostics,
 background jobs, plugins, terminal status, and recommended next actions.
+Use `stem.heal` when you want the same Vigil-backed recovery guidance in
+a focused, read-only action view; watchdog toasts will point there when
+runtime health worsens.
 
 Use `project.brain` when you want a tighter project view: workspace
 root, index state, open languages, diagnostics pressure, and per-LSP

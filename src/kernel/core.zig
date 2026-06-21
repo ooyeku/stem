@@ -4,6 +4,7 @@ const logger_service = @import("../services/logger.zig");
 const log = logger_service.scoped("Core");
 const vaxis = @import("vaxis");
 const vigil_api = @import("../services/vigil_adapters.zig");
+const telemetry = @import("../services/telemetry.zig");
 const EditorState = @import("../core/state.zig").EditorState;
 const FileManager = @import("../core/file_manager.zig").FileManager;
 const auto_pair = @import("../core/auto_pair.zig");
@@ -59,6 +60,8 @@ const LeaderDispatch = @import("leader_dispatch.zig").LeaderDispatch;
 const render_mod = @import("render.zig");
 const pickers = @import("pickers.zig");
 const input = @import("input.zig");
+const runtime_watchdog = @import("runtime_watchdog.zig");
+const RuntimeWatchdog = runtime_watchdog.RuntimeWatchdog;
 const ReferencesPicker = pickers.ReferencesPicker;
 const DiagnosticsPicker = pickers.DiagnosticsPicker;
 
@@ -447,6 +450,9 @@ pub const Core = struct {
     /// repos, more on monorepos) and persists across restarts so the
     /// first query in a fresh session is also warm.
     search_index: SearchIndex,
+    runtime_watchdog: RuntimeWatchdog = .{},
+    last_watchdog_check_ms: i64 = 0,
+    watchdog_check_interval_ms: i64 = 2_000,
     mouse_pressed: bool = false,
     mouse_press_row: usize = 0,
     mouse_press_col: usize = 0,
@@ -1511,6 +1517,7 @@ pub const Core = struct {
         try R.register("plugin.show", "Plugins: List Loaded", "Show plugins currently loaded in the running stem instance", Wrap(SystemCommands.cmdShowPlugins).run, null);
         try R.register("plugin.inspect", "Plugins: Inspect", "Open a capability inspector showing manifest, permissions, restart policy, and live state for every installed plugin", Wrap(PluginCommands.cmdPluginInspect).run, null);
         try R.register("stem.control_center", "Stem: Control Center", "Open a live cockpit for runtime health, project brain, LSPs, jobs, plugins, and message-bus pressure", Wrap(SystemCommands.cmdShowControlCenter).run, null);
+        try R.register("stem.heal", "Stem: Heal Runtime", "Open recovery actions for runtime health issues", Wrap(SystemCommands.cmdStemHeal).run, null);
         try R.register("project.brain", "Project: Brain", "Show workspace index health, open languages, diagnostics, and LSP coverage", Wrap(SystemCommands.cmdShowProjectBrain).run, null);
         try R.register("stats.show", "Stats: Message Bus", "Live view of stem's Vigil-backed message bus stats", Wrap(SystemCommands.cmdShowStats).run, null);
         try R.register("task.list", "Tasks: List Detected", "Show detected project build/test/run commands for the current workspace", Wrap(SystemCommands.cmdProjectTasks).run, null);
@@ -1830,6 +1837,7 @@ pub const Core = struct {
                         // etc.) stays armed and surprises the next
                         // keystroke they make.
                         self.maybeTimeoutLeaderChord();
+                        self.maybeWatchRuntime();
 
                         // Hover and which-key are both user-driven —
                         // the auto-hover idle timer used to fire
@@ -3539,6 +3547,73 @@ pub const Core = struct {
         // away promptly; otherwise it stays on screen until some
         // other event triggers a frame.
         self.requestRender();
+    }
+
+    fn maybeWatchRuntime(self: *Core) void {
+        const now = std.Io.Clock.real.now(self.io).toMilliseconds();
+        if (self.last_watchdog_check_ms != 0 and now - self.last_watchdog_check_ms < self.watchdog_check_interval_ms) return;
+        self.last_watchdog_check_ms = now;
+
+        const health = self.buildRuntimeHealthInput() catch |err| {
+            log.debug("runtime watchdog snapshot failed: {s}", .{@errorName(err)});
+            return;
+        };
+        if (self.runtime_watchdog.observe(health, now)) |toast| {
+            self.setStatusLiteralLeveled(watchdogStatusLevel(toast.severity), toast.message, 3500);
+        }
+    }
+
+    fn buildRuntimeHealthInput(self: *Core) !runtime_watchdog.HealthInput {
+        const plugin_health = self.plugin_manager.healthSnapshot();
+        var lsp_health = try self.lsp_manager.healthSnapshot(self.allocator);
+        defer lsp_health.deinit(self.allocator);
+        var index_health = try self.search_index.healthSnapshot(self.allocator);
+        defer index_health.deinit(self.allocator);
+        var job_summary = try self.job_manager.snapshot(self.allocator);
+        defer job_summary.deinit(self.allocator);
+        const bus_drops = try self.watchdogBusDropTotals();
+
+        return .{
+            .lsp_unhealthy_servers = lsp_health.unhealthy_servers,
+            .plugin_crashes = plugin_health.lifecycle.crashes,
+            .plugin_pending_restarts = plugin_health.pending_restarts,
+            .bus_drops_full = bus_drops.full,
+            .bus_drops_backpressure = bus_drops.backpressure,
+            .bus_drops_rate_limited = bus_drops.rate_limited,
+            .failed_jobs = job_summary.failed,
+            .index_at_capacity = index_health.at_capacity,
+            .has_last_task = self.task_history.last() != null,
+        };
+    }
+
+    const WatchdogBusDropTotals = struct {
+        full: u64 = 0,
+        backpressure: u64 = 0,
+        rate_limited: u64 = 0,
+    };
+
+    fn watchdogBusDropTotals(self: *Core) !WatchdogBusDropTotals {
+        const per_bus = try telemetry.snapshotPerBus(self.allocator);
+        defer {
+            for (per_bus) |bus| self.allocator.free(bus.bus_name);
+            self.allocator.free(per_bus);
+        }
+
+        var totals = WatchdogBusDropTotals{};
+        for (per_bus) |bus| {
+            totals.full += bus.stats.dropped_full;
+            totals.backpressure += bus.stats.dropped_backpressure;
+            totals.rate_limited += bus.stats.dropped_rate_limited;
+        }
+        return totals;
+    }
+
+    fn watchdogStatusLevel(severity: runtime_watchdog.Severity) protocol.StatusLevel {
+        return switch (severity) {
+            .info => .info,
+            .warning => .warning,
+            .err => .err,
+        };
     }
 
     /// the cursor moves, so the highlight follows intent.
