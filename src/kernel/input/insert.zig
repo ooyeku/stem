@@ -51,6 +51,14 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
         return true;
     }
 
+    const is_edit_key =
+        key.matches(vaxis.Key.backspace, .{}) or
+        key.matches(vaxis.Key.delete, .{}) or
+        key.matches(vaxis.Key.enter, .{}) or
+        key.matches(vaxis.Key.tab, .{}) or
+        key.text != null;
+    if (is_edit_key and core.rejectReadOnlyPresentationEdit()) return true;
+
     const s = core.state();
     if (key.matches(vaxis.Key.left, .{})) {
         try s.moveCursorLeftGrapheme();

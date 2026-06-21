@@ -1,7 +1,7 @@
 {
   "name": "plugin_manager",
-  "version": "0.5.0",
-  "description": "Plugin operator dashboard. Shows runtime health, permissions, widgets, denials, and hot-reloads plugins via host imports.",
+  "version": "0.6.0",
+  "description": "Plugin operator dashboard. Shows runtime health, commands, permissions, widgets, denials, storage health, and hot-reloads plugins through the SDK.",
   "runtime": "wasm",
   "entry": "plugin-manager-wasm.wasm",
   "permissions": {
@@ -9,8 +9,10 @@
     "manage_plugins": true
   },
   "commands": [
-    {"id": "plugin-manager.stats", "title": "[Plugin Manager] Dashboard", "description": "Display plugin health, permissions, widgets, and capability denials"},
+    {"id": "plugin-manager.stats", "title": "[Plugin Manager] Dashboard", "description": "Display plugin health, commands, permissions, widgets, and capability denials"},
     {"id": "plugin-manager.json", "title": "[Plugin Manager] Raw JSON", "description": "Open the structured plugin dashboard JSON"},
+    {"id": "plugin-manager.permissions", "title": "[Plugin Manager] Permissions", "description": "Review permission grants and capability denials"},
+    {"id": "plugin-manager.storage", "title": "[Plugin Manager] Storage", "description": "Check plugin-manager persistent storage health"},
     {"id": "plugin-manager.reload_all", "title": "[Plugin Manager] Reload All", "description": "Unload and reload every installed plugin"},
     {"id": "plugin.load", "title": "[Plugin] Load", "description": "Reminder: install plugins via `stem plugin install <path>`"},
     {"id": "plugin.unload", "title": "[Plugin] Unload", "description": "Reminder: remove plugins via `stem plugin remove <name>`"}

@@ -18,6 +18,7 @@ plugins and contributors working on the host-side internals.
 - [Permissions](#permissions)
 - [Restart policy](#restart-policy)
 - [Wasm runtime](#wasm-runtime)
+- [Plugin SDK](#plugin-sdk)
 - [Exec runtime](#exec-runtime)
 - [Plugin CLI](#plugin-cli)
 - [Bundled plugins](#bundled-plugins)
@@ -51,6 +52,8 @@ Each plugin lives in its own directory:
 ```text
 my-plugin/
 ├── plugin.json
+├── src/
+│   └── main.zig
 └── my-plugin.wasm            # runtime: "wasm"
 ```
 
@@ -171,10 +174,11 @@ interpreter and never unwinds through stem.
 | `stem_show_notification` | `(level, ptr, len)` | Show an in-editor status notification. |
 | `stem_open_buffer` | `(name, content)` | Open a virtual buffer in the editor. |
 | `stem_spawn_capture` | `(cmd, out_buf, out_max) → i32` | Run an allow-listed process and copy stdout into wasm memory; gated by `permissions.spawn`. |
+| `stem_spawn_capture2` | `(cmd, cwd, timeout_ms, include_stderr, out_buf) → i32` | Richer spawn call with cwd, timeout, and optional stderr capture. |
 | `stem_subscribe_event` | `(topic) → i32` | Subscribe to editor events; delivered to `handle_event`. |
 | `stem_read_file` / `stem_write_file` | `(path, buffer/content) → i32` | Read or write files allowed by `permissions.filesystem`. |
 | `stem_set_status_item` / `stem_clear_status_item` | `(id, text, alignment, priority)` / `(id)` | Publish or remove a plugin-owned status item. |
-| `stem_set_panel` / `stem_clear_panel` | `(id, title, body, alignment, priority)` / `(id)` | Publish or remove a plugin-owned panel. |
+| `stem_set_panel` / `stem_clear_panel` | `(id, title, body, position, width_percent)` / `(id)` | Publish or remove a plugin-owned panel. |
 | `stem_get_buffer_content` / `stem_get_buffer_path` | `(out_buf, out_max) → i32` | Copy active-buffer content or path into wasm memory. |
 | `stem_get_plugin_dashboard_json` | `(out_buf, out_max) → i32` | Copy structured plugin runtime/permission/widget/denial data as JSON. |
 | `stem_get_plugin_dashboard_report` | `(out_buf, out_max) → i32` | Copy the same dashboard data as a Markdown report. |
@@ -189,42 +193,75 @@ interpreter and never unwinds through stem.
 | `handle_command(id_ptr, id_len)` | Command palette invocation | Manifest-declared commands route here. |
 | `deactivate()` (optional) | Shutdown / unload | Best-effort. |
 
-### Minimal example
+`stem_get_plugin_dashboard_json` / `stem_get_plugin_dashboard_report`
+now include command and keybinding counts along with runtime,
+permissions, widgets, subscriptions, and capability denials.
+
+### SDK example
 
 ```zig
 const std = @import("std");
+const stem = @import("stem");
 
-extern "env" fn stem_log(level: i32, ptr: [*]const u8, len: i32) void;
-extern "env" fn stem_register_command(
-    id_ptr: [*]const u8,
-    id_len: i32,
-    title_ptr: [*]const u8,
-    title_len: i32,
-    desc_ptr: [*]const u8,
-    desc_len: i32,
-) void;
-
-const CMD_ID = "my_plugin.hello";
-const TITLE = "[My Plugin] Hello";
-const DESC = "Log a greeting";
+const CMD = stem.Command{
+    .id = "my_plugin.hello",
+    .title = "[My Plugin] Hello",
+    .description = "Log a greeting",
+};
 
 export fn activate() void {
-    stem_register_command(CMD_ID.ptr, CMD_ID.len, TITLE.ptr, TITLE.len, DESC.ptr, DESC.len);
+    stem.registerCommand(CMD);
+    stem.log(.info, "my_plugin ready");
 }
 
 export fn handle_command(id_ptr: [*]const u8, id_len: i32) void {
-    const id = id_ptr[0..@intCast(id_len)];
-    if (std.mem.eql(u8, id, CMD_ID)) {
-        const msg = "hello from wasm";
-        stem_log(1, msg.ptr, msg.len);
+    const id = stem.fromRaw(id_ptr, id_len);
+    if (std.mem.eql(u8, id, CMD.id)) {
+        stem.notify(.info, "hello from wasm");
     }
 }
 ```
 
-The bundled `echo`, `git`, and `plugin_manager` plugins are the
-current references. The interpreter implements MVP wasm plus the
-bulk-memory `memory.init` / `data.drop` opcodes so plugins can ship
-passive data segments.
+The bundled `sdk_demo` plugin is the broad reference for SDK usage.
+`plugin_manager` also uses the SDK for its dashboard commands. The
+interpreter implements MVP wasm plus the bulk-memory `memory.init` /
+`data.drop` opcodes so plugins can ship passive data segments.
+
+## Plugin SDK
+
+The Zig SDK lives at
+[bundled/plugins/sdk/stem.zig](../bundled/plugins/sdk/stem.zig). It is
+a thin wrapper over the raw wasm ABI, but it gives plugin authors a
+stable import surface:
+
+- exports the `__stem_scratch_addr` / `__stem_scratch_size` buffer the
+  host needs for `handle_command` and `handle_event`;
+- wraps logging, notifications, command registration, virtual buffers,
+  spawn capture, event subscription, filesystem access, status items,
+  panels, active-buffer reads, dashboard reads, plugin storage, and
+  plugin load/unload calls;
+- provides small helpers such as `stem.fromRaw`,
+  `stem.storageReadU32`, and `stem.storageWriteU32`.
+
+Bundled wasm plugins receive the SDK as `@import("stem")` through
+[build.zig](../build.zig). Third-party plugins can copy
+`bundled/plugins/sdk/stem.zig` into their project and add it as a Zig
+module named `stem`, or copy the `sdk_demo` build pattern.
+
+Common SDK calls:
+
+| SDK call | Host capability |
+|---|---|
+| `stem.registerCommand` / `stem.registerCommands` | Palette command registration |
+| `stem.openBuffer` | Virtual report buffer |
+| `stem.spawnCapture` / `stem.spawnCaptureEx` | `permissions.spawn` |
+| `stem.subscribeEvent` | `permissions.events` |
+| `stem.readFile` / `stem.writeFile` | `permissions.filesystem` |
+| `stem.setStatusItem` / `stem.setPanel` | Plugin-owned UI widgets |
+| `stem.activeBufferContent` / `stem.activeBufferPath` | Active editor context |
+| `stem.pluginDashboardReport` / `stem.pluginDashboardJson` | Plugin manager telemetry |
+| `stem.storageRead` / `stem.storageWrite` | Plugin-private persistence |
+| `stem.loadPlugin` / `stem.unloadPlugin` | `permissions.manage_plugins` |
 
 ## Exec runtime
 
@@ -288,7 +325,8 @@ The CLI lives in
 |---|---|---|---|
 | `echo` | wasm | `echo.hello` | Reference wasm plugin; pops a notification |
 | `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` | Uses `stem_spawn_capture` for `git`; live `Git: <branch>` indicator via event subscriptions |
-| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.json`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` | Runtime dashboard with health, permissions, widgets, capability denials, raw JSON, and hot reload |
+| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.json`, `plugin-manager.permissions`, `plugin-manager.storage`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` | SDK-backed runtime dashboard with health, commands, keybindings, permissions, widgets, storage health, capability denials, raw JSON, and hot reload |
+| `sdk_demo` | wasm | `sdk-demo.report`, `sdk-demo.inspect_buffer`, `sdk-demo.toggle_panel` | SDK example covering commands, events, status items, panels, active-buffer reads, dashboard data, and plugin storage |
 
 ---
 

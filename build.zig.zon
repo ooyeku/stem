@@ -1,15 +1,8 @@
 .{
     .name = .stem,
-    .version = "0.10.0",
+    .version = "0.11.0",
     .fingerprint = 0x20bf92e5730ad4ee, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
-    // IMPORTANT: every dependency URL must reference a fixed commit SHA
-    // (git+...#<sha> or .../archive/<sha>.tar.gz). Branch-tip URLs
-    // (refs/heads/main, refs/heads/master) silently fail later because
-    // GitHub regenerates the tarball on every upstream commit, drifting
-    // the SHA-256 away from the recorded `.hash`. Fresh clones then hit
-    // "manifest hash mismatch" while cached clones keep working. To
-    // refresh a dep, get the new SHA and run `zig fetch --save <url>`.
     .dependencies = .{
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis.git#d569f8eb204ed636d902e21ed305581701701adf",
@@ -146,8 +139,13 @@
     },
 
     .paths = .{
+        "README.md",
         "build.zig",
         "build.zig.zon",
+        "bundled",
+        "docs",
+        "install.ps1",
+        "install.sh",
         "src",
     },
 }

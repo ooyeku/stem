@@ -311,6 +311,7 @@ pub fn buildAndSend(core: anytype) !void {
             .modified = buf.state.modified,
             .is_active = i == core.buffer_manager.active_index,
             .is_large = buf.is_large,
+            .presentation = buf.presentation,
         };
     }
 
@@ -624,6 +625,7 @@ pub fn buildAndSend(core: anytype) !void {
                 panes[i] = .{
                     .id = b.pane.id,
                     .buffer_index = b.pane.buffer_index,
+                    .presentation = pane_buffer.presentation,
                     .is_focused = b.pane.id == focused_pane_id,
                     .x = @as(f32, @floatFromInt(b.x)) / @as(f32, @floatFromInt(core.win_size.cols)),
                     .y = @as(f32, @floatFromInt(b.y)) / @as(f32, @floatFromInt(content_rows)),

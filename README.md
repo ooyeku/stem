@@ -88,7 +88,8 @@ when it isn't already there.
 - Inline diagnostics ("error lens") rendered at end-of-line
 - Word-under-cursor highlight after a short idle
 - Integrated terminal mode
-- Manifest-driven plugin system with wasm and exec runtimes
+- Manifest-driven plugin system with wasm/exec runtimes, a Zig SDK,
+  bundled examples, and a plugin-manager dashboard
 - Auto-completion, hover docs, go-to-definition, references,
   diagnostics, and document symbols (via LSP)
 - Jump to next/previous diagnostic (`]d`/`[d`), git hunk (`]g`/`[g`),
@@ -571,10 +572,12 @@ plugins are supported.
 |--------|---------|-------------|
 | `echo` | wasm | Reference plugin: a single command that pops a notification |
 | `git` | wasm | Status / diff / staged-diff plus a live branch indicator |
-| `plugin_manager` | wasm | Plugin dashboard and reload commands |
+| `plugin_manager` | wasm | SDK-backed dashboard, raw JSON, permissions, storage health, and reload commands |
+| `sdk_demo` | wasm | SDK example covering commands, events, status items, panels, active-buffer reads, dashboard data, and plugin storage |
 
 See [docs/plugins.md](docs/plugins.md) for the full author guide
-and host internals.
+and host internals, including the SDK at
+[bundled/plugins/sdk/stem.zig](bundled/plugins/sdk/stem.zig).
 
 ## Troubleshooting
 

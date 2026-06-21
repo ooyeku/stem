@@ -14,6 +14,7 @@ pub const EditCommands = struct {
     }
 
     pub fn cmdEditUndo(core: anytype) anyerror!void {
+        if (core.rejectReadOnlyPresentationEdit()) return;
         const s = core.state();
 
         core.history_manager.flushTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
@@ -57,6 +58,7 @@ pub const EditCommands = struct {
     }
 
     pub fn cmdEditRedo(core: anytype) anyerror!void {
+        if (core.rejectReadOnlyPresentationEdit()) return;
         const s = core.state();
 
         if (core.history_manager.redo()) |txn| {
@@ -121,6 +123,7 @@ pub const EditCommands = struct {
     }
 
     pub fn cmdEditCut(core: anytype) anyerror!void {
+        if (core.rejectReadOnlyPresentationEdit()) return;
         const s = core.state();
 
         const text = try core.getSelectionText() orelse {
@@ -172,6 +175,7 @@ pub const EditCommands = struct {
     }
 
     pub fn cmdEditPaste(core: anytype) anyerror!void {
+        if (core.rejectReadOnlyPresentationEdit()) return;
         if (core.clipboard.items.len == 0) {
             core.setStatusLiteralLeveled(.warning, "Clipboard is empty", 1500);
             try core.sendUpdate();
@@ -194,6 +198,7 @@ pub const EditCommands = struct {
     }
 
     pub fn cmdEditDeleteLine(core: anytype) anyerror!void {
+        if (core.rejectReadOnlyPresentationEdit()) return;
         const s = core.state();
         try s.deleteLine(s.cursor_row);
         const total = s.buffer.lineCount();
@@ -206,6 +211,7 @@ pub const EditCommands = struct {
     }
 
     pub fn cmdEditDuplicateLine(core: anytype) anyerror!void {
+        if (core.rejectReadOnlyPresentationEdit()) return;
         const s = core.state();
         try s.duplicateLine(s.cursor_row);
         core.setStatusLiteral("Duplicated line", 1500);
@@ -214,6 +220,7 @@ pub const EditCommands = struct {
     }
 
     pub fn cmdEditMoveLineUp(core: anytype) anyerror!void {
+        if (core.rejectReadOnlyPresentationEdit()) return;
         const s = core.state();
         if (s.cursor_row > 0) {
             try s.swapAdjacentLines(s.cursor_row, s.cursor_row - 1);
@@ -228,6 +235,7 @@ pub const EditCommands = struct {
     }
 
     pub fn cmdEditMoveLineDown(core: anytype) anyerror!void {
+        if (core.rejectReadOnlyPresentationEdit()) return;
         const s = core.state();
         const total_lines = s.buffer.lineCount();
         if (s.cursor_row + 1 < total_lines) {
@@ -243,6 +251,7 @@ pub const EditCommands = struct {
     }
 
     pub fn cmdEditJoinLines(core: anytype) anyerror!void {
+        if (core.rejectReadOnlyPresentationEdit()) return;
         const s = core.state();
         try s.joinLines(s.cursor_row);
         core.setStatusLiteral("Joined line", 1200);
@@ -251,6 +260,7 @@ pub const EditCommands = struct {
     }
 
     pub fn cmdEditInsertDateTime(core: anytype) anyerror!void {
+        if (core.rejectReadOnlyPresentationEdit()) return;
         const timestamp = std.Io.Clock.real.now(core.io).toSeconds();
         const epoch_secs: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp) };
         const day_seconds = epoch_secs.getDaySeconds();
@@ -274,3 +284,51 @@ pub const EditCommands = struct {
         try core.sendUpdate();
     }
 };
+
+test "delete line command rejects read-only presentation buffers before mutating" {
+    const EditorState = @import("../../core/state.zig").EditorState;
+    const TestIo = @import("../../test_utils.zig").TestIo;
+
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var state_value = try EditorState.init(allocator, io_ctx.io(), "alpha\nbeta\n");
+    defer state_value.deinit();
+
+    const FakeCore = struct {
+        state_ptr: *EditorState,
+        rejected: bool = false,
+        sent_lsp: bool = false,
+        sent_update: bool = false,
+
+        pub fn state(self: *@This()) *EditorState {
+            return self.state_ptr;
+        }
+
+        pub fn rejectReadOnlyPresentationEdit(self: *@This()) bool {
+            self.rejected = true;
+            return true;
+        }
+
+        pub fn setStatusLiteral(_: *@This(), _: []const u8, _: u64) void {}
+
+        pub fn sendLspDocChanged(self: *@This()) !void {
+            self.sent_lsp = true;
+        }
+
+        pub fn sendUpdate(self: *@This()) !void {
+            self.sent_update = true;
+        }
+    };
+
+    var core = FakeCore{ .state_ptr = &state_value };
+    try EditCommands.cmdEditDeleteLine(&core);
+
+    const content = try state_value.buffer.toString(allocator);
+    defer allocator.free(content);
+    try std.testing.expect(core.rejected);
+    try std.testing.expect(!core.sent_lsp);
+    try std.testing.expect(!core.sent_update);
+    try std.testing.expectEqualStrings("alpha\nbeta\n", content);
+}

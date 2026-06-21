@@ -62,6 +62,7 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
     }
 
     if (key.matches(vaxis.Key.delete, .{}) or key.matches(vaxis.Key.backspace, .{})) {
+        if (core.rejectReadOnlyPresentationEdit()) return true;
         const s = core.state();
 
         var start_row: usize = s.cursor_row;
@@ -229,4 +230,61 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
     }
 
     return false;
+}
+
+test "visual delete rejects read-only presentation buffers before mutating" {
+    const EditorState = @import("../../core/state.zig").EditorState;
+    const TestIo = @import("../../test_utils.zig").TestIo;
+
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var state_value = try EditorState.init(allocator, io_ctx.io(), "alpha\nbeta\n");
+    defer state_value.deinit();
+    state_value.selection_anchor = .{ .row = 0, .col = 0 };
+    state_value.cursor_row = 0;
+    state_value.cursor_col = 5;
+
+    const FakeCore = struct {
+        state_ptr: *EditorState,
+        text_object_state: enum {
+            none,
+            inside_pending,
+            around_pending,
+            surround_add_pending,
+        } = .none,
+        mode: enum { visual, select } = .visual,
+        nav_repeat_count: usize = 0,
+        rejected: bool = false,
+        sent_lsp: bool = false,
+        sent_update: bool = false,
+
+        pub fn state(self: *@This()) *EditorState {
+            return self.state_ptr;
+        }
+
+        pub fn rejectReadOnlyPresentationEdit(self: *@This()) bool {
+            self.rejected = true;
+            return true;
+        }
+
+        pub fn sendLspDocChanged(self: *@This()) !void {
+            self.sent_lsp = true;
+        }
+
+        pub fn sendUpdate(self: *@This()) !void {
+            self.sent_update = true;
+        }
+    };
+
+    var core = FakeCore{ .state_ptr = &state_value };
+    try std.testing.expect(try handle(&core, .{ .codepoint = vaxis.Key.delete }));
+
+    const content = try state_value.buffer.toString(allocator);
+    defer allocator.free(content);
+    try std.testing.expect(core.rejected);
+    try std.testing.expect(!core.sent_lsp);
+    try std.testing.expect(!core.sent_update);
+    try std.testing.expectEqualStrings("alpha\nbeta\n", content);
 }

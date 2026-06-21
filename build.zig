@@ -345,19 +345,27 @@ pub fn build(b: *std.Build) void {
     });
 
     const WasmPlugin = struct { name: []const u8, source: []const u8 };
+    const plugin_sdk_mod = b.createModule(.{
+        .root_source_file = b.path("bundled/plugins/sdk/stem.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
     const wasm_plugins = [_]WasmPlugin{
         .{ .name = "echo", .source = "bundled/plugins/echo/src/main.zig" },
         .{ .name = "git-wasm", .source = "bundled/plugins/git-wasm/src/main.zig" },
         .{ .name = "plugin-manager-wasm", .source = "bundled/plugins/plugin-manager-wasm/src/main.zig" },
+        .{ .name = "sdk-demo", .source = "bundled/plugins/sdk-demo/src/main.zig" },
     };
     inline for (wasm_plugins) |wp| {
+        const plugin_root_mod = b.createModule(.{
+            .root_source_file = b.path(wp.source),
+            .target = wasm_target,
+            .optimize = .ReleaseSmall,
+        });
+        plugin_root_mod.addImport("stem", plugin_sdk_mod);
         const exe_wasm = b.addExecutable(.{
             .name = wp.name,
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(wp.source),
-                .target = wasm_target,
-                .optimize = .ReleaseSmall,
-            }),
+            .root_module = plugin_root_mod,
         });
         exe_wasm.entry = .disabled;
         exe_wasm.rdynamic = true;

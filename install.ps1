@@ -71,8 +71,19 @@ try {
     }
 
     $exe = Join-Path $repoRoot "zig-out\bin\stem.exe"
+    $hostExe = Join-Path $repoRoot "zig-out\bin\stem-lsp-host.exe"
+    $zigHostExe = Join-Path $repoRoot "zig-out\bin\stem-lsp-zig.exe"
+    $zigHostNoExt = Join-Path $repoRoot "zig-out\bin\stem-lsp-zig"
     if (-not (Test-Path $exe)) {
         Write-Host "Error: expected $exe after build, not found." -ForegroundColor Red
+        exit 1
+    }
+    if (-not (Test-Path $hostExe)) {
+        Write-Host "Error: expected $hostExe after build, not found." -ForegroundColor Red
+        exit 1
+    }
+    if (-not (Test-Path $zigHostExe) -and -not (Test-Path $zigHostNoExt)) {
+        Write-Host "Error: expected $zigHostExe after build, not found." -ForegroundColor Red
         exit 1
     }
 
@@ -89,9 +100,15 @@ try {
     New-Item -ItemType Directory -Force -Path $userPlugins  | Out-Null
 
     Copy-Item -Force $exe (Join-Path $binDir "stem.exe")
+    Copy-Item -Force $hostExe (Join-Path $binDir "stem-lsp-host.exe")
+    if (Test-Path $zigHostExe) {
+        Copy-Item -Force $zigHostExe (Join-Path $binDir "stem-lsp-zig.exe")
+    } else {
+        Copy-Item -Force $zigHostNoExt (Join-Path $binDir "stem-lsp-zig.exe")
+    }
 
     # ---- Plugins (wasm, ship as <name>/plugin.json + <name>/<name>.wasm) ----
-    $plugins = @("echo", "git-wasm", "plugin-manager-wasm")
+    $plugins = @("echo", "git-wasm", "plugin-manager-wasm", "sdk-demo")
 
     function Install-PluginDir($name, $targetRoot) {
         $src = Join-Path $repoRoot "bundled\plugins\$name"

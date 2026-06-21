@@ -1580,6 +1580,8 @@ pub const PluginManager = struct {
         }
         try w.writeAll("],\"summary\":{");
         try w.print("\"loaded\":{d},", .{self.process_plugins.count() + self.wasm_plugins.count()});
+        try w.print("\"commands\":{d},", .{self.allocated_contexts.items.len});
+        try w.print("\"keybindings\":{d},", .{self.plugin_keybindings.count()});
         try w.print("\"status_items\":{d},", .{self.status_items.count()});
         try w.print("\"panels\":{d},", .{self.panels.count()});
         try w.print("\"denials\":{d}", .{self.capability_denials.count()});
@@ -1605,6 +1607,7 @@ pub const PluginManager = struct {
             self.process_plugins.count(),
         });
         try w.print("- Widgets: {d} status items, {d} panels\n", .{ self.status_items.count(), self.panels.count() });
+        try w.print("- Commands: {d}, keybindings: {d}\n", .{ self.allocated_contexts.items.len, self.plugin_keybindings.count() });
         try w.print("- Capability denials: {d}\n\n", .{self.capability_denials.count()});
 
         if (names.len == 0) {
@@ -1618,6 +1621,10 @@ pub const PluginManager = struct {
             try w.print("## {s}\n", .{name});
             try w.print("- Runtime: {s}\n", .{runtime});
             try w.print("- Restart: {s}\n", .{@tagName(policy)});
+            try w.print("- Commands: {d}, keybindings: {d}\n", .{
+                self.countCommandsFor(name),
+                self.countKeybindingsFor(name),
+            });
             try w.print("- Widgets: {d} status, {d} panels\n", .{
                 self.countStatusItemsFor(name),
                 self.countPanelsFor(name),
@@ -1670,6 +1677,8 @@ pub const PluginManager = struct {
         try jsonrpc.writeJsonStringKey(w, "restart_policy");
         try jsonrpc.writeJsonString(w, @tagName(policy));
         try w.writeByte(',');
+        try w.print("\"commands\":{d},", .{self.countCommandsFor(name)});
+        try w.print("\"keybindings\":{d},", .{self.countKeybindingsFor(name)});
         try w.print("\"status_items\":{d},", .{self.countStatusItemsFor(name)});
         try w.print("\"panels\":{d},", .{self.countPanelsFor(name)});
         try w.print("\"subscriptions\":{d},", .{self.countSubscriptionsFor(name)});
@@ -1728,6 +1737,11 @@ pub const PluginManager = struct {
         while (wasm_it.next()) |name| try appendUniqueName(allocator, &out, name.*);
         var denial_it = self.capability_denials.valueIterator();
         while (denial_it.next()) |d| try appendUniqueName(allocator, &out, d.plugin_id);
+        for (self.allocated_contexts.items) |ctx| {
+            try appendUniqueName(allocator, &out, ctx.plugin_id);
+        }
+        var kb_it = self.plugin_keybindings.valueIterator();
+        while (kb_it.next()) |binding| try appendUniqueName(allocator, &out, binding.plugin_id);
 
         return out.toOwnedSlice(allocator);
     }
@@ -1774,6 +1788,23 @@ pub const PluginManager = struct {
             for (subs.items) |sub| {
                 if (std.mem.eql(u8, sub.plugin_id, plugin_id)) n += 1;
             }
+        }
+        return n;
+    }
+
+    fn countCommandsFor(self: *PluginManager, plugin_id: []const u8) usize {
+        var n: usize = 0;
+        for (self.allocated_contexts.items) |ctx| {
+            if (std.mem.eql(u8, ctx.plugin_id, plugin_id)) n += 1;
+        }
+        return n;
+    }
+
+    fn countKeybindingsFor(self: *PluginManager, plugin_id: []const u8) usize {
+        var n: usize = 0;
+        var it = self.plugin_keybindings.valueIterator();
+        while (it.next()) |binding| {
+            if (std.mem.eql(u8, binding.plugin_id, plugin_id)) n += 1;
         }
         return n;
     }
@@ -3063,6 +3094,13 @@ test "PluginManager dashboard report surfaces permissions widgets and denials" {
         .filesystem = &.{"read:."},
     });
     try manager.installRestartPolicy("git", .on_crash);
+    try manager.registerManifestCommand("git", .wasm, .{
+        .id = "git.status",
+        .title = "[Git] Status",
+        .description = "Show repository status",
+        .keybinding = "Space g s",
+    });
+    defer manager.cleanupPluginResources("git");
     try manager.upsertStatusItem("git", "branch", "Git: main*", 2, 10);
     try manager.upsertPanel("git", "summary", "Git", "dirty files: 2", 1, 30);
     manager.recordCapabilityDenied("git", .spawn, "curl");
@@ -3072,6 +3110,8 @@ test "PluginManager dashboard report surfaces permissions widgets and denials" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"git\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"runtime\":\"none\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"restart_policy\":\"on_crash\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"commands\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"keybindings\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"status_items\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"panels\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"denials\":1") != null);
@@ -3080,6 +3120,8 @@ test "PluginManager dashboard report surfaces permissions widgets and denials" {
     defer allocator.free(report);
     try std.testing.expect(std.mem.indexOf(u8, report, "Plugin Dashboard") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "git") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "Commands: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, report, "keybindings: 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "spawn: git") != null);
     try std.testing.expect(std.mem.indexOf(u8, report, "denied spawn curl") != null);
 }

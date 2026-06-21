@@ -5,7 +5,7 @@ const TabBar = @import("tab_bar.zig").TabBar;
 const FilePicker = @import("file_picker.zig").FilePicker;
 const BufferPicker = @import("buffer_picker.zig").BufferPicker;
 const LogView = @import("log_view.zig").LogView;
-const HelpView = @import("help_view.zig").HelpView;
+const MarkdownView = @import("markdown_view.zig").MarkdownView;
 const protocol = @import("../kernel/protocol.zig");
 const theme = @import("theme.zig");
 const width_utils = @import("width.zig");
@@ -506,13 +506,13 @@ pub const HighlightFallback = struct {
 pub const View = struct {
     allocator: std.mem.Allocator,
     status_bar: StatusBar,
-    help_view: HelpView,
+    markdown_view: MarkdownView,
 
     pub fn init(allocator: std.mem.Allocator) View {
         return .{
             .allocator = allocator,
             .status_bar = StatusBar.init(allocator),
-            .help_view = HelpView.init(allocator),
+            .markdown_view = MarkdownView.init(allocator),
         };
     }
 
@@ -784,34 +784,29 @@ pub const View = struct {
             try self.drawTerminalOutput(terminal_area, snapshot, frame_allocator);
         }
 
-        const is_help_buffer = blk: {
+        const active_buffer_info = blk: {
             if (snapshot.active_buffer_index < snapshot.buffers.len) {
-                const buf_name = snapshot.buffers[snapshot.active_buffer_index].name;
-                break :blk std.mem.eql(u8, buf_name, "[HELP]") or
-                    std.mem.eql(u8, buf_name, "[PLUGINS]") or
-                    std.mem.eql(u8, buf_name, "[Plugin Stats]") or
-                    std.mem.eql(u8, buf_name, "[Git Status]") or
-                    std.mem.eql(u8, buf_name, "[Git Diff]") or
-                    std.mem.eql(u8, buf_name, "[Git Diff Staged]") or
-                    std.mem.eql(u8, buf_name, "[References]");
+                break :blk &snapshot.buffers[snapshot.active_buffer_index];
             }
-            break :blk false;
+            break :blk null;
         };
 
-        if (is_help_buffer) {
-            self.help_view.draw(text_area, snapshot.visible_lines, snapshot.scroll_offset) catch {};
-            const help_status_area = win.child(.{
-                .y_off = win.height - 1,
-                .height = status_height,
-            });
-            try self.status_bar.draw(help_status_area, snapshot, frame_allocator);
-            return;
+        if (active_buffer_info) |info| {
+            if (info.presentation == .markdown_view) {
+                self.markdown_view.draw(text_area, snapshot.visible_lines, snapshot.scroll_offset) catch {};
+                self.drawScrollbar(text_area, snapshot.total_lines, text_area.height, snapshot.scroll_offset);
+                const presentation_status_area = win.child(.{
+                    .y_off = win.height - 1,
+                    .height = status_height,
+                });
+                try self.status_bar.draw(presentation_status_area, snapshot, frame_allocator);
+                return;
+            }
         }
 
         const is_logs_buffer = blk: {
-            if (snapshot.active_buffer_index < snapshot.buffers.len) {
-                const buf_name = snapshot.buffers[snapshot.active_buffer_index].name;
-                break :blk std.mem.eql(u8, buf_name, "[LOGS]");
+            if (active_buffer_info) |info| {
+                break :blk std.mem.eql(u8, info.name, "[LOGS]");
             }
             break :blk false;
         };
@@ -1349,13 +1344,6 @@ pub const View = struct {
             }
         }
 
-        const is_help_buffer = std.mem.eql(u8, buf_name, "[HELP]") or
-            std.mem.eql(u8, buf_name, "[PLUGINS]") or
-            std.mem.eql(u8, buf_name, "[Plugin Stats]") or
-            std.mem.eql(u8, buf_name, "[Git Status]") or
-            std.mem.eql(u8, buf_name, "[Git Diff]") or
-            std.mem.eql(u8, buf_name, "[Git Diff Staged]");
-
         const is_logs_buffer = std.mem.eql(u8, buf_name, "[LOGS]");
 
         const content_area = win.child(.{
@@ -1363,8 +1351,8 @@ pub const View = struct {
             .height = if (win.height > 1) win.height - 1 else 1,
         });
 
-        if (is_help_buffer and pane.visible_lines.len > 0) {
-            self.help_view.draw(content_area, pane.visible_lines, pane.scroll_offset) catch {};
+        if (pane.presentation == .markdown_view) {
+            self.markdown_view.draw(content_area, pane.visible_lines, pane.scroll_offset) catch {};
             return;
         }
 

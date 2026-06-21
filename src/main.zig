@@ -914,3 +914,19 @@ test "UI-requested quit does not wait on terminal input reader" {
     try std.testing.expect(!plan.join_input_thread);
     try std.testing.expect(plan.exit_process_directly);
 }
+
+test "UserQuit input errors request UI shutdown" {
+    const core_mod = @import("kernel/core.zig");
+    const FakeCore = struct {
+        sent_quit: bool = false,
+
+        pub fn sendQuitToUI(self: *@This()) !void {
+            self.sent_quit = true;
+        }
+    };
+
+    var fake = FakeCore{};
+    try std.testing.expect(try core_mod.handleUserQuitInputError(&fake, error.UserQuit));
+    try std.testing.expect(fake.sent_quit);
+    try std.testing.expectError(error.AccessDenied, core_mod.handleUserQuitInputError(&fake, error.AccessDenied));
+}

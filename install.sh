@@ -97,14 +97,18 @@ echo "Installing bundled plugins to $PLUGIN_DIR"
 
 $SUDO mkdir -p "$BIN_DIR" "$PLUGIN_DIR"
 $SUDO cp zig-out/bin/stem "$BIN_DIR/stem"
-$SUDO chmod +x "$BIN_DIR/stem"
+$SUDO cp zig-out/bin/stem-lsp-host "$BIN_DIR/stem-lsp-host"
+$SUDO cp zig-out/bin/stem-lsp-zig "$BIN_DIR/stem-lsp-zig"
+$SUDO chmod +x "$BIN_DIR/stem" "$BIN_DIR/stem-lsp-host" "$BIN_DIR/stem-lsp-zig"
 
 # On macOS the kernel sometimes SIGKILLs a freshly-`cp`'d binary
 # whose embedded adhoc signature got invalidated by the copy. Re-
 # signing in place repairs the signature against the new on-disk
 # location. Harmless no-op on other platforms (codesign absent).
 if command -v codesign >/dev/null 2>&1; then
-    $SUDO codesign --force -s - "$BIN_DIR/stem" >/dev/null 2>&1 || true
+    for bin in stem stem-lsp-host stem-lsp-zig; do
+        $SUDO codesign --force -s - "$BIN_DIR/$bin" >/dev/null 2>&1 || true
+    done
 fi
 
 # ===== Bundled plugin install =====
@@ -155,8 +159,8 @@ install_plugin_dir() {
 USER_PLUGIN_DIR="$HOME/.stem/plugins"
 mkdir -p "$USER_PLUGIN_DIR"
 
-# Wasm bundled plugins: echo, git, plugin-manager.
-WASM_PLUGINS="echo git-wasm plugin-manager-wasm"
+# Wasm bundled plugins: echo, git, plugin-manager, sdk demo.
+WASM_PLUGINS="echo git-wasm plugin-manager-wasm sdk-demo"
 
 echo "Installing bundled wasm plugins to $PLUGIN_DIR/"
 for name in $WASM_PLUGINS; do

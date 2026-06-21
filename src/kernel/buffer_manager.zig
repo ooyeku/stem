@@ -1,6 +1,7 @@
 const std = @import("std");
 const EditorState = @import("../core/state.zig").EditorState;
 const PieceTable = @import("../core/piece_table.zig").PieceTable;
+const protocol = @import("protocol.zig");
 
 const test_utils = @import("../test_utils.zig");
 const TestIo = @import("../test_utils.zig").TestIo;
@@ -24,6 +25,10 @@ pub const Buffer = struct {
     /// buffer: tree-sitter, brackets, LSP and auto-pair are all
     /// skipped. Editing a 5 MB log shouldn't choke the editor.
     is_large: bool = false,
+    /// Rendering surface for the buffer. Disk-backed buffers remain
+    /// editable text; virtual report buffers may render as polished
+    /// presentation views.
+    presentation: protocol.BufferPresentation = .text,
     /// True if the user asked to force-load (e.g. by re-trying past
     /// the soft threshold). Lets the status bar distinguish "auto-
     /// degraded" from "user-overrode".
@@ -42,6 +47,10 @@ pub const Buffer = struct {
         row: usize,
         col: usize,
     };
+
+    pub fn isPresentationReadOnly(self: *const Buffer) bool {
+        return self.presentation == .markdown_view;
+    }
 
     pub fn deinit(self: *Buffer, allocator: std.mem.Allocator) void {
         self.state.deinit();
@@ -83,6 +92,118 @@ pub fn classifyContent(content: []const u8, threshold_bytes: usize, threshold_li
         }
     }
     return .{ .is_large = false };
+}
+
+pub fn classifyVirtualPresentation(name: []const u8, content: []const u8) protocol.BufferPresentation {
+    if (std.mem.eql(u8, name, "[LOGS]")) return .text;
+    if (isGeneratedReportBufferName(name)) return .markdown_view;
+
+    var score: usize = 0;
+    var heading_count: usize = 0;
+    var list_count: usize = 0;
+    var table_count: usize = 0;
+    var line_iter = std.mem.splitScalar(u8, content, '\n');
+    var scanned: usize = 0;
+
+    while (line_iter.next()) |line| {
+        if (scanned >= 96) break;
+        scanned += 1;
+
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+
+        if (std.mem.startsWith(u8, trimmed, "# ") or
+            std.mem.startsWith(u8, trimmed, "## ") or
+            std.mem.startsWith(u8, trimmed, "### "))
+        {
+            heading_count += 1;
+            score += 4;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, trimmed, "diff --git") or
+            std.mem.startsWith(u8, trimmed, "@@"))
+        {
+            score += 4;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, trimmed, "```")) {
+            score += 3;
+            continue;
+        }
+
+        if (std.mem.eql(u8, trimmed, "---") or
+            std.mem.eql(u8, trimmed, "***") or
+            std.mem.eql(u8, trimmed, "___"))
+        {
+            score += 2;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, trimmed, "- ") or
+            std.mem.startsWith(u8, trimmed, "* "))
+        {
+            list_count += 1;
+            score += 1;
+            continue;
+        }
+
+        if (trimmed.len >= 3 and trimmed[0] == '|' and trimmed[trimmed.len - 1] == '|') {
+            table_count += 1;
+            score += 2;
+            continue;
+        }
+
+        if (std.mem.indexOfScalar(u8, trimmed, '`') != null) {
+            score += 1;
+        }
+    }
+
+    if (heading_count > 0) return .markdown_view;
+    if (table_count >= 2) return .markdown_view;
+    if (list_count >= 3) return .markdown_view;
+    return if (score >= 4) .markdown_view else .text;
+}
+
+pub fn isGeneratedReportBufferName(name: []const u8) bool {
+    const exact = [_][]const u8{
+        "[HELP]",
+        "[PLUGINS]",
+        "[Plugins]",
+        "[Plugin Stats]",
+        "[Git Status]",
+        "[Git Diff]",
+        "[Git Diff Staged]",
+        "[Plugin Manager]",
+        "[Plugin Permissions]",
+        "[Plugin Storage]",
+        "[Plugin Load]",
+        "[Plugin Unload]",
+        "[Plugin Reload]",
+        "[STATS]",
+        "[CONTROL CENTER]",
+        "[PROJECT BRAIN]",
+        "[TASKS]",
+        "[TASK OUTPUT]",
+        "[Jobs]",
+        "[LSP Status]",
+        "[Diagnostics]",
+        "[References]",
+        "[Bookmarks]",
+        "[Recovery Backups]",
+        "[Build]",
+        "[Zig Build]",
+        "[Zig Test]",
+        "[Zig Run]",
+        "[Error]",
+    };
+
+    for (exact) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+
+    return false;
 }
 
 pub const BufferManager = struct {
@@ -332,6 +453,7 @@ pub const BufferManager = struct {
     }
 
     pub fn openVirtual(self: *BufferManager, name: []const u8, content: []const u8) !void {
+        const presentation = classifyVirtualPresentation(name, content);
         for (self.buffers.items, 0..) |*buf, i| {
             if (std.mem.eql(u8, buf.name, name)) {
                 const cursor_row = buf.state.cursor_row;
@@ -347,6 +469,7 @@ pub const BufferManager = struct {
                 buf.state.cursor_row = @min(cursor_row, max_row);
                 buf.state.cursor_col = @min(cursor_col, buf.state.getLineLength(buf.state.cursor_row));
                 buf.state.scroll_offset = @min(scroll_offset, max_row);
+                buf.presentation = presentation;
                 buf.opened_from = opened_from;
                 self.active_index = i;
                 return;
@@ -365,6 +488,7 @@ pub const BufferManager = struct {
             .state = state,
             .name = buf_name,
             .file_path = null,
+            .presentation = presentation,
         };
 
         try self.buffers.append(self.allocator, buffer);
@@ -620,6 +744,114 @@ test "buffer manager open virtual update preserves viewport state" {
     try std.testing.expectEqual(@as(usize, 3), buf.state.cursor_row);
     try std.testing.expectEqual(@as(usize, 2), buf.state.cursor_col);
     try std.testing.expectEqual(@as(usize, 2), buf.state.scroll_offset);
+}
+
+test "buffer manager marks markdown virtual buffers for presentation rendering" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var mgr = BufferManager.init(allocator, io);
+    defer mgr.deinit();
+
+    try mgr.openVirtual("[Plugin Manager]", "# Plugin Manager\n\n- Loaded: 4\n");
+
+    const buf = mgr.getActive();
+    try std.testing.expectEqual(.markdown_view, buf.presentation);
+    try std.testing.expect(buf.isPresentationReadOnly());
+}
+
+test "buffer manager keeps plain virtual buffers as editable-style text presentation" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var mgr = BufferManager.init(allocator, io);
+    defer mgr.deinit();
+
+    try mgr.openVirtual("[RAW]", "plain output\nwithout markdown markers\n");
+
+    const buf = mgr.getActive();
+    try std.testing.expectEqual(.text, buf.presentation);
+    try std.testing.expect(!buf.isPresentationReadOnly());
+}
+
+test "buffer manager treats diff virtual buffers as presentation rendering" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var mgr = BufferManager.init(allocator, io);
+    defer mgr.deinit();
+
+    try mgr.openVirtual("[Git Diff]", "diff --git a/src/main.zig b/src/main.zig\n@@ -1 +1 @@\n-old\n+new\n");
+
+    const buf = mgr.getActive();
+    try std.testing.expectEqual(.markdown_view, buf.presentation);
+}
+
+test "buffer manager refreshes virtual presentation on update" {
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+    const io = io_ctx.io();
+    var mgr = BufferManager.init(allocator, io);
+    defer mgr.deinit();
+
+    try mgr.openVirtual("[Report]", "plain output\n");
+    try std.testing.expectEqual(.text, mgr.getActive().presentation);
+
+    try mgr.openVirtual("[Report]", "# Report\n\n- Ready: yes\n");
+    try std.testing.expectEqual(.markdown_view, mgr.getActive().presentation);
+}
+
+test "buffer manager marks every known generated report buffer as presentation" {
+    const Case = struct {
+        name: []const u8,
+        content: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .name = "[HELP]", .content = "Stem help text\n\nUse Space for commands.\n" },
+        .{ .name = "[PLUGINS]", .content = "Plugin Manager\nLoaded plugins: 4\n" },
+        .{ .name = "[Plugins]", .content = "Plugin inspection\nRuntime: wasm\n" },
+        .{ .name = "[Git Status]", .content = "On branch main\nStaged: 0   Unstaged: 0   Untracked: 0\nWorking tree clean.\n" },
+        .{ .name = "[Git Diff]", .content = "No unstaged changes.\n" },
+        .{ .name = "[Git Diff Staged]", .content = "No staged changes.\n" },
+        .{ .name = "[Plugin Manager]", .content = "Plugin Manager dashboard unavailable.\n" },
+        .{ .name = "[Plugin Permissions]", .content = "Permission dashboard unavailable.\n" },
+        .{ .name = "[Plugin Storage]", .content = "plugin_manager storage:\ndashboard.opens: 1\n" },
+        .{ .name = "[Plugin Load]", .content = "Plugin loading is managed through the stem plugin CLI.\n" },
+        .{ .name = "[Plugin Unload]", .content = "Plugin removal instructions.\n" },
+        .{ .name = "[Plugin Reload]", .content = "Reloading installed plugins...\n" },
+        .{ .name = "[STATS]", .content = "Vigil\nTelemetry bridge: initialized\n" },
+        .{ .name = "[CONTROL CENTER]", .content = "Control Center\nBuild status: idle\n" },
+        .{ .name = "[PROJECT BRAIN]", .content = "Project Brain\nWorkspace: stem\n" },
+        .{ .name = "[TASKS]", .content = "Project Tasks\nzig.build zig build build.zig\n" },
+        .{ .name = "[TASK OUTPUT]", .content = "Task Output\nStarted background task #1.\n" },
+        .{ .name = "[Jobs]", .content = "Background Jobs\nActive: 0\n" },
+        .{ .name = "[LSP Status]", .content = "LSP Status\nServers: 2 running\n" },
+        .{ .name = "[Diagnostics]", .content = "=== Diagnostics ===\n\nLn 4: [WARN] unused local\n" },
+        .{ .name = "[References]", .content = "Symbol: WorkerState\nLn 12: pub const WorkerState\n" },
+        .{ .name = "[Bookmarks]", .content = "Bookmarks\nSlot  Line   File\n" },
+        .{ .name = "[Recovery Backups]", .content = "Recovery backups in /tmp\n(no backups present)\n" },
+        .{ .name = "[Build]", .content = "Could not find build.zig in any parent directory.\n" },
+        .{ .name = "[Zig Build]", .content = "BUILD SUCCESSFUL\nDuration: 10ms\n" },
+        .{ .name = "[Zig Test]", .content = "ALL TESTS PASSED\nDuration: 10ms\n" },
+        .{ .name = "[Zig Run]", .content = "RUN COMPLETED\nDuration: 10ms\n" },
+        .{ .name = "[Error]", .content = "Reload failed: FileNotFound\n" },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(.markdown_view, classifyVirtualPresentation(case.name, case.content));
+    }
+}
+
+test "buffer manager keeps document-like virtual buffers editable text" {
+    try std.testing.expectEqual(.text, classifyVirtualPresentation("[Scratch]", ""));
+    try std.testing.expectEqual(.text, classifyVirtualPresentation("Scratch-2", ""));
+    try std.testing.expectEqual(.text, classifyVirtualPresentation("[HEAD] main.zig", "const std = @import(\"std\");\n"));
+    try std.testing.expectEqual(.text, classifyVirtualPresentation("[Plugin JSON]", "{\"loaded\":true}\n"));
+    try std.testing.expectEqual(.text, classifyVirtualPresentation("plain-buffer", "plain output\n"));
 }
 
 test "buffer manager switch to buffer" {

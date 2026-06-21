@@ -798,8 +798,11 @@ graph TB
   with `(ptr, len)` host imports; exec plugins run as child
   processes communicating over framed JSON-RPC on stdio.
 - **Permissions.** Manifest declarations gate the wired capabilities
-  (`spawn`, `events`, `manage_plugins`). Missing entries default to
-  deny.
+  (`spawn`, `events`, `filesystem`, `manage_plugins`). Missing
+  entries default to deny.
+- **SDK.** Bundled wasm plugins can import `@import("stem")`, which
+  wraps host imports for commands, buffers, widgets, storage, events,
+  dashboard data, and plugin lifecycle actions.
 - **Restart policy.** Exec plugins can opt into automatic restart on
   crash with a 1 s → 5 s → 30 s backoff. Restarts run on the core
   tick so spawns never originate from a reader thread that's still
@@ -811,7 +814,8 @@ graph TB
 |---|---|---|
 | `echo` | wasm | `echo.hello` |
 | `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` |
-| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.json`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` |
+| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.json`, `plugin-manager.permissions`, `plugin-manager.storage`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` |
+| `sdk_demo` | wasm | `sdk-demo.report`, `sdk-demo.inspect_buffer`, `sdk-demo.toggle_panel` |
 
 ### Operator CLI
 

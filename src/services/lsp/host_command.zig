@@ -9,8 +9,21 @@ pub fn hostPathFromExePath(
     exe_path: []const u8,
     host_basename: []const u8,
 ) ![]u8 {
-    const dir = std.fs.path.dirname(exe_path) orelse ".";
-    return try std.fs.path.join(allocator, &.{ dir, host_basename });
+    const basename = if (std.mem.endsWith(u8, exe_path, ".exe") and !std.mem.endsWith(u8, host_basename, ".exe"))
+        try std.fmt.allocPrint(allocator, "{s}.exe", .{host_basename})
+    else
+        try allocator.dupe(u8, host_basename);
+    defer allocator.free(basename);
+
+    if (std.mem.lastIndexOfAny(u8, exe_path, "/\\")) |sep_index| {
+        return try std.fmt.allocPrint(
+            allocator,
+            "{s}{s}",
+            .{ exe_path[0 .. sep_index + 1], basename },
+        );
+    }
+
+    return try std.fs.path.join(allocator, &.{ ".", basename });
 }
 
 pub fn hostPathFromCurrentExe(
@@ -74,6 +87,13 @@ test "host path is derived from the running stem binary directory" {
     defer std.testing.allocator.free(actual);
 
     try std.testing.expectEqualStrings("/opt/stem/bin/stem-lsp-host", actual);
+}
+
+test "host path preserves windows separator style from the executable path" {
+    const actual = try hostPathFromExePath(std.testing.allocator, "C:\\stem\\bin\\stem.exe", "stem-lsp-host");
+    defer std.testing.allocator.free(actual);
+
+    try std.testing.expectEqualStrings("C:\\stem\\bin\\stem-lsp-host.exe", actual);
 }
 
 test "external host argv wraps the real LSP command after separator" {

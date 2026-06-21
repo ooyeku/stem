@@ -159,6 +159,13 @@ pub const PluginInfo = struct {
     is_running: bool,
 };
 
+pub const BufferPresentation = enum(u8) {
+    /// Normal editable text buffer: draw line numbers, cursor, syntax, etc.
+    text = 0,
+    /// Read-only report/dashboard content authored as markdown.
+    markdown_view = 1,
+};
+
 pub const BufferInfo = struct {
     id: u32,
     name: []const u8,
@@ -168,6 +175,7 @@ pub const BufferInfo = struct {
     /// thresholds at load time. Tabs render a `[L]` badge so the user
     /// knows tree-sitter / LSP / brackets are intentionally off.
     is_large: bool = false,
+    presentation: BufferPresentation = .text,
 };
 
 pub const LogEntry = struct {
@@ -344,6 +352,7 @@ pub const EditorConfigSnapshot = struct {
 pub const PaneSnapshot = struct {
     id: u32,
     buffer_index: usize,
+    presentation: BufferPresentation = .text,
     is_focused: bool,
     x: f32,
     y: f32,
@@ -2112,6 +2121,7 @@ test "buffer info struct" {
     try std.testing.expectEqual(@as(u32, 1), info.id);
     try std.testing.expect(info.modified);
     try std.testing.expect(!info.is_active);
+    try std.testing.expectEqual(BufferPresentation.text, info.presentation);
 }
 
 test "completion entry struct" {
@@ -2144,6 +2154,7 @@ test "pane snapshot struct" {
     };
     try std.testing.expect(pane.is_focused);
     try std.testing.expectEqual(@as(f32, 0.5), pane.width);
+    try std.testing.expectEqual(BufferPresentation.text, pane.presentation);
 }
 
 test "syntax token struct" {

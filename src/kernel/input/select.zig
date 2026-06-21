@@ -599,6 +599,7 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
         return true;
     }
     if (key.matches(Keys.mode_insert, .{})) {
+        if (core.rejectReadOnlyPresentationEdit()) return true;
         core.mode = .insert;
         return true;
     }

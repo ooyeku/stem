@@ -1,9 +1,13 @@
 //! Plugin manager (wasm runtime).
 //!
-//! Four commands:
+//! Seven commands:
 //!
 //!   - `plugin-manager.stats`     — render the structured host
 //!                                   plugin dashboard in a buffer.
+//!   - `plugin-manager.json`      — open the dashboard JSON payload.
+//!   - `plugin-manager.permissions` — focus the dashboard on grants
+//!                                     and capability denials.
+//!   - `plugin-manager.storage`   — check persistent storage health.
 //!   - `plugin-manager.reload_all` — unload + reload every installed plugin
 //!                                   without restarting the editor.
 //!   - `plugin.load`              — show CLI install hint (wasm has no
@@ -20,71 +24,29 @@
 //! buffer rather than aborting the sweep.
 
 const std = @import("std");
-
-extern "env" fn stem_log(level: i32, msg_ptr: [*]const u8, msg_len: i32) void;
-extern "env" fn stem_register_command(
-    id_ptr: [*]const u8,
-    id_len: i32,
-    title_ptr: [*]const u8,
-    title_len: i32,
-    desc_ptr: [*]const u8,
-    desc_len: i32,
-) void;
-extern "env" fn stem_open_buffer(
-    name_ptr: [*]const u8,
-    name_len: i32,
-    content_ptr: [*]const u8,
-    content_len: i32,
-) void;
-extern "env" fn stem_spawn_capture(
-    cmd_ptr: [*]const u8,
-    cmd_len: i32,
-    out_ptr: [*]u8,
-    out_max: i32,
-) i32;
-extern "env" fn stem_get_plugin_dashboard_report(out_ptr: [*]u8, out_max: i32) i32;
-extern "env" fn stem_get_plugin_dashboard_json(out_ptr: [*]u8, out_max: i32) i32;
-extern "env" fn stem_storage_read(
-    key_ptr: [*]const u8,
-    key_len: i32,
-    out_ptr: [*]u8,
-    out_max: i32,
-) i32;
-extern "env" fn stem_storage_write(
-    key_ptr: [*]const u8,
-    key_len: i32,
-    content_ptr: [*]const u8,
-    content_len: i32,
-) i32;
-extern "env" fn stem_load_plugin(name_ptr: [*]const u8, name_len: i32) i32;
-extern "env" fn stem_unload_plugin(name_ptr: [*]const u8, name_len: i32) i32;
+const stem = @import("stem");
+const list_parser = @import("list_parser.zig");
 
 var scratch: [256 * 1024]u8 = undefined;
 var report_buf: [256 * 1024]u8 = undefined;
 var report_len: usize = 0;
 
-// Host-dispatch scratch region — see echo-wasm for the protocol.
-var stem_scratch: [4096]u8 = undefined;
-export fn __stem_scratch_addr() i32 {
-    return @intCast(@intFromPtr(&stem_scratch));
-}
-export fn __stem_scratch_size() i32 {
-    return @intCast(stem_scratch.len);
-}
-
 const CMD_STATS = "plugin-manager.stats";
 const CMD_JSON = "plugin-manager.json";
+const CMD_PERMISSIONS = "plugin-manager.permissions";
+const CMD_STORAGE = "plugin-manager.storage";
 const CMD_RELOAD = "plugin-manager.reload_all";
 const CMD_LOAD = "plugin.load";
 const CMD_UNLOAD = "plugin.unload";
 
-const Cmd = struct { id: []const u8, title: []const u8, desc: []const u8 };
-const COMMANDS = [_]Cmd{
-    .{ .id = CMD_STATS, .title = "[Plugin Manager] Dashboard", .desc = "Display plugin health, permissions, widgets, and denials" },
-    .{ .id = CMD_JSON, .title = "[Plugin Manager] Raw JSON", .desc = "Open the structured plugin dashboard JSON" },
-    .{ .id = CMD_RELOAD, .title = "[Plugin Manager] Reload All", .desc = "Unload and reload every installed plugin" },
-    .{ .id = CMD_LOAD, .title = "[Plugin] Load", .desc = "Reminder: install plugins via `stem plugin install <path>`" },
-    .{ .id = CMD_UNLOAD, .title = "[Plugin] Unload", .desc = "Reminder: remove plugins via `stem plugin remove <name>`" },
+const COMMANDS = [_]stem.Command{
+    .{ .id = CMD_STATS, .title = "[Plugin Manager] Dashboard", .description = "Display plugin health, commands, permissions, widgets, and denials" },
+    .{ .id = CMD_JSON, .title = "[Plugin Manager] Raw JSON", .description = "Open the structured plugin dashboard JSON" },
+    .{ .id = CMD_PERMISSIONS, .title = "[Plugin Manager] Permissions", .description = "Review permission grants and capability denials" },
+    .{ .id = CMD_STORAGE, .title = "[Plugin Manager] Storage", .description = "Check plugin-manager persistent storage health" },
+    .{ .id = CMD_RELOAD, .title = "[Plugin Manager] Reload All", .description = "Unload and reload every installed plugin" },
+    .{ .id = CMD_LOAD, .title = "[Plugin] Load", .description = "Reminder: install plugins via `stem plugin install <path>`" },
+    .{ .id = CMD_UNLOAD, .title = "[Plugin] Unload", .description = "Reminder: remove plugins via `stem plugin remove <name>`" },
 };
 
 const LOAD_HINT =
@@ -109,22 +71,12 @@ const UNLOAD_HINT =
 ;
 
 export fn activate() void {
-    inline for (COMMANDS) |c| {
-        stem_register_command(
-            c.id.ptr,
-            c.id.len,
-            c.title.ptr,
-            c.title.len,
-            c.desc.ptr,
-            c.desc.len,
-        );
-    }
-    const ready = "plugin_manager plugin (wasm): ready";
-    stem_log(1, ready.ptr, ready.len);
+    stem.registerCommands(COMMANDS);
+    stem.log(.info, "plugin_manager plugin (wasm): ready");
 }
 
 export fn handle_command(id_ptr: [*]const u8, id_len: i32) void {
-    const id = id_ptr[0..@intCast(id_len)];
+    const id = stem.fromRaw(id_ptr, id_len);
 
     if (std.mem.eql(u8, id, CMD_STATS)) {
         runStats();
@@ -134,101 +86,100 @@ export fn handle_command(id_ptr: [*]const u8, id_len: i32) void {
         runJson();
         return;
     }
+    if (std.mem.eql(u8, id, CMD_PERMISSIONS)) {
+        runPermissions();
+        return;
+    }
+    if (std.mem.eql(u8, id, CMD_STORAGE)) {
+        runStorage();
+        return;
+    }
     if (std.mem.eql(u8, id, CMD_RELOAD)) {
         runReloadAll();
         return;
     }
     if (std.mem.eql(u8, id, CMD_LOAD)) {
-        stem_open_buffer(
-            "[Plugin Load]".ptr,
-            "[Plugin Load]".len,
-            LOAD_HINT.ptr,
-            LOAD_HINT.len,
-        );
+        stem.openBuffer("[Plugin Load]", LOAD_HINT);
         return;
     }
     if (std.mem.eql(u8, id, CMD_UNLOAD)) {
-        stem_open_buffer(
-            "[Plugin Unload]".ptr,
-            "[Plugin Unload]".len,
-            UNLOAD_HINT.ptr,
-            UNLOAD_HINT.len,
-        );
+        stem.openBuffer("[Plugin Unload]", UNLOAD_HINT);
         return;
     }
 }
 
 fn runStats() void {
-    const written = stem_get_plugin_dashboard_report(&scratch, @intCast(scratch.len));
+    const written = stem.pluginDashboardReport(&scratch);
     if (written <= 0) {
         const fallback = "Plugin dashboard unavailable from host. Run `stem plugin list` from your shell to see installed plugins.";
-        stem_open_buffer(
-            "[Plugin Manager]".ptr,
-            "[Plugin Manager]".len,
-            fallback.ptr,
-            @intCast(fallback.len),
-        );
+        stem.openBuffer("[Plugin Manager]", fallback);
         return;
     }
 
     const opens = incrementDashboardOpenCount();
     report_len = 0;
+    appendReport("# Plugin Manager v2\n\n");
+    appendReport("Actions: Dashboard, Permissions, Storage, Raw JSON, Reload All.\n\n");
     appendReport(scratch[0..@intCast(written)]);
     appendReport("\n---\n");
     var tail: [96]u8 = undefined;
     const tail_msg = std.fmt.bufPrint(&tail, "Dashboard opened {d} time(s) by plugin_manager.\n", .{opens}) catch "";
     appendReport(tail_msg);
 
-    stem_open_buffer(
-        "[Plugin Manager]".ptr,
-        "[Plugin Manager]".len,
-        &report_buf,
-        @intCast(report_len),
-    );
+    stem.openBuffer("[Plugin Manager]", report_buf[0..report_len]);
 }
 
 fn incrementDashboardOpenCount() u32 {
-    const key = "dashboard.opens";
-    var buf: [32]u8 = undefined;
-    const n = stem_storage_read(key.ptr, key.len, &buf, @intCast(buf.len));
-    var current: u32 = 0;
-    if (n > 0) {
-        current = std.fmt.parseInt(u32, std.mem.trim(u8, buf[0..@intCast(n)], " \t\r\n"), 10) catch 0;
-    }
+    const current = stem.storageReadU32("dashboard.opens", 0);
     const next = current +| 1;
-    var out: [32]u8 = undefined;
-    const text = std.fmt.bufPrint(&out, "{d}", .{next}) catch return next;
-    _ = stem_storage_write(key.ptr, key.len, text.ptr, @intCast(text.len));
+    stem.storageWriteU32("dashboard.opens", next);
     return next;
 }
 
 fn runJson() void {
-    const written = stem_get_plugin_dashboard_json(&scratch, @intCast(scratch.len));
+    const written = stem.pluginDashboardJson(&scratch);
     if (written <= 0) {
         const fallback = "{}\n";
-        stem_open_buffer("[Plugin JSON]".ptr, "[Plugin JSON]".len, fallback.ptr, fallback.len);
+        stem.openBuffer("[Plugin JSON]", fallback);
         return;
     }
-    stem_open_buffer("[Plugin JSON]".ptr, "[Plugin JSON]".len, &scratch, written);
+    stem.openBuffer("[Plugin JSON]", scratch[0..@intCast(written)]);
+}
+
+fn runPermissions() void {
+    const written = stem.pluginDashboardReport(&scratch);
+    report_len = 0;
+    appendReport("# Plugin Permissions\n\n");
+    appendReport("This view focuses on manifest grants and capability denials.\n\n");
+    if (written > 0) {
+        appendReport(scratch[0..@intCast(written)]);
+    } else {
+        appendReport("Permission dashboard unavailable.\n");
+    }
+    stem.openBuffer("[Plugin Permissions]", report_buf[0..report_len]);
+}
+
+fn runStorage() void {
+    report_len = 0;
+    const storage_opens = stem.storageReadU32("storage.opens", 0) +| 1;
+    stem.storageWriteU32("storage.opens", storage_opens);
+
+    appendReport("# Plugin Storage\n\n");
+    appendReport("Persistent plugin storage is scoped by plugin id and key.\n\n");
+    appendReport("plugin_manager storage:\n");
+    appendReportInt("dashboard.opens", stem.storageReadU32("dashboard.opens", 0));
+    appendReportInt("storage.opens", storage_opens);
+    appendReport("\nUse `stem cache status` from your shell to inspect cache sizes.\n");
+    stem.openBuffer("[Plugin Storage]", report_buf[0..report_len]);
 }
 
 /// Walk `stem plugin list`, pull out each plugin name, then unload +
 /// reload it. Failures are recorded but don't stop the sweep.
 fn runReloadAll() void {
-    const written = stem_spawn_capture(
-        "stem plugin list".ptr,
-        "stem plugin list".len,
-        &scratch,
-        @intCast(scratch.len),
-    );
+    const written = stem.spawnCapture("stem plugin list", &scratch);
     if (written <= 0) {
         const msg = "reload_all: could not run `stem plugin list` (spawn permission missing or stem not on PATH).";
-        stem_open_buffer(
-            "[Plugin Reload]".ptr,
-            "[Plugin Reload]".len,
-            msg.ptr,
-            @intCast(msg.len),
-        );
+        stem.openBuffer("[Plugin Reload]", msg);
         return;
     }
 
@@ -241,7 +192,7 @@ fn runReloadAll() void {
 
     var it = std.mem.splitScalar(u8, scratch[0..@intCast(written)], '\n');
     while (it.next()) |line| {
-        const name = parsePluginName(line) orelse continue;
+        const name = list_parser.parsePluginName(line) orelse continue;
         // Skip self — unloading ourselves mid-call would crash the host.
         if (std.mem.eql(u8, name, "plugin_manager")) {
             appendReport("  · plugin_manager (skipped — self)\n");
@@ -251,8 +202,8 @@ fn runReloadAll() void {
         // Unload result is informational; many plugins may not be
         // running yet, in which case unload returns a non-zero error
         // code which we ignore.
-        _ = stem_unload_plugin(name.ptr, @intCast(name.len));
-        const load_rc = stem_load_plugin(name.ptr, @intCast(name.len));
+        _ = stem.unloadPlugin(name);
+        const load_rc = stem.loadPlugin(name);
         if (load_rc == 0) {
             ok += 1;
             appendReport("  ✓ ");
@@ -274,33 +225,7 @@ fn runReloadAll() void {
     ) catch "\n(done)\n";
     appendReport(tail);
 
-    stem_open_buffer(
-        "[Plugin Reload]".ptr,
-        "[Plugin Reload]".len,
-        &report_buf,
-        @intCast(report_len),
-    );
-}
-
-/// `stem plugin list` emits entry lines like:
-///
-///     "  echo-wasm                0.5.0  (wasm)"
-///
-/// Two leading spaces, then the plugin name (no whitespace), then
-/// version + `(runtime)`. Description lines use four leading spaces
-/// and don't have the `(runtime)` token, which is how we tell them
-/// apart from entry lines.
-fn parsePluginName(line: []const u8) ?[]const u8 {
-    if (line.len < 3) return null;
-    if (line[0] != ' ' or line[1] != ' ') return null;
-    if (line[2] == ' ') return null; // description line (4-space indent)
-    // Must look like an entry line — `(` somewhere on it for the
-    // runtime tag.
-    if (std.mem.indexOfScalar(u8, line, '(') == null) return null;
-    const rest = line[2..];
-    const end = std.mem.indexOfAny(u8, rest, " \t") orelse return null;
-    if (end == 0) return null;
-    return rest[0..end];
+    stem.openBuffer("[Plugin Reload]", report_buf[0..report_len]);
 }
 
 fn appendReport(s: []const u8) void {
@@ -308,4 +233,10 @@ fn appendReport(s: []const u8) void {
     const n = @min(s.len, remaining);
     @memcpy(report_buf[report_len .. report_len + n], s[0..n]);
     report_len += n;
+}
+
+fn appendReportInt(label: []const u8, value: u32) void {
+    var buf: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "- {s}: {d}\n", .{ label, value }) catch return;
+    appendReport(line);
 }

@@ -1,0 +1,27 @@
+{
+  "name": "sdk_demo",
+  "version": "0.1.0",
+  "description": "SDK example plugin for Stem. Demonstrates commands, events, status items, panels, active-buffer reads, dashboard data, and plugin storage.",
+  "runtime": "wasm",
+  "entry": "sdk-demo.wasm",
+  "permissions": {
+    "events": ["buffer.switched", "file.saved"]
+  },
+  "commands": [
+    {
+      "id": "sdk-demo.report",
+      "title": "[SDK Demo] Report",
+      "description": "Open a report built with the Stem plugin SDK"
+    },
+    {
+      "id": "sdk-demo.inspect_buffer",
+      "title": "[SDK Demo] Inspect Buffer",
+      "description": "Summarize the active buffer through the SDK host API"
+    },
+    {
+      "id": "sdk-demo.toggle_panel",
+      "title": "[SDK Demo] Toggle Panel",
+      "description": "Toggle a sample plugin panel"
+    }
+  ]
+}

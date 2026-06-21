@@ -94,6 +94,12 @@ fn Wrap(comptime f: anytype) type {
     };
 }
 
+pub fn handleUserQuitInputError(core: anytype, err: anyerror) anyerror!bool {
+    if (err != error.UserQuit) return err;
+    core.sendQuitToUI() catch {};
+    return true;
+}
+
 pub const MultiCursor = struct {
     row: usize,
     col: usize,
@@ -693,6 +699,25 @@ pub const Core = struct {
         return self.buffer_manager.getActive().is_large;
     }
 
+    pub fn activeBufferIsPresentationReadOnly(self: *Core) bool {
+        if (self.split_manager) |*sm| {
+            const pane = sm.getFocusedPane();
+            if (pane.buffer_index < self.buffer_manager.buffers.items.len) {
+                return self.buffer_manager.buffers.items[pane.buffer_index].isPresentationReadOnly();
+            }
+        }
+        return self.buffer_manager.getActive().isPresentationReadOnly();
+    }
+
+    pub fn rejectReadOnlyPresentationEdit(self: *Core) bool {
+        if (!self.activeBufferIsPresentationReadOnly()) return false;
+        self.mode = .view;
+        self.dismissCompletion();
+        self.clearMultiCursors();
+        self.setStatusLiteralLeveled(.info, "Presentation views are read-only", 1500);
+        return true;
+    }
+
     /// Whether the buffer at `index` is in large-file mode. Used by
     /// pane-render code in `sendUpdate` so each split can be gated
     /// independently of the focused one.
@@ -855,6 +880,8 @@ pub const Core = struct {
     }
 
     pub fn insertCharWithHistory(self: *Core, char: u8) !void {
+        if (self.rejectReadOnlyPresentationEdit()) return;
+
         const s = self.state();
 
         // Single-cursor fast path.
@@ -954,6 +981,8 @@ pub const Core = struct {
     }
 
     pub fn insertTextWithHistory(self: *Core, text: []const u8) !void {
+        if (self.rejectReadOnlyPresentationEdit()) return;
+
         const s = self.state();
         const offset = s.getOffsetFromCursor();
         self.history_manager.beginTransaction(.{ .row = s.cursor_row, .col = s.cursor_col });
@@ -1022,6 +1051,8 @@ pub const Core = struct {
     }
 
     pub fn insertNewlineWithHistory(self: *Core) !void {
+        if (self.rejectReadOnlyPresentationEdit()) return;
+
         const s = self.state();
         const offset = s.getOffsetFromCursor();
         const insertion = try self.buildNewlineInsertion();
@@ -1043,6 +1074,8 @@ pub const Core = struct {
     }
 
     pub fn smartAutoPairBackspaceWithHistory(self: *Core) !bool {
+        if (self.rejectReadOnlyPresentationEdit()) return false;
+
         const s = self.state();
         const char_before = s.getCharBeforeCursor();
         const char_after = s.getCharAfterCursor();
@@ -1068,6 +1101,8 @@ pub const Core = struct {
         char: u8,
         config: auto_pair.AutoPairConfig,
     ) !enum { inserted, skipped, wrapped } {
+        if (self.rejectReadOnlyPresentationEdit()) return .skipped;
+
         const s = self.state();
         if (!config.enabled) return .inserted;
 
@@ -1107,6 +1142,8 @@ pub const Core = struct {
     }
 
     pub fn deleteCharWithHistory(self: *Core) !void {
+        if (self.rejectReadOnlyPresentationEdit()) return;
+
         const s = self.state();
         const offset = s.getOffsetFromCursor();
         if (offset >= s.buffer.totalLength()) return;
@@ -1119,6 +1156,8 @@ pub const Core = struct {
     }
 
     pub fn backspaceCharWithHistory(self: *Core) !void {
+        if (self.rejectReadOnlyPresentationEdit()) return;
+
         const s = self.state();
 
         // Single-cursor fast path.
@@ -1200,7 +1239,9 @@ pub const Core = struct {
     }
 
     pub fn deleteRangeWithHistory(self: *Core, start_offset: usize, end_offset: usize) !void {
+        if (self.rejectReadOnlyPresentationEdit()) return;
         if (end_offset <= start_offset) return;
+
         const s = self.state();
         const len = end_offset - start_offset;
         var deleted_text = try self.allocator.alloc(u8, len);
@@ -2177,12 +2218,8 @@ pub const Core = struct {
                             .log_view => {},
                             .select => {
                                 const result = input.select.handle(self, key) catch |err| {
-                                    if (err == error.UserQuit) {
-                                        // best-effort: shutting down anyway; UI may have already exited
-                                        self.sendQuitToUI() catch {};
-                                        return;
-                                    }
-                                    return err;
+                                    _ = try handleUserQuitInputError(self, err);
+                                    return;
                                 };
                                 if (result) {
                                     try self.sendUpdate();
@@ -2199,7 +2236,11 @@ pub const Core = struct {
                                 }
                             },
                             .view => {
-                                if (try input.view.handle(self, key)) {
+                                const result = input.view.handle(self, key) catch |err| {
+                                    _ = try handleUserQuitInputError(self, err);
+                                    return;
+                                };
+                                if (result) {
                                     try self.sendUpdate();
                                 }
                             },
@@ -2925,6 +2966,7 @@ pub const Core = struct {
 
     pub fn confirmCompletion(self: *Core) !void {
         if (!self.completion_active) return;
+        if (self.rejectReadOnlyPresentationEdit()) return;
         if (self.filtered_completion_items.items.len == 0) return;
         if (self.completion_selected >= self.filtered_completion_items.items.len) return;
 
@@ -5405,6 +5447,7 @@ pub const Core = struct {
     /// on both sides; brackets get matched pairs. Cursor lands after
     /// the closer.
     pub fn addSurround(self: *Core, ch: u8) !void {
+        if (self.rejectReadOnlyPresentationEdit()) return;
         const s = self.state();
         const anchor = s.selection_anchor orelse {
             self.setStatusLiteralLeveled(.warning, "No selection to surround", 1500);
@@ -5439,6 +5482,7 @@ pub const Core = struct {
     /// `s d <c>` in select mode: delete the enclosing pair `<c>`
     /// (e.g. the parens around the cursor). Leaves contents intact.
     pub fn deleteSurround(self: *Core, ch: u8) !void {
+        if (self.rejectReadOnlyPresentationEdit()) return;
         const s = self.state();
         const pair = surroundPair(ch);
         const range = if (pair.open == pair.close)
@@ -5462,6 +5506,7 @@ pub const Core = struct {
     /// `s r <old> <new>` in select mode: swap the surrounding `<old>`
     /// pair for `<new>`. Same lookup as deleteSurround, then re-emit.
     pub fn replaceSurround(self: *Core, old_ch: u8, new_ch: u8) !void {
+        if (self.rejectReadOnlyPresentationEdit()) return;
         const s = self.state();
         const old_pair = surroundPair(old_ch);
         const new_pair = surroundPair(new_ch);
