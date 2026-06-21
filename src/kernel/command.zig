@@ -19,6 +19,8 @@ pub const CommandMatch = struct {
     score: i64,
 };
 
+pub const ScoreBoostFn = *const fn (ctx: ?*const anyopaque, id: []const u8) i64;
+
 pub const CommandRegistry = struct {
     allocator: std.mem.Allocator,
     commands: std.StringHashMap(Command),
@@ -58,13 +60,25 @@ pub const CommandRegistry = struct {
     }
 
     pub fn search(self: *CommandRegistry, query: []const u8, out_results: *std.ArrayListUnmanaged(Command), allocator: std.mem.Allocator) !void {
+        try self.searchWithBoost(query, out_results, allocator, null, null);
+    }
+
+    pub fn searchWithBoost(
+        self: *CommandRegistry,
+        query: []const u8,
+        out_results: *std.ArrayListUnmanaged(Command),
+        allocator: std.mem.Allocator,
+        boost_ctx: ?*const anyopaque,
+        boost_fn: ?ScoreBoostFn,
+    ) !void {
         var matches = std.ArrayListUnmanaged(CommandMatch).empty;
         defer matches.deinit(self.allocator);
 
         var it = self.commands.valueIterator();
         while (it.next()) |cmd| {
+            const boost = if (boost_fn) |f| f(boost_ctx, cmd.id) else 0;
             if (query.len == 0) {
-                try matches.append(self.allocator, .{ .command = cmd.*, .score = 0 });
+                try matches.append(self.allocator, .{ .command = cmd.*, .score = boost });
                 continue;
             }
 
@@ -75,7 +89,7 @@ pub const CommandRegistry = struct {
 
             if (best_score > 0) {
                 const final_score = if (title_score == best_score) best_score + 50 else best_score;
-                try matches.append(self.allocator, .{ .command = cmd.*, .score = final_score });
+                try matches.append(self.allocator, .{ .command = cmd.*, .score = final_score + boost });
             }
         }
 
@@ -347,6 +361,60 @@ test "CommandRegistry search empty query" {
     try registry.search("", &results, std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 2), results.items.len);
+}
+
+test "CommandRegistry searchWithBoost ranks boosted empty-query commands first" {
+    var registry = CommandRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const test_fn = struct {
+        fn testFunc(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
+            _ = ctx;
+            _ = context;
+        }
+    }.testFunc;
+
+    try registry.register("alpha", "Alpha", "First", test_fn, null);
+    try registry.register("beta", "Beta", "Second", test_fn, null);
+
+    const Boost = struct {
+        fn score(_: ?*const anyopaque, id: []const u8) i64 {
+            return if (std.mem.eql(u8, id, "beta")) 25 else 0;
+        }
+    };
+
+    var results = std.ArrayListUnmanaged(Command).empty;
+    defer results.deinit(std.testing.allocator);
+    try registry.searchWithBoost("", &results, std.testing.allocator, null, Boost.score);
+
+    try std.testing.expectEqualStrings("beta", results.items[0].id);
+}
+
+test "CommandRegistry searchWithBoost applies small recency boost to matches" {
+    var registry = CommandRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const test_fn = struct {
+        fn testFunc(ctx: *anyopaque, context: ?*const anyopaque) anyerror!void {
+            _ = ctx;
+            _ = context;
+        }
+    }.testFunc;
+
+    try registry.register("task.alpha", "Task Alpha", "Run alpha", test_fn, null);
+    try registry.register("task.beta", "Task Beta", "Run beta", test_fn, null);
+
+    const Boost = struct {
+        fn score(_: ?*const anyopaque, id: []const u8) i64 {
+            return if (std.mem.eql(u8, id, "task.beta")) 25 else 0;
+        }
+    };
+
+    var results = std.ArrayListUnmanaged(Command).empty;
+    defer results.deinit(std.testing.allocator);
+    try registry.searchWithBoost("task", &results, std.testing.allocator, null, Boost.score);
+
+    try std.testing.expectEqualStrings("task.beta", results.items[0].id);
 }
 
 test "CommandRegistry search exact title match" {

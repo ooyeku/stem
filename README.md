@@ -105,7 +105,8 @@ when it isn't already there.
   from Zig, Rust, Go, Python, npm, and Make projects; `task.run_build`
   and `task.run_test` execute the preferred detected tasks as retained
   background jobs, with `task.run`, `task.run_dev`, `task.run_lint`,
-  and `task.run_format` for matching project scripts
+  and `task.run_format` for matching project scripts; `task.rerun_last`
+  launches the most recent project task again
 - **Large-file mode**: files past 5 MB / 50k lines auto-degrade —
   tree-sitter, brackets, LSP, and auto-pair disabled so a multi-MB
   log stays responsive. `[LARGE]` badge in the status bar
@@ -477,7 +478,8 @@ coverage. Use `task.list` to see detected project commands from
 or `task.run_test` to execute the preferred detected task under Stem's
 background job manager; `task.run`, `task.run_dev`, `task.run_lint`,
 and `task.run_format` cover run/start, dev, lint, and format tasks. Use
-`task.output` to reopen the latest retained stdout/stderr report.
+`task.rerun_last` to launch the most recent task again, and `task.output`
+to reopen the latest retained stdout/stderr report.
 The same detector is available from the shell with `stem task list`,
 `stem task run <id|kind>`, and `stem task doctor`.
 

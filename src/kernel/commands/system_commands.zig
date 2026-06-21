@@ -167,6 +167,32 @@ pub const SystemCommands = struct {
         try runDetectedTask(core, .format);
     }
 
+    pub fn cmdTaskRerunLast(core: anytype) anyerror!void {
+        const last = core.task_history.last() orelse {
+            var aw: std.Io.Writer.Allocating = .init(core.allocator);
+            defer aw.deinit();
+
+            try writeNoLastTaskMessage(&aw.writer);
+            try core.openVirtualBuffer("[TASK OUTPUT]", aw.written());
+            core.mode = .view;
+            try core.sendUpdate();
+            return;
+        };
+
+        try startProjectTask(core, last.root, &last.task);
+    }
+
+    pub fn writeNoLastTaskMessage(w: anytype) !void {
+        try w.writeAll(
+            \\# Task Output
+            \\
+            \\No project task has been run in this Stem session.
+            \\
+            \\Run `task.list` to inspect detected tasks, `task.run_build` to run a build task, or `task.run_test` to run a test task.
+            \\
+        );
+    }
+
     pub fn cmdTaskOutput(core: anytype) anyerror!void {
         var summary = try core.job_manager.snapshot(core.allocator);
         defer summary.deinit(core.allocator);
@@ -919,6 +945,11 @@ pub const SystemCommands = struct {
             return;
         };
 
+        try startProjectTask(core, root, task);
+    }
+
+    fn startProjectTask(core: anytype, root: []const u8, task: *const project_tasks.ProjectTask) !void {
+        const allocator = core.allocator;
         const job_name = try std.fmt.allocPrint(allocator, "Task: {s}", .{task.label});
         defer allocator.free(job_name);
 
@@ -928,6 +959,7 @@ pub const SystemCommands = struct {
             allocator.destroy(ctx);
             return err;
         };
+        core.task_history.record(root, task.*) catch {};
 
         const body = try std.fmt.allocPrint(allocator,
             \\# Task Output
@@ -939,7 +971,7 @@ pub const SystemCommands = struct {
             \\- Command: `{s}`
             \\- Root: {s}
             \\
-            \\Open `job.list` to monitor status, or `task.output` to reopen the retained output after completion.
+            \\Open `job.list` to monitor status, `task.output` to reopen the retained output after completion, or `task.rerun_last` to launch it again.
             \\
         , .{ id, task.label, task.id, task.command, root });
         defer allocator.free(body);
@@ -1199,3 +1231,15 @@ pub const SystemCommands = struct {
         };
     }
 };
+
+test "task rerun no-history message suggests task commands" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    try SystemCommands.writeNoLastTaskMessage(&aw.writer);
+    const text = aw.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "No project task has been run") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "task.list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "task.run_test") != null);
+}

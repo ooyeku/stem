@@ -102,9 +102,7 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
                 core.previous_mode = core.mode;
                 core.mode = .command_palette;
                 core.command_palette_input.clearRetainingCapacity();
-                core.command_palette_results.clearRetainingCapacity();
-                try core.command_registry.search("", &core.command_palette_results, core.allocator);
-                core.command_palette_selected = 0;
+                try core.updateCommandSearch();
                 core.leader_pending = false;
             },
             Keys.action_undo => try EditCommands.cmdEditUndo(core),

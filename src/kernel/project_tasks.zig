@@ -165,6 +165,10 @@ pub fn formatRunResult(allocator: std.mem.Allocator, result: *const TaskRunResul
         result.duration_ms,
     });
 
+    if (!result.success) {
+        try writeFailureSummary(w, result);
+    }
+
     try w.writeAll("## Stdout\n\n```text\n");
     if (result.stdout.len > 0) {
         try w.writeAll(result.stdout);
@@ -178,6 +182,51 @@ pub fn formatRunResult(allocator: std.mem.Allocator, result: *const TaskRunResul
     try w.writeAll("```\n");
 
     return aw.toOwnedSlice();
+}
+
+fn writeFailureSummary(w: anytype, result: *const TaskRunResult) !void {
+    try w.print(
+        \\## Failure Summary
+        \\
+        \\- Status: failed
+        \\- Exit code: {d}
+        \\
+    , .{result.exit_code});
+
+    if (result.stderr.len > 0) {
+        try w.writeAll("### stderr excerpt\n\n```text\n");
+        try writeUsefulLines(w, result.stderr, 5);
+        try w.writeAll("```\n\n");
+    } else if (result.stdout.len > 0) {
+        try w.writeAll("### stdout excerpt\n\n```text\n");
+        try writeUsefulLines(w, result.stdout, 5);
+        try w.writeAll("```\n\n");
+    } else {
+        try w.writeAll("No stdout/stderr output was captured.\n\n");
+    }
+
+    try w.writeAll(
+        \\### Next Actions
+        \\
+        \\- `task.output`: reopen this retained output.
+        \\- `job.list`: inspect background job status.
+        \\- `task.list`: inspect detected project tasks.
+        \\
+    );
+}
+
+fn writeUsefulLines(w: anytype, text: []const u8, limit: usize) !void {
+    var iter = std.mem.splitScalar(u8, text, '\n');
+    var written: usize = 0;
+    while (iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+
+        try w.writeAll(trimmed);
+        try w.writeByte('\n');
+        written += 1;
+        if (written >= limit) break;
+    }
 }
 
 pub const ProjectTaskList = struct {
@@ -536,6 +585,48 @@ test "project task list finds preferred task by kind" {
     try std.testing.expectEqualStrings("zig.build", list.findFirstByKind(.build).?.id);
     try std.testing.expectEqualStrings("npm.test", list.findFirstByKind(.@"test").?.id);
     try std.testing.expect(list.findFirstByKind(.run) == null);
+}
+
+test "formatRunResult includes failure summary from stderr" {
+    const result = TaskRunResult{
+        .task_id = "zig.test",
+        .label = "Zig: Test",
+        .command = "zig build test",
+        .cwd = "/tmp/stem",
+        .stdout = "build output\n",
+        .stderr = "first error\nsecond error\n",
+        .success = false,
+        .exit_code = 2,
+        .duration_ms = 42,
+    };
+
+    const text = try formatRunResult(std.testing.allocator, &result);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "## Failure Summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Exit code: 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "first error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "task.list") != null);
+}
+
+test "formatRunResult falls back to stdout in failure summary" {
+    const result = TaskRunResult{
+        .task_id = "npm.test",
+        .label = "npm: test",
+        .command = "npm test",
+        .cwd = "/tmp/stem",
+        .stdout = "line one\nline two\n",
+        .stderr = "",
+        .success = false,
+        .exit_code = 1,
+        .duration_ms = 99,
+    };
+
+    const text = try formatRunResult(std.testing.allocator, &result);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "stdout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "line two") != null);
 }
 
 fn expectTask(tasks: *const ProjectTaskList, id: []const u8, command: []const u8) !void {

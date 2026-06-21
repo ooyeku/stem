@@ -31,6 +31,8 @@ test {
     _ = @import("kernel/workspace.zig");
     _ = @import("kernel/build_jobs.zig");
     _ = @import("kernel/project_tasks.zig");
+    _ = @import("kernel/command_history.zig");
+    _ = @import("kernel/task_history.zig");
     _ = @import("kernel/buffer_manager.zig");
     _ = @import("kernel/command.zig");
     _ = @import("kernel/protocol.zig");
@@ -85,6 +87,7 @@ test {
     _ = @import("kernel/message_bus.zig");
     _ = @import("kernel/request_reply.zig");
     _ = @import("services/telemetry.zig");
+    _ = @import("kernel/commands/system_commands.zig");
 
     // Fuzz corpus tests live under `src/fuzz/mod.zig` and are wired through
     // `zig build fuzz`. Importing them here as well makes that target compile

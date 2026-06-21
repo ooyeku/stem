@@ -24,6 +24,8 @@ const TerminalService = @import("../services/terminal.zig").TerminalService;
 const StorageManager = @import("../config/storage.zig").StorageManager;
 const CommandRegistry = @import("command.zig").CommandRegistry;
 const Command = @import("command.zig").Command;
+const CommandHistory = @import("command_history.zig").CommandHistory;
+const TaskHistory = @import("task_history.zig").TaskHistory;
 const SplitManager = @import("split_manager.zig").SplitManager;
 const SplitNode = @import("split_manager.zig").SplitNode;
 const HistoryManager = @import("history.zig").HistoryManager;
@@ -285,6 +287,7 @@ pub const Core = struct {
     lsp_doc_version: i64 = 1,
     syntax_manager: SyntaxManager,
     command_registry: *CommandRegistry,
+    command_history: CommandHistory,
     command_palette_input: std.ArrayListUnmanaged(u8) = .empty,
     command_palette_results: std.ArrayListUnmanaged(Command) = .empty,
     command_palette_selected: usize = 0,
@@ -429,6 +432,7 @@ pub const Core = struct {
     decoration_manager: DecorationManager,
     job_manager: JobManager,
     workspace_manager: WorkspaceManager,
+    task_history: TaskHistory,
     current_build_job: ?u64 = null,
     build_status: enum { idle, building, success, failed } = .idle,
     diff_highlights: std.ArrayListUnmanaged(protocol.DiffLineHighlight) = .empty,
@@ -546,6 +550,7 @@ pub const Core = struct {
                 break :blk ts;
             },
             .command_registry = cmd_reg,
+            .command_history = CommandHistory.init(allocator, 32),
             .command_palette_results = .empty,
             .history_manager = HistoryManager.init(allocator, io),
             .jump_list = JumpList.init(allocator, io, 100),
@@ -553,6 +558,7 @@ pub const Core = struct {
             .decoration_manager = DecorationManager.init(allocator),
             .job_manager = JobManager.init(allocator, io),
             .workspace_manager = WorkspaceManager.init(allocator, io),
+            .task_history = TaskHistory.init(allocator),
             .plugin_manager = undefined,
             .search_index = undefined,
             .initial_files = initial_files,
@@ -626,6 +632,7 @@ pub const Core = struct {
 
         self.command_registry.deinit();
         self.allocator.destroy(self.command_registry);
+        self.command_history.deinit();
         self.command_palette_input.deinit(self.allocator);
         self.command_palette_results.deinit(self.allocator);
         self.go_to_line_input.deinit(self.allocator);
@@ -667,6 +674,7 @@ pub const Core = struct {
         self.decoration_manager.deinit();
         self.job_manager.deinit();
         self.workspace_manager.deinit();
+        self.task_history.deinit();
         self.clipboard.deinit(self.allocator);
 
         if (self.pending_lsp_refresh_path) |path| {
@@ -1512,6 +1520,7 @@ pub const Core = struct {
         try R.register("task.run_dev", "Tasks: Run Dev", "Run the preferred detected dev task as a background job", Wrap(SystemCommands.cmdTaskRunDev).run, null);
         try R.register("task.run_lint", "Tasks: Run Lint", "Run the preferred detected lint task as a background job", Wrap(SystemCommands.cmdTaskRunLint).run, null);
         try R.register("task.run_format", "Tasks: Run Format", "Run the preferred detected format task as a background job", Wrap(SystemCommands.cmdTaskRunFormat).run, null);
+        try R.register("task.rerun_last", "Tasks: Rerun Last", "Rerun the last project task started in this Stem session", Wrap(SystemCommands.cmdTaskRerunLast).run, null);
         try R.register("task.output", "Tasks: Show Last Output", "Open the retained output from the latest project task job", Wrap(SystemCommands.cmdTaskOutput).run, null);
         try R.register("job.list", "Jobs: List Active", "Show all active background jobs (Space+j)", Wrap(SystemCommands.cmdJobList).run, null);
         try R.register("view.logs", "View: Logs", "Open log viewer", Wrap(SystemCommands.cmdViewLogs).run, null);
@@ -4576,7 +4585,13 @@ pub const Core = struct {
 
     pub fn updateCommandSearch(self: *Core) !void {
         self.command_palette_results.clearRetainingCapacity();
-        try self.command_registry.search(self.command_palette_input.items, &self.command_palette_results, self.allocator);
+        try self.command_registry.searchWithBoost(
+            self.command_palette_input.items,
+            &self.command_palette_results,
+            self.allocator,
+            &self.command_history,
+            CommandHistory.scoreBoostAdapter,
+        );
         self.command_palette_selected = 0;
     }
 

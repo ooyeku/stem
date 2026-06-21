@@ -28,6 +28,10 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
             core.mode = core.previous_mode;
             core.command_palette_input.clearRetainingCapacity();
 
+            core.command_history.record(cmd.id) catch |err| {
+                log.warn("failed to record command history for '{s}': {s}", .{ cmd.id, @errorName(err) });
+            };
+
             cmd.execute(core, cmd.context) catch |err| {
                 log.err("command '{s}' failed: {s}", .{ cmd.id, @errorName(err) });
             };
