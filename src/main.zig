@@ -92,6 +92,7 @@ const ShutdownPlan = struct {
     stop_vaxis_loop: bool,
     join_input_thread: bool,
     exit_process_directly: bool,
+    restore_terminal_before_direct_exit: bool,
 };
 
 fn shutdownPlan(cause: ShutdownCause) ShutdownPlan {
@@ -105,6 +106,7 @@ fn shutdownPlan(cause: ShutdownCause) ShutdownPlan {
             .stop_vaxis_loop = false,
             .join_input_thread = false,
             .exit_process_directly = true,
+            .restore_terminal_before_direct_exit = true,
         },
     };
 }
@@ -891,6 +893,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         core_thread.join();
         core_ctx.core.deinit();
         stem_runtime.shutdown();
+        if (plan.restore_terminal_before_direct_exit) tty.deinit();
         std.process.exit(0);
     }
 }
@@ -913,6 +916,14 @@ test "UI-requested quit does not wait on terminal input reader" {
     try std.testing.expect(!plan.stop_vaxis_loop);
     try std.testing.expect(!plan.join_input_thread);
     try std.testing.expect(plan.exit_process_directly);
+}
+
+test "direct-exit shutdown plan restores terminal modes" {
+    const plan = shutdownPlan(.ui_requested);
+    try std.testing.expect(@hasField(ShutdownPlan, "restore_terminal_before_direct_exit"));
+    if (comptime @hasField(ShutdownPlan, "restore_terminal_before_direct_exit")) {
+        try std.testing.expect(@field(plan, "restore_terminal_before_direct_exit"));
+    }
 }
 
 test "UserQuit input errors request UI shutdown" {
