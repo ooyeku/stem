@@ -45,6 +45,10 @@ pub const SyntaxManager = struct {
     parse_cond: std.Io.Condition = .init,
     parse_thread: ?std.Thread = null,
     parse_shutdown: std.atomic.Value(bool) = .{ .raw = false },
+    /// Liveness flag for the parse worker: set by the owner before spawn,
+    /// cleared by the worker on exit. `parse_thread != null` with this false
+    /// means the worker died without a shutdown request.
+    parse_worker_alive: std.atomic.Value(bool) = .{ .raw = false },
 
     /// Single-slot memoization for `highlight`. When the caller asks for
     /// the same buffer-version + visible range we just computed, return a
@@ -330,7 +334,30 @@ pub const SyntaxManager = struct {
         // mutex/condvar primitives the worker uses.
         self.io = io;
         self.parse_shutdown.store(false, .release);
-        self.parse_thread = try std.Thread.spawn(.{}, parseWorkerMain, .{self});
+        // Set before spawn so a watchdog probe between spawn and the
+        // worker's first instruction can't misread a starting worker as dead.
+        self.parse_worker_alive.store(true, .release);
+        self.parse_thread = std.Thread.spawn(.{}, parseWorkerMain, .{self}) catch |err| {
+            self.parse_worker_alive.store(false, .release);
+            return err;
+        };
+    }
+
+    /// Watchdog hook: if the parse worker exited without a shutdown request
+    /// (swallowed panic path, unexpected return), reap the dead thread and
+    /// respawn it. Returns true when a restart actually happened. Must be
+    /// called from the thread that owns worker lifecycle (core).
+    pub fn restartParseWorkerIfDead(self: *SyntaxManager, io: std.Io) bool {
+        if (self.parse_thread == null) return false; // never started
+        if (self.parse_worker_alive.load(.acquire)) return false; // healthy
+        if (self.parse_shutdown.load(.acquire)) return false; // shutting down
+
+        if (self.parse_thread) |t| {
+            t.join(); // already exited; returns immediately
+            self.parse_thread = null;
+        }
+        self.startParseWorker(io) catch return false;
+        return true;
     }
 
     fn stopParseWorker(self: *SyntaxManager) void {
@@ -365,6 +392,7 @@ pub const SyntaxManager = struct {
         thread_name.set("stem-parse");
         log.debug("parse worker started", .{});
         defer log.debug("parse worker exited", .{});
+        defer self.parse_worker_alive.store(false, .release);
 
         while (true) {
             // Wait for a job.

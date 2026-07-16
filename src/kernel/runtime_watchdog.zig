@@ -12,6 +12,9 @@ pub const HealthInput = struct {
     failed_jobs: usize = 0,
     index_at_capacity: bool = false,
     has_last_task: bool = false,
+    /// Total Vigil runtime alerts (dead letters, poison messages, circuit
+    /// opens, supervisor restarts, component crashes) since startup.
+    runtime_alerts: u64 = 0,
 };
 
 pub const HealingRecommendation = struct {
@@ -29,6 +32,7 @@ pub const ToastKey = enum {
     bus_drops,
     job_failed,
     index_capacity,
+    runtime_degraded,
 };
 
 pub const WatchdogToast = struct {
@@ -115,6 +119,16 @@ pub fn appendRecommendations(
             .command = "project.brain",
         });
     }
+
+    if (input.runtime_alerts > 0) {
+        try out.append(allocator, .{
+            .severity = .warning,
+            .title = "Runtime alerts",
+            .detail = "Vigil reported dead-lettered messages, crashes, or open circuits.",
+            .command = "stem.control_center",
+            .alternate_command = "stem.heal",
+        });
+    }
 }
 
 fn detectToast(prev: HealthInput, input: HealthInput) ?WatchdogToast {
@@ -165,6 +179,13 @@ fn detectToast(prev: HealthInput, input: HealthInput) ?WatchdogToast {
             .key = .index_capacity,
             .severity = .warning,
             .message = "Project index reached capacity - run project.brain",
+        };
+    }
+    if (input.runtime_alerts > prev.runtime_alerts) {
+        return .{
+            .key = .runtime_degraded,
+            .severity = .warning,
+            .message = "Runtime degraded: messaging alerts - run stem.control_center",
         };
     }
     return null;

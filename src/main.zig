@@ -525,6 +525,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // lifecycle supervisors for plugins/LSP.
     var stem_runtime = try StemRuntime.init(allocator);
     stem_runtime.attachEventBroker();
+    // Opt-in multi-instance presence (STEM_CLUSTER=<port>[,host:port,...]).
+    stem_runtime.enableClusterFromEnv();
     defer stem_runtime.deinit();
 
     const inbox_allocator = allocator;

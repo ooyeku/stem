@@ -321,6 +321,67 @@ pub const SystemCommands = struct {
                     .{ timer_stats.pending, timer_stats.fired, timer_stats.cancelled },
                 );
             }
+            if (runtime_health.alerts.total() > 0) {
+                try w.print(
+                    "- Alerts: {d} dead-lettered, {d} poison, {d} circuits opened, {d} restarts, {d} crashes\n",
+                    .{
+                        runtime_health.alerts.dead_lettered,
+                        runtime_health.alerts.poison_detected,
+                        runtime_health.alerts.circuits_opened,
+                        runtime_health.alerts.supervisor_restarts,
+                        runtime_health.alerts.component_crashes,
+                    },
+                );
+            } else {
+                try w.writeAll("- Alerts: none\n");
+            }
+            // Multi-instance cluster presence (STEM_CLUSTER), when enabled.
+            if (runtime.clusterSnapshot(allocator) catch null) |cluster_opt| {
+                var cluster = cluster_opt;
+                defer cluster.deinit();
+                try w.print(
+                    "\n### Cluster ({d} local, {d} remote names)\n\n",
+                    .{ cluster.local_names, cluster.cached_remote_names },
+                );
+                if (cluster.peers.len == 0) {
+                    try w.writeAll("- No peers configured\n");
+                }
+                for (cluster.peers) |peer| {
+                    try w.print("- {s}:{d} — {s}, {d} reconnects, {d} consecutive failures\n", .{
+                        peer.address,
+                        peer.port,
+                        if (peer.is_alive) "alive" else "unreachable",
+                        peer.reconnects,
+                        peer.consecutive_failures,
+                    });
+                }
+            }
+
+            // Dead-letter queues: what the runtime shunted aside instead of
+            // delivering, per editor inbox. Empty queues stay silent.
+            inline for (.{ .ui, .core }) |service| {
+                if (runtime.resolveService(service)) |mailbox| dead_blk: {
+                    var dead = mailbox.snapshotDeadLetters(allocator) catch break :dead_blk;
+                    defer dead.deinit();
+                    if (dead.entries.len > 0) {
+                        try w.print("\n### Dead letters ({s})\n\n", .{@tagName(service)});
+                        const shown = @min(dead.entries.len, 10);
+                        for (dead.entries[0..shown]) |entry| {
+                            const payload_len = if (entry.message.payload) |p| p.len else 0;
+                            try w.print("- #{d}: {s}, from {s}, {d} bytes{s}\n", .{
+                                entry.id,
+                                @tagName(entry.reason),
+                                entry.message.sender,
+                                payload_len,
+                                if (entry.poisoned) " (poisoned)" else "",
+                            });
+                        }
+                        if (dead.entries.len > shown) {
+                            try w.print("- … {d} more\n", .{dead.entries.len - shown});
+                        }
+                    }
+                }
+            }
             if (runtime.debugDump(allocator)) |dump| {
                 defer allocator.free(dump);
                 try w.print("\n### Vigil runtime dump\n\n```\n{s}```\n", .{dump});

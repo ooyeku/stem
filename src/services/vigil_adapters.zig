@@ -14,6 +14,13 @@ pub const Subscriber = vigil.pubsub.Subscriber;
 pub const Supervisor = vigil.Supervisor;
 pub const Mutex = vigil.compat.Mutex;
 pub const TimerService = vigil.TimerService;
+pub const DeadLetterNotice = vigil.DeadLetterNotice;
+pub const DeadLetterSnapshot = vigil.DeadLetterSnapshot;
+pub const CircuitBreaker = vigil.CircuitBreaker;
+pub const CircuitBreakerConfig = vigil.CircuitBreakerConfig;
+pub const BackoffPolicy = vigil.BackoffPolicy;
+pub const RetryPolicy = vigil.RetryPolicy;
+pub const executePolicy = vigil.executePolicy;
 
 /// Deterministic test doubles (SimulatedClock, fillInbox, drainInbox, ...).
 pub const testing = vigil.testing;
@@ -42,6 +49,11 @@ pub fn createInbox(runtime_ref: *Runtime) !*Inbox {
     // stem's threads drain quickly, and a TTL would silently expire messages
     // queued behind a slow render. With no TTLs, receives skip expiry
     // bookkeeping entirely.
+    //
+    // `.throughput` was evaluated for a dedicated render lane and rejected:
+    // each editor thread blocks on ONE inbox (Vigil has no multi-inbox
+    // select), so renders must share the UI inbox — and that inbox needs
+    // priority queues so a critical `.quit` overtakes queued frames.
     return runtime_ref.inboxWithProfile(.balanced, editor_inbox_capacity);
 }
 

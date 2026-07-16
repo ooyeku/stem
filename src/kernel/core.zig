@@ -72,6 +72,18 @@ pub const CompletionDisplayItem = struct {
     kind_category: protocol.CompletionEntry.KindCategory = .other,
 };
 
+/// Vigil poison-message callback for the core inbox. May run on any thread
+/// that touches the mailbox, so it only logs; user-visible surfacing happens
+/// through the RuntimeAlerts telemetry counters.
+fn poisonMessageHook(context: ?*anyopaque, notice: vigil_api.DeadLetterNotice) void {
+    _ = context;
+    log.warn("poison message on core inbox: id={d} reason={s} attempts={d}", .{
+        notice.id,
+        @tagName(notice.reason),
+        notice.attempt_count,
+    });
+}
+
 fn jsonValueToU32(v: std.json.Value) ?u32 {
     return switch (v) {
         .integer => |iv| if (iv < 0 or iv > std.math.maxInt(u32)) null else @intCast(iv),
@@ -343,6 +355,8 @@ pub const Core = struct {
     last_recovery_ms: i64 = 0,
     recovery_interval_ms: i64 = 30_000,
     lsp_dirty: bool = false,
+    /// Cancellation id of the pending precise debounce wake, if any.
+    lsp_debounce_timer_id: ?u64 = null,
     lsp_debounce_deadline: i64 = 0,
     lsp_debounce_ms: i64 = 100,
     references_pending: bool = false,
@@ -452,6 +466,17 @@ pub const Core = struct {
     search_index: SearchIndex,
     runtime_watchdog: RuntimeWatchdog = .{},
     last_watchdog_check_ms: i64 = 0,
+    /// Bounded self-healing for the workspace index walk (see
+    /// ensureBackgroundWorkers).
+    last_index_retry_ms: i64 = 0,
+    index_retry_attempts: u8 = 0,
+    /// Vigil checkpoint pipeline for crash-recovery session snapshots:
+    /// async background writes, unchanged-state skips, version headers.
+    /// Lazily created on the first snapshot; null means snapshots fall back
+    /// to the synchronous legacy path.
+    session_checkpoint_backend: ?*vigil_api.raw.FileCheckpointer = null,
+    session_checkpoints: ?*vigil_api.raw.CheckpointService = null,
+    session_checkpoint_id: ?[]u8 = null,
     watchdog_check_interval_ms: i64 = 2_000,
     mouse_pressed: bool = false,
     mouse_press_row: usize = 0,
@@ -589,6 +614,10 @@ pub const Core = struct {
     }
 
     pub fn deinit(self: *Core) void {
+        // Flush any in-flight session checkpoint before teardown so a quit
+        // right after an edit still lands the latest recovery snapshot.
+        self.deinitSessionCheckpoints();
+
         // Tell scan workers to bail and wait briefly for them to exit. They
         // hold references to `self.allocator` and `scan_paths`, so we can't
         // free the queue until they're done.
@@ -1558,6 +1587,12 @@ pub const Core = struct {
         self.core_inbox = inbox;
         self.core_bus = bus;
         self.plugin_manager.core_inbox = inbox;
+
+        // Poison-message hook: a message rejected `max_delivery_attempts`
+        // times crosses into poison — log the specifics so the failure is
+        // attributable. The degraded-runtime toast fires separately via the
+        // telemetry alert counters, so this handler stays thread-agnostic.
+        inbox.onPoisonMessage(null, poisonMessageHook);
 
         // Install the editor edit-hook now that `self` has a stable
         // address. The trampoline forwards every insert/delete event
@@ -3021,6 +3056,38 @@ pub const Core = struct {
         self.plugin_manager.broadcastEvent(.buffer_changed, self.buffer_manager.getActive().name);
 
         self.lsp_debounce_deadline = std.Io.Clock.real.now(self.io).toMilliseconds() + self.lsp_debounce_ms;
+        self.scheduleLspDebounceWake();
+    }
+
+    /// Precise trailing-edge wake for the LSP debounce: a delayed tick via
+    /// Vigil's timer service lands at the deadline, so the didChange flush
+    /// fires within ~1 ms of it instead of on the next 100 ms heartbeat
+    /// (worst case ~2x the debounce late). The heartbeat check in
+    /// processDebouncedLspUpdate stays as the fallback, and double-fires are
+    /// harmless — the deadline gate makes the second pass a no-op.
+    fn scheduleLspDebounceWake(self: *Core) void {
+        const runtime = self.runtime_services orelse return;
+        const timers = runtime.vigil_runtime.timers() catch return;
+        if (self.lsp_debounce_timer_id) |id| {
+            _ = timers.cancel(id);
+            self.lsp_debounce_timer_id = null;
+        }
+
+        const inbox = self.core_inbox orelse return;
+        var tick_msg: protocol.Message = .tick;
+        const bytes = tick_msg.encode(self.allocator) catch return;
+        defer self.allocator.free(bytes);
+        const msg = vigil_api.Message.init(
+            self.allocator,
+            "lsp-debounce-wake",
+            "stem.core",
+            bytes,
+            null,
+            .normal,
+            null,
+        ) catch return;
+        const delay: u32 = @intCast(std.math.clamp(self.lsp_debounce_ms, 1, 10_000));
+        self.lsp_debounce_timer_id = timers.sendAfter(delay, inbox.mailbox, msg) catch null;
     }
 
     fn processDebouncedLspUpdate(self: *Core) void {
@@ -3566,6 +3633,40 @@ pub const Core = struct {
         if (self.runtime_watchdog.observe(health, now)) |toast| {
             self.setStatusLiteralLeveled(watchdogStatusLevel(toast.severity), toast.message, 3500);
         }
+
+        self.ensureBackgroundWorkers(now);
+    }
+
+    const max_index_retries: u8 = 3;
+    const index_retry_interval_ms: i64 = 60_000;
+
+    /// Self-healing for the in-process background workers, run on the
+    /// watchdog cadence. The syntax parse worker is respawned if it died;
+    /// a failed workspace index walk is retried a bounded number of times.
+    fn ensureBackgroundWorkers(self: *Core, now_ms: i64) void {
+        if (self.syntax_manager.restartParseWorkerIfDead(self.io)) {
+            log.warn("syntax parse worker died; restarted", .{});
+            if (self.runtime_services) |rt| {
+                rt.worker_supervisor.recordCrash("syntax-parse");
+                rt.worker_supervisor.recordRestartScheduled("syntax-parse", 0, 1);
+            }
+            self.setStatusLiteral("Syntax worker restarted", 3000);
+        }
+
+        if (self.search_index.needsRetry() and
+            self.index_retry_attempts < max_index_retries and
+            now_ms - self.last_index_retry_ms >= index_retry_interval_ms)
+        {
+            self.last_index_retry_ms = now_ms;
+            self.index_retry_attempts += 1;
+            if (self.runtime_services) |rt| {
+                rt.worker_supervisor.recordRestartScheduled("search-index", 0, self.index_retry_attempts);
+            }
+            log.info("retrying workspace index walk (attempt {d}/{d})", .{ self.index_retry_attempts, max_index_retries });
+            self.search_index.retryIndexing() catch |err| {
+                log.warn("workspace index retry failed to start: {}", .{err});
+            };
+        }
     }
 
     fn buildRuntimeHealthInput(self: *Core) !runtime_watchdog.HealthInput {
@@ -3588,6 +3689,7 @@ pub const Core = struct {
             .failed_jobs = job_summary.failed,
             .index_at_capacity = index_health.at_capacity,
             .has_last_task = self.task_history.last() != null,
+            .runtime_alerts = @import("../services/runtime.zig").RuntimeAlerts.snapshot().total(),
         };
     }
 
@@ -4500,14 +4602,17 @@ pub const Core = struct {
             log.warn("Failed to save session: {}", .{err});
         };
 
-        // Clean exit — drop the crash recovery snapshot so the next
-        // launch knows there's nothing to recover. If this fails we
-        // still proceed; worst case the next launch sees a stale
-        // recovery and offers it (then overwrites once the user saves).
+        // Clean exit — drop the crash recovery snapshot (checkpoint and
+        // legacy forms) so the next launch knows there's nothing to
+        // recover. If this fails we still proceed; worst case the next
+        // launch sees a stale recovery and offers it (then overwrites once
+        // the user saves).
         if (self.storage.getRecoveryPath()) |rp| {
             defer self.allocator.free(rp);
-            std.Io.Dir.cwd().deleteFile(self.io, rp) catch {};
-        } else |_| {}
+            self.discardRecoverySnapshots(rp);
+        } else |_| {
+            self.discardRecoverySnapshots(null);
+        }
 
         var msg = protocol.Message{ .command = .quit };
         const bytes = try msg.encode(self.allocator);
@@ -4516,20 +4621,39 @@ pub const Core = struct {
     }
 
     /// Periodic crash-safety snapshot. Same payload as the clean
-    /// session save, but to the recovery file; survives a crash so
-    /// the next launch can prompt to restore open buffers + cursors.
+    /// session save, but persisted through Vigil's checkpoint service:
+    /// the write happens on a background thread (the core thread never
+    /// waits on storage), byte-identical snapshots are skipped, files are
+    /// version-stamped, and the temp-file-plus-rename dance is atomic.
     /// Called on every save and from the tick handler on a coarse
-    /// (~30 s) timer.
+    /// (~30 s) timer. Falls back to the synchronous legacy write when the
+    /// service can't be created.
     fn writeRecoverySnapshot(self: *Core) void {
-        const rp = self.storage.getRecoveryPath() catch return;
-        defer self.allocator.free(rp);
-
         var splits_json: ?[]const u8 = null;
         defer if (splits_json) |s| self.allocator.free(s);
         if (self.split_manager) |*sm| {
             splits_json = sm.toJson(self.allocator) catch null;
         }
 
+        if (self.ensureSessionCheckpoints()) |service| {
+            const payload = session.serialize(
+                self.allocator,
+                self.buffer_manager.buffers,
+                self.buffer_manager.active_index,
+                splits_json,
+            ) catch |err| {
+                log.debug("Recovery snapshot serialize failed: {}", .{err});
+                return;
+            } orelse return; // nothing file-backed to persist
+            defer self.allocator.free(payload);
+            service.saveAsync(self.session_checkpoint_id.?, payload) catch |err| {
+                log.debug("Recovery checkpoint enqueue failed: {}", .{err});
+            };
+            return;
+        }
+
+        const rp = self.storage.getRecoveryPath() catch return;
+        defer self.allocator.free(rp);
         session.save(
             self.allocator,
             self.io,
@@ -4540,6 +4664,84 @@ pub const Core = struct {
         ) catch |err| {
             log.debug("Recovery snapshot write failed: {}", .{err});
         };
+    }
+
+    /// Lazily create the checkpoint service rooted in the sessions dir.
+    /// The checkpoint id is the recovery file's basename, so the service
+    /// writes `<sessions>/<hash>.json.recover.checkpoint` next to any
+    /// legacy `.recover` file.
+    fn ensureSessionCheckpoints(self: *Core) ?*vigil_api.raw.CheckpointService {
+        if (self.session_checkpoints) |service| return service;
+
+        const rp = self.storage.getRecoveryPath() catch return null;
+        defer self.allocator.free(rp);
+        const dir = std.fs.path.dirname(rp) orelse return null;
+        const base = std.fs.path.basename(rp);
+
+        const backend = self.allocator.create(vigil_api.raw.FileCheckpointer) catch return null;
+        backend.* = vigil_api.raw.FileCheckpointer.initWithIo(self.allocator, self.io, dir) catch {
+            self.allocator.destroy(backend);
+            return null;
+        };
+        const service = self.allocator.create(vigil_api.raw.CheckpointService) catch {
+            backend.deinit();
+            self.allocator.destroy(backend);
+            return null;
+        };
+        service.* = vigil_api.raw.CheckpointService.init(self.allocator, backend.toCheckpointer(), .{
+            .version = 1,
+        });
+        service.start() catch {
+            service.deinit();
+            self.allocator.destroy(service);
+            backend.deinit();
+            self.allocator.destroy(backend);
+            return null;
+        };
+        const id = self.allocator.dupe(u8, base) catch {
+            service.deinit();
+            self.allocator.destroy(service);
+            backend.deinit();
+            self.allocator.destroy(backend);
+            return null;
+        };
+
+        self.session_checkpoint_backend = backend;
+        self.session_checkpoints = service;
+        self.session_checkpoint_id = id;
+        return service;
+    }
+
+    /// Flush pending snapshot writes and tear down the checkpoint pipeline.
+    fn deinitSessionCheckpoints(self: *Core) void {
+        if (self.session_checkpoints) |service| {
+            service.flush();
+            service.deinit();
+            self.allocator.destroy(service);
+            self.session_checkpoints = null;
+        }
+        if (self.session_checkpoint_backend) |backend| {
+            backend.deinit();
+            self.allocator.destroy(backend);
+            self.session_checkpoint_backend = null;
+        }
+        if (self.session_checkpoint_id) |id| {
+            self.allocator.free(id);
+            self.session_checkpoint_id = null;
+        }
+    }
+
+    /// Drop the crash-recovery snapshot in both its checkpoint and legacy
+    /// locations — called on clean exit and after a successful recovery.
+    fn discardRecoverySnapshots(self: *Core, legacy_path: ?[]const u8) void {
+        if (self.session_checkpoints != null) {
+            if (self.session_checkpoint_id) |id| {
+                self.session_checkpoint_backend.?.toCheckpointer().delete(id);
+            }
+        }
+        if (legacy_path) |rp| {
+            std.Io.Dir.cwd().deleteFile(self.io, rp) catch {};
+        }
     }
 
     fn restoreSession(self: *Core) void {
@@ -4553,6 +4755,24 @@ pub const Core = struct {
 
         var loaded_from_recovery = false;
         const loaded: ?session.Session = blk: {
+            // Current format: Vigil checkpoint with version header.
+            if (self.ensureSessionCheckpoints()) |service| {
+                const maybe_bytes = service.load(self.session_checkpoint_id.?, self.allocator) catch |err| bytes_blk: {
+                    log.warn("Recovery checkpoint load failed: {}; trying legacy snapshot", .{err});
+                    break :bytes_blk null;
+                };
+                if (maybe_bytes) |bytes| {
+                    defer self.allocator.free(bytes);
+                    if (session.parseBytes(self.allocator, bytes)) |s| {
+                        log.warn("Found crash recovery checkpoint; restoring", .{});
+                        loaded_from_recovery = true;
+                        break :blk s;
+                    } else |err| {
+                        log.warn("Recovery checkpoint parse failed: {}; trying legacy snapshot", .{err});
+                    }
+                }
+            }
+            // Legacy raw `.recover` file written by a pre-checkpoint stem.
             if (recover_path) |rp| {
                 if (std.Io.Dir.accessAbsolute(self.io, rp, .{})) |_| {
                     if (session.load(self.allocator, self.io, rp)) |sess_opt| {
@@ -4581,9 +4801,7 @@ pub const Core = struct {
             // it. Without this, a launch-then-immediate-crash sequence
             // (before the 30 s periodic rewrite fires) would resurface
             // the same stale recovery on the next launch.
-            if (recover_path) |rp| {
-                std.Io.Dir.cwd().deleteFile(self.io, rp) catch {};
-            }
+            self.discardRecoverySnapshots(recover_path);
         }
 
         if (sess.buffers.len == 0) return;

@@ -10,6 +10,14 @@
 //! thread, and dispatches each dequeued command to a caller-supplied handler.
 //! Knowledge of `LSPManager`, `LSPServer`, etc. lives in the handler — that
 //! keeps this module re-usable and avoids a circular import.
+//!
+//! Vigil's `GenServer` was evaluated (v2.3.0) as a replacement and rejected:
+//! its message loop poll-sleeps at 1 ms when idle (this queue parks on a
+//! condvar — zero wakeups), its mailbox hard-codes a 5 s default TTL that
+//! would silently expire commands queued behind a slow server start (losing
+//! e.g. a user's `didOpen`), and typed commands would need pointer-in-payload
+//! encoding plus a side-band dedup registry. Re-evaluate if GenServer gains
+//! configurable mailbox options and a parked receive.
 
 const std = @import("std");
 const log = std.log.scoped(.LSPSupervisor);

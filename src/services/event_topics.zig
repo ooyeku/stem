@@ -6,6 +6,8 @@ pub const LifecycleTopic = enum {
     plugin_restart_scheduled,
     lsp_crashed,
     lsp_restart_scheduled,
+    worker_crashed,
+    worker_restart_scheduled,
 };
 
 /// Stable topic names declared by plugin manifests and delivered to plugin
@@ -59,6 +61,8 @@ pub fn lifecycleTopic(topic: LifecycleTopic) []const u8 {
         .plugin_restart_scheduled => "runtime.plugin.restart_scheduled",
         .lsp_crashed => "runtime.lsp.crashed",
         .lsp_restart_scheduled => "runtime.lsp.restart_scheduled",
+        .worker_crashed => "runtime.worker.crashed",
+        .worker_restart_scheduled => "runtime.worker.restart_scheduled",
     };
 }
 

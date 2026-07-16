@@ -130,6 +130,41 @@ pub const SearchIndex = struct {
         t.detach();
     }
 
+    /// True when a previous indexing run for this root ended without a
+    /// fresh index (worker errored out mid-walk) and no worker is running —
+    /// i.e. a retry would actually help.
+    pub fn needsRetry(self: *SearchIndex) bool {
+        if (self.worker_running.load(.acquire)) return false;
+        if (self.fresh.load(.acquire)) return false;
+        if (self.shutdown_requested.load(.acquire)) return false;
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.root != null;
+    }
+
+    /// Watchdog hook: re-run the indexer for the already-configured root.
+    /// Unlike `startIndexing`, this does not treat "same root" as a no-op —
+    /// that guard is exactly what blocks recovery after a failed walk.
+    pub fn retryIndexing(self: *SearchIndex) !void {
+        if (!self.needsRetry()) return;
+
+        self.mu.lock();
+        const root_dup: ?[]u8 = if (self.root) |r|
+            self.allocator.dupe(u8, r) catch null
+        else
+            null;
+        self.mu.unlock();
+        const owned = root_dup orelse return;
+
+        self.worker_running.store(true, .release);
+        errdefer self.worker_running.store(false, .release);
+        const t = std.Thread.spawn(.{}, indexerWorker, .{ self, owned }) catch |err| {
+            self.allocator.free(owned);
+            return err;
+        };
+        t.detach();
+    }
+
     /// Append a path the user just saved, if it's inside our root and
     /// not already indexed. Cheap — O(N) lookup since we don't keep
     /// a set, but N is bounded at `max_paths` and the cost is paid on

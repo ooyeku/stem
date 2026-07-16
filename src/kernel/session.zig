@@ -16,14 +16,15 @@ pub const BufferState = struct {
     name: []const u8,
 };
 
-pub fn save(
+/// Serialize the session to owned JSON bytes, or null when there are no
+/// file-backed buffers worth persisting. Caller frees the returned slice.
+/// Shared by the direct file save below and the Vigil checkpoint pipeline.
+pub fn serialize(
     allocator: std.mem.Allocator,
-    io: std.Io,
-    session_path: []const u8,
     buffers: anytype,
     active_index: usize,
     splits_json: ?[]const u8,
-) !void {
+) !?[]u8 {
     var buffer_states = std.ArrayListUnmanaged(BufferState).empty;
     defer buffer_states.deinit(allocator);
 
@@ -40,13 +41,10 @@ pub fn save(
         });
     }
 
-    if (buffer_states.items.len == 0) {
-        log.info("No file-backed buffers to save", .{});
-        return;
-    }
+    if (buffer_states.items.len == 0) return null;
 
     var json = std.ArrayListUnmanaged(u8).empty;
-    defer json.deinit(allocator);
+    errdefer json.deinit(allocator);
 
     try json.appendSlice(allocator, "{\"version\":1,\"active\":");
     try appendInt(allocator, &json, active_index);
@@ -75,6 +73,29 @@ pub fn save(
     }
 
     try json.append(allocator, '}');
+    return try json.toOwnedSlice(allocator);
+}
+
+/// Parse serialized session bytes (the `serialize` format). The caller owns
+/// the returned session; free with `freeSession`.
+pub fn parseBytes(allocator: std.mem.Allocator, json: []const u8) !Session {
+    return parseSession(allocator, json);
+}
+
+pub fn save(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    session_path: []const u8,
+    buffers: anytype,
+    active_index: usize,
+    splits_json: ?[]const u8,
+) !void {
+    const payload = (try serialize(allocator, buffers, active_index, splits_json)) orelse {
+        log.info("No file-backed buffers to save", .{});
+        return;
+    };
+    defer allocator.free(payload);
+    const json_items = payload;
 
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{session_path});
     defer allocator.free(tmp_path);
@@ -85,7 +106,7 @@ pub fn save(
             return err;
         };
         defer file.close(io);
-        try file.writePositionalAll(io, json.items, 0);
+        try file.writePositionalAll(io, json_items, 0);
     }
 
     std.Io.Dir.renameAbsolute(tmp_path, session_path, io) catch |err| {
@@ -94,7 +115,7 @@ pub fn save(
         return err;
     };
 
-    log.info("Session saved: {} buffers, has_splits={}", .{ buffer_states.items.len, splits_json != null });
+    log.info("Session saved: {} bytes, has_splits={}", .{ json_items.len, splits_json != null });
 }
 
 pub fn load(allocator: std.mem.Allocator, io: std.Io, session_path: []const u8) !?Session {
@@ -262,6 +283,40 @@ pub fn freeSession(allocator: std.mem.Allocator, session: Session) void {
     }
     allocator.free(session.buffers);
     if (session.splits_json) |s| allocator.free(s);
+}
+
+test "serialize and parseBytes round-trip through the checkpoint pipeline format" {
+    const allocator = std.testing.allocator;
+
+    const FakeBuffer = struct {
+        file_path: ?[]const u8,
+        name: []const u8,
+        state: struct { cursor_row: usize, cursor_col: usize, scroll_offset: usize },
+    };
+    const FakeList = struct { items: []const FakeBuffer };
+    const buffers = FakeList{ .items = &.{
+        .{ .file_path = "/tmp/a.zig", .name = "a.zig", .state = .{ .cursor_row = 3, .cursor_col = 7, .scroll_offset = 1 } },
+        .{ .file_path = null, .name = "[scratch]", .state = .{ .cursor_row = 0, .cursor_col = 0, .scroll_offset = 0 } },
+        .{ .file_path = "/tmp/b.zig", .name = "b.zig", .state = .{ .cursor_row = 9, .cursor_col = 0, .scroll_offset = 4 } },
+    } };
+
+    const payload = (try serialize(allocator, buffers, 1, null)).?;
+    defer allocator.free(payload);
+
+    const s = try parseBytes(allocator, payload);
+    defer freeSession(allocator, s);
+    // The scratch buffer is skipped; both file-backed buffers survive.
+    try std.testing.expectEqual(@as(usize, 2), s.buffers.len);
+    try std.testing.expectEqualStrings("/tmp/a.zig", s.buffers[0].file_path.?);
+    try std.testing.expectEqual(@as(usize, 3), s.buffers[0].cursor_row);
+    try std.testing.expectEqualStrings("/tmp/b.zig", s.buffers[1].file_path.?);
+    try std.testing.expectEqual(@as(usize, 4), s.buffers[1].scroll_offset);
+
+    // No file-backed buffers → nothing to persist.
+    const empty = FakeList{ .items = &.{
+        .{ .file_path = null, .name = "[scratch]", .state = .{ .cursor_row = 0, .cursor_col = 0, .scroll_offset = 0 } },
+    } };
+    try std.testing.expectEqual(@as(?[]u8, null), try serialize(allocator, empty, 0, null));
 }
 
 test "appendInt basic" {

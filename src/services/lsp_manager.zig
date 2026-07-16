@@ -69,6 +69,9 @@ pub const LSPManager = struct {
     /// so the supervisor's worker thread can read/write without sharing state
     /// with the LSPServer (which gets destroyed across restarts).
     restart_state: std.StringHashMapUnmanaged(RestartState) = .empty,
+    /// Per-language circuit breakers gating restart storms. Guarded by
+    /// `restart_state_mutex`; keys are owned copies shared with nothing.
+    restart_breakers: std.StringHashMapUnmanaged(*vigil_api.CircuitBreaker) = .empty,
     restart_state_mutex: std.Io.Mutex = .init,
 
     /// Per-file pending `textDocument/didChange` payloads. Coalesces a
@@ -133,6 +136,8 @@ pub const LSPManager = struct {
         pending_changes: usize = 0,
         in_progress_starts: usize = 0,
         restart_tracked_languages: usize = 0,
+        /// Restart circuit breakers currently open (restarts suspended).
+        circuits_open: usize = 0,
         lifecycle: vigil_supervision.Snapshot = .{},
 
         pub fn deinit(self: *HealthSnapshot, allocator: std.mem.Allocator) void {
@@ -229,6 +234,10 @@ pub const LSPManager = struct {
                     server.last_restart_attempt_ms = state.last_attempt_ms;
                 }
             }
+            var breaker_it = self.restart_breakers.valueIterator();
+            while (breaker_it.next()) |breaker| {
+                if (breaker.*.getState() == .open) snapshot.circuits_open += 1;
+            }
         }
 
         self.pending_changes_mutex.lockUncancelable(self.io);
@@ -250,17 +259,23 @@ pub const LSPManager = struct {
     /// running server; if its `server_healthy` is false and it's not in a
     /// backoff window, enqueue a restart on the supervisor.
     const watchdog_interval_ms: u64 = 3000;
-    /// Cap restart attempts so a server that keeps crashing doesn't pin a
-    /// CPU re-starting it forever. After this many attempts in a row, we
-    /// stop trying until the user does something (open a new file, run the
-    /// "LSP: Restart Server" command, etc.).
+    /// Consecutive restart failures before the per-language circuit breaker
+    /// opens and restarts stop. Unlike the old hard give-up, the breaker
+    /// half-opens after `breaker_reset_timeout_ms` and admits one probe
+    /// restart, so a fixed server recovers without user intervention.
     const max_restart_attempts: u32 = 5;
-    /// Base backoff in ms. Doubled on each consecutive attempt, capped at
-    /// `max_backoff_ms`.
-    const base_backoff_ms: i64 = 1_000;
-    const max_backoff_ms: i64 = 30_000;
+    /// Delay between restart attempts: 1s, 2s, 4s, 8s, 16s (capped 30s),
+    /// plus deterministic jitter so several broken servers don't restart in
+    /// lockstep.
+    const restart_backoff: vigil_api.BackoffPolicy = .{ .jittered = .{
+        .base = .{ .initial_ms = 1_000, .multiplier = 2, .max_ms = 30_000 },
+        .jitter_ms = 250,
+    } };
+    /// How long an open breaker waits before allowing a probe restart.
+    const breaker_reset_timeout_ms: u32 = 30_000;
     /// If a server has been healthy for this long, reset the attempt count
-    /// — a successful recovery shouldn't burn future budget.
+    /// and force the breaker closed — a successful recovery shouldn't burn
+    /// future budget.
     const recovery_window_ms: i64 = 60_000;
 
     fn watchdogMain(self: *LSPManager) void {
@@ -374,17 +389,53 @@ pub const LSPManager = struct {
             gop.value_ptr.* = .{};
         }
 
-        if (gop.value_ptr.attempts >= max_restart_attempts) return false;
-
+        // Backoff spacing first (cheap, consumes nothing), breaker gate last
+        // — beforeCall() spends half-open probe budget, so it must only run
+        // when we would otherwise proceed.
         const since = now_ms - gop.value_ptr.last_attempt_ms;
-        // Exponential backoff: 1s, 2s, 4s, 8s, 16s (capped at 30s).
-        const backoff = @min(base_backoff_ms * (@as(i64, 1) << @intCast(gop.value_ptr.attempts)), max_backoff_ms);
+        const backoff: i64 = restart_backoff.delayMs(gop.value_ptr.attempts);
         if (gop.value_ptr.last_attempt_ms != 0 and since < backoff) return false;
+
+        const breaker = self.restartBreakerLocked(lang) orelse return false;
+        breaker.beforeCall() catch return false; // circuit open: wait for the probe window
+        // The restart being scheduled means the server failed; count it now
+        // so `max_restart_attempts` consecutive failures open the circuit
+        // (emitting a `circuit_opened` telemetry alert).
+        breaker.recordFailure();
 
         gop.value_ptr.attempts += 1;
         gop.value_ptr.last_attempt_ms = now_ms;
         gop.value_ptr.healthy_since_ms = 0;
         return true;
+    }
+
+    /// Get or create the restart circuit breaker for `lang`. Caller holds
+    /// `restart_state_mutex`.
+    fn restartBreakerLocked(self: *LSPManager, lang: []const u8) ?*vigil_api.CircuitBreaker {
+        if (self.restart_breakers.get(lang)) |breaker| return breaker;
+
+        const breaker = self.allocator.create(vigil_api.CircuitBreaker) catch return null;
+        breaker.* = vigil_api.CircuitBreaker.init(self.allocator, lang, .{
+            .failure_threshold = max_restart_attempts,
+            .reset_timeout_ms = breaker_reset_timeout_ms,
+            .half_open_requests = 1,
+            .half_open_success_threshold = 1,
+        }) catch {
+            self.allocator.destroy(breaker);
+            return null;
+        };
+        const key = self.allocator.dupe(u8, lang) catch {
+            breaker.deinit();
+            self.allocator.destroy(breaker);
+            return null;
+        };
+        self.restart_breakers.put(self.allocator, key, breaker) catch {
+            self.allocator.free(key);
+            breaker.deinit();
+            self.allocator.destroy(breaker);
+            return null;
+        };
+        return breaker;
     }
 
     fn markHealthyRestartBudgetAt(self: *LSPManager, lang: []const u8, now_ms: i64) void {
@@ -404,6 +455,9 @@ pub const LSPManager = struct {
             state.attempts = 0;
             state.last_attempt_ms = 0;
             state.healthy_since_ms = 0;
+            // A sustained recovery closes the breaker outright so a later,
+            // unrelated failure starts with a full budget.
+            if (self.restart_breakers.get(lang)) |breaker| breaker.forceClose();
         }
     }
 
@@ -449,9 +503,37 @@ pub const LSPManager = struct {
         defer if (root_owned) |r| self.allocator.free(r);
         defer self.endStart(lang_owned);
 
-        self.startServerInternal(lang_owned, root_owned) catch |err| {
-            log.warn("[LSP parallel-start] {s} failed: {}", .{ lang_owned, err });
+        // Vigil reliability policy: a start that fails transiently (binary
+        // mid-install, momentary spawn failure) gets two more attempts with
+        // jittered exponential backoff before we give up. Safe to retry:
+        // failed starts roll back fully before returning. We run detached,
+        // so the policy's sleeps block nobody.
+        const StartAttempt = struct {
+            manager: *LSPManager,
+            lang: []const u8,
+            root: ?[]const u8,
+
+            fn run(ctx: *@This()) anyerror!void {
+                return ctx.manager.startServerInternal(ctx.lang, ctx.root);
+            }
         };
+        var attempt: StartAttempt = .{ .manager = self, .lang = lang_owned, .root = root_owned };
+        const result = vigil_api.executePolicy(StartAttempt, void, &attempt, StartAttempt.run, .{
+            .retry = .{
+                .max_attempts = 3,
+                .backoff = .{ .jittered = .{
+                    .base = .{ .initial_ms = 500, .multiplier = 2, .max_ms = 5_000 },
+                    .jitter_ms = 250,
+                } },
+            },
+        });
+        switch (result) {
+            .success, .fallback => {},
+            .permanent_failure, .timeout, .circuit_open => |failure| log.warn(
+                "[LSP parallel-start] {s} failed after {d} attempts: {any}",
+                .{ lang_owned, failure.attempts, failure.last_error },
+            ),
+        }
     }
 
     fn supervisorExecute(ctx: *anyopaque, cmd: supervisor_mod.Command) void {
@@ -593,6 +675,14 @@ pub const LSPManager = struct {
         var rs_it = self.restart_state.keyIterator();
         while (rs_it.next()) |k| self.allocator.free(k.*);
         self.restart_state.deinit(self.allocator);
+
+        var rb_it = self.restart_breakers.iterator();
+        while (rb_it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.restart_breakers.deinit(self.allocator);
 
         // Drop any debounced didChange payloads. The servers are
         // about to die (or already are) — sending the final flush
@@ -2432,6 +2522,14 @@ pub const LSPManager = struct {
         const server = maybe_server.?;
 
         if (!server.server_healthy.load(.acquire) and server.server_running.load(.acquire)) {
+            // Same backoff/circuit-breaker gate as the watchdog. This path
+            // fires from the render hot path, so without the gate a broken
+            // server would enqueue a restart per frame, bypassing the cap.
+            if (!self.shouldRetryRestart(lang)) {
+                self.manager_mutex.unlock(self.io);
+                return;
+            }
+            self.recordLspRestartScheduled(lang, 0, 0);
             // Hand off the recovery to the supervisor; this returns
             // immediately so we don't freeze the caller.
             log.info("[LSP AUTO-RECOVERY] {s} server unhealthy, queueing restart...", .{lang});
@@ -2943,14 +3041,20 @@ test "LSPManager restart budget resets only after healthy recovery" {
     var attempts: u32 = 0;
     while (attempts < LSPManager.max_restart_attempts) : (attempts += 1) {
         try std.testing.expect(manager.shouldRetryRestartAt(lang, now));
-        now += LSPManager.max_backoff_ms + 1;
+        // Step past the vigil backoff delay for the next attempt.
+        now += @as(i64, LSPManager.restart_backoff.delayMs(attempts + 1)) + 1;
     }
 
+    // After max_restart_attempts consecutive failures the circuit breaker is
+    // open (it runs on real time, not the simulated clock), so restarts stay
+    // suspended no matter how far the simulated clock advances.
     try std.testing.expect(!manager.shouldRetryRestartAt(lang, now + LSPManager.recovery_window_ms * 10));
 
     manager.markHealthyRestartBudgetAt(lang, now);
     try std.testing.expect(!manager.shouldRetryRestartAt(lang, now + LSPManager.recovery_window_ms / 2));
 
+    // A sustained healthy window resets the budget and force-closes the
+    // breaker, so the next restart is admitted immediately.
     manager.markHealthyRestartBudgetAt(lang, now + LSPManager.recovery_window_ms + 1);
-    try std.testing.expect(manager.shouldRetryRestartAt(lang, now + LSPManager.recovery_window_ms + LSPManager.max_backoff_ms + 2));
+    try std.testing.expect(manager.shouldRetryRestartAt(lang, now + LSPManager.recovery_window_ms + 2));
 }

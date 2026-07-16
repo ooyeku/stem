@@ -6,6 +6,8 @@ const event_topics = @import("event_topics.zig");
 pub const ComponentKind = enum {
     plugins,
     lsp,
+    /// In-process background workers (syntax parser, search indexer).
+    workers,
 };
 
 pub const Snapshot = struct {
@@ -54,6 +56,11 @@ pub const ComponentSupervisor = struct {
         var metadata_owned = false;
         const metadata = switch (self.kind) {
             .plugins => component_id,
+            .workers => blk: {
+                const m = std.fmt.allocPrint(self.allocator, "worker:{s}", .{component_id}) catch break :blk component_id;
+                metadata_owned = true;
+                break :blk m;
+            },
             .lsp => blk: {
                 const m = std.fmt.allocPrint(self.allocator, "lsp:{s}", .{component_id}) catch break :blk component_id;
                 metadata_owned = true;
@@ -71,6 +78,7 @@ pub const ComponentSupervisor = struct {
         const topic = switch (self.kind) {
             .plugins => event_topics.lifecycleTopic(.plugin_crashed),
             .lsp => event_topics.lifecycleTopic(.lsp_crashed),
+            .workers => event_topics.lifecycleTopic(.worker_crashed),
         };
         self.publish(topic, component_id);
     }
@@ -97,6 +105,7 @@ pub const ComponentSupervisor = struct {
         const topic = switch (self.kind) {
             .plugins => event_topics.lifecycleTopic(.plugin_restart_scheduled),
             .lsp => event_topics.lifecycleTopic(.lsp_restart_scheduled),
+            .workers => event_topics.lifecycleTopic(.worker_restart_scheduled),
         };
         self.publish(topic, component_id);
     }

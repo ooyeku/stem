@@ -111,6 +111,13 @@ pub const PluginManager = struct {
     /// Populated by `plugin/subscribeEvent` (exec) and
     /// `stem_subscribe_event` (wasm); drained on plugin unload.
     event_subscribers: std.AutoHashMapUnmanaged(protocol.PluginEvent, std.ArrayListUnmanaged(EventSub)) = .empty,
+    /// Flow control for high-frequency event fanout. Delivery is synchronous
+    /// on the calling (core) thread, so a held arrow key with a slow plugin
+    /// subscribed to cursor events would otherwise stall the editor. Vigil's
+    /// lock-free GCRA limiter caps deliveries; only drop-safe events
+    /// (`cursor_moved` — positional, latest-wins) are ever throttled.
+    cursor_event_limiter: vigil_api.raw.RateLimiter,
+    events_rate_limited: std.atomic.Value(u64) = .init(0),
 
     /// Plugin status-bar widgets, keyed by `"<plugin_id>:<item_id>"`.
     status_items: std.StringHashMapUnmanaged(StoredStatusItem) = .empty,
@@ -157,6 +164,8 @@ pub const PluginManager = struct {
         status_items: usize = 0,
         panels: usize = 0,
         keybindings: usize = 0,
+        /// Cursor events dropped by the fanout rate limiter.
+        events_rate_limited: u64 = 0,
         vigil_broker_attached: bool = false,
         vigil_supervisor_attached: bool = false,
         lifecycle: vigil_supervision.Snapshot = .{},
@@ -198,6 +207,8 @@ pub const PluginManager = struct {
             .environ_block = environ_block,
             .ui_bus = ui_bus,
             .command_registry = command_registry,
+            // Runtime init: the GCRA limiter samples the monotonic clock.
+            .cursor_event_limiter = vigil_api.raw.RateLimiter.initBurst(30, 60),
         };
     }
 
@@ -224,6 +235,7 @@ pub const PluginManager = struct {
             .keybindings = self.plugin_keybindings.count(),
             .vigil_broker_attached = self.event_broker != null,
             .vigil_supervisor_attached = self.lifecycle_supervisor != null,
+            .events_rate_limited = self.events_rate_limited.load(.monotonic),
         };
         snapshot.loaded_plugins = snapshot.process_plugins + snapshot.wasm_plugins;
 
@@ -2878,6 +2890,15 @@ pub const PluginManager = struct {
     ///   3. Each subscribed wasm plugin, by invoking the optional
     ///      `handle_event` export.
     pub fn broadcastEvent(self: *PluginManager, event: protocol.PluginEvent, data: []const u8) void {
+        // Throttle drop-safe high-frequency events before doing any fanout
+        // work. Cursor events are positional snapshots, so a dropped one is
+        // superseded by the next allowed one; a plugin may briefly see a
+        // stale position at the very end of a fast burst.
+        if (event == .cursor_moved and !self.cursor_event_limiter.allow()) {
+            _ = self.events_rate_limited.fetchAdd(1, .monotonic);
+            return;
+        }
+
         const topic = pluginEventTopic(event);
         const editor_topic = event_topics.editorEventTopic(event);
 
