@@ -2894,18 +2894,12 @@ pub const PluginManager = struct {
     }
 
     fn publishEventTopic(self: *PluginManager, topic: []const u8, data: []const u8) void {
-        if (self.event_broker) |broker| {
-            _ = broker.publish(topic, data) catch |err| {
-                log.warn("pubsub publish '{s}' failed: {}", .{ topic, err });
-            };
-            return;
-        }
-
-        if (vigil_api.globalBroker()) |broker| {
-            _ = broker.publish(topic, data) catch |err| {
-                log.warn("pubsub publish '{s}' failed: {}", .{ topic, err });
-            };
-        }
+        // Vigil 2.2 removed the global pub/sub broker; publishing requires the
+        // runtime-owned broker attached via setVigilServices.
+        const broker = self.event_broker orelse return;
+        _ = broker.publish(topic, data) catch |err| {
+            log.warn("pubsub publish '{s}' failed: {}", .{ topic, err });
+        };
     }
 
     fn deliverExecEvent(self: *PluginManager, plugin_id: []const u8, topic: []const u8, data: []const u8) void {

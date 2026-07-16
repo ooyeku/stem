@@ -248,12 +248,16 @@ pub const MessageBus = struct {
         return dropped;
     }
 
-    fn dropQueuedByIdInQueue(mailbox: *vigil.ProcessMailbox, queue: *std.ArrayList(Message), id: []const u8) usize {
+    /// Vigil 2.3.0 replaced the mailbox's ArrayList queues with ring buffers;
+    /// the queue type is not re-exported, so name it via the mailbox field.
+    const MailboxQueue = @FieldType(vigil.ProcessMailbox, "messages");
+
+    fn dropQueuedByIdInQueue(mailbox: *vigil.ProcessMailbox, queue: *MailboxQueue, id: []const u8) usize {
         var dropped: usize = 0;
         var i: usize = 0;
-        while (i < queue.items.len) {
-            if (std.mem.eql(u8, queue.items[i].id, id)) {
-                var old = queue.orderedRemove(i);
+        while (i < queue.len()) {
+            if (std.mem.eql(u8, queue.at(i).id, id)) {
+                var old = queue.removeAt(i);
                 if (std.mem.eql(u8, id, render_coalesce_id)) {
                     releaseRenderArenaFromPayload(old.payload);
                 }

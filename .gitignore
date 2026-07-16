@@ -18,3 +18,5 @@ zig-pkg
 .metals
 .scala-build
 .ruby-lsp
+
+.DS_Store

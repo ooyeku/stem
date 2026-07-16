@@ -7,6 +7,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 
 const Keys = @import("../../config/keys.zig").Keys;
+const EditorState = @import("../../core/state.zig").EditorState;
 const Help = @import("../../ui/help.zig");
 const LeaderDispatch = @import("../leader_dispatch.zig").LeaderDispatch;
 const LspCommands = @import("../commands/lsp_commands.zig").LspCommands;
@@ -154,6 +155,10 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
         return true;
     }
 
+    if (core.activeBufferIsPresentationReadOnly()) {
+        if (handlePresentationViewportScroll(core, key)) return true;
+    }
+
     const s = core.state();
     if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
         try s.moveCursorLeftGrapheme();
@@ -177,4 +182,114 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
         s.moveCursorToLineEnd();
     }
     return true;
+}
+
+fn handlePresentationViewportScroll(core: anytype, key: vaxis.Key) bool {
+    const visible_rows = core.getFocusedPaneHeight();
+    if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+        scrollViewportBy(core.state(), visible_rows, 1);
+    } else if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+        scrollViewportBy(core.state(), visible_rows, -1);
+    } else if (key.matches(vaxis.Key.page_down, .{})) {
+        scrollViewportBy(core.state(), visible_rows, @intCast(visible_rows));
+    } else if (key.matches(vaxis.Key.page_up, .{})) {
+        scrollViewportBy(core.state(), visible_rows, -@as(isize, @intCast(visible_rows)));
+    } else if (key.matches(vaxis.Key.home, .{})) {
+        scrollViewportTo(core.state(), visible_rows, 0);
+    } else if (key.matches(vaxis.Key.end, .{})) {
+        const s = core.state();
+        const line_count = s.buffer.lineCount();
+        const max_scroll = maxViewportScroll(line_count, visible_rows);
+        scrollViewportTo(s, visible_rows, max_scroll);
+    } else {
+        return false;
+    }
+
+    core.scroll_in_progress = true;
+    core.last_scroll_time = std.Io.Clock.real.now(core.io).toMilliseconds();
+    return true;
+}
+
+fn scrollViewportBy(state: *EditorState, visible_rows: usize, delta: isize) void {
+    const line_count = state.buffer.lineCount();
+    const max_scroll = maxViewportScroll(line_count, visible_rows);
+    const current = state.scroll_offset;
+    const next = if (delta >= 0)
+        @min(current + @as(usize, @intCast(delta)), max_scroll)
+    else
+        current -| @as(usize, @intCast(-delta));
+
+    scrollViewportTo(state, visible_rows, next);
+}
+
+fn scrollViewportTo(state: *EditorState, visible_rows: usize, offset: usize) void {
+    const safe_visible_rows = @max(visible_rows, 1);
+    const line_count = state.buffer.lineCount();
+    const max_scroll = maxViewportScroll(line_count, safe_visible_rows);
+    state.scroll_offset = @min(offset, max_scroll);
+
+    const max_row = if (line_count == 0) 0 else line_count - 1;
+    const viewport_last = @min(max_row, state.scroll_offset + safe_visible_rows - 1);
+    if (state.cursor_row < state.scroll_offset) {
+        state.cursor_row = state.scroll_offset;
+    } else if (state.cursor_row > viewport_last) {
+        state.cursor_row = viewport_last;
+    }
+    state.cursor_col = @min(state.cursor_col, state.getLineLength(state.cursor_row));
+    state.preferred_col = null;
+}
+
+fn maxViewportScroll(line_count: usize, visible_rows: usize) usize {
+    const safe_visible_rows = @max(visible_rows, 1);
+    return if (line_count > safe_visible_rows) line_count - safe_visible_rows else 0;
+}
+
+test "view viewport scroll moves offset immediately and keeps cursor visible" {
+    const TestIo = @import("../../test_utils.zig").TestIo;
+
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var state_value = try EditorState.init(allocator, io_ctx.io(),
+        \\line 1
+        \\line 2
+        \\line 3
+        \\line 4
+        \\line 5
+        \\line 6
+        \\
+    );
+    defer state_value.deinit();
+
+    scrollViewportBy(&state_value, 3, 1);
+
+    try std.testing.expectEqual(@as(usize, 1), state_value.scroll_offset);
+    try std.testing.expectEqual(@as(usize, 1), state_value.cursor_row);
+}
+
+test "view viewport scroll clamps at document edges" {
+    const TestIo = @import("../../test_utils.zig").TestIo;
+
+    const allocator = std.testing.allocator;
+    var io_ctx = TestIo.init(allocator);
+    defer io_ctx.deinit();
+
+    var state_value = try EditorState.init(allocator, io_ctx.io(),
+        \\line 1
+        \\line 2
+        \\line 3
+        \\line 4
+        \\line 5
+        \\
+    );
+    defer state_value.deinit();
+
+    scrollViewportBy(&state_value, 2, 99);
+    try std.testing.expectEqual(@as(usize, 3), state_value.scroll_offset);
+    try std.testing.expectEqual(@as(usize, 3), state_value.cursor_row);
+
+    scrollViewportBy(&state_value, 2, -99);
+    try std.testing.expectEqual(@as(usize, 0), state_value.scroll_offset);
+    try std.testing.expectEqual(@as(usize, 1), state_value.cursor_row);
 }

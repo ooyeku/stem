@@ -36,10 +36,6 @@ pub fn standaloneInboxForTest(allocator: std.mem.Allocator) !*Inbox {
     return vigil.inbox(allocator);
 }
 
-pub fn globalBroker() ?*PubSubBroker {
-    return vigil.pubsub.getGlobal();
-}
-
 pub fn sleep(ns: u64) void {
     vigil.compat.sleep(ns);
 }
