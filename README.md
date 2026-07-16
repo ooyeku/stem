@@ -1,16 +1,58 @@
 # Stem
- 
-A modal text editor for the terminal. Built in Zig, with tree-sitter
-syntax highlighting and built-in LSP integration for 20+ languages.
 
-Stem aims to keep modal editing approachable: Vim-style modes, a Space
-leader, and a discoverable command palette. ZLS is embedded so Zig
-works with no setup; other language servers install on request via
-`stem lsp install`.
+**The editor built like a telecom switch: it supervises itself, heals
+itself, and can show you exactly what its runtime is doing.**
+
+Stem is a modal text editor for the terminal, built in Zig on an
+Erlang/OTP-style supervised runtime ([vigil](https://github.com/ooyeku/vigil)).
+Every subsystem — language servers, plugins, background workers — runs
+under supervision with circuit breakers, backoff policies, and
+watchdogs. When something crashes, stem restarts it. When something
+misbehaves, stem contains it. And when you want to know what's going
+on, the runtime is a pane of glass, not a black box.
+
+On top of that backbone sits an approachable modal editor: Vim-style
+modes, a Space leader, a discoverable command palette, tree-sitter
+highlighting for 29 languages, and built-in LSP for 20+ language
+servers. ZLS is embedded so Zig works with no setup; other servers
+install on request via `stem lsp install`.
 
 ![Zig](https://img.shields.io/badge/zig-0.16%2B-orange)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-green)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
+
+## Reliability by design
+
+Most editors bolt error handling onto an event loop. Stem inverts
+that: the runtime is the product, and editing features are workloads
+it supervises. Concretely, that means:
+
+- **Self-healing subsystems.** A language server that crash-loops hits
+  a per-language circuit breaker — restarts back off with jitter, stop
+  after repeated failures, then probe again automatically once the
+  cause has likely cleared. A dead syntax worker or failed workspace
+  index walk is detected by the watchdog and restarted, with a toast
+  so you know it happened.
+- **Nothing fails silently.** Undeliverable messages go to inspectable
+  dead-letter queues instead of vanishing. Dead letters, poison
+  messages, open circuits, and component crashes all feed a
+  "check-engine light": a status-bar warning that points you at the
+  live cockpit.
+- **A pane of glass, not a black box.** `stem.control_center` shows
+  queue depths, message-bus pressure, circuit-breaker states,
+  dead-letter contents, timer stats, and a rolling timeline of runtime
+  events — while the editor runs.
+- **Crash safety as a feature.** Sessions checkpoint in the background
+  (versioned, atomic, skipped when unchanged); dirty buffers back up
+  every 30 s; a crash restores your buffers, cursors, and splits on
+  the next launch.
+- **Bounded everything.** Priority-classed message passing means a
+  critical quit overtakes queued renders; flow control means a slow
+  plugin can't stall your cursor; large files degrade gracefully
+  instead of freezing the editor.
+
+If you've ever wondered *why* your editor feels wrong and had no way
+to find out, this is the editor that can answer.
 
 ## Install
 
@@ -69,6 +111,35 @@ when it isn't already there.
 
 ## Features
 
+### Supervised runtime
+
+- Erlang/OTP-style supervision (via [vigil](https://github.com/ooyeku/vigil)):
+  plugins, LSP servers, and background workers run under supervisors
+  with crash tracking and automatic restarts
+- Per-language circuit breakers on LSP restarts — jittered exponential
+  backoff, automatic half-open probes, no crash-loops pinning a core
+- Watchdog-driven self-healing: dead syntax workers respawn, failed
+  index walks retry, and every recovery is announced in the status bar
+- Dead-letter queues with live inspection — undeliverable messages are
+  retained and attributable, never silently dropped
+- Runtime "check-engine light": telemetry-fed alert counters surface
+  dead letters, poison messages, open circuits, and crashes as they happen
+- Stem Control Center (`stem.control_center`) for runtime, Vigil,
+  project-index, LSP, job, plugin, and message-bus health in one view
+- Stem Heal (`stem.heal`) for Vigil-backed runtime recovery
+  recommendations and watchdog guidance
+- Session restore with versioned, atomic, background-written
+  crash-recovery checkpoints
+- Periodic auto-save backups of dirty buffers in `~/.stem/recover/`,
+  surfaced at startup if any survived a crash
+- Opt-in multi-instance presence (`STEM_CLUSTER`): stem instances
+  discover and health-check each other over a distributed registry
+- **Large-file mode**: files past 5 MB / 50k lines auto-degrade —
+  tree-sitter, brackets, LSP, and auto-pair disabled so a multi-MB
+  log stays responsive. `[LARGE]` badge in the status bar
+
+### Editing
+
 - Modal editing — Select, Insert, Visual, View, and Terminal modes
 - Multi-buffer workflow with a tab bar
 - Horizontal and vertical split panes
@@ -94,13 +165,6 @@ when it isn't already there.
   diagnostics, and document symbols (via LSP)
 - Jump to next/previous diagnostic (`]d`/`[d`), git hunk (`]g`/`[g`),
   AST sibling (`]s`/`[s`), function (`]m`/`[m`)
-- Session restore with crash-recovery snapshots
-- Periodic auto-save backups of dirty buffers in `~/.stem/recover/`,
-  surfaced at startup if any survived a crash
-- Stem Control Center (`stem.control_center`) for runtime, Vigil,
-  project-index, LSP, job, plugin, and message-bus health in one view
-- Stem Heal (`stem.heal`) for Vigil-backed runtime recovery
-  recommendations and watchdog guidance
 - Project Brain (`project.brain`) for workspace index state, open
   languages, diagnostics pressure, and LSP coverage
 - Project Tasks (`task.list`) detects common build/test/run commands
@@ -109,9 +173,6 @@ when it isn't already there.
   background jobs, with `task.run`, `task.run_dev`, `task.run_lint`,
   and `task.run_format` for matching project scripts; `task.rerun_last`
   launches the most recent project task again
-- **Large-file mode**: files past 5 MB / 50k lines auto-degrade —
-  tree-sitter, brackets, LSP, and auto-pair disabled so a multi-MB
-  log stays responsive. `[LARGE]` badge in the status bar
 - Background workspace file index for instant `Find` queries
 - CLI search tools (`stem --find`, `--vfind`, `--scope`)
 
@@ -541,6 +602,15 @@ zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast    # experimental
 
 ## Architecture
 
+Stem is split into a UI thread and a core thread that communicate
+exclusively through vigil's priority-classed message bus — a critical
+`.quit` overtakes queued renders, bulk traffic is rate-limited and
+watermarked, and every drop is counted. Language servers, plugins,
+and background workers hang off supervisors owned by a single
+`StemRuntime`, so the process tree is inspectable and every failure
+has an owner. The runtime cockpit reads the same telemetry the
+watchdog acts on.
+
 ```
 src/
 ├── main.zig           # Entry point and CLI handling
@@ -562,7 +632,9 @@ src/
 All Zig dependencies are pinned in [build.zig.zon](build.zig.zon):
 
 - [libvaxis](https://github.com/rockorager/libvaxis) — terminal UI
-- [vigil](https://github.com/ooyeku/vigil) — actor-style message passing
+- [vigil](https://github.com/ooyeku/vigil) — Erlang/OTP-style supervised
+  runtime: message passing, supervision trees, circuit breakers,
+  checkpoints, timers, and telemetry
 - [zls](https://github.com/zigtools/zls) — embedded Zig LSP
 - [lsp-kit](https://github.com/zigtools/lsp-kit) — LSP protocol types
 - [uucode](https://github.com/jacobsandlund/uucode) — Unicode tables
@@ -610,6 +682,7 @@ access.
 
 ## Documentation
 
+- [Roadmap](docs/roadmap.md) — where stem is going, release by release
 - [Plugins](docs/plugins.md) — author guide + host internals
 - [stem.md](docs/stem.md) — long-form reference
 
@@ -621,6 +694,9 @@ access.
 
 - Modal-editing ideas from [Vim](https://www.vim.org/),
   [Kakoune](https://kakoune.org/), and [Helix](https://helix-editor.com/)
+- Runtime philosophy from [Erlang/OTP](https://www.erlang.org/) —
+  supervision trees, let-it-crash, and observability as a first-class
+  concern
 - Built with [Zig](https://ziglang.org/)
 - Syntax highlighting powered by
   [tree-sitter](https://tree-sitter.github.io/)
