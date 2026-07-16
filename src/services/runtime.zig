@@ -51,6 +51,9 @@ pub const StemRuntime = struct {
         registered_services: usize,
         shutdown_hooks: usize,
         shutdown_started: bool,
+        timeline_enabled: bool,
+        /// Timer-service counters; null until the first timer is scheduled.
+        timers: ?vigil.TimerServiceSnapshot,
         plugin_supervisor: vigil_supervision.Snapshot,
         lsp_supervisor: vigil_supervision.Snapshot,
     };
@@ -83,9 +86,25 @@ pub const StemRuntime = struct {
         };
     }
 
+    /// Number of recent Vigil telemetry events retained for debugging.
+    const timeline_capacity: usize = 256;
+
+    /// Post-placement wiring: called once `self` is at its final address
+    /// (`init` returns by value, so pointers into `self` can only be handed
+    /// out afterwards).
     pub fn attachEventBroker(self: *StemRuntime) void {
         self.plugin_supervisor.setEventBroker(&self.event_broker);
         self.lsp_supervisor.setEventBroker(&self.event_broker);
+        // Bounded ring of recent runtime telemetry events (dead letters,
+        // lifecycle transitions). Feeds `debugDump()`; failure to allocate
+        // it just means dumps omit the timeline tail.
+        self.vigil_runtime.enableTimeline(timeline_capacity) catch {};
+    }
+
+    /// Human-readable Vigil runtime state: health, registered mailboxes,
+    /// and the tail of the event timeline. Caller owns the returned slice.
+    pub fn debugDump(self: *StemRuntime, allocator: std.mem.Allocator) ![]u8 {
+        return self.vigil_runtime.debugDump(allocator);
     }
 
     pub fn deinit(self: *StemRuntime) void {
@@ -137,6 +156,8 @@ pub const StemRuntime = struct {
             .registered_services = service_count,
             .shutdown_hooks = hook_count,
             .shutdown_started = shutdown_started,
+            .timeline_enabled = self.vigil_runtime.timeline != null,
+            .timers = if (self.vigil_runtime.timer_svc) |svc| svc.snapshot() else null,
             .plugin_supervisor = self.plugin_supervisor.snapshot(),
             .lsp_supervisor = self.lsp_supervisor.snapshot(),
         };
@@ -298,6 +319,32 @@ test "StemRuntime health snapshot includes Vigil version and supervisors" {
     try std.testing.expect(snapshot.telemetry_initialized);
     try std.testing.expectEqual(@as(u64, 1), snapshot.plugin_supervisor.crashes);
     try std.testing.expectEqual(@as(u64, 1), snapshot.lsp_supervisor.restarts_scheduled);
+}
+
+test "StemRuntime debug toolkit exposes timeline and dump" {
+    var runtime = try StemRuntime.init(std.testing.allocator);
+    runtime.attachEventBroker();
+    defer runtime.deinit();
+
+    var snapshot = runtime.healthSnapshot();
+    try std.testing.expect(snapshot.timeline_enabled);
+    try std.testing.expect(snapshot.timers == null);
+
+    // Scheduling work lazily starts the runtime timer service, and the
+    // health snapshot picks it up.
+    const timers = try runtime.vigil_runtime.timers();
+    const Noop = struct {
+        fn tick() void {}
+    };
+    const id = try timers.setInterval(60_000, Noop.tick);
+    defer _ = timers.cancel(id);
+    snapshot = runtime.healthSnapshot();
+    try std.testing.expect(snapshot.timers != null);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.timers.?.pending);
+
+    const dump = try runtime.debugDump(std.testing.allocator);
+    defer std.testing.allocator.free(dump);
+    try std.testing.expect(std.mem.indexOf(u8, dump, "vigil runtime dump") != null);
 }
 
 test "StemRuntime registers editor inboxes in Vigil registry" {

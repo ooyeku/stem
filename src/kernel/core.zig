@@ -1664,8 +1664,13 @@ pub const Core = struct {
         self.surfaceOrphanBackups();
 
         try self.sendUpdate();
+        // Batched receive: under bursts (fast typing, LSP diagnostic floods)
+        // this drains up to a batch of messages per mailbox lock instead of
+        // locking once per message; when idle it parks exactly like recv().
+        var receiver = vigil_api.BatchReceiver.init(inbox);
+        defer receiver.deinit();
         while (true) {
-            const msg = inbox.recv() catch |err| {
+            const msg = receiver.next() catch |err| {
                 if (err == error.InboxClosed) return;
                 return err;
             };

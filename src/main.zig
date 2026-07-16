@@ -54,6 +54,54 @@ fn handleWindowsCtrl(ctrl_type: u32) callconv(.winapi) c_int {
     }
 }
 
+/// Periodic work scheduled on Vigil's runtime timer service (one shared
+/// scheduler thread) instead of one dedicated thread per timer. Module-level
+/// because `TimerService` callbacks are context-free function pointers; main
+/// fills these in before scheduling. All callbacks run sequentially on the
+/// single scheduler thread, so the non-atomic fields are race-free.
+const PeriodicTasks = struct {
+    var heartbeat_bus: ?*MessageBus = null;
+    var quit_bus: ?*MessageBus = null;
+    var allocator: std.mem.Allocator = undefined;
+    var stop: ?*std.atomic.Value(bool) = null;
+    var tick_seq: u64 = 0;
+    var quit_sent: bool = false;
+
+    /// Every 100 ms: send the editor tick. Coalescible — if core is busy,
+    /// queueing 20 ticks behind a slow render helps nobody.
+    fn heartbeatTick() void {
+        const stop_flag = stop orelse return;
+        if (stop_flag.load(.acquire)) return;
+        const bus = heartbeat_bus orelse return;
+        var tick_msg: protocol.Message = .tick;
+        const bytes = tick_msg.encode(allocator) catch return;
+        defer allocator.free(bytes);
+        tick_seq +%= 1;
+        bus.sendCoalesced(.tick, bytes, tick_seq) catch {};
+    }
+
+    /// Every 200 ms: poll the `shutdown_requested` flag set by the
+    /// SIGINT/SIGTERM/SIGHUP handler. When set, inject a `.quit` so the UI
+    /// loop wakes and runs the normal teardown path. This is what makes
+    /// `kill -TERM <pid>` exit stem cleanly.
+    fn signalPoll() void {
+        const stop_flag = stop orelse return;
+        if (stop_flag.load(.acquire) or quit_sent) return;
+        if (!shutdown_requested.load(.acquire)) return;
+        const bus = quit_bus orelse return;
+        quit_sent = true;
+        const msg = (protocol.Message{ .quit = {} }).encode(allocator) catch return;
+        defer allocator.free(msg);
+        // .quit is the textbook critical message: it must not sit behind
+        // queued bulk traffic during shutdown.
+        bus.sendCritical(msg) catch {};
+        // Backup wakeup: `Inbox.recv()` polls this flag directly. Do not
+        // call `Inbox.close()` here; that deallocates the inbox while the
+        // UI thread still owns its pointer.
+        bus.inbox.closed.store(true, .release);
+    }
+};
+
 fn installShutdownSignals() !void {
     if (@import("builtin").os.tag == .windows) {
         const SetConsoleCtrlHandler = struct {
@@ -657,75 +705,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .stop = &app_stop,
     }});
 
-    const HeartbeatThread = struct {
-        bus: *MessageBus,
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        stop: *std.atomic.Value(bool),
-        fn run(self: @This()) !void {
-            setThreadName("stem-heartbeat");
-            var tick_seq: u64 = 0;
-            while (!self.stop.load(.acquire)) {
-                std.Io.sleep(self.io, .fromMilliseconds(100), .awake) catch break;
-                if (self.stop.load(.acquire)) break;
-                var tick_msg: protocol.Message = .tick;
-                const bytes = tick_msg.encode(self.allocator) catch continue;
-                defer self.allocator.free(bytes);
-                tick_seq +%= 1;
-                // Heartbeat is the canonical coalescible message — if
-                // core is busy, queueing 20 ticks behind a slow render
-                // helps nobody.
-                self.bus.sendCoalesced(.tick, bytes, tick_seq) catch break;
-            }
-        }
-    };
-    const heartbeat_thread = try std.Thread.spawn(.{}, HeartbeatThread.run, .{HeartbeatThread{
-        .bus = &core_bus,
-        .allocator = inbox_allocator,
-        .io = io,
-        .stop = &app_stop,
-    }});
-
-    // Signal monitor: polls the `shutdown_requested` flag set by the
-    // SIGINT/SIGTERM/SIGHUP handler. When set, injects a `.quit` into
-    // `main_inbox` so the UI loop wakes and runs the normal teardown
-    // path. This is what makes `kill -TERM <pid>` exit stem cleanly.
-    const SignalMonitor = struct {
-        bus: *MessageBus,
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        stop: *std.atomic.Value(bool),
-        fn run(self: @This()) void {
-            setThreadName("stem-sigmon");
-            while (!self.stop.load(.acquire)) {
-                std.Io.sleep(self.io, .fromMilliseconds(200), .awake) catch {
-                    // Signals may interrupt the sleeping thread that is
-                    // responsible for observing them. Keep polling instead of
-                    // returning before `shutdown_requested` is checked.
-                    vigil_api.sleep(10 * std.time.ns_per_ms);
-                };
-                if (self.stop.load(.acquire)) return;
-                if (shutdown_requested.load(.acquire)) {
-                    const msg = (protocol.Message{ .quit = {} }).encode(self.allocator) catch return;
-                    defer self.allocator.free(msg);
-                    // .quit is the textbook critical message: it must
-                    // not sit behind queued bulk traffic during shutdown.
-                    self.bus.sendCritical(msg) catch {};
-                    // Backup wakeup: `Inbox.recv()` polls this flag directly.
-                    // Do not call `Inbox.close()` here; that deallocates the
-                    // inbox while the UI thread still owns its pointer.
-                    self.bus.inbox.closed.store(true, .release);
-                    return;
-                }
-            }
-        }
-    };
-    const signal_monitor_thread = try std.Thread.spawn(.{}, SignalMonitor.run, .{SignalMonitor{
-        .bus = &main_bus,
-        .allocator = inbox_allocator,
-        .io = io,
-        .stop = &app_stop,
-    }});
+    // Heartbeat ticks and the signal poll run on Vigil's runtime timer
+    // service — one shared scheduler thread with a deadline min-heap —
+    // instead of a dedicated sleep-loop thread each.
+    const timer_service = try stem_runtime.vigil_runtime.timers();
+    PeriodicTasks.heartbeat_bus = &core_bus;
+    PeriodicTasks.quit_bus = &main_bus;
+    PeriodicTasks.allocator = inbox_allocator;
+    PeriodicTasks.stop = &app_stop;
+    const heartbeat_timer = try timer_service.setInterval(100, PeriodicTasks.heartbeatTick);
+    const signal_poll_timer = try timer_service.setInterval(200, PeriodicTasks.signalPoll);
     const View = @import("ui/view.zig").View;
     var view = View.init(allocator);
     var loop_arena = std.heap.ArenaAllocator.init(allocator);
@@ -853,8 +842,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // unless the shutdown policy explicitly says it is safe.
     if (plan.stop_vaxis_loop) loop.stop();
     if (plan.join_input_thread) input_thread.join();
-    heartbeat_thread.join();
-    signal_monitor_thread.join();
+    // A callback observing `app_stop` mid-flight finishes harmlessly; the
+    // buses stay alive until this function returns.
+    _ = timer_service.cancel(heartbeat_timer);
+    _ = timer_service.cancel(signal_poll_timer);
 
     vx.setMouseMode(tty.writer(), false) catch {};
     vx.exitAltScreen(tty.writer()) catch {};
@@ -865,8 +856,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (last_arena) |arena| {
         if (last_arena_pool) |pool| pool.release(arena);
     }
+    // Drain both inboxes in batches (one mailbox lock per batch). The
+    // inboxes' `closed` flags are already set, so this goes through the
+    // mailbox directly rather than the Inbox receive APIs.
+    var drain_buf: [32]vigil_api.Message = undefined;
     while (true) {
-        if (main_inbox.mailbox.receive()) |msg| {
+        const n = main_inbox.mailbox.receiveBatch(&drain_buf);
+        if (n == 0) break;
+        for (drain_buf[0..n]) |msg| {
             if (msg.payload) |payload| {
                 if (protocol.Message.decode(payload) catch null) |decoded| {
                     if (decoded == .render_update) {
@@ -878,16 +875,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 }
             }
             msg.deinit();
-        } else |_| {
-            break;
         }
     }
     while (true) {
-        if (core_inbox.mailbox.receive()) |msg| {
-            msg.deinit();
-        } else |_| {
-            break;
-        }
+        const n = core_inbox.mailbox.receiveBatch(&drain_buf);
+        if (n == 0) break;
+        for (drain_buf[0..n]) |msg| msg.deinit();
     }
     if (plan.exit_process_directly) {
         core_thread.join();

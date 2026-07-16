@@ -295,6 +295,7 @@ pub const SystemCommands = struct {
                 \\- Shutdown hooks: {d}
                 \\- Shutdown started: {s}
                 \\- Timeline events retained: {d}
+                \\- Vigil event timeline: {s}
                 \\- Plugin supervisor: {d} crashes, {d} restarts scheduled
                 \\- LSP supervisor: {d} crashes, {d} restarts scheduled
                 \\
@@ -308,11 +309,22 @@ pub const SystemCommands = struct {
                 runtime_health.shutdown_hooks,
                 if (runtime_health.shutdown_started) "yes" else "no",
                 timeline.len,
+                if (runtime_health.timeline_enabled) "enabled" else "disabled",
                 runtime_health.plugin_supervisor.crashes,
                 runtime_health.plugin_supervisor.restarts_scheduled,
                 runtime_health.lsp_supervisor.crashes,
                 runtime_health.lsp_supervisor.restarts_scheduled,
             });
+            if (runtime_health.timers) |timer_stats| {
+                try w.print(
+                    "- Timer service: {d} pending, {d} fired, {d} cancelled\n",
+                    .{ timer_stats.pending, timer_stats.fired, timer_stats.cancelled },
+                );
+            }
+            if (runtime.debugDump(allocator)) |dump| {
+                defer allocator.free(dump);
+                try w.print("\n### Vigil runtime dump\n\n```\n{s}```\n", .{dump});
+            } else |_| {}
         } else {
             try w.writeAll("- Runtime services are not attached.\n");
         }

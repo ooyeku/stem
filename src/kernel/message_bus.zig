@@ -221,15 +221,20 @@ pub const MessageBus = struct {
             return err;
         };
 
-        self.inbox.mailbox.send(msg) catch |err| switch (err) {
+        // sendWithDisposition (Vigil 2.2+) tells us when a full mailbox
+        // shunted the message to dead-letter instead of the consumer — for
+        // the bus's purposes that is a drop, not a send.
+        const delivery = self.inbox.mailbox.sendWithDisposition(msg) catch |err| switch (err) {
             error.MailboxFull => {
                 self.recordDroppedFull(class, payload.len);
                 return;
             },
             else => return err,
         };
-
-        self.recordSent(class, payload.len);
+        switch (delivery) {
+            .enqueued => self.recordSent(class, payload.len),
+            .dead_lettered => self.recordDroppedFull(class, payload.len),
+        }
     }
 
     fn dropQueuedById(self: *MessageBus, id: []const u8) usize {
@@ -423,11 +428,7 @@ test "MessageBus: sends and counts" {
     try std.testing.expectEqual(@as(usize, 0), s.totalDropped());
 
     // Drain so the inbox can close cleanly.
-    while (true) {
-        const m = ib.mailbox.receive() catch break;
-        var mm = m;
-        mm.deinit();
-    }
+    _ = try vigil_api.testing.drainInbox(ib, 64);
 }
 
 test "MessageBus: coalescing keeps only the newest pending payload" {
@@ -516,11 +517,7 @@ test "MessageBus: critical sends arrive before bulk on the priority queue" {
     try std.testing.expectEqualStrings("CRIT", first.payload.?);
 
     // Drain the rest.
-    while (true) {
-        const m = ib.mailbox.receive() catch break;
-        var mm = m;
-        mm.deinit();
-    }
+    _ = try vigil_api.testing.drainInbox(ib, 64);
 }
 
 test "MessageBus: bulk backpressure drops over watermark" {
@@ -539,11 +536,36 @@ test "MessageBus: bulk backpressure drops over watermark" {
     try std.testing.expectEqual(@as(usize, 2), s.sent[@intFromEnum(Class.bulk)]);
     try std.testing.expectEqual(@as(usize, 1), s.dropped_backpressure[@intFromEnum(Class.bulk)]);
 
+    _ = try vigil_api.testing.drainInbox(ib, 64);
+}
+
+test "MessageBus: full mailbox counts as dropped_full instead of erroring" {
+    const a = std.testing.allocator;
+    const ib = try vigil_api.standaloneInboxForTest(a);
+    defer ib.close();
+
+    // Saturate the mailbox through the raw inbox, then send through the bus:
+    // the overflow must be absorbed into stats, not surfaced to the caller.
+    const filled = try vigil_api.testing.fillInbox(ib, "filler");
+    try std.testing.expect(filled > 0);
+
+    var bus = MessageBus.init(a, ib, "test-bus");
+    try bus.sendInteractive("overflow");
+
+    // The overflow message went to the dead-letter queue, not the consumer,
+    // so the bus must count it as dropped rather than sent.
+    const s = bus.snapshotStats();
+    try std.testing.expectEqual(@as(usize, 0), s.sent[@intFromEnum(Class.interactive)]);
+    try std.testing.expectEqual(@as(usize, 1), s.dropped_full[@intFromEnum(Class.interactive)]);
+    try std.testing.expectEqual(@as(usize, 1), ib.mailbox.deadLetterCount());
+
+    var drained: usize = 0;
     while (true) {
-        const m = ib.mailbox.receive() catch break;
-        var mm = m;
-        mm.deinit();
+        const n = try vigil_api.testing.drainInbox(ib, 64);
+        if (n == 0) break;
+        drained += n;
     }
+    try std.testing.expectEqual(filled, drained);
 }
 
 test "MessageBus: Vigil rate limiter drops noisy bulk sends" {
@@ -565,9 +587,5 @@ test "MessageBus: Vigil rate limiter drops noisy bulk sends" {
     try std.testing.expectEqual(@as(usize, 1), s.sent[@intFromEnum(Class.bulk)]);
     try std.testing.expectEqual(@as(usize, 1), s.dropped_rate_limited[@intFromEnum(Class.bulk)]);
 
-    while (true) {
-        const m = ib.mailbox.receive() catch break;
-        var mm = m;
-        mm.deinit();
-    }
+    _ = try vigil_api.testing.drainInbox(ib, 64);
 }
