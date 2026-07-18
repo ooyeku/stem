@@ -44,9 +44,9 @@ the build.
 
 ## Where to start
 
-Issues labeled
-[`good first issue`](https://github.com/ooyeku/stem/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
-are scoped to be approachable without deep knowledge of the codebase.
+The [open issues](https://github.com/ooyeku/stem/issues) include
+several scoped small enough to be approachable without deep knowledge
+of the codebase.
 The [roadmap](docs/roadmap.md) shows where the project is headed;
 [docs/architecture.md](docs/architecture.md) explains why it's built
 the way it is.

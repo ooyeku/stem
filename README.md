@@ -60,12 +60,6 @@ to find out, this is the editor that can answer.
 
 ## Install
 
-**Homebrew (macOS / Linux):**
-
-```bash
-brew install ooyeku/tap/stem
-```
-
 **Prebuilt binaries** for macOS (arm64/x86_64) and Linux
 (x86_64/arm64) are on the
 [releases page](https://github.com/ooyeku/stem/releases):
