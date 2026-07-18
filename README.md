@@ -21,6 +21,8 @@ install on request via `stem lsp install`.
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-green)
 ![License](https://img.shields.io/badge/license-MIT-brightgreen)
 
+![stem demo — editing, splits, and the command palette](assets/demo.gif)
+
 ## Reliability by design
 
 Most editors bolt error handling onto an event loop. Stem inverts
@@ -41,7 +43,9 @@ it supervises. Concretely, that means:
 - **A pane of glass, not a black box.** `stem.control_center` shows
   queue depths, message-bus pressure, circuit-breaker states,
   dead-letter contents, timer stats, and a rolling timeline of runtime
-  events — while the editor runs.
+  events — while the editor runs:
+
+  ![stem control center — the live runtime cockpit](assets/cockpit.gif)
 - **Crash safety as a feature.** Sessions checkpoint in the background
   (versioned, atomic, skipped when unchanged); dirty buffers back up
   every 30 s; a crash restores your buffers, cursors, and splits on
@@ -56,9 +60,19 @@ to find out, this is the editor that can answer.
 
 ## Install
 
-> Prebuilt binaries and one-line install scripts will land with the
-> first tagged release. For now, build from source — `zig build` does
-> everything end-to-end.
+**Homebrew (macOS / Linux):**
+
+```bash
+brew install ooyeku/tap/stem
+```
+
+**Prebuilt binaries** for macOS (arm64/x86_64) and Linux
+(x86_64/arm64) are on the
+[releases page](https://github.com/ooyeku/stem/releases):
+
+```bash
+tar xzf stem-<target>.tar.gz && sudo mv stem /usr/local/bin/
+```
 
 ### From source
 
@@ -682,9 +696,12 @@ access.
 
 ## Documentation
 
+- [Architecture](docs/architecture.md) — *What if an editor was built
+  like Erlang?* The design rationale, with the bugs honesty caught
 - [Roadmap](docs/roadmap.md) — where stem is going, release by release
 - [Plugins](docs/plugins.md) — author guide + host internals
 - [stem.md](docs/stem.md) — long-form reference
+- [Contributing](CONTRIBUTING.md) — ground rules and where to start
 
 ## License
 
