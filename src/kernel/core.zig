@@ -599,6 +599,7 @@ pub const Core = struct {
         if (runtime_services) |runtime| {
             core.plugin_manager.setVigilServices(&runtime.event_broker, &runtime.plugin_supervisor);
             core.lsp_manager.setVigilSupervisor(&runtime.lsp_supervisor);
+            core.lsp_manager.telemetry_emitter = &runtime.vigil_runtime.telemetry_emitter;
         }
         core.search_index = SearchIndex.init(allocator, io, environ_block);
 

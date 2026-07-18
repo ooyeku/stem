@@ -20,6 +20,9 @@ pub const ComponentSupervisor = struct {
     kind: ComponentKind,
     supervisor: vigil.Supervisor,
     event_broker: ?*vigil.pubsub.PubSubBroker = null,
+    /// Injected runtime emitter for crash/restart events (Vigil 3.0 has no
+    /// global emitter). Not owned; must outlive this supervisor.
+    telemetry_emitter: ?*vigil.telemetry.TelemetryEmitter = null,
     stats_mu: vigil_api.Mutex = .{},
     stats: Snapshot = .{},
 
@@ -48,6 +51,15 @@ pub const ComponentSupervisor = struct {
         self.event_broker = broker;
     }
 
+    pub fn setTelemetryEmitter(self: *ComponentSupervisor, emitter: *vigil.telemetry.TelemetryEmitter) void {
+        self.telemetry_emitter = emitter;
+    }
+
+    fn emitTelemetry(self: *ComponentSupervisor, event: vigil.telemetry.Event) void {
+        const emitter = self.telemetry_emitter orelse return;
+        emitter.emit(event);
+    }
+
     pub fn recordCrash(self: *ComponentSupervisor, component_id: []const u8) void {
         self.stats_mu.lock();
         self.stats.crashes +%= 1;
@@ -69,7 +81,7 @@ pub const ComponentSupervisor = struct {
         };
         defer if (metadata_owned) self.allocator.free(metadata);
 
-        vigil.telemetry.emit(.{
+        self.emitTelemetry(.{
             .event_type = .process_crashed,
             .timestamp_ms = vigil_api.milliTimestamp(),
             .metadata = metadata,
@@ -96,7 +108,7 @@ pub const ComponentSupervisor = struct {
         self.stats.restarts_scheduled +%= 1;
         self.stats_mu.unlock();
 
-        vigil.telemetry.emit(.{
+        self.emitTelemetry(.{
             .event_type = .supervisor_restart,
             .timestamp_ms = vigil_api.milliTimestamp(),
             .metadata = component_id,
@@ -124,14 +136,12 @@ pub const ComponentSupervisor = struct {
 };
 
 test "ComponentSupervisor is backed by a Vigil supervisor and telemetry" {
-    try vigil.telemetry.initGlobal(std.testing.allocator);
-    defer vigil.telemetry.deinitGlobal();
-
     var runtime = try vigil.runtime(std.testing.allocator, .{});
     defer runtime.deinit();
 
     var supervisor = ComponentSupervisor.init(std.testing.allocator, &runtime, .plugins);
     defer supervisor.deinit();
+    supervisor.setTelemetryEmitter(&runtime.telemetry_emitter);
 
     try std.testing.expect(supervisor.supervisor.options.enable_telemetry);
     try std.testing.expectEqual(vigil.RestartStrategy.one_for_one, supervisor.supervisor.options.strategy);

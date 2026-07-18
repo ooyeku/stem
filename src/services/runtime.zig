@@ -95,18 +95,17 @@ pub const RuntimeAlerts = struct {
         bump(&component_crashes);
     }
 
-    /// Register handlers on both emitters stem uses: the runtime emitter
-    /// (inbox dead-letter/poison lifecycle) and the global emitter
-    /// (ComponentSupervisor crash/restart, circuit breakers). Registration
-    /// failures are nonfatal — the light just stays dark.
+    /// Register handlers on the runtime emitter. Since Vigil 3.0 removed
+    /// global telemetry, every producer (inbox lifecycle, supervisors,
+    /// circuit breakers) is injected with the runtime emitter, so one
+    /// registration covers them all. Failures are nonfatal — the light
+    /// just stays dark.
     fn attach(emitter: *vigil.telemetry.TelemetryEmitter) void {
         emitter.on(.message_dead_lettered, onDeadLetter) catch {};
         emitter.on(.poison_message_detected, onPoison) catch {};
-        if (vigil.telemetry.getGlobal()) |global| {
-            global.on(.circuit_opened, onCircuitOpened) catch {};
-            global.on(.supervisor_restart, onSupervisorRestart) catch {};
-            global.on(.process_crashed, onProcessCrashed) catch {};
-        }
+        emitter.on(.circuit_opened, onCircuitOpened) catch {};
+        emitter.on(.supervisor_restart, onSupervisorRestart) catch {};
+        emitter.on(.process_crashed, onProcessCrashed) catch {};
     }
 };
 
@@ -214,6 +213,13 @@ pub const StemRuntime = struct {
         self.plugin_supervisor.setEventBroker(&self.event_broker);
         self.lsp_supervisor.setEventBroker(&self.event_broker);
         self.worker_supervisor.setEventBroker(&self.event_broker);
+        // Vigil 3.0 removed global telemetry: inject the runtime emitter
+        // into every producer, and subscribe the stem telemetry bridge and
+        // alert counters to that one emitter.
+        self.plugin_supervisor.setTelemetryEmitter(&self.vigil_runtime.telemetry_emitter);
+        self.lsp_supervisor.setTelemetryEmitter(&self.vigil_runtime.telemetry_emitter);
+        self.worker_supervisor.setTelemetryEmitter(&self.vigil_runtime.telemetry_emitter);
+        telemetry.attachEmitter(&self.vigil_runtime.telemetry_emitter);
         // Bounded ring of recent runtime telemetry events (dead letters,
         // lifecycle transitions). Feeds `debugDump()`; failure to allocate
         // it just means dumps omit the timeline tail.
@@ -454,7 +460,30 @@ pub const StemRuntime = struct {
             telemetry.recordTimeline(.shutdown, hooks[i].name, "run");
             hooks[i].callback(hooks[i].context);
         }
-        self.vigil_runtime.shutdown();
+        // Vigil 3.0's drain probes every registered mailbox's queue depth,
+        // but stem's teardown order may have already closed (freed) the
+        // editor inboxes behind those registrations. Unregister them first
+        // — stem's own teardown loops drain the editor inboxes explicitly,
+        // so drain's remaining job is stopping intake/timers and running
+        // Vigil-side shutdown hooks.
+        self.service_mu.lock();
+        var service_names = self.registered_services.keyIterator();
+        while (service_names.next()) |name| {
+            self.vigil_runtime.registry.unregister(name.*);
+        }
+        self.service_mu.unlock();
+
+        // Graceful drain (Vigil 3.0): stop intake and timers, give any
+        // remaining registered inboxes up to 500 ms to empty, then run
+        // Vigil-side shutdown hooks. Falls back to an immediate shutdown if
+        // the drain itself cannot allocate its registry snapshot.
+        const drained = self.vigil_runtime.drain(500) catch blk: {
+            self.vigil_runtime.shutdown();
+            break :blk true;
+        };
+        if (!drained) {
+            telemetry.recordTimeline(.shutdown, "runtime", "drain_timeout");
+        }
         telemetry.recordTimeline(.shutdown, "runtime", "complete");
     }
 
@@ -486,7 +515,7 @@ test "StemRuntime owns Vigil runtime inboxes and pubsub broker" {
     defer runtime.deinit();
 
     const version = vigil.getVersion();
-    try std.testing.expectEqual(@as(u32, 2), version.major);
+    try std.testing.expectEqual(@as(u32, 3), version.major);
     try std.testing.expect(@hasDecl(vigil, "Runtime"));
     try std.testing.expect(!@hasDecl(vigil, "createMailbox"));
     try std.testing.expect(!@hasDecl(vigil, "global_registry"));
@@ -530,7 +559,7 @@ test "StemRuntime health snapshot includes Vigil version and supervisors" {
     runtime.lsp_supervisor.recordRestartScheduled("zig", 0, 1);
 
     const snapshot = runtime.healthSnapshot();
-    try std.testing.expectEqual(@as(u32, 2), snapshot.vigil_major);
+    try std.testing.expectEqual(@as(u32, 3), snapshot.vigil_major);
     try std.testing.expect(snapshot.telemetry_initialized);
     try std.testing.expectEqual(@as(u64, 1), snapshot.plugin_supervisor.crashes);
     try std.testing.expectEqual(@as(u64, 1), snapshot.lsp_supervisor.restarts_scheduled);

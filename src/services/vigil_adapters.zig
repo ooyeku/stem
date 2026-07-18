@@ -14,6 +14,7 @@ pub const Subscriber = vigil.pubsub.Subscriber;
 pub const Supervisor = vigil.Supervisor;
 pub const Mutex = vigil.compat.Mutex;
 pub const TimerService = vigil.TimerService;
+pub const TelemetryEmitter = vigil.telemetry.TelemetryEmitter;
 pub const DeadLetterNotice = vigil.DeadLetterNotice;
 pub const DeadLetterSnapshot = vigil.DeadLetterSnapshot;
 pub const CircuitBreaker = vigil.CircuitBreaker;
@@ -147,7 +148,7 @@ pub fn classify(name: []const u8) ApiSurface {
 }
 
 test "Vigil adapter documents the v2 surface Stem uses" {
-    try std.testing.expectEqual(@as(u32, 2), vigilVersionMajor());
+    try std.testing.expectEqual(@as(u32, 3), vigilVersionMajor());
     try std.testing.expect(hasRuntimeApi());
     try std.testing.expect(!hasRemovedMailboxApi());
     try std.testing.expect(@hasDecl(vigil, "TimerService"));

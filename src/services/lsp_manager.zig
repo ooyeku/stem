@@ -72,6 +72,9 @@ pub const LSPManager = struct {
     /// Per-language circuit breakers gating restart storms. Guarded by
     /// `restart_state_mutex`; keys are owned copies shared with nothing.
     restart_breakers: std.StringHashMapUnmanaged(*vigil_api.CircuitBreaker) = .empty,
+    /// Runtime telemetry emitter injected into breakers so `circuit_opened`
+    /// events reach the alert counters (Vigil 3.0: no global emitter).
+    telemetry_emitter: ?*vigil_api.TelemetryEmitter = null,
     restart_state_mutex: std.Io.Mutex = .init,
 
     /// Per-file pending `textDocument/didChange` payloads. Coalesces a
@@ -424,6 +427,7 @@ pub const LSPManager = struct {
             self.allocator.destroy(breaker);
             return null;
         };
+        breaker.setTelemetryEmitter(self.telemetry_emitter);
         const key = self.allocator.dupe(u8, lang) catch {
             breaker.deinit();
             self.allocator.destroy(breaker);

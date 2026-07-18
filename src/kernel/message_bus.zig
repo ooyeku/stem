@@ -189,7 +189,7 @@ pub const MessageBus = struct {
         // backed up. Doing this BEFORE constructing the message saves an
         // alloc on the rejection path.
         if (class == .bulk or class == .background) {
-            const mailbox_stats = self.inbox.mailbox.getStats();
+            const mailbox_stats = self.inbox.mailbox.metrics();
             const pending = mailbox_stats.messages_received -| mailbox_stats.messages_sent;
             const watermark = if (class == .bulk)
                 self.backpressure.bulk_high_watermark

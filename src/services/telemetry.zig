@@ -1,10 +1,10 @@
 //! Stem ↔ Vigil telemetry bridge.
 //!
-//! Vigil exposes a global telemetry emitter; stem subscribes to it and
-//! also maintains a process-local rollup so the log view / plugin
-//! dashboard can show "messages sent per bus", "messages dropped per
-//! reason", "plugin crashes", "supervisor restarts" without scraping
-//! individual events.
+//! Stem subscribes to the runtime-owned Vigil telemetry emitter (via
+//! `attachEmitter`; Vigil 3.0 has no global emitter) and maintains a
+//! process-local rollup so the log view / plugin dashboard can show
+//! "messages sent per bus", "messages dropped per reason", "plugin
+//! crashes", "supervisor restarts" without scraping individual events.
 //!
 //! The bridge is also where stem's own infrastructure events
 //! (MessageBus sends, coalesces, drops, plugin reloads) are recorded.
@@ -36,6 +36,9 @@ const State = struct {
     /// Allocator used for the hashmap; held until deinit.
     allocator: std.mem.Allocator = undefined,
     initialized: bool = false,
+    /// Runtime-owned Vigil emitter the bridge is subscribed to; set via
+    /// `attachEmitter`. Not owned.
+    emitter: ?*vigil.telemetry.TelemetryEmitter = null,
 };
 
 pub const SendStats = struct {
@@ -64,8 +67,10 @@ pub const TimelineEntry = struct {
 
 var state: State = .{};
 
-/// Initialize the bridge and start the global Vigil telemetry emitter.
-/// Safe to call multiple times; second call is a no-op.
+/// Initialize the bridge's local rollup state. Safe to call multiple
+/// times; second call is a no-op. Vigil 3.0 removed the global emitter,
+/// so event subscription happens separately via `attachEmitter` once the
+/// runtime-owned emitter has a stable address.
 pub fn init(allocator: std.mem.Allocator) !void {
     state.mu.lock();
     defer state.mu.unlock();
@@ -73,19 +78,18 @@ pub fn init(allocator: std.mem.Allocator) !void {
 
     state.allocator = allocator;
     state.initialized = true;
+}
 
-    // The global emitter is what `MessageBus` and others write into.
-    vigil.telemetry.initGlobal(allocator) catch {
-        // If telemetry init fails we still want stem to run — local
-        // counters are still populated.
-        state.initialized = false;
-        return;
-    };
-
-    // Listen for vigil's own events so plugin / supervisor activity
-    // ends up in our rollup too.
-    vigil.telemetry.on(.process_crashed, onProcessCrashed) catch {};
-    vigil.telemetry.on(.supervisor_restart, onSupervisorRestart) catch {};
+/// Subscribe the bridge to a runtime-owned Vigil telemetry emitter so
+/// plugin / supervisor activity ends up in our rollup. The emitter must
+/// outlive the bridge (in practice: `StemRuntime.vigil_runtime`'s).
+pub fn attachEmitter(emitter: *vigil.telemetry.TelemetryEmitter) void {
+    state.mu.lock();
+    defer state.mu.unlock();
+    if (!state.initialized or state.emitter != null) return;
+    state.emitter = emitter;
+    emitter.on(.process_crashed, onProcessCrashed) catch {};
+    emitter.on(.supervisor_restart, onSupervisorRestart) catch {};
 }
 
 pub fn deinit() void {
@@ -99,7 +103,7 @@ pub fn deinit() void {
     state.sends_per_bus.deinit(state.allocator);
     state.sends_per_bus = .empty;
     clearTimelineLocked();
-    vigil.telemetry.deinitGlobal();
+    state.emitter = null;
     state.initialized = false;
     state.bytes_sent = 0;
     state.coalesce_events = 0;
@@ -402,12 +406,16 @@ test "telemetry: Vigil process crash metadata separates LSP from plugin crashes"
     try Self.init(std.testing.allocator);
     defer Self.deinit();
 
-    vigil.telemetry.emit(.{
+    var emitter = vigil.telemetry.TelemetryEmitter.init(std.testing.allocator);
+    defer emitter.deinit();
+    Self.attachEmitter(&emitter);
+
+    emitter.emit(.{
         .event_type = .process_crashed,
         .timestamp_ms = vigil_api.milliTimestamp(),
         .metadata = "lsp:zig",
     });
-    vigil.telemetry.emit(.{
+    emitter.emit(.{
         .event_type = .process_crashed,
         .timestamp_ms = vigil_api.milliTimestamp(),
         .metadata = "git",
