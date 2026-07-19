@@ -62,23 +62,25 @@ to find out, this is the editor that can answer.
 
 **Prebuilt binaries** for macOS (arm64/x86_64) and Linux
 (x86_64/arm64) are on the
-[releases page](https://github.com/ooyeku/stem/releases):
+[releases page](https://github.com/ooyeku/stem/releases). Each tarball
+ships an installer that puts stem, the LSP host binaries, and the
+bundled plugins in the same places the from-source install does, and
+checks that `stem` is on your PATH (telling you exactly what to add if
+it isn't):
 
 ```bash
-tar xzf stem-<target>.tar.gz && sudo mv stem /usr/local/bin/
+tar xzf stem-<version>-<target>.tar.gz
+cd stem-<version>-<target>
+./install.sh                  # or: ./install.sh --prefix ~/.local
 ```
 
 > **macOS note:** the prebuilt binaries are not signed or notarized yet.
-> If you download one with a browser, Gatekeeper refuses to run it
-> ("Apple could not verify 'stem' is free of malware"). Either fetch the
-> archive with `curl -LO` instead — command-line downloads don't get the
-> quarantine attribute — or clear it after a browser download:
->
-> ```bash
-> xattr -d com.apple.quarantine ./stem
-> ```
->
-> Installing from source (below) avoids this entirely.
+> `install.sh` clears the Gatekeeper quarantine attribute for you, so
+> the installed `stem` runs without the "Apple could not verify" dialog
+> even after a browser download. If you skip the installer and run the
+> binary straight from the archive, either fetch it with `curl -LO`
+> (command-line downloads aren't quarantined) or clear the attribute
+> yourself: `xattr -d com.apple.quarantine ./stem`.
 
 ### From source
 

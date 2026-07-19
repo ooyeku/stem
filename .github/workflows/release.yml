@@ -52,14 +52,27 @@ jobs:
           name="stem-${GITHUB_REF_NAME}-${{ matrix.os_label }}"
           stage="dist/${name}"
           mkdir -p "$stage"
-          cp "zig-out/bin/stem${{ matrix.exe_suffix }}" "$stage/"
+          if [ -n "${{ matrix.exe_suffix }}" ]; then
+            # Windows: bare binary + docs, as before. The self-installing
+            # archive treatment is Unix-only for now.
+            cp "zig-out/bin/stem${{ matrix.exe_suffix }}" "$stage/"
+          else
+            # All three binaries the from-source installer ships (the
+            # editor plus the LSP host processes it spawns), and the
+            # prebuilt installer: same prefix/plugin/PATH behavior as
+            # the repo's install.sh, minus the build step.
+            for bin in stem stem-lsp-host stem-lsp-zig; do
+              cp "zig-out/bin/$bin" "$stage/"
+            done
+            install -m 0755 packaging/install.sh "$stage/"
+          fi
           cp README.md LICENSE "$stage/"
           # Bundled wasm plugins, laid out as the editor's plugin loader
           # expects: <root>/plugins/<name>/{plugin.json,<name>.wasm}. The
           # wasm is target-independent (wasm32-freestanding), so the
           # freshly built artifact in zig-out/bin is correct for every
-          # target. Mirrors the layout install.sh writes under the prefix.
-          for name in echo git-wasm plugin-manager-wasm; do
+          # target. Mirrors the set install.sh installs from source.
+          for name in echo git-wasm plugin-manager-wasm sdk-demo; do
             mkdir -p "$stage/plugins/$name"
             cp "bundled/plugins/$name/plugin.json" "$stage/plugins/$name/"
             cp "zig-out/bin/$name.wasm" "$stage/plugins/$name/"
