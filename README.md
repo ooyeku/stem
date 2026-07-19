@@ -68,6 +68,18 @@ to find out, this is the editor that can answer.
 tar xzf stem-<target>.tar.gz && sudo mv stem /usr/local/bin/
 ```
 
+> **macOS note:** the prebuilt binaries are not signed or notarized yet.
+> If you download one with a browser, Gatekeeper refuses to run it
+> ("Apple could not verify 'stem' is free of malware"). Either fetch the
+> archive with `curl -LO` instead — command-line downloads don't get the
+> quarantine attribute — or clear it after a browser download:
+>
+> ```bash
+> xattr -d com.apple.quarantine ./stem
+> ```
+>
+> Installing from source (below) avoids this entirely.
+
 ### From source
 
 Requires **Zig 0.16+** and a C compiler. All other dependencies
