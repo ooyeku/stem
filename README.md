@@ -1,15 +1,15 @@
 # Stem
 
-**The editor built like a telecom switch: it supervises itself, heals
-itself, and can show you exactly what its runtime is doing.**
+**A modal terminal editor that supervises its own subsystems, restarts
+what crashes, and shows you exactly what its runtime is doing.**
 
-Stem is a modal text editor for the terminal, built in Zig on an
-Erlang/OTP-style supervised runtime ([vigil](https://github.com/ooyeku/vigil)).
+Stem is a modal text editor for the terminal, built in Zig on a
+supervised runtime ([vigil](https://github.com/ooyeku/vigil)).
 Every subsystem — language servers, plugins, background workers — runs
 under supervision with circuit breakers, backoff policies, and
 watchdogs. When something crashes, stem restarts it. When something
 misbehaves, stem contains it. And when you want to know what's going
-on, the runtime is a pane of glass, not a black box.
+on, you open the runtime cockpit and look.
 
 On top of that backbone sits an approachable modal editor: Vim-style
 modes, a Space leader, a discoverable command palette, tree-sitter
@@ -55,8 +55,9 @@ it supervises. Concretely, that means:
   plugin can't stall your cursor; large files degrade gracefully
   instead of freezing the editor.
 
-If you've ever wondered *why* your editor feels wrong and had no way
-to find out, this is the editor that can answer.
+When something does go wrong — a stuck language server, a frozen
+highlight worker, dropped messages — the control center usually shows
+you what and why, while the rest of the editor keeps working.
 
 ## Install
 
@@ -135,7 +136,7 @@ when it isn't already there.
 
 ### Supervised runtime
 
-- Erlang/OTP-style supervision (via [vigil](https://github.com/ooyeku/vigil)):
+- Supervised subsystems (via [vigil](https://github.com/ooyeku/vigil)):
   plugins, LSP servers, and background workers run under supervisors
   with crash tracking and automatic restarts
 - Per-language circuit breakers on LSP restarts — jittered exponential
@@ -654,9 +655,9 @@ src/
 All Zig dependencies are pinned in [build.zig.zon](build.zig.zon):
 
 - [libvaxis](https://github.com/rockorager/libvaxis) — terminal UI
-- [vigil](https://github.com/ooyeku/vigil) — Erlang/OTP-style supervised
-  runtime: message passing, supervision trees, circuit breakers,
-  checkpoints, timers, and telemetry
+- [vigil](https://github.com/ooyeku/vigil) — supervised runtime:
+  message passing, supervision trees, circuit breakers, checkpoints,
+  timers, and telemetry
 - [zls](https://github.com/zigtools/zls) — embedded Zig LSP
 - [lsp-kit](https://github.com/zigtools/lsp-kit) — LSP protocol types
 - [uucode](https://github.com/jacobsandlund/uucode) — Unicode tables
@@ -704,8 +705,8 @@ access.
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — *What if an editor was built
-  like Erlang?* The design rationale, with the bugs honesty caught
+- [Architecture](docs/architecture.md) — how the supervised runtime
+  is put together, what it costs, and the bugs it caught
 - [Roadmap](docs/roadmap.md) — where stem is going, release by release
 - [Plugins](docs/plugins.md) — author guide + host internals
 - [stem.md](docs/stem.md) — long-form reference

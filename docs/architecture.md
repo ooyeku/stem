@@ -1,4 +1,4 @@
-# What if an editor was built like Erlang?
+# Stem's architecture
 
 *The design rationale behind stem's supervised runtime.*
 
@@ -11,17 +11,13 @@ editors, that moment is undiagnosable: the internals are an event loop
 with callbacks, state is everywhere, and your options are "restart it"
 or "live with it."
 
-Telephone switches solved this problem fifty years ago. Erlang/OTP's
-answer — isolate everything into supervised processes, let them crash,
-restart them from a known state, and make the whole tree observable —
-is why phone networks have nine-nines uptime while your editor
-sometimes needs a restart after lunch.
-
-Stem is an experiment in taking that answer literally for a terminal
-editor. It's built in Zig on [vigil](https://github.com/ooyeku/vigil),
-an OTP-style runtime: supervision trees, priority mailboxes, circuit
-breakers, checkpoints, and telemetry — no BEAM required, one static
-binary.
+Stem's answer is a well-worn pattern from supervised-process runtimes
+(Erlang/OTP is the best-known example): isolate subsystems, let them
+crash, restart them from known state, and make the whole tree
+observable. Stem applies that pattern to a terminal editor. It's
+built in Zig on [vigil](https://github.com/ooyeku/vigil), a runtime
+library providing supervision trees, priority mailboxes, circuit
+breakers, checkpoints, and telemetry — one static binary, no VM.
 
 ## The shape
 

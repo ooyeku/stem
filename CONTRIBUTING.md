@@ -5,9 +5,9 @@ of every size are welcome — from a typo fix to a roadmap feature.
 
 ## Ground rules
 
-Stem's identity is **reliability**: it supervises itself, heals
-itself, and can show you what its runtime is doing. Contributions are
-judged against that bar. Concretely:
+Stem's identity is **reliability**: it supervises its subsystems,
+restarts what crashes, and can show you what its runtime is doing.
+Contributions are judged against that bar. Concretely:
 
 - Failures must be *observable* — if your code can fail, the failure
   should reach a log, a telemetry counter, or the control center. No

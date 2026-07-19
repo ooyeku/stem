@@ -1,7 +1,7 @@
 # Roadmap
 
-Stem's identity is fixed: **the editor built like a telecom switch —
-it supervises itself, heals itself, and can show you exactly what its
+Stem's identity is fixed: **the editor that supervises its own
+subsystems, restarts what crashes, and can show you exactly what its
 runtime is doing.** Every roadmap item below was screened against that
 positioning. Features earn a slot by making stem more dependable, more
 observable, or more recoverable — not by chasing feature-count parity
@@ -122,8 +122,8 @@ it. This release makes time-dependent behavior provable:
 - Begin a terminal compatibility matrix (kitty, alacritty, wezterm,
   tmux, iTerm2, Terminal.app, Linux console) with documented results
 
-*Positioning check: aligned — "built like a telecom switch" obligates
-proof, not vibes.*
+*Positioning check: aligned — a reliability claim obligates proof,
+not vibes.*
 
 ---
 
