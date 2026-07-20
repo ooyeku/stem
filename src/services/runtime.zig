@@ -18,6 +18,7 @@ pub const RuntimeAlerts = struct {
     var circuits_opened: std.atomic.Value(u64) = .init(0);
     var supervisor_restarts: std.atomic.Value(u64) = .init(0);
     var component_crashes: std.atomic.Value(u64) = .init(0);
+    var plugin_traps: std.atomic.Value(u64) = .init(0);
     /// Millisecond wall-clock of the most recent alert, 0 when none.
     var last_alert_ms: std.atomic.Value(i64) = .init(0);
 
@@ -27,12 +28,13 @@ pub const RuntimeAlerts = struct {
         circuits_opened: u64,
         supervisor_restarts: u64,
         component_crashes: u64,
+        plugin_traps: u64,
         last_alert_ms: i64,
 
         pub fn total(self: Snapshot) u64 {
             return self.dead_lettered + self.poison_detected +
                 self.circuits_opened + self.supervisor_restarts +
-                self.component_crashes;
+                self.component_crashes + self.plugin_traps;
         }
     };
 
@@ -43,8 +45,18 @@ pub const RuntimeAlerts = struct {
             .circuits_opened = circuits_opened.load(.monotonic),
             .supervisor_restarts = supervisor_restarts.load(.monotonic),
             .component_crashes = component_crashes.load(.monotonic),
+            .plugin_traps = plugin_traps.load(.monotonic),
             .last_alert_ms = last_alert_ms.load(.monotonic),
         };
+    }
+
+    /// A wasm plugin call trapped (OutOfFuel, memory fault, ...) after
+    /// activation. Not a vigil telemetry event — the plugin manager
+    /// calls this directly — but it lights the same check-engine light:
+    /// a plugin failing on your keystroke is exactly the kind of
+    /// contained failure the light exists to surface.
+    pub fn recordPluginTrap() void {
+        bump(&plugin_traps);
     }
 
     /// True when an alert fired within the trailing window — drives the
@@ -62,6 +74,7 @@ pub const RuntimeAlerts = struct {
         circuits_opened.store(0, .monotonic);
         supervisor_restarts.store(0, .monotonic);
         component_crashes.store(0, .monotonic);
+        plugin_traps.store(0, .monotonic);
         last_alert_ms.store(0, .monotonic);
     }
 
@@ -582,14 +595,19 @@ test "RuntimeAlerts counts telemetry events from both emitters" {
     // The global emitter carries supervisor crash/restart events.
     runtime.plugin_supervisor.recordCrash("git");
 
+    // Plugin traps arrive from the plugin manager directly, not via a
+    // vigil telemetry event, but land on the same light.
+    RuntimeAlerts.recordPluginTrap();
+
     const alerts = RuntimeAlerts.snapshot();
     try std.testing.expectEqual(@as(u64, 1), alerts.dead_lettered);
     try std.testing.expectEqual(@as(u64, 1), alerts.component_crashes);
-    try std.testing.expectEqual(@as(u64, 2), alerts.total());
+    try std.testing.expectEqual(@as(u64, 1), alerts.plugin_traps);
+    try std.testing.expectEqual(@as(u64, 3), alerts.total());
     try std.testing.expect(RuntimeAlerts.recentlyDegraded(60_000));
 
     const health = runtime.healthSnapshot();
-    try std.testing.expectEqual(@as(u64, 2), health.alerts.total());
+    try std.testing.expectEqual(@as(u64, 3), health.alerts.total());
 }
 
 test "StemRuntime cluster presence is off by default and rejects bad specs" {

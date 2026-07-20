@@ -6,7 +6,7 @@ pub const vfs = @import("kernel/vfs.zig");
 pub const schema = @import("config/schema.zig");
 pub const lsp_server = @import("services/lsp/server.zig");
 pub const test_utils = @import("test_utils.zig");
-pub const wasm_interpreter = @import("plugins/wasm/interpreter.zig");
+pub const wasm_interpreter = @import("wick");
 // Hidden from the test target: syntax/manager.zig has ~25 latent tests
 // that fail when run via `std.testing.refAllDecls` (see note below).
 // Tools like `zig build query-check` build with `is_test = false` so
@@ -59,8 +59,8 @@ test {
     _ = @import("plugins/manager.zig");
     _ = @import("plugins/manifest.zig");
     _ = @import("plugins/process_loader.zig");
-    _ = @import("plugins/wasm/interpreter.zig");
     _ = @import("plugins/wasm/loader.zig");
+    _ = @import("kernel/macros.zig");
     _ = @import("tools/plugin_cli.zig");
     _ = @import("tools/lsp_host_args.zig");
     _ = @import("lsp/transport.zig");

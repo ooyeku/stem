@@ -306,12 +306,22 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("uucode", uucode_dep.module("uucode"));
 
+    // wick: the wasm interpreter that runs the plugin system. Extracted
+    // from this repo (formerly src/plugins/wasm/interpreter.zig); the
+    // compatibility contract lives in wick's docs/stem-contract.md.
+    const wick_dep = b.dependency("wick", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("wick", wick_dep.module("wick"));
+
     // Add dependencies to the main module as well (needed for tests)
     mod.addImport("vaxis", vaxis_dep.module("vaxis"));
     mod.addImport("vigil", vigil_dep.module("vigil"));
     mod.addImport("zls", zls_dep.module("zls"));
     mod.addImport("lsp", lsp_dep.module("lsp"));
     mod.addImport("uucode", uucode_dep.module("uucode"));
+    mod.addImport("wick", wick_dep.module("wick"));
     // Include paths for the exe so it can see tree-sitter headers.
     exe.root_module.addIncludePath(ts_dep.path("lib/include"));
     exe.root_module.addIncludePath(ts_dep.path("lib/src"));

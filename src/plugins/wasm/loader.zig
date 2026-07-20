@@ -21,7 +21,7 @@ const std = @import("std");
 const vigil_api = @import("../../services/vigil_adapters.zig");
 const log = std.log.scoped(.WasmPlugin);
 
-const interp = @import("interpreter.zig");
+const interp = @import("wick");
 const Mutex = vigil_api.Mutex;
 
 /// Caller-supplied hooks. Mirror `process_loader.Callbacks` so the
@@ -111,6 +111,28 @@ pub const SpawnOpts = struct {
     include_stderr: bool = false,
 };
 
+/// Rolling per-plugin call statistics. Containment without visibility
+/// is only half the job — these counters feed the plugin dashboard
+/// and the control center so a plugin's cost and failure history are
+/// inspectable while the editor runs.
+pub const CallStats = struct {
+    /// Plugin-logic invocations (activate / handle_command /
+    /// handle_event / deactivate). Internal helper calls like
+    /// `__stem_scratch_addr` are not counted.
+    calls: u64 = 0,
+    /// Calls that failed with a trap, OutOfFuel, or any other
+    /// interpreter error.
+    traps: u64 = 0,
+    /// `@errorName` of the most recent failed call (static storage,
+    /// never freed).
+    last_error: ?[]const u8 = null,
+    /// Fuel consumed by the most recent call.
+    last_fuel_used: u64 = 0,
+    /// Worst-case fuel consumed by any single call — how close this
+    /// plugin has come to the budget.
+    max_fuel_used: u64 = 0,
+};
+
 pub const WasmPlugin = struct {
     allocator: std.mem.Allocator,
     /// Plugin id — duped, owned.
@@ -121,9 +143,32 @@ pub const WasmPlugin = struct {
     instance: interp.Instance,
     callbacks: Callbacks,
     state: State = .loaded,
+    stats: CallStats = .{},
     /// Mutex guarding `instance` invocations. Plugins are not
     /// re-entrant; the host serializes calls.
     invoke_mu: Mutex = .{},
+
+    /// Run a plugin entry point through the interpreter, updating
+    /// `stats` on the way out. Callers hold `invoke_mu`.
+    fn invokeTracked(self: *WasmPlugin, idx: u32, args: []const u64, results: []u64) interp.Error!u32 {
+        self.stats.calls += 1;
+        const rc = interp.invoke(&self.instance, idx, args, results) catch |err| {
+            self.stats.traps += 1;
+            self.stats.last_error = @errorName(err);
+            self.recordFuelUsed();
+            return err;
+        };
+        self.recordFuelUsed();
+        return rc;
+    }
+
+    fn recordFuelUsed(self: *WasmPlugin) void {
+        const budget = self.instance.limits.fuel orelse return;
+        const remaining = self.instance.fuel_remaining orelse return;
+        const used = budget - remaining;
+        self.stats.last_fuel_used = used;
+        if (used > self.stats.max_fuel_used) self.stats.max_fuel_used = used;
+    }
 
     pub fn deinit(self: *WasmPlugin) void {
         // Best-effort: call `deactivate` if it exists and we haven't
@@ -131,7 +176,7 @@ pub const WasmPlugin = struct {
         if (self.state == .activated) {
             if (self.module.findExport("deactivate", .func)) |idx| {
                 var results: [4]u64 = undefined;
-                _ = interp.invoke(&self.instance, idx, &.{}, results[0..0]) catch {};
+                _ = self.invokeTracked(idx, &.{}, results[0..0]) catch {};
             }
         }
         self.instance.deinit();
@@ -158,8 +203,11 @@ pub const WasmPlugin = struct {
         defer self.invoke_mu.unlock();
         var results: [4]u64 = undefined;
         const ft = self.instance.funcType(idx) orelse return error.InvalidModule;
-        const rc = interp.invoke(&self.instance, idx, &.{}, results[0..ft.results.len]) catch |err| {
-            log.err("plugin '{s}' activate trapped: {s}", .{ self.plugin_id, @errorName(err) });
+        const rc = self.invokeTracked(idx, &.{}, results[0..ft.results.len]) catch |err| {
+            // warn, not err: a trapped plugin call is a *contained*
+            // failure (state -> .failed, error surfaced to the
+            // manager); err-level is reserved for host integrity.
+            log.warn("plugin '{s}' activate trapped: {s}", .{ self.plugin_id, @errorName(err) });
             self.state = .failed;
             return err;
         };
@@ -184,13 +232,12 @@ pub const WasmPlugin = struct {
         const scratch_ptr = self.scratchPtr() catch unreachable;
 
         var results: [4]u64 = undefined;
-        _ = interp.invoke(
-            &self.instance,
+        _ = self.invokeTracked(
             idx,
             &.{ @as(u64, scratch_ptr), @as(u64, command_id.len) },
             results[0..0],
         ) catch |err| {
-            log.err("plugin '{s}' handle_command trapped: {s}", .{ self.plugin_id, @errorName(err) });
+            log.warn("plugin '{s}' handle_command trapped: {s}", .{ self.plugin_id, @errorName(err) });
             return err;
         };
     }
@@ -213,8 +260,7 @@ pub const WasmPlugin = struct {
         const data_ptr = scratch_ptr + @as(u32, @intCast(topic.len));
 
         var results: [4]u64 = undefined;
-        _ = interp.invoke(
-            &self.instance,
+        _ = self.invokeTracked(
             idx,
             &.{
                 @as(u64, topic_ptr),
@@ -224,7 +270,7 @@ pub const WasmPlugin = struct {
             },
             results[0..0],
         ) catch |err| {
-            log.err("plugin '{s}' handle_event trapped: {s}", .{ self.plugin_id, @errorName(err) });
+            log.warn("plugin '{s}' handle_event trapped: {s}", .{ self.plugin_id, @errorName(err) });
             return err;
         };
     }
@@ -264,6 +310,19 @@ pub const WasmPlugin = struct {
 /// Load + instantiate a wasm plugin from an absolute path. Caller
 /// takes ownership of the returned `*WasmPlugin`. The plugin's id is
 /// duplicated from `plugin_id` so the caller can free the original.
+/// Instruction budget per plugin call (activate, handle_command,
+/// handle_event, ...). Each wasm instruction costs 1; the budget
+/// resets on every call. A runaway plugin (infinite loop, pathological
+/// input) fails that one call with `error.OutOfFuel` — logged and
+/// contained like any other plugin trap — instead of hanging the
+/// editor. Sizing: the busiest bundled plugin call (plugin-manager
+/// dashboard render) uses well under 5M; 50M gives an order of
+/// magnitude of headroom while bounding a runaway call to well under
+/// a second of wall time. Host calls (spawn_capture etc.) cost one
+/// instruction regardless of how long the host takes, so slow git
+/// subprocesses are not penalized.
+pub const CALL_FUEL_BUDGET: u64 = 50_000_000;
+
 pub fn load(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -324,7 +383,9 @@ pub fn load(
         .{ .module_name = "env", .field_name = "stem_unload_plugin", .func = hostStemUnloadPlugin },
     };
 
-    wp.instance = try interp.instantiate(allocator, &wp.module, &host_imports, @ptrCast(wp));
+    wp.instance = try interp.instantiateWithLimits(allocator, &wp.module, &host_imports, @ptrCast(wp), .{
+        .fuel = CALL_FUEL_BUDGET,
+    });
     return wp;
 }
 
@@ -743,6 +804,8 @@ test "load + activate + dispatchCommand against the built echo.wasm" {
         wp.deinit();
         a.destroy(wp);
     }
+    // Every plugin instance carries the per-call fuel budget.
+    try std.testing.expectEqual(CALL_FUEL_BUDGET, wp.instance.limits.fuel.?);
     try wp.activate();
     try std.testing.expect(ts.commands.items.len == 1);
     try std.testing.expectEqualStrings("echo.hello", ts.commands.items[0]);
@@ -750,4 +813,82 @@ test "load + activate + dispatchCommand against the built echo.wasm" {
     // After both calls we should have at least one log (the "ready" log
     // from activate) plus one from handle_command.
     try std.testing.expect(ts.logs.items.len >= 2);
+    // Stats observed both calls, no traps, and real fuel consumption.
+    try std.testing.expectEqual(@as(u64, 2), wp.stats.calls);
+    try std.testing.expectEqual(@as(u64, 0), wp.stats.traps);
+    try std.testing.expect(wp.stats.max_fuel_used > 0);
+    try std.testing.expect(wp.stats.max_fuel_used < CALL_FUEL_BUDGET);
+}
+
+// A plugin whose `activate` never returns must cost one bounded,
+// observable failed call — not a hung editor. Uses a tightened budget
+// so the test doesn't burn the full production allowance.
+test "runaway plugin call is contained by the fuel budget" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Minimal wasm module: `activate: () -> ()` containing `loop { br 0 }`.
+    const runaway = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        // type: () -> ()
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        // function: 1 func, type 0
+        0x03, 0x02,
+        0x01, 0x00,
+        // export "activate" = func 0
+        0x07, 0x0C, 0x01, 0x08, 0x61, 0x63,
+        0x74, 0x69, 0x76, 0x61, 0x74, 0x65, 0x00, 0x00,
+        // code: loop { br 0 }
+        0x0A, 0x09, 0x01, 0x07, 0x00, 0x03, 0x40, 0x0C,
+        0x00, 0x0B, 0x0B,
+    };
+
+    var tmp = try @import("../../test_utils.zig").Tempdir.init(a, io);
+    defer tmp.deinit();
+    try tmp.writeFile("runaway.wasm", &runaway);
+    const abs_path = try tmp.joinPath(a, "runaway.wasm");
+    defer a.free(abs_path);
+
+    var ts: TestState = .{ .allocator = a };
+    defer ts.deinit();
+    const wp = try load(a, io, "runaway", abs_path, .{
+        .user_data = @ptrCast(&ts),
+        .on_log = TestState.onLog,
+        .on_register_command = TestState.onReg,
+        .on_show_notification = TestState.onNote,
+        .on_open_buffer = TestState.onOpenBuf,
+        .on_spawn_capture = TestState.onSpawn,
+        .on_subscribe_event = TestState.onSubEv,
+        .on_read_file = TestState.onReadFile,
+        .on_write_file = TestState.onWriteFile,
+        .on_set_status_item = TestState.onSetSI,
+        .on_clear_status_item = TestState.onClearSI,
+        .on_set_panel = TestState.onSetPanel,
+        .on_clear_panel = TestState.onClearPanel,
+        .on_get_buffer_content = TestState.onGetBufContent,
+        .on_get_buffer_path = TestState.onGetBufPath,
+        .on_get_plugin_dashboard_json = TestState.onGetPluginDashboardJson,
+        .on_get_plugin_dashboard_report = TestState.onGetPluginDashboardReport,
+        .on_storage_read = TestState.onStorageRead,
+        .on_storage_write = TestState.onStorageWrite,
+        .on_load_plugin = TestState.onLoadPlugin,
+        .on_unload_plugin = TestState.onUnloadPlugin,
+    });
+    defer {
+        wp.deinit();
+        a.destroy(wp);
+    }
+
+    // Tighten the budget so exhaustion is instant; the mechanism under
+    // test is identical at any budget size.
+    wp.instance.limits.fuel = 100_000;
+    try std.testing.expectError(error.OutOfFuel, wp.activate());
+    try std.testing.expectEqual(State.failed, wp.state);
+    // The failure is recorded, attributable, and shows the call burned
+    // its entire budget.
+    try std.testing.expectEqual(@as(u64, 1), wp.stats.traps);
+    try std.testing.expectEqualStrings("OutOfFuel", wp.stats.last_error.?);
+    try std.testing.expectEqual(@as(u64, 100_000), wp.stats.last_fuel_used);
 }
