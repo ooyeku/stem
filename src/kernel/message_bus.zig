@@ -589,3 +589,192 @@ test "MessageBus: Vigil rate limiter drops noisy bulk sends" {
 
     _ = try vigil_api.testing.drainInbox(ib, 64);
 }
+
+test "MessageBus: macro replay burst round-trips markers and inputs in order" {
+    // Regression for transactional macros: the core thread enqueues
+    // [begin, keys..., end] onto its own bus; every message must
+    // arrive, in order, through the same BatchReceiver the core loop
+    // uses. A dropped marker would leave the undo bracket open forever.
+    const a = std.testing.allocator;
+    const ib = try vigil_api.standaloneInboxForTest(a);
+    defer ib.close();
+
+    var bus = MessageBus.init(a, ib, "to-core");
+
+    {
+        const b = try (protocol.Message{ .command = .macro_replay_begin }).encode(a);
+        defer a.free(b);
+        try bus.sendInteractive(b);
+    }
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const key: @import("vaxis").Key = .{ .codepoint = 'x', .mods = .{}, .text = "x" };
+        const b = try (protocol.Message{ .input = key }).encode(a);
+        defer a.free(b);
+        try bus.sendInteractive(b);
+    }
+    {
+        const b = try (protocol.Message{ .command = .macro_replay_end }).encode(a);
+        defer a.free(b);
+        try bus.sendInteractive(b);
+    }
+
+    const stats = bus.snapshotStats();
+    try std.testing.expectEqual(@as(usize, 0), stats.totalDropped());
+
+    var receiver = vigil_api.BatchReceiver.init(ib);
+    defer receiver.deinit();
+    var commands: usize = 0;
+    var inputs: usize = 0;
+    var first_tag: ?std.meta.Tag(protocol.Message) = null;
+    var last_tag: ?std.meta.Tag(protocol.Message) = null;
+    var n: usize = 0;
+    while (n < 12) : (n += 1) {
+        const msg = try receiver.next();
+        defer msg.deinit();
+        const decoded = try protocol.Message.decode(msg.payload.?);
+        if (first_tag == null) first_tag = decoded;
+        last_tag = decoded;
+        switch (decoded) {
+            .command => commands += 1,
+            .input => inputs += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), commands);
+    try std.testing.expectEqual(@as(usize, 10), inputs);
+    try std.testing.expectEqual(std.meta.Tag(protocol.Message).command, first_tag.?);
+    try std.testing.expectEqual(std.meta.Tag(protocol.Message).command, last_tag.?);
+}
+
+test "MessageBus: burst round-trips on the REAL balanced priority inbox" {
+    // Same as the macro-burst test above but on the production inbox
+    // profile (priority queues + dead-letter), not the plain test
+    // inbox — bursts of same-priority messages must all arrive.
+    const a = std.testing.allocator;
+    const StemRuntime = @import("../services/runtime.zig").StemRuntime;
+    var runtime = try StemRuntime.init(a);
+    defer runtime.deinit();
+    const ib = try vigil_api.createInbox(&runtime.vigil_runtime);
+    defer ib.close();
+
+    var bus = MessageBus.init(a, ib, "to-core");
+
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const b = try (protocol.Message{ .command = .macro_replay_begin }).encode(a);
+        defer a.free(b);
+        try bus.sendInteractive(b);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bus.snapshotStats().totalDropped());
+
+    var receiver = vigil_api.BatchReceiver.init(ib);
+    defer receiver.deinit();
+    var got: usize = 0;
+    while (got < 12) : (got += 1) {
+        var msg = receiver.next() catch break;
+        defer msg.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 12), got);
+}
+
+test "MessageBus: self-send from within the receive loop is delivered" {
+    // The transactional-macro pattern: the core thread, while HANDLING
+    // a message it just received (after parking in receiveWait), sends
+    // a burst to its own inbox and must receive every one of them on
+    // subsequent loop iterations.
+    const a = std.testing.allocator;
+    const StemRuntime = @import("../services/runtime.zig").StemRuntime;
+    var runtime = try StemRuntime.init(a);
+    defer runtime.deinit();
+    const ib = try vigil_api.createInbox(&runtime.vigil_runtime);
+    defer ib.close();
+
+    var bus = MessageBus.init(a, ib, "to-core");
+
+    const Consumer = struct {
+        bus: *MessageBus,
+        ib: *vigil_api.Inbox,
+        received_after_trigger: usize = 0,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(self: *@This(), alloc: std.mem.Allocator) void {
+            var receiver = vigil_api.BatchReceiver.init(self.ib);
+            defer receiver.deinit();
+            var triggered = false;
+            while (true) {
+                const msg = receiver.next() catch break;
+                defer msg.deinit();
+                const payload = msg.payload orelse continue;
+                if (payload.len > 0 and payload[0] == 0xBB) break; // kill sentinel
+                if (!triggered and payload.len > 0 and payload[0] == 0xAA) {
+                    triggered = true;
+                    // Mid-handling burst to our own inbox.
+                    var i: usize = 0;
+                    while (i < 12) : (i += 1) {
+                        const b = (protocol.Message{ .command = .macro_replay_begin }).encode(alloc) catch break;
+                        defer alloc.free(b);
+                        self.bus.sendInteractive(b) catch break;
+                    }
+                    continue;
+                }
+                if (triggered) {
+                    self.received_after_trigger += 1;
+                }
+            }
+            self.done.store(true, .release);
+        }
+    };
+
+    var consumer: Consumer = .{ .bus = &bus, .ib = ib };
+    const t = try std.Thread.spawn(.{}, Consumer.run, .{ &consumer, a });
+
+    // Let the consumer park in receiveWait first, then wake it.
+    vigil_api.sleep(50 * std.time.ns_per_ms);
+    try bus.sendInteractive(&.{0xAA});
+
+    // Give the consumer time to observe the self-sent burst, then stop it.
+    var waited: usize = 0;
+    while (consumer.received_after_trigger < 12 and waited < 200) : (waited += 1) {
+        vigil_api.sleep(10 * std.time.ns_per_ms);
+    }
+    try bus.sendInteractive(&.{0xBB});
+    t.join();
+
+    try std.testing.expectEqual(@as(usize, 12), consumer.received_after_trigger);
+}
+
+test "MessageBus: burst into a WRAPPED ring queue survives growth" {
+    // The live-editor failure mode: after enough single send/receive
+    // cycles the priority ring's head/tail have wrapped; a burst that
+    // forces the ring to GROW while wrapped must not lose messages.
+    const a = std.testing.allocator;
+    const StemRuntime = @import("../services/runtime.zig").StemRuntime;
+    var runtime = try StemRuntime.init(a);
+    defer runtime.deinit();
+    const ib = try vigil_api.createInbox(&runtime.vigil_runtime);
+    defer ib.close();
+
+    var bus = MessageBus.init(a, ib, "to-core");
+
+    // Wrap the ring: 40 interleaved send/receive singles.
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        try bus.sendInteractive(&.{0x01});
+        var m = try ib.mailbox.receive();
+        m.deinit();
+    }
+
+    // Now the burst.
+    i = 0;
+    while (i < 12) : (i += 1) {
+        try bus.sendInteractive(&.{0x02});
+    }
+    var got: usize = 0;
+    while (ib.mailbox.receive()) |msg| {
+        var m = msg;
+        defer m.deinit();
+        got += 1;
+    } else |_| {}
+    try std.testing.expectEqual(@as(usize, 12), got);
+}

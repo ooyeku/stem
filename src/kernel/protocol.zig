@@ -1667,6 +1667,11 @@ pub const Command = enum {
     next_buffer,
     prev_buffer,
     quit,
+    /// Transactional macro-replay brackets. Enqueued around the
+    /// replayed input messages so the core loop can open/close the
+    /// single-undo-group window in FIFO order with the keys.
+    macro_replay_begin,
+    macro_replay_end,
 };
 
 test "mode enum values" {

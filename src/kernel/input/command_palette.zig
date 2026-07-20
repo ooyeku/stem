@@ -34,6 +34,10 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
 
             cmd.execute(core, cmd.context) catch |err| {
                 log.err("command '{s}' failed: {s}", .{ cmd.id, @errorName(err) });
+                // A failed command inside a macro replay poisons the
+                // bracket — the whole replay rolls back at the end
+                // marker instead of leaving a half-applied macro.
+                core.macros.noteFailure(err);
             };
         }
         return true;

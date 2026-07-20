@@ -229,6 +229,46 @@ pub const HistoryManager = struct {
         return txn;
     }
 
+    /// Collapse every transaction pushed after `base` into one, so a
+    /// single undo reverses the whole span. Used by macro replay:
+    /// "the macro applies as one undo group". Undo applies actions in
+    /// reverse order, so straight concatenation composes correctly.
+    /// On allocation failure the span is left un-merged — still a
+    /// correct history, just not a single group.
+    pub fn mergeSince(self: *HistoryManager, base: usize) void {
+        if (base >= self.undo_stack.items.len) return;
+        const span = self.undo_stack.items[base..];
+        if (span.len < 2) return;
+
+        var total: usize = 0;
+        for (span) |txn| total += txn.actions.items.len;
+
+        var merged = span[0];
+        merged.actions.ensureTotalCapacity(self.allocator, total) catch {
+            log.warn("mergeSince: allocation failed; leaving {d} transactions un-merged", .{span.len});
+            return;
+        };
+        // Infallible from here: move action payloads (ownership of the
+        // text slices transfers), free only the source list shells.
+        for (span[1..]) |*txn| {
+            merged.actions.appendSliceAssumeCapacity(txn.actions.items);
+            txn.actions.deinit(self.allocator);
+        }
+        merged.cursor_after = span[span.len - 1].cursor_after;
+        self.undo_stack.items[base] = merged;
+        self.undo_stack.shrinkRetainingCapacity(base + 1);
+    }
+
+    /// Drop the redo stack. Macro rollback uses this: unwinding a
+    /// failed replay pushes redo entries, and "redo half a failed
+    /// macro" must not be an available operation.
+    pub fn clearRedo(self: *HistoryManager) void {
+        for (self.redo_stack.items) |*txn| {
+            txn.deinit(self.allocator);
+        }
+        self.redo_stack.clearRetainingCapacity();
+    }
+
     pub fn canUndo(self: *HistoryManager) bool {
         return self.undo_stack.items.len > 0 or
             (self.current_transaction != null and self.current_transaction.?.actions.items.len > 0);

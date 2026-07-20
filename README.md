@@ -356,6 +356,19 @@ string literals, `(` `[` `{` `<` matching pairs (use either bracket).
 Typing and backspace replicate at every cursor. Newlines and
 line-altering operations collapse back to the primary cursor.
 
+### Macros (Select mode)
+
+Macros record the message stream the editor actually processes — not
+raw terminal bytes — and replay is **transactional**: the whole
+replay applies as one undo group, and a replay that errors mid-way
+rolls the buffer back instead of leaving a half-applied mess.
+
+| Key | Action |
+|-----|--------|
+| `q` then `a`–`z` | Start recording into that register |
+| `q` (while recording) | Stop recording |
+| `[N]` `@` then `a`–`z` | Replay a register N times (default 1) |
+
 ### Save / open / quit
 
 On macOS use `Cmd`, on Linux/Windows use `Ctrl`:

@@ -271,6 +271,7 @@ pub fn handle(core: anytype, key: vaxis.Key) !bool {
                 core.syncPaneToState();
                 core.command_registry.execute(cmd_id, core) catch |err| {
                     log.warn("plugin keybind '{s}' exec failed: {s}", .{ cmd_id, @errorName(err) });
+                    core.macros.noteFailure(err);
                 };
                 core.plugin_chord_buf.clearRetainingCapacity();
                 core.leader_pending = false;
