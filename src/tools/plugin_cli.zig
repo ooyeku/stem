@@ -22,7 +22,6 @@ const std = @import("std");
 
 const manifest_mod = @import("../plugins/manifest.zig");
 const wasm_loader = @import("../plugins/wasm/loader.zig");
-const wasm_interp = @import("wick");
 const plugin_inspect = @import("../plugins/inspect.zig");
 
 pub const Context = struct {

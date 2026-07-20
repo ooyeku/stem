@@ -348,7 +348,7 @@ pub fn build(b: *std.Build) void {
     // supports exec (out-of-process JSON-RPC) plugins, but nothing
     // bundled uses that path. Built for `wasm32-freestanding`; host
     // imports (env.stem_*) are left unresolved at build time and bound
-    // by the host's pure-Zig interpreter at instantiate time.
+    // by the wick interpreter at instantiate time.
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,

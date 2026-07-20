@@ -2,7 +2,8 @@
 //!
 //! Manages the lifecycle of a wasm plugin:
 //!   1. Read the `.wasm` file pointed at by the manifest's `entry`.
-//!   2. Decode it with our pure-Zig interpreter.
+//!   2. Decode it with wick, the pure-Zig wasm interpreter
+//!      (github.com/ooyeku/wick — extracted from this repo).
 //!   3. Bind the `env.stem_*` host imports.
 //!   4. Instantiate the module (runs no code).
 //!   5. Call the exported `activate` function — plugin uses it to
@@ -182,14 +183,6 @@ pub const WasmPlugin = struct {
         self.instance.deinit();
         self.module.deinit();
         self.allocator.free(self.plugin_id);
-    }
-
-    /// Read a NUL-or-length-paired wasm linear-memory string into a
-    /// host slice. Caller does NOT own — the returned slice is a view
-    /// into the wasm instance memory and is invalidated by the next
-    /// `memory.grow`.
-    fn readWasmStr(self: *WasmPlugin, ptr: u32, len: u32) ![]const u8 {
-        return self.instance.slice(ptr, len);
     }
 
     /// Invoke the plugin's exported `activate` function.

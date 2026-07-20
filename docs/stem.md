@@ -766,7 +766,7 @@ graph TB
         CR[CommandRegistry]
         CORE[Core inbox]
         UI[UI inbox]
-        WASM[Wasm interpreter]
+        WASM[wick interpreter]
     end
 
     subgraph "Wasm plugin"
@@ -794,9 +794,11 @@ graph TB
 - **Manifest loading.** Auto-discovers `~/.stem/plugins/<name>/plugin.json`
   on startup and seeds commands into the palette before runtime
   activation.
-- **Isolation.** Wasm plugins run inside the pure-Zig interpreter
-  with `(ptr, len)` host imports; exec plugins run as child
-  processes communicating over framed JSON-RPC on stdio.
+- **Isolation.** Wasm plugins run inside the
+  [wick](https://github.com/ooyeku/wick) interpreter with
+  `(ptr, len)` host imports and a per-call instruction fuel budget;
+  exec plugins run as child processes communicating over framed
+  JSON-RPC on stdio.
 - **Permissions.** Manifest declarations gate the wired capabilities
   (`spawn`, `events`, `filesystem`, `manage_plugins`). Missing
   entries default to deny.
@@ -887,7 +889,7 @@ to drop the workspace index.
 
 | Mode | Entry | Description |
 |---|---|---|
-| `select` | default | Navigation, selection, leader chord dispatch |
+| `select` | default | Navigation, selection, leader chord dispatch, macro record/replay (`q` / `@`) |
 | `insert` | `i` | Text input; auto-pair, signature help on `(` / `,` |
 | `visual` | `v` | Visual selection (text objects via `i <c>` / `a <c>`) |
 | `visual_search` | `/` (forward), `?` (backward) | Incremental in-buffer search with live highlights |
@@ -1128,8 +1130,7 @@ stem/
 │   │   ├── jsonrpc.zig
 │   │   ├── inspect.zig
 │   │   └── wasm/
-│   │       ├── interpreter.zig
-│   │       └── loader.zig
+│   │       └── loader.zig   # interpreter is the wick package
 │   ├── tools/
 │   │   ├── search.zig
 │   │   ├── vfind.zig
@@ -1151,7 +1152,8 @@ stem/
 │       ├── editor_state_fuzz.zig
 │       ├── config_setbypath_fuzz.zig
 │       ├── lsp_json_fuzz.zig
-│       └── uri_fuzz.zig
+│       ├── uri_fuzz.zig
+│       └── wasm_loader_fuzz.zig
 ├── bundled/plugins/
 ├── docs/
 ├── scripts/completions/   (bash, fish, zsh)
@@ -1169,6 +1171,7 @@ stem/
 |---|---|---|
 | [vaxis](https://github.com/rockorager/libvaxis) | Terminal UI engine | Direct rendering |
 | [vigil](https://github.com/ooyeku/vigil) | Actor-style message passing | Thread communication |
+| [wick](https://github.com/ooyeku/wick) | Wasm interpreter (plugins) | Fuel-metered plugin calls |
 | [zls](https://github.com/zigtools/zls) | Zig Language Server | Embedded, in-process |
 | [lsp-kit](https://github.com/zigtools/lsp-kit) | LSP protocol types | Shared with ZLS |
 | [uucode](https://github.com/jacobsandlund/uucode) | Unicode tables | Width / case folding |
@@ -1182,8 +1185,9 @@ Build requirements:
 ### Fuzz testing
 
 Fuzz targets in [src/fuzz/](../src/fuzz/) cover the piece table,
-editor state, URI parser, JSON LSP messages, and the
-`config.setByPath` API.
+editor state, URI parser, JSON LSP messages, the `config.setByPath`
+API, and the wasm plugin loader (hostile module bytes through the
+wick decoder).
 
 ```bash
 zig build fuzz                   # macOS

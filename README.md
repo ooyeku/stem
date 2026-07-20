@@ -37,9 +37,9 @@ it supervises. Concretely, that means:
   so you know it happened.
 - **Nothing fails silently.** Undeliverable messages go to inspectable
   dead-letter queues instead of vanishing. Dead letters, poison
-  messages, open circuits, and component crashes all feed a
-  "check-engine light": a status-bar warning that points you at the
-  live cockpit.
+  messages, open circuits, component crashes, and plugin traps all
+  feed a "check-engine light": a status-bar warning that points you
+  at the live cockpit.
 - **A pane of glass, not a black box.** `stem.control_center` shows
   queue depths, message-bus pressure, circuit-breaker states,
   dead-letter contents, timer stats, and a rolling timeline of runtime
@@ -146,7 +146,11 @@ when it isn't already there.
 - Dead-letter queues with live inspection — undeliverable messages are
   retained and attributable, never silently dropped
 - Runtime "check-engine light": telemetry-fed alert counters surface
-  dead letters, poison messages, open circuits, and crashes as they happen
+  dead letters, poison messages, open circuits, crashes, and plugin
+  traps as they happen
+- Fuel-metered plugin calls (via [wick](https://github.com/ooyeku/wick)):
+  a runaway plugin fails one bounded call instead of hanging the
+  editor, with per-plugin call/trap/fuel stats in the dashboard
 - Stem Control Center (`stem.control_center`) for runtime, Vigil,
   project-index, LSP, job, plugin, and message-bus health in one view
 - Stem Heal (`stem.heal`) for Vigil-backed runtime recovery
@@ -657,7 +661,7 @@ src/
 ├── syntax/            # Tree-sitter integration and language queries
 ├── services/          # LSP, logging, terminal, global search
 ├── lsp/               # LSP protocol client and transport
-├── plugins/           # Manifest, wasm interpreter, exec runtime
+├── plugins/           # Manifest, wasm loader (wick), exec runtime
 ├── config/            # Config schema, keys, persistent storage
 ├── tools/             # CLI tools (find, vfind, scope, plugin, operator commands)
 └── fuzz/              # Fuzz targets (piece table, state, URIs)
@@ -671,6 +675,9 @@ All Zig dependencies are pinned in [build.zig.zon](build.zig.zon):
 - [vigil](https://github.com/ooyeku/vigil) — supervised runtime:
   message passing, supervision trees, circuit breakers, checkpoints,
   timers, and telemetry
+- [wick](https://github.com/ooyeku/wick) — pure-Zig wasm interpreter
+  running the plugin system, with per-call fuel metering (extracted
+  from stem)
 - [zls](https://github.com/zigtools/zls) — embedded Zig LSP
 - [lsp-kit](https://github.com/zigtools/lsp-kit) — LSP protocol types
 - [uucode](https://github.com/jacobsandlund/uucode) — Unicode tables
@@ -687,7 +694,7 @@ plugins are supported.
 |--------|---------|-------------|
 | `echo` | wasm | Reference plugin: a single command that pops a notification |
 | `git` | wasm | Status / diff / staged-diff plus a live branch indicator |
-| `plugin_manager` | wasm | SDK-backed dashboard, raw JSON, permissions, storage health, and reload commands |
+| `plugin_manager` | wasm | SDK-backed dashboard (incl. per-plugin call/trap/fuel stats), raw JSON, permissions, storage health, and reload commands |
 | `sdk_demo` | wasm | SDK example covering commands, events, status items, panels, active-buffer reads, dashboard data, and plugin storage |
 
 See [docs/plugins.md](docs/plugins.md) for the full author guide

@@ -8,9 +8,9 @@
 //! Two runtimes:
 //!
 //!   * **wasm** — `bundled/plugins/<name>/{plugin.json, <name>.wasm}`.
-//!     A WebAssembly module loaded by the pure-Zig interpreter and
-//!     bound to a small set of `env.stem_*` host imports. See
-//!     `wasm/{interpreter,loader}.zig`.
+//!     A WebAssembly module executed by the wick interpreter
+//!     (github.com/ooyeku/wick) and bound to a small set of
+//!     `env.stem_*` host imports. See `wasm/loader.zig`.
 //!   * **exec** — `~/.stem/plugins/<name>/{plugin.json, <entry>}`.
 //!     A child process speaking JSON-RPC 2.0 over stdio with LSP
 //!     framing. See `process_loader.zig`. Nothing bundled uses this

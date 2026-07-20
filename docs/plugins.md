@@ -1,8 +1,9 @@
 # Stem Plugins
 
 Stem has a manifest-driven plugin system with two runtimes: a
-sandboxed pure-Zig `wasm` interpreter and an out-of-process `exec`
-runtime that talks JSON-RPC over stdio. Both load from
+sandboxed `wasm` runtime powered by [wick](https://github.com/ooyeku/wick)
+(the pure-Zig wasm interpreter extracted from stem) and an
+out-of-process `exec` runtime that talks JSON-RPC over stdio. Both load from
 `~/.stem/plugins/<name>/`, share the same `plugin.json` schema and
 permission model, and plug into the command palette through
 `PluginManager`.
@@ -32,7 +33,7 @@ plugins and contributors working on the host-side internals.
 
 | Runtime | Artifact | Isolation | Best for |
 |---|---|---|---|
-| `wasm` | `<name>.wasm` (wasm32-freestanding) | Stem's pure-Zig wasm interpreter | Small, sandboxed commands with narrow host needs |
+| `wasm` | `<name>.wasm` (wasm32-freestanding) | wick interpreter: sandboxed memory, fuel-metered calls | Small, sandboxed commands with narrow host needs |
 | `exec` | Native executable | OS process boundary, framed JSON-RPC | Plugins needing their own runtime, deps, or language ecosystem |
 
 Both runtimes share:
@@ -43,7 +44,9 @@ Both runtimes share:
 - Cleanup of registered commands and permission records on unload
 
 The exec runtime adds an optional crash-restart policy; wasm plugins
-are stateless across activation so they don't need one.
+are stateless across activation so they don't need one. Every wasm
+call runs under an instruction fuel budget — a runaway call fails
+with `OutOfFuel` and is counted as a trap in the plugin's stats.
 
 ## Directory layout
 
@@ -194,8 +197,11 @@ interpreter and never unwinds through stem.
 | `deactivate()` (optional) | Shutdown / unload | Best-effort. |
 
 `stem_get_plugin_dashboard_json` / `stem_get_plugin_dashboard_report`
-now include command and keybinding counts along with runtime,
-permissions, widgets, subscriptions, and capability denials.
+include command and keybinding counts along with runtime,
+permissions, widgets, subscriptions, and capability denials — plus,
+for wasm plugins, per-plugin call stats: total calls, traps, the
+most recent error, and last/max fuel consumed per call against the
+budget.
 
 ### SDK example
 
@@ -224,8 +230,9 @@ export fn handle_command(id_ptr: [*]const u8, id_len: i32) void {
 
 The bundled `sdk_demo` plugin is the broad reference for SDK usage.
 `plugin_manager` also uses the SDK for its dashboard commands. The
-interpreter implements MVP wasm plus the bulk-memory `memory.init` /
-`data.drop` opcodes so plugins can ship passive data segments.
+wick interpreter covers full wasm 1.0 (including floats and
+`call_indirect`) plus the bulk-memory `memory.init` / `data.drop`
+opcodes so plugins can ship passive data segments.
 
 ## Plugin SDK
 
@@ -325,7 +332,7 @@ The CLI lives in
 |---|---|---|---|
 | `echo` | wasm | `echo.hello` | Reference wasm plugin; pops a notification |
 | `git` | wasm | `git.status`, `git.diff`, `git.diff_staged` | Uses `stem_spawn_capture` for `git`; live `Git: <branch>` indicator via event subscriptions |
-| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.json`, `plugin-manager.permissions`, `plugin-manager.storage`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` | SDK-backed runtime dashboard with health, commands, keybindings, permissions, widgets, storage health, capability denials, raw JSON, and hot reload |
+| `plugin_manager` | wasm | `plugin-manager.stats`, `plugin-manager.json`, `plugin-manager.permissions`, `plugin-manager.storage`, `plugin-manager.reload_all`, `plugin.load`, `plugin.unload` | SDK-backed runtime dashboard with health, commands, keybindings, permissions, widgets, storage health, capability denials, per-plugin call/trap/fuel stats, raw JSON, and hot reload |
 | `sdk_demo` | wasm | `sdk-demo.report`, `sdk-demo.inspect_buffer`, `sdk-demo.toggle_panel` | SDK example covering commands, events, status items, panels, active-buffer reads, dashboard data, and plugin storage |
 
 ---
@@ -342,7 +349,7 @@ graph TB
         CR[CommandRegistry]
         CORE[Core inbox]
         UI[UI inbox]
-        WASM[Wasm interpreter]
+        WASM[wick interpreter]
     end
 
     subgraph "Wasm plugin"
@@ -384,16 +391,28 @@ orchestrates both runtimes. Notable responsibilities:
   `restart_state`; pending restarts queue into `pending_restarts`
   and drain on the core tick (never from a reader thread mid-unwind).
 
-### Wasm interpreter
+### Wasm runtime (wick)
 
-The pure-Zig interpreter is in
-[src/plugins/wasm/interpreter.zig](../src/plugins/wasm/interpreter.zig).
-Loader and lifecycle live in
-[src/plugins/wasm/loader.zig](../src/plugins/wasm/loader.zig).
+The interpreter is [wick](https://github.com/ooyeku/wick) — the
+pure-Zig wasm interpreter extracted from this repo, pinned in
+[build.zig.zon](../build.zig.zon). Loader and lifecycle live in
+[src/plugins/wasm/loader.zig](../src/plugins/wasm/loader.zig); the
+API/behavior contract between the two projects is wick's
+`docs/stem-contract.md`.
 
-- MVP wasm coverage plus the bulk-memory `memory.init` / `data.drop`
+- Full wasm 1.0 coverage (i32/i64/f32/f64, funcref tables and
+  `call_indirect`) plus the bulk-memory `memory.init` / `data.drop`
   opcodes (so plugins can ship passive data segments for static
   strings).
+- Every plugin call runs under an instruction budget
+  (`CALL_FUEL_BUDGET`, 50M instructions, reset per call). A runaway
+  call fails with `OutOfFuel` instead of hanging the editor; host
+  imports cost one instruction regardless of how long the host side
+  takes.
+- The loader keeps per-plugin `CallStats` — calls, traps, most
+  recent error, last/max fuel per call — surfaced in the plugin
+  dashboard and the control center; traps also feed the runtime
+  check-engine light.
 - All host imports operate on `(ptr, len)` pairs against the
   plugin's linear memory — no Zig structs cross the boundary.
 - Traps halt inside the interpreter; the manager surfaces a status
