@@ -16,6 +16,10 @@ pub const BufferState = struct {
     name: []const u8,
 };
 
+/// On-disk format version. Bumped only for breaking layout changes;
+/// `parseSession` accepts any version it can read field-wise.
+pub const format_version = 1;
+
 /// Serialize the session to owned JSON bytes, or null when there are no
 /// file-backed buffers worth persisting. Caller frees the returned slice.
 /// Shared by the direct file save below and the Vigil checkpoint pipeline.
@@ -25,55 +29,65 @@ pub fn serialize(
     active_index: usize,
     splits_json: ?[]const u8,
 ) !?[]u8 {
-    var buffer_states = std.ArrayListUnmanaged(BufferState).empty;
-    defer buffer_states.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    var js: std.json.Stringify = .{ .writer = &aw.writer };
 
+    try js.beginObject();
+    try js.objectField("version");
+    try js.write(format_version);
+    try js.objectField("active");
+    try js.write(active_index);
+    try js.objectField("buffers");
+    try js.beginArray();
+
+    var written: usize = 0;
     for (buffers.items) |buf| {
-        if (buf.file_path == null) continue;
-
-        try buffer_states.append(allocator, .{
-            .file_path = buf.file_path,
-            .cursor_row = buf.state.cursor_row,
-            .cursor_col = buf.state.cursor_col,
-            .scroll_offset = buf.state.scroll_offset,
-            .is_virtual = false,
-            .name = buf.name,
-        });
-    }
-
-    if (buffer_states.items.len == 0) return null;
-
-    var json = std.ArrayListUnmanaged(u8).empty;
-    errdefer json.deinit(allocator);
-
-    try json.appendSlice(allocator, "{\"version\":1,\"active\":");
-    try appendInt(allocator, &json, active_index);
-    try json.appendSlice(allocator, ",\"buffers\":[");
-
-    for (buffer_states.items, 0..) |bs, i| {
-        if (i > 0) try json.append(allocator, ',');
-        try json.appendSlice(allocator, "{\"path\":\"");
-        if (bs.file_path) |p| {
-            try appendEscaped(allocator, &json, p);
+        const path = buf.file_path orelse continue;
+        // JSON strings must be valid UTF-8, but Unix paths are arbitrary
+        // bytes. Writing one raw would make the *entire* session file
+        // unparseable on the next launch, so drop the single offending
+        // buffer instead of losing every buffer along with it.
+        if (!std.unicode.utf8ValidateSlice(path)) {
+            log.warn("Skipping buffer with non-UTF-8 path during session save", .{});
+            continue;
         }
-        try json.appendSlice(allocator, "\",\"row\":");
-        try appendInt(allocator, &json, bs.cursor_row);
-        try json.appendSlice(allocator, ",\"col\":");
-        try appendInt(allocator, &json, bs.cursor_col);
-        try json.appendSlice(allocator, ",\"scroll\":");
-        try appendInt(allocator, &json, bs.scroll_offset);
-        try json.append(allocator, '}');
+        try js.beginObject();
+        try js.objectField("path");
+        try js.write(path);
+        try js.objectField("row");
+        try js.write(buf.state.cursor_row);
+        try js.objectField("col");
+        try js.write(buf.state.cursor_col);
+        try js.objectField("scroll");
+        try js.write(buf.state.scroll_offset);
+        try js.endObject();
+        written += 1;
     }
+    try js.endArray();
 
-    try json.appendSlice(allocator, "]");
+    if (written == 0) {
+        aw.deinit();
+        return null;
+    }
 
     if (splits_json) |splits| {
-        try json.appendSlice(allocator, ",\"splits\":");
-        try json.appendSlice(allocator, splits);
+        // Embedded verbatim: this is SplitManager's own format, and
+        // re-encoding it here would couple the two. Validate first so a
+        // malformed layout can't corrupt the whole file — losing the
+        // split layout beats losing the buffer list.
+        if (std.json.validate(allocator, splits) catch false) {
+            try js.objectField("splits");
+            try js.beginWriteRaw();
+            try aw.writer.writeAll(splits);
+            js.endWriteRaw();
+        } else {
+            log.warn("Dropping malformed splits JSON from session save", .{});
+        }
     }
 
-    try json.append(allocator, '}');
-    return try json.toOwnedSlice(allocator);
+    try js.endObject();
+    return try aw.toOwnedSlice();
 }
 
 /// Parse serialized session bytes (the `serialize` format). The caller owns
@@ -141,7 +155,27 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, session_path: []const u8) 
     };
 }
 
+/// Parse the session document. Uses `std.json` rather than scanning for
+/// field markers: paths are arbitrary text, so a path containing `"`,
+/// `\`, or `}` used to truncate or corrupt the record it lived in — and
+/// for an editor whose promise is "a crash never loses your place", a
+/// recovery file that can't survive its own filenames is the worst kind
+/// of bug.
+///
+/// Tolerant by design: unreadable individual buffers are skipped rather
+/// than failing the whole restore, and out-of-range numbers saturate
+/// instead of overflowing. A document that isn't a JSON object at all is
+/// an error — both callers fall back to another snapshot on error.
 fn parseSession(allocator: std.mem.Allocator, json: []const u8) !Session {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionFormat,
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.InvalidSessionFormat;
+    const root = parsed.value.object;
+
     var buffers = std.ArrayListUnmanaged(BufferState).empty;
     errdefer {
         for (buffers.items) |b| {
@@ -151,129 +185,70 @@ fn parseSession(allocator: std.mem.Allocator, json: []const u8) !Session {
         buffers.deinit(allocator);
     }
 
-    var active: usize = 0;
-    var splits_json: ?[]const u8 = null;
+    if (root.get("buffers")) |buffers_value| {
+        if (buffers_value == .array) {
+            for (buffers_value.array.items) |entry| {
+                if (entry != .object) continue;
+                const path_value = entry.object.get("path") orelse continue;
+                if (path_value != .string or path_value.string.len == 0) continue;
 
-    if (std.mem.indexOf(u8, json, "\"active\":")) |pos| {
-        var i = pos + 9;
-        var num: usize = 0;
-        while (i < json.len and json[i] >= '0' and json[i] <= '9') {
-            num = num * 10 + (json[i] - '0');
-            i += 1;
-        }
-        active = num;
-    }
-
-    if (std.mem.indexOf(u8, json, "\"buffers\":[")) |start| {
-        var i = start + 11;
-
-        while (i < json.len) {
-            const obj_start = std.mem.indexOfPos(u8, json, i, "{") orelse break;
-            const obj_end = std.mem.indexOfPos(u8, json, obj_start, "}") orelse break;
-            const obj = json[obj_start .. obj_end + 1];
-
-            var path: ?[]const u8 = null;
-            errdefer if (path) |p| allocator.free(p);
-            if (std.mem.indexOf(u8, obj, "\"path\":\"")) |p| {
-                const path_start = p + 8;
-                if (std.mem.indexOfPos(u8, obj, path_start, "\"")) |path_end| {
-                    path = try allocator.dupe(u8, obj[path_start..path_end]);
-                }
-            }
-
-            var row: usize = 0;
-            if (std.mem.indexOf(u8, obj, "\"row\":")) |p| {
-                var j = p + 6;
-                while (j < obj.len and obj[j] >= '0' and obj[j] <= '9') {
-                    row = row * 10 + (obj[j] - '0');
-                    j += 1;
-                }
-            }
-
-            var col: usize = 0;
-            if (std.mem.indexOf(u8, obj, "\"col\":")) |p| {
-                var j = p + 6;
-                while (j < obj.len and obj[j] >= '0' and obj[j] <= '9') {
-                    col = col * 10 + (obj[j] - '0');
-                    j += 1;
-                }
-            }
-
-            var scroll: usize = 0;
-            if (std.mem.indexOf(u8, obj, "\"scroll\":")) |p| {
-                var j = p + 9;
-                while (j < obj.len and obj[j] >= '0' and obj[j] <= '9') {
-                    scroll = scroll * 10 + (obj[j] - '0');
-                    j += 1;
-                }
-            }
-
-            if (path) |pth| {
-                const basename = std.fs.path.basename(pth);
-                const name_dup = try allocator.dupe(u8, basename);
+                const path_dup = try allocator.dupe(u8, path_value.string);
+                errdefer allocator.free(path_dup);
+                const name_dup = try allocator.dupe(u8, std.fs.path.basename(path_dup));
                 errdefer allocator.free(name_dup);
+
                 try buffers.append(allocator, .{
-                    .file_path = pth,
-                    .cursor_row = row,
-                    .cursor_col = col,
-                    .scroll_offset = scroll,
+                    .file_path = path_dup,
+                    .cursor_row = numberField(entry.object, "row"),
+                    .cursor_col = numberField(entry.object, "col"),
+                    .scroll_offset = numberField(entry.object, "scroll"),
                     .is_virtual = false,
                     .name = name_dup,
                 });
-                // Ownership of pth + name_dup has been transferred to the
-                // appended entry; disable the path errdefer for this iteration.
-                path = null;
             }
-
-            i = obj_end + 1;
         }
     }
 
-    if (std.mem.indexOf(u8, json, "\"splits\":")) |splits_start| {
-        const splits_obj_start = splits_start + 9;
-        if (splits_obj_start < json.len and json[splits_obj_start] == '{') {
-            var depth: usize = 0;
-            var splits_end: usize = splits_obj_start;
-            for (json[splits_obj_start..], splits_obj_start..) |c, idx| {
-                if (c == '{') depth += 1;
-                if (c == '}') {
-                    depth -= 1;
-                    if (depth == 0) {
-                        splits_end = idx + 1;
-                        break;
-                    }
-                }
-            }
-            if (splits_end > splits_obj_start) {
-                splits_json = try allocator.dupe(u8, json[splits_obj_start..splits_end]);
-            }
+    // Re-encode the splits subtree back to text for SplitManager, which
+    // owns that format. `ObjectMap` preserves insertion order, so the
+    // round-trip is faithful.
+    var splits_json: ?[]const u8 = null;
+    errdefer if (splits_json) |s| allocator.free(s);
+    if (root.get("splits")) |splits_value| {
+        if (splits_value == .object) {
+            splits_json = try std.json.Stringify.valueAlloc(allocator, splits_value, .{});
         }
     }
 
     return Session{
         .buffers = try buffers.toOwnedSlice(allocator),
-        .active_buffer = active,
+        .active_buffer = if (root.get("active")) |v| numberValue(v) else 0,
         .splits_json = splits_json,
     };
 }
 
-fn appendInt(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), n: usize) !void {
-    var buf: [20]u8 = undefined;
-    const str = std.fmt.bufPrint(&buf, "{}", .{n}) catch unreachable;
-    try list.appendSlice(allocator, str);
+fn numberField(obj: std.json.ObjectMap, key: []const u8) usize {
+    return if (obj.get(key)) |v| numberValue(v) else 0;
 }
 
-fn appendEscaped(allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try list.appendSlice(allocator, "\\\""),
-            '\\' => try list.appendSlice(allocator, "\\\\"),
-            '\n' => try list.appendSlice(allocator, "\\n"),
-            '\r' => try list.appendSlice(allocator, "\\r"),
-            '\t' => try list.appendSlice(allocator, "\\t"),
-            else => try list.append(allocator, c),
-        }
-    }
+/// Coerce a JSON number to `usize`, saturating rather than overflowing.
+/// Values too large for `i64` arrive as `.number_string`; the old parser
+/// wrapped (or panicked in a safe build) on those.
+fn numberValue(v: std.json.Value) usize {
+    return switch (v) {
+        .integer => |i| if (i <= 0) 0 else std.math.cast(usize, i) orelse std.math.maxInt(usize),
+        .number_string => |s| if (s.len > 0 and s[0] == '-')
+            0
+        else
+            std.fmt.parseInt(usize, s, 10) catch std.math.maxInt(usize),
+        .float => |f| if (!(f > 0))
+            0
+        else if (f >= @as(f64, @floatFromInt(std.math.maxInt(usize))))
+            std.math.maxInt(usize)
+        else
+            @intFromFloat(f),
+        else => 0,
+    };
 }
 
 pub fn freeSession(allocator: std.mem.Allocator, session: Session) void {
@@ -319,24 +294,6 @@ test "serialize and parseBytes round-trip through the checkpoint pipeline format
     try std.testing.expectEqual(@as(?[]u8, null), try serialize(allocator, empty, 0, null));
 }
 
-test "appendInt basic" {
-    const allocator = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(u8).empty;
-    defer list.deinit(allocator);
-
-    try appendInt(allocator, &list, 42);
-    try std.testing.expectEqualStrings("42", list.items);
-}
-
-test "appendEscaped special chars" {
-    const allocator = std.testing.allocator;
-    var list = std.ArrayListUnmanaged(u8).empty;
-    defer list.deinit(allocator);
-
-    try appendEscaped(allocator, &list, "hello\"world");
-    try std.testing.expectEqualStrings("hello\\\"world", list.items);
-}
-
 test "parseSession basic" {
     const allocator = std.testing.allocator;
     const json =
@@ -376,9 +333,9 @@ test "parseSession with multiple buffers preserves order" {
 
 test "parseSession on bare values doesn't crash" {
     const allocator = std.testing.allocator;
-    // The current parser is forgiving — it returns an empty session for
-    // degenerate input. That's acceptable; just verify it doesn't crash.
-    // (See todo.md: strict validation is a follow-up.)
+    // A document that isn't a JSON object is rejected rather than
+    // silently treated as an empty session; both callers fall back to
+    // another snapshot when parsing fails.
     for ([_][]const u8{ "", "[]", "null", "42" }) |s| {
         if (parseSession(allocator, s)) |session| {
             freeSession(allocator, session);
@@ -405,25 +362,134 @@ test "parseSession handles malformed JSON without panicking" {
     }
 }
 
-// KNOWN ISSUE: the session parser is hand-rolled and doesn't decode JSON
-// string escapes in path fields. A path containing `"` or `\` round-trips
-// as a truncated/corrupted string. Documented in todo.md ("session escape
-// round-trip"). When the parser is replaced with std.json.parseFromSlice
-// the test below should be enabled to lock the fix in.
-test "appendEscaped round-trips simple paths" {
-    const allocator = std.testing.allocator;
-    var json: std.ArrayListUnmanaged(u8) = .empty;
-    defer json.deinit(allocator);
-    try json.appendSlice(allocator, "{\"version\":1,\"active\":0,\"buffers\":[{\"path\":\"");
-    try appendEscaped(allocator, &json, "/path/with no special chars.zig");
-    try json.appendSlice(allocator, "\",\"row\":0,\"col\":0,\"scroll\":0}]}");
+const TestCursor = struct { cursor_row: usize = 0, cursor_col: usize = 0, scroll_offset: usize = 0 };
+const TestBuffer = struct { file_path: ?[]const u8, name: []const u8 = "b", state: TestCursor = .{} };
+const TestBufferList = struct { items: []const TestBuffer };
 
-    const s = try parseSession(allocator, json.items);
+test "paths containing JSON metacharacters survive a round-trip" {
+    const allocator = std.testing.allocator;
+    // Every one of these corrupted or truncated the record under the old
+    // marker-scanning parser: `"` ended the path early, `}` ended the
+    // object early, and control characters were emitted unescaped.
+    const nasty = [_][]const u8{
+        "/tmp/with\"quote.zig",
+        "/tmp/with\\backslash.zig",
+        "/tmp/with}brace.zig",
+        "/tmp/with{brace.zig",
+        "/tmp/with\nnewline.zig",
+        "/tmp/with\ttab.zig",
+        "/tmp/with\x01control.zig",
+        "/tmp/with-\u{1F600}-emoji.zig",
+        "/tmp/\"path\":\"decoy.zig",
+    };
+    for (nasty) |path| {
+        const buffers = TestBufferList{ .items = &.{
+            .{ .file_path = path, .state = .{ .cursor_row = 7, .cursor_col = 3 } },
+        } };
+        const payload = (try serialize(allocator, buffers, 0, null)).?;
+        defer allocator.free(payload);
+
+        const s = try parseBytes(allocator, payload);
+        defer freeSession(allocator, s);
+
+        try std.testing.expectEqual(@as(usize, 1), s.buffers.len);
+        try std.testing.expectEqualStrings(path, s.buffers[0].file_path.?);
+        try std.testing.expectEqual(@as(usize, 7), s.buffers[0].cursor_row);
+        try std.testing.expectEqual(@as(usize, 3), s.buffers[0].cursor_col);
+    }
+}
+
+test "a non-UTF-8 path is dropped instead of poisoning the whole session" {
+    const allocator = std.testing.allocator;
+    const buffers = TestBufferList{ .items = &.{
+        .{ .file_path = "/tmp/good.zig" },
+        .{ .file_path = "/tmp/bad-\xff-path.zig" },
+        .{ .file_path = "/tmp/also-good.zig" },
+    } };
+    const payload = (try serialize(allocator, buffers, 0, null)).?;
+    defer allocator.free(payload);
+
+    const s = try parseBytes(allocator, payload);
+    defer freeSession(allocator, s);
+
+    try std.testing.expectEqual(@as(usize, 2), s.buffers.len);
+    try std.testing.expectEqualStrings("/tmp/good.zig", s.buffers[0].file_path.?);
+    try std.testing.expectEqualStrings("/tmp/also-good.zig", s.buffers[1].file_path.?);
+}
+
+test "out-of-range numbers saturate instead of wrapping" {
+    const allocator = std.testing.allocator;
+    // The old parser accumulated digits into a usize with no bound, which
+    // wraps in ReleaseFast and panics in a safe build.
+    const json =
+        \\{"version":1,"active":999999999999999999999999,"buffers":[
+        \\  {"path":"/a.zig","row":999999999999999999999999,"col":-5,"scroll":3}
+        \\]}
+    ;
+    const s = try parseSession(allocator, json);
+    defer freeSession(allocator, s);
+
+    try std.testing.expectEqual(std.math.maxInt(usize), s.active_buffer);
+    try std.testing.expectEqual(std.math.maxInt(usize), s.buffers[0].cursor_row);
+    try std.testing.expectEqual(@as(usize, 0), s.buffers[0].cursor_col);
+    try std.testing.expectEqual(@as(usize, 3), s.buffers[0].scroll_offset);
+}
+
+test "splits survive a round-trip with braces inside strings" {
+    const allocator = std.testing.allocator;
+    // Brace-depth counting over raw bytes mis-terminated the splits object
+    // whenever a brace appeared inside a string.
+    const splits =
+        \\{"focused":1,"next_id":2,"label":"a{b}c","root":{"type":"pane","id":1}}
+    ;
+    const buffers = TestBufferList{ .items = &.{.{ .file_path = "/a.zig" }} };
+    const payload = (try serialize(allocator, buffers, 0, splits)).?;
+    defer allocator.free(payload);
+
+    const s = try parseBytes(allocator, payload);
+    defer freeSession(allocator, s);
+
+    const got = s.splits_json orelse return error.TestExpectedSplits;
+    var reparsed = try std.json.parseFromSlice(std.json.Value, allocator, got, .{});
+    defer reparsed.deinit();
+    try std.testing.expectEqualStrings("a{b}c", reparsed.value.object.get("label").?.string);
+    try std.testing.expectEqual(@as(i64, 1), reparsed.value.object.get("focused").?.integer);
+    try std.testing.expect(reparsed.value.object.get("root").? == .object);
+}
+
+test "malformed splits are dropped without taking the buffers down" {
+    const allocator = std.testing.allocator;
+    const buffers = TestBufferList{ .items = &.{.{ .file_path = "/a.zig" }} };
+    const payload = (try serialize(allocator, buffers, 0, "{not valid json")).?;
+    defer allocator.free(payload);
+
+    const s = try parseBytes(allocator, payload);
     defer freeSession(allocator, s);
 
     try std.testing.expectEqual(@as(usize, 1), s.buffers.len);
-    try std.testing.expectEqualStrings(
-        "/path/with no special chars.zig",
-        s.buffers[0].file_path.?,
-    );
+    try std.testing.expectEqual(@as(?[]const u8, null), s.splits_json);
+}
+
+test "a real split layout round-trips back into SplitManager" {
+    const allocator = std.testing.allocator;
+    const SplitManager = @import("split_manager.zig").SplitManager;
+
+    var sm = try SplitManager.init(allocator, 0);
+    defer sm.deinit();
+    const original = try sm.toJson(allocator);
+    defer allocator.free(original);
+
+    const buffers = TestBufferList{ .items = &.{.{ .file_path = "/a.zig" }} };
+    const payload = (try serialize(allocator, buffers, 0, original)).?;
+    defer allocator.free(payload);
+
+    const s = try parseBytes(allocator, payload);
+    defer freeSession(allocator, s);
+
+    // Splits are re-encoded on the way out, so prove the consumer can
+    // still read what we hand back.
+    var restored = try SplitManager.initFromJson(allocator, s.splits_json.?);
+    defer restored.deinit();
+    try std.testing.expectEqual(sm.focused_pane_id, restored.focused_pane_id);
+    try std.testing.expectEqual(sm.next_pane_id, restored.next_pane_id);
 }

@@ -38,18 +38,7 @@ Already landed on main, headlining this release:
 
 ### Session format: replace the hand-rolled parser
 
-The session/recovery parser is hand-rolled JSON with a documented
-escape-handling bug — a path containing `"` or `\` corrupts on
-round-trip. For an editor whose promise is "a crash never loses your
-place," recovery-file correctness is not optional.
-
-- Replace the scanner with `std.json` parse/serialize
-- Route the format through the checkpoint pipeline's version headers,
-  with a migration hook so 0.12-era sessions load transparently
-- Property-test the round-trip (fuzzed paths, splits payloads)
-
-*Positioning check: this **is** the identity — crash recovery that
-cannot be trusted is worse than none.*
+Slipped to 0.14.0, where it shipped — see that release below.
 
 ### System clipboard that works everywhere (OSC-52)
 
@@ -99,6 +88,26 @@ Landed on the 0.14.0 branch:
 - Per-plugin call/trap/fuel stats in the plugin dashboard and control
   center; plugin traps feed the check-engine light alongside dead
   letters and open circuits
+
+### Ships: a session format that survives its own filenames
+
+Carried over from 0.13.0. The hand-rolled parser scanned for field
+markers, so a path containing `"`, `\`, or `}` truncated or dropped
+the record it lived in — on the exact session file stem writes for a
+workspace holding `quote"file.zig` and `brace}file.zig`, the old
+parser recovered one usable buffer out of three.
+
+- Parsing and serialization now go through `std.json`, so paths are
+  escaped and decoded properly and control characters are legal
+- Out-of-range numbers saturate instead of wrapping (a long enough
+  digit run used to panic a safe build)
+- A path that isn't valid UTF-8 costs that one buffer, not the whole
+  session file; malformed split layouts are dropped the same way
+- Round-trip tests cover quotes, braces, newlines, control bytes,
+  emoji, and a split layout replayed back through `SplitManager`
+
+*Positioning check: this **is** the identity — crash recovery that
+cannot be trusted is worse than none.*
 
 ### Ships: macros with transactional record and replay
 
