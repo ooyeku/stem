@@ -394,16 +394,22 @@ orchestrates both runtimes. Notable responsibilities:
 ### Wasm runtime (wick)
 
 The interpreter is [wick](https://github.com/ooyeku/wick) — the
-pure-Zig wasm interpreter extracted from this repo, pinned in
-[build.zig.zon](../build.zig.zon). Loader and lifecycle live in
-[src/plugins/wasm/loader.zig](../src/plugins/wasm/loader.zig); the
-API/behavior contract between the two projects is wick's
-`docs/stem-contract.md`.
+pure-Zig wasm interpreter extracted from this repo, pinned by release
+tag in [build.zig.zon](../build.zig.zon). Loader and lifecycle live in
+[src/plugins/wasm/loader.zig](../src/plugins/wasm/loader.zig).
 
 - Full wasm 1.0 coverage (i32/i64/f32/f64, funcref tables and
   `call_indirect`) plus the bulk-memory `memory.init` / `data.drop`
   opcodes (so plugins can ship passive data segments for static
-  strings).
+  strings). Function bodies are translated to a pre-decoded IR once at
+  load time and executed by a threaded-dispatch loop.
+- **Entry points are signature-checked when they're resolved.** The
+  loader declares the ABI as Zig function types and asks wick to match
+  them against the module, so a plugin exporting `handle_command` with
+  the wrong shape fails with `SignatureMismatch` instead of being
+  called with the host's assumed arity and reading garbage locals.
+  `activate` may be either `() -> ()` or `() -> i32`; the rest of the
+  ABI is exact.
 - Every plugin call runs under an instruction budget
   (`CALL_FUEL_BUDGET`, 50M instructions, reset per call). A runaway
   call fails with `OutOfFuel` instead of hanging the editor; host
