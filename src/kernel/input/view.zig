@@ -285,9 +285,13 @@ test "view viewport scroll clamps at document edges" {
     );
     defer state_value.deinit();
 
+    // Six lines: the five above plus the empty line after the trailing
+    // newline, which is a real position the cursor can occupy. A two-row
+    // viewport therefore bottoms out at offset 4, showing "line 5" and
+    // that final empty line, and the cursor follows the viewport down.
     scrollViewportBy(&state_value, 2, 99);
-    try std.testing.expectEqual(@as(usize, 3), state_value.scroll_offset);
-    try std.testing.expectEqual(@as(usize, 3), state_value.cursor_row);
+    try std.testing.expectEqual(@as(usize, 4), state_value.scroll_offset);
+    try std.testing.expectEqual(@as(usize, 4), state_value.cursor_row);
 
     scrollViewportBy(&state_value, 2, -99);
     try std.testing.expectEqual(@as(usize, 0), state_value.scroll_offset);

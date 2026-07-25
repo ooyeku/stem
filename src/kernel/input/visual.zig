@@ -259,6 +259,7 @@ test "visual delete rejects read-only presentation buffers before mutating" {
         rejected: bool = false,
         sent_lsp: bool = false,
         sent_update: bool = false,
+        scroll_in_progress: bool = false,
 
         pub fn state(self: *@This()) *EditorState {
             return self.state_ptr;
@@ -275,6 +276,41 @@ test "visual delete rejects read-only presentation buffers before mutating" {
 
         pub fn sendUpdate(self: *@This()) !void {
             self.sent_update = true;
+        }
+
+        /// Part of the interface `handleKey` expects. These tests drive
+        /// neither the text-object chord nor multi-cursor, so the bodies
+        /// are unused — but the double still has to offer the methods for
+        /// `handleKey` to compile against it.
+        pub fn selectTextObject(self: *@This(), ch: u8, around: bool) !void {
+            _ = self;
+            _ = ch;
+            _ = around;
+        }
+
+        pub fn addNextOccurrence(self: *@This()) !void {
+            _ = self;
+        }
+
+        pub fn addSurround(self: *@This(), ch: u8) !void {
+            _ = self;
+            _ = ch;
+        }
+
+        pub fn getSelectionText(self: *@This()) !?[]u8 {
+            _ = self;
+            return null;
+        }
+
+        pub fn adjustSelectionStructural(self: *@This(), kind: anytype) !void {
+            _ = self;
+            _ = kind;
+        }
+
+        pub fn enterIncrementalSearch(self: *@This(), prev_mode: anytype, direction: anytype) !void {
+            _ = self;
+            _ = prev_mode;
+            _ = direction;
         }
     };
 

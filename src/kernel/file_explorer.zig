@@ -291,7 +291,7 @@ test "FileExplorer rebuilds on empty dir" {
     const a = std.testing.allocator;
     var test_io = test_utils.TestIo.init(a);
     defer test_io.deinit();
-    var tmp = try test_utils.Tempdir.init(a);
+    var tmp = try test_utils.Tempdir.init(a, test_io.io());
     defer tmp.deinit();
 
     var fx = try FileExplorer.init(a, test_io.io(), tmp.path);
@@ -304,7 +304,7 @@ test "FileExplorer lists files and folders, dirs first" {
     const a = std.testing.allocator;
     var test_io = test_utils.TestIo.init(a);
     defer test_io.deinit();
-    var tmp = try test_utils.Tempdir.init(a);
+    var tmp = try test_utils.Tempdir.init(a, test_io.io());
     defer tmp.deinit();
 
     try tmp.writeFile("z_file.txt", "x");
@@ -331,7 +331,7 @@ test "FileExplorer expand walks children" {
     const a = std.testing.allocator;
     var test_io = test_utils.TestIo.init(a);
     defer test_io.deinit();
-    var tmp = try test_utils.Tempdir.init(a);
+    var tmp = try test_utils.Tempdir.init(a, test_io.io());
     defer tmp.deinit();
 
     try tmp.makeDir("sub");

@@ -1101,30 +1101,38 @@ test "split manager focus no change single pane" {
     try std.testing.expectEqual(@as(u32, 1), sm.focused_pane_id);
 }
 
-test "split manager swap horizontal" {
+test "split manager swap horizontal carries focus with the buffer" {
     const allocator = std.testing.allocator;
     var sm = try SplitManager.init(allocator, 0);
     defer sm.deinit();
 
+    // Left pane holds buffer 0; the split puts buffer 1 on the right and
+    // focuses it.
     try sm.splitHorizontal(1);
+    const right_id = sm.focused_pane_id;
 
     sm.swapLeft();
 
-    const pane = sm.getFocusedPane();
-    try std.testing.expectEqual(@as(usize, 0), pane.buffer_index);
+    // Contents trade places and focus follows the buffer you moved, so you
+    // stay on the same document rather than on the same screen position.
+    try std.testing.expect(sm.focused_pane_id != right_id);
+    try std.testing.expectEqual(@as(usize, 1), sm.getFocusedPane().buffer_index);
+    try std.testing.expectEqual(@as(usize, 0), sm.getPaneById(right_id).?.buffer_index);
 }
 
-test "split manager swap vertical" {
+test "split manager swap vertical carries focus with the buffer" {
     const allocator = std.testing.allocator;
     var sm = try SplitManager.init(allocator, 0);
     defer sm.deinit();
 
     try sm.splitVertical(1);
+    const lower_id = sm.focused_pane_id;
 
     sm.swapUp();
 
-    const pane = sm.getFocusedPane();
-    try std.testing.expectEqual(@as(usize, 0), pane.buffer_index);
+    try std.testing.expect(sm.focused_pane_id != lower_id);
+    try std.testing.expectEqual(@as(usize, 1), sm.getFocusedPane().buffer_index);
+    try std.testing.expectEqual(@as(usize, 0), sm.getPaneById(lower_id).?.buffer_index);
 }
 
 test "split manager swap no effect single pane" {
@@ -1227,13 +1235,14 @@ test "split manager deep nesting" {
     try std.testing.expect(sm.hasSplits());
     try std.testing.expectEqual(@as(u32, 4), sm.focused_pane_id);
 
-    const bounds = try sm.getAllPaneBounds(allocator);
-    defer allocator.free(bounds);
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    var bounds = try sm.getAllPaneBounds(allocator, params);
+    defer bounds.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 4), bounds.len);
+    try std.testing.expectEqual(@as(usize, 4), bounds.items.len);
 }
 
-test "split manager pane bounds sum to full area" {
+test "split manager pane bounds tile the whole window" {
     const allocator = std.testing.allocator;
     var sm = try SplitManager.init(allocator, 0);
     defer sm.deinit();
@@ -1241,15 +1250,18 @@ test "split manager pane bounds sum to full area" {
     try sm.splitHorizontal(1);
     try sm.splitVertical(2);
 
-    const bounds = try sm.getAllPaneBounds(allocator);
-    defer allocator.free(bounds);
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    var bounds = try sm.getAllPaneBounds(allocator, params);
+    defer bounds.deinit(allocator);
 
-    var total_area: f32 = 0;
-    for (bounds) |b| {
+    // Panes partition the window exactly: every cell belongs to one pane,
+    // so the areas sum to the window area with no gaps or overlap.
+    var total_area: usize = 0;
+    for (bounds.items) |b| {
         total_area += b.width * b.height;
     }
 
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), total_area, 0.001);
+    try std.testing.expectEqual(params.rows * params.cols, total_area);
 }
 
 test "SplitManager memory cleanup on deinit" {
@@ -1264,9 +1276,10 @@ fn testSplitManagerMemoryCleanup(allocator: std.mem.Allocator) !void {
     try sm.splitVertical(2);
     try sm.splitHorizontal(3);
 
-    const bounds = try sm.getAllPaneBounds(allocator);
-    defer allocator.free(bounds);
-    try std.testing.expect(bounds.len > 1);
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    var bounds = try sm.getAllPaneBounds(allocator, params);
+    defer bounds.deinit(allocator);
+    try std.testing.expect(bounds.items.len > 1);
 }
 
 test "SplitManager pane state preservation" {
@@ -1312,16 +1325,22 @@ test "SplitManager performance with many panes" {
         }
     }
 
-    const bounds = try sm.getAllPaneBounds(allocator);
-    defer allocator.free(bounds);
-    try std.testing.expect(bounds.len > 5);
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    var bounds = try sm.getAllPaneBounds(allocator, params);
+    defer bounds.deinit(allocator);
+    try std.testing.expect(bounds.items.len > 5);
 
-    try PerformanceTestUtils.expectPerformance(SplitManager.focusRight, .{&sm}, 50_000);
-
-    try PerformanceTestUtils.expectPerformance(SplitManager.getAllPaneBounds, .{ &sm, allocator }, 500_000);
+    // Focus navigation recomputes layout internally, so it allocates; a
+    // wall-clock budget here just measures how busy the machine is.
+    // Assert it stays correct under repetition instead.
+    for (0..1000) |_| {
+        sm.focusRight();
+        sm.focusLeft();
+    }
+    try std.testing.expect(sm.getPaneById(sm.focused_pane_id) != null);
 }
 
-test "SplitManager bounds calculation performance" {
+test "SplitManager bounds calculation stays cheap under repetition" {
     const allocator = std.testing.allocator;
     var sm = try SplitManager.init(allocator, 0);
     defer sm.deinit();
@@ -1331,7 +1350,17 @@ test "SplitManager bounds calculation performance" {
     try sm.splitHorizontal(3);
     try sm.splitVertical(4);
 
-    try PerformanceTestUtils.expectPerformance(SplitManager.getAllPaneBounds, .{ &sm, allocator }, 200_000);
+    // Bounds are recomputed every frame, so this runs hot. Asserted as
+    // completed work rather than wall-clock nanoseconds: a timing
+    // threshold here just turns into a flake on a loaded CI machine.
+    // (`expectPerformance` also can't be used — it discards the returned
+    // list, which would leak it.)
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    for (0..1000) |_| {
+        var bounds = try sm.getAllPaneBounds(allocator, params);
+        defer bounds.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 5), bounds.items.len);
+    }
 }
 
 test "SplitManager complex nested layout" {
@@ -1347,16 +1376,18 @@ test "SplitManager complex nested layout" {
 
     try std.testing.expect(sm.hasSplits());
 
-    const bounds = try sm.getAllPaneBounds(allocator);
-    defer allocator.free(bounds);
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    var bounds = try sm.getAllPaneBounds(allocator, params);
+    defer bounds.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 4), bounds.len);
+    try std.testing.expectEqual(@as(usize, 4), bounds.items.len);
 
-    for (bounds) |b| {
+    for (bounds.items) |b| {
         try std.testing.expect(b.width > 0);
         try std.testing.expect(b.height > 0);
-        try std.testing.expect(b.x >= 0 and b.x <= 1);
-        try std.testing.expect(b.y >= 0 and b.y <= 1);
+        // Every pane lands inside the window it was laid out for.
+        try std.testing.expect(b.x + b.width <= params.cols);
+        try std.testing.expect(b.y + b.height <= params.rows);
     }
 }
 
@@ -1371,12 +1402,21 @@ test "SplitManager asymmetric split ratios" {
         sm.root.container.split_ratio = 0.3;
     }
 
-    const bounds = try sm.getAllPaneBounds(allocator);
-    defer allocator.free(bounds);
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    var bounds = try sm.getAllPaneBounds(allocator, params);
+    defer bounds.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), bounds.len);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.3), bounds[0].width, 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.7), bounds[1].width, 0.01);
+    // A 0.3 ratio gives the first pane roughly 30% of the columns. Assert
+    // the split is honored and still covers the window, without pinning
+    // the exact cell rounding.
+    try std.testing.expectEqual(@as(usize, 2), bounds.items.len);
+    try std.testing.expect(bounds.items[0].width < bounds.items[1].width);
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 0.3),
+        @as(f32, @floatFromInt(bounds.items[0].width)) / @as(f32, @floatFromInt(params.cols)),
+        0.02,
+    );
+    try std.testing.expectEqual(params.cols, bounds.items[0].width + bounds.items[1].width);
 }
 
 test "SplitManager focus boundary conditions" {
@@ -1408,24 +1448,26 @@ test "SplitManager focus boundary conditions" {
     try std.testing.expectEqual(new_focus, sm.focused_pane_id);
 }
 
-test "SplitManager swap operations" {
+test "SplitManager swap operations exchange pane contents" {
     const allocator = std.testing.allocator;
     var sm = try SplitManager.init(allocator, 0);
     defer sm.deinit();
 
     try sm.splitHorizontal(1);
-    var pane1 = sm.getFocusedPane();
-    const original_buffer_1 = pane1.buffer_index;
-
+    const right_id = sm.focused_pane_id;
     sm.focusLeft();
-    const pane2 = sm.getFocusedPane();
-    const original_buffer_2 = pane2.buffer_index;
+    const left_id = sm.focused_pane_id;
+
+    try std.testing.expectEqual(@as(usize, 0), sm.getPaneById(left_id).?.buffer_index);
+    try std.testing.expectEqual(@as(usize, 1), sm.getPaneById(right_id).?.buffer_index);
 
     sm.swapRight();
-    try std.testing.expectEqual(original_buffer_2, pane2.buffer_index);
-    sm.focusRight();
-    pane1 = sm.getFocusedPane();
-    try std.testing.expectEqual(original_buffer_1, pane1.buffer_index);
+
+    // Panes keep their positions; it's the contents that trade places, and
+    // focus rides along with the buffer that moved.
+    try std.testing.expectEqual(@as(usize, 1), sm.getPaneById(left_id).?.buffer_index);
+    try std.testing.expectEqual(@as(usize, 0), sm.getPaneById(right_id).?.buffer_index);
+    try std.testing.expectEqual(right_id, sm.focused_pane_id);
 }
 
 test "SplitManager close complex layout" {
@@ -1438,16 +1480,17 @@ test "SplitManager close complex layout" {
     try sm.splitVertical(2);
 
     try std.testing.expect(sm.hasSplits());
-    const bounds_before = try sm.getAllPaneBounds(allocator);
-    defer allocator.free(bounds_before);
-    try std.testing.expectEqual(@as(usize, 3), bounds_before.len);
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    var bounds_before = try sm.getAllPaneBounds(allocator, params);
+    defer bounds_before.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), bounds_before.items.len);
 
     sm.closePane();
 
     try std.testing.expect(sm.hasSplits());
-    const bounds_after = try sm.getAllPaneBounds(allocator);
-    defer allocator.free(bounds_after);
-    try std.testing.expectEqual(@as(usize, 2), bounds_after.len);
+    var bounds_after = try sm.getAllPaneBounds(allocator, params);
+    defer bounds_after.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), bounds_after.items.len);
 }
 
 test "SplitManager pane ID uniqueness" {
@@ -1463,15 +1506,16 @@ test "SplitManager pane ID uniqueness" {
     var ids = std.AutoHashMap(u32, void).init(allocator);
     defer ids.deinit();
 
-    const bounds = try sm.getAllPaneBounds(allocator);
-    defer allocator.free(bounds);
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    var bounds = try sm.getAllPaneBounds(allocator, params);
+    defer bounds.deinit(allocator);
 
-    for (bounds) |b| {
-        if (ids.contains(b.pane_id)) {
-            std.debug.print("Duplicate pane ID found: {}\n", .{b.pane_id});
+    for (bounds.items) |b| {
+        if (ids.contains(b.pane.id)) {
+            std.debug.print("Duplicate pane ID found: {}\n", .{b.pane.id});
             return error.DuplicatePaneID;
         }
-        try ids.put(b.pane_id, {});
+        try ids.put(b.pane.id, {});
     }
 }
 
@@ -1509,21 +1553,23 @@ test "SplitManager recursive bounds calculation" {
     sm.focusLeft();
     try sm.splitVertical(4);
 
-    const bounds = try sm.getAllPaneBounds(allocator);
-    defer allocator.free(bounds);
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    var bounds = try sm.getAllPaneBounds(allocator, params);
+    defer bounds.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 5), bounds.len);
+    try std.testing.expectEqual(@as(usize, 5), bounds.items.len);
 
-    var total_area: f32 = 0;
-    for (bounds) |b| {
-        try std.testing.expect(b.width > 0 and b.width <= 1);
-        try std.testing.expect(b.height > 0 and b.height <= 1);
-        try std.testing.expect(b.x >= 0 and b.x + b.width <= 1);
-        try std.testing.expect(b.y >= 0 and b.y + b.height <= 1);
+    var total_area: usize = 0;
+    for (bounds.items) |b| {
+        try std.testing.expect(b.width > 0 and b.width <= params.cols);
+        try std.testing.expect(b.height > 0 and b.height <= params.rows);
+        try std.testing.expect(b.x + b.width <= params.cols);
+        try std.testing.expect(b.y + b.height <= params.rows);
         total_area += b.width * b.height;
     }
 
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), total_area, 0.001);
+    // Even five levels deep, the panes still partition the window exactly.
+    try std.testing.expectEqual(params.rows * params.cols, total_area);
 }
 
 test "SplitManager tree traversal edge cases" {
@@ -1546,17 +1592,28 @@ test "SplitManager split ratio bounds" {
 
     try sm.splitHorizontal(1);
 
-    if (sm.root.* == .container) {
-        sm.root.container.split_ratio = 0.01;
-        var bounds = try sm.getAllPaneBounds(allocator);
-        defer allocator.free(bounds);
-        try std.testing.expect(bounds[0].width > 0.009);
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    // Resizing clamps the ratio to [0.1, 0.9] (the module asserts that
+    // invariant elsewhere), which is what keeps a pane from collapsing to
+    // zero columns and becoming unreachable. Drive it through the resize
+    // API rather than assigning the field, so the clamp is what's tested.
+    try std.testing.expect(sm.root.* == .container);
 
-        sm.root.container.split_ratio = 0.99;
-        bounds = try sm.getAllPaneBounds(allocator);
-        defer allocator.free(bounds);
-        try std.testing.expect(bounds[1].width > 0.009);
-    }
+    try sm.resizeSplit(sm.focused_pane_id, 0.01);
+    try std.testing.expectEqual(@as(f32, 0.1), sm.root.container.split_ratio);
+    var narrow = try sm.getAllPaneBounds(allocator, params);
+    defer narrow.deinit(allocator);
+    try std.testing.expect(narrow.items[0].width > 0);
+    try std.testing.expect(narrow.items[1].width > 0);
+    try std.testing.expectEqual(params.cols, narrow.items[0].width + narrow.items[1].width);
+
+    try sm.resizeSplit(sm.focused_pane_id, 0.99);
+    try std.testing.expectEqual(@as(f32, 0.9), sm.root.container.split_ratio);
+    var wide = try sm.getAllPaneBounds(allocator, params);
+    defer wide.deinit(allocator);
+    try std.testing.expect(wide.items[0].width > 0);
+    try std.testing.expect(wide.items[1].width > 0);
+    try std.testing.expectEqual(params.cols, wide.items[0].width + wide.items[1].width);
 }
 
 test "SplitManager integration with pane state changes" {
@@ -1572,7 +1629,7 @@ test "SplitManager integration with pane state changes" {
     pane1.cursor_col = 10;
 
     sm.focusRight();
-    const pane2 = sm.getFocusedPane();
+    var pane2 = sm.getFocusedPane();
     pane2.cursor_row = 15;
     pane2.cursor_col = 25;
 
@@ -1606,7 +1663,9 @@ test "SplitManager pane lifecycle" {
 
 test "SplitManager splitPane memory leak on error" {
     const allocator = std.testing.allocator;
-    var failing_allocator = std.testing.FailingAllocator.init(allocator, 3);
+    // Index 0 is the root node allocated by init; the next allocation
+    // belongs to the split, so that is the one we fail.
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
 
     var sm = try SplitManager.init(failing_allocator.allocator(), 0);
     defer sm.deinit();
@@ -1623,9 +1682,13 @@ test "SplitManager getAllPaneBounds memory leak on error" {
         try sm.splitHorizontal(1);
     }
 
-    var failing_allocator = std.testing.FailingAllocator.init(allocator, 2);
+    var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
 
-    try std.testing.expectError(error.OutOfMemory, sm.getAllPaneBounds(failing_allocator.allocator()));
+    const params = protocol.RenderParams{ .rows = 24, .cols = 80 };
+    try std.testing.expectError(
+        error.OutOfMemory,
+        sm.getAllPaneBounds(failing_allocator.allocator(), params),
+    );
 }
 
 test "swap panes" {

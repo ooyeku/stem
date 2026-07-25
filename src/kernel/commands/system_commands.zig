@@ -81,7 +81,20 @@ pub const SystemCommands = struct {
             var w_it = core.plugin_manager.wasm_plugins.valueIterator();
             while (w_it.next()) |wp_ptr| {
                 const wp = wp_ptr.*;
-                const line = try std.fmt.allocPrint(core.allocator, "### {d}. {s}\n- `Runtime`: wasm\n\n", .{ idx, wp.plugin_id });
+                const line = try std.fmt.allocPrint(
+                    core.allocator,
+                    "### {d}. {s}\n- `Runtime`: wasm\n- `Calls`: {d} ({d} trapped{s}{s})\n- `Fuel`: max {d} used of {d} budget\n\n",
+                    .{
+                        idx,
+                        wp.plugin_id,
+                        wp.stats.calls,
+                        wp.stats.traps,
+                        if (wp.stats.last_error != null) ", last: " else "",
+                        wp.stats.last_error orelse "",
+                        wp.stats.max_fuel_used,
+                        @import("../../plugins/wasm/loader.zig").CALL_FUEL_BUDGET,
+                    },
+                );
                 defer core.allocator.free(line);
                 try text.appendSlice(core.allocator, line);
                 idx += 1;
@@ -323,13 +336,14 @@ pub const SystemCommands = struct {
             }
             if (runtime_health.alerts.total() > 0) {
                 try w.print(
-                    "- Alerts: {d} dead-lettered, {d} poison, {d} circuits opened, {d} restarts, {d} crashes\n",
+                    "- Alerts: {d} dead-lettered, {d} poison, {d} circuits opened, {d} restarts, {d} crashes, {d} plugin traps\n",
                     .{
                         runtime_health.alerts.dead_lettered,
                         runtime_health.alerts.poison_detected,
                         runtime_health.alerts.circuits_opened,
                         runtime_health.alerts.supervisor_restarts,
                         runtime_health.alerts.component_crashes,
+                        runtime_health.alerts.plugin_traps,
                     },
                 );
             } else {

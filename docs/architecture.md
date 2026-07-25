@@ -116,11 +116,15 @@ Honesty about the trade-offs:
 
 ## Where this goes
 
-The [roadmap](roadmap.md) runs the same thesis forward: named
-registers that survive crashes, macros with transactional replay
-(all-or-nothing, rolled back on mid-replay failure), chaos testing as
-a merge gate, and a plugin host where a plugin crash is a contained,
-observable event.
+The [roadmap](roadmap.md) runs the same thesis forward. Some of it
+has already landed: named registers that survive crashes (0.13),
+macros with transactional replay — all-or-nothing, rolled back on
+mid-replay failure (0.14) — and a plugin host where a misbehaving
+plugin is a contained, observable event: every wasm call runs under
+an instruction fuel budget, and per-plugin trap and fuel stats feed
+the same check-engine light as the rest of the runtime (0.14).
+Still ahead: chaos testing as a merge gate and deterministic
+simulation of every time-dependent subsystem.
 
 If you've read this far, the ten-second demo: open stem, run
 `stem.control_center`, and `kill -9` your language server from another

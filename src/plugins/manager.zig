@@ -8,9 +8,9 @@
 //! Two runtimes:
 //!
 //!   * **wasm** — `bundled/plugins/<name>/{plugin.json, <name>.wasm}`.
-//!     A WebAssembly module loaded by the pure-Zig interpreter and
-//!     bound to a small set of `env.stem_*` host imports. See
-//!     `wasm/{interpreter,loader}.zig`.
+//!     A WebAssembly module executed by the wick interpreter
+//!     (github.com/ooyeku/wick) and bound to a small set of
+//!     `env.stem_*` host imports. See `wasm/loader.zig`.
 //!   * **exec** — `~/.stem/plugins/<name>/{plugin.json, <entry>}`.
 //!     A child process speaking JSON-RPC 2.0 over stdio with LSP
 //!     framing. See `process_loader.zig`. Nothing bundled uses this
@@ -1642,6 +1642,17 @@ pub const PluginManager = struct {
                 self.countPanelsFor(name),
             });
             try w.print("- Subscriptions: {d}\n", .{self.countSubscriptionsFor(name)});
+            if (self.wasm_plugins.get(name)) |wp| {
+                try w.print("- Calls: {d} ({d} trapped), fuel max {d} / {d} budget\n", .{
+                    wp.stats.calls,
+                    wp.stats.traps,
+                    wp.stats.max_fuel_used,
+                    wasm_loader.CALL_FUEL_BUDGET,
+                });
+                if (wp.stats.last_error) |e| {
+                    try w.print("- Last error: {s}\n", .{e});
+                }
+            }
 
             if (self.plugin_permissions.get(name)) |perms| {
                 try w.writeAll("- Permissions: ");
@@ -1695,6 +1706,23 @@ pub const PluginManager = struct {
         try w.print("\"panels\":{d},", .{self.countPanelsFor(name)});
         try w.print("\"subscriptions\":{d},", .{self.countSubscriptionsFor(name)});
         try w.print("\"denials\":{d},", .{self.countDenialsFor(name)});
+        // Wasm runtime cost/failure stats (exec plugins have no
+        // interpreter, so the block is null for them).
+        if (self.wasm_plugins.get(name)) |wp| {
+            try w.writeAll("\"calls\":{");
+            try w.print("\"total\":{d},\"traps\":{d},", .{ wp.stats.calls, wp.stats.traps });
+            try w.print("\"fuel_last\":{d},\"fuel_max\":{d},", .{ wp.stats.last_fuel_used, wp.stats.max_fuel_used });
+            try w.print("\"fuel_budget\":{d},", .{wasm_loader.CALL_FUEL_BUDGET});
+            try jsonrpc.writeJsonStringKey(w, "last_error");
+            if (wp.stats.last_error) |e| {
+                try jsonrpc.writeJsonString(w, e);
+            } else {
+                try w.writeAll("null");
+            }
+            try w.writeAll("},");
+        } else {
+            try w.writeAll("\"calls\":null,");
+        }
         try w.writeAll("\"permissions\":{");
         if (self.plugin_permissions.get(name)) |perms| {
             try w.writeAll("\"spawn\":");
@@ -2828,7 +2856,16 @@ pub const PluginManager = struct {
             );
             return;
         }
-        try wp.dispatchCommand(cmd_ctx.command_id);
+        wp.dispatchCommand(cmd_ctx.command_id) catch |err| {
+            // Contained failure: count it toward the check-engine
+            // light and stamp the runtime timeline so the control
+            // center can show what trapped, when, and on which
+            // command. The error still propagates so the invoker
+            // can toast the user.
+            @import("../services/runtime.zig").RuntimeAlerts.recordPluginTrap();
+            telemetry.recordTimeline(.plugin, wp.plugin_id, @errorName(err));
+            return err;
+        };
     }
 
     // -------------------------------------------------------------------
@@ -2946,6 +2983,8 @@ pub const PluginManager = struct {
         const wp = self.wasm_plugins.get(plugin_id) orelse return;
         wp.dispatchEvent(topic, data) catch |err| {
             log.warn("wasm event delivery to '{s}' failed: {s}", .{ plugin_id, @errorName(err) });
+            @import("../services/runtime.zig").RuntimeAlerts.recordPluginTrap();
+            telemetry.recordTimeline(.plugin, plugin_id, @errorName(err));
         };
     }
 

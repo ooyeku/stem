@@ -1,6 +1,6 @@
 .{
     .name = .stem,
-    .version = "0.13.1",
+    .version = "0.14.0",
     .fingerprint = 0x20bf92e5730ad4ee, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
@@ -11,6 +11,10 @@
         .vigil = .{
             .url = "git+https://github.com/ooyeku/vigil?ref=v3.0.1#84891cc8593bca5cd195530ef9096c5d82755708",
             .hash = "vigil-3.0.1-0NlCVBMVCgAWMqsHUKLkbiCTNUnqBKOBEdYSHBBIN04E",
+        },
+        .wick = .{
+            .url = "git+https://github.com/ooyeku/wick#e1863b8398414a8cbefbceb56e411f9920d17696",
+            .hash = "wick-0.1.0-USl9A27VAQBXZpHJGamgAdIvdALivqpsfO1xLsrFrA9F",
         },
         .zls = .{
             .url = "https://github.com/zigtools/zls/archive/refs/tags/0.16.0.tar.gz",

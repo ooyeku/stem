@@ -278,6 +278,18 @@ pub const MemoryTestUtils = struct {
             try self.allocations.append(self.allocator, ptr);
         }
 
+        /// Drop a pointer from the live set. Without this every tracked
+        /// allocation looked like a leak, so `testNoLeaks` could only pass
+        /// for a function that allocated nothing at all.
+        pub fn untrack(self: *AllocationTracker, ptr: *anyopaque) void {
+            for (self.allocations.items, 0..) |candidate, i| {
+                if (candidate == ptr) {
+                    _ = self.allocations.swapRemove(i);
+                    return;
+                }
+            }
+        }
+
         pub fn verifyClean(self: *AllocationTracker) !void {
             if (self.allocations.items.len > 0) {
                 std.debug.print("Memory leak detected: {} unfreed allocations\n", .{self.allocations.items.len});
@@ -336,6 +348,7 @@ pub const MemoryTestUtils = struct {
 
         fn free(ctx: *anyopaque, buf: []u8, buf_align: std.mem.Alignment, ret_addr: usize) void {
             const self: *TrackingAllocator = @ptrCast(@alignCast(ctx));
+            self.tracker.untrack(buf.ptr);
             self.parent_allocator.rawFree(buf, buf_align, ret_addr);
         }
     };

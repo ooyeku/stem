@@ -178,6 +178,8 @@ pub const Core = struct {
     terminal_saved_input: std.ArrayListUnmanaged(u8) = .empty,
     terminal_cwd: ?[]const u8 = null,
     terminal_old_cwd: ?[]const u8 = null,
+    /// Transactional macro record/replay — see kernel/macros.zig.
+    macros: @import("macros.zig").MacroSystem,
     leader_pending: bool,
     /// Wall-clock ms when `leader_pending` last went true. Read by
     /// the tick handler to auto-cancel after
@@ -563,6 +565,7 @@ pub const Core = struct {
             .io = io,
             .environ_block = environ_block,
             .arena_pool = ArenaPool.init(allocator, io),
+            .macros = @import("macros.zig").MacroSystem.init(allocator),
             .storage = storage,
             .runtime_services = runtime_services,
             .buffer_manager = BufferManager.init(allocator, io),
@@ -618,6 +621,7 @@ pub const Core = struct {
         // Flush any in-flight session checkpoint before teardown so a quit
         // right after an edit still lands the latest recovery snapshot.
         self.deinitSessionCheckpoints();
+        self.macros.deinit();
 
         // Tell scan workers to bail and wait briefly for them to exit. They
         // hold references to `self.allocator` and `scan_paths`, so we can't
@@ -1706,13 +1710,18 @@ pub const Core = struct {
         var receiver = vigil_api.BatchReceiver.init(inbox);
         defer receiver.deinit();
         while (true) {
-            const msg = receiver.next() catch |err| {
+            // Macro replay injection: staged keys are processed ahead of
+            // the inbox, so a replay executes atomically with respect to
+            // live input — a user keystroke cannot land mid-replay.
+            const injected: ?[]const u8 = self.macros.takeReplayMessage(self);
+            const msg: ?vigil_api.Message = if (injected != null) null else receiver.next() catch |err| {
                 if (err == error.InboxClosed) return;
                 return err;
             };
-            defer msg.deinit();
+            defer if (msg) |m| m.deinit();
 
-            if (msg.payload) |payload| {
+            const maybe_payload: ?[]const u8 = injected orelse if (msg) |m| m.payload else null;
+            if (maybe_payload) |payload| {
                 const decoded = protocol.Message.decode(payload) catch |err| {
                     log.warn("Failed to decode msg: {}", .{err});
                     continue;
@@ -1753,6 +1762,7 @@ pub const Core = struct {
                             self.syncPaneToState();
                             self.command_registry.execute(cmd_id, self) catch |err| {
                                 log.err("Failed to execute core command '{s}' from plugin: {}", .{ cmd_id, err });
+                                self.macros.noteFailure(err);
                             };
                         } else if (pm.message_type == .get_state) {
                             const active_buf = self.buffer_manager.getActive();
@@ -2188,6 +2198,17 @@ pub const Core = struct {
                     },
                     .input => |key| {
                         self.last_cursor_move_time = std.Io.Clock.real.now(self.io).toMilliseconds();
+                        // Macro control keys (q / @ / slot letter in
+                        // Select mode) are consumed here, before hover
+                        // and mode dispatch, and are never recorded.
+                        // Every key that passes falls into the tap so
+                        // an active recording captures the exact
+                        // stream the editor is about to process.
+                        if (self.macros.interceptKey(self, key)) {
+                            try self.sendUpdate();
+                            continue;
+                        }
+                        self.macros.tapKey(self, key);
 
                         // Hover dispatch runs before mode-specific input.
                         // Two cases:
@@ -2573,6 +2594,11 @@ pub const Core = struct {
                     },
                     .command => |cmd| {
                         switch (cmd) {
+                            .macro_replay_begin => self.macros.onReplayBegin(self),
+                            .macro_replay_end => {
+                                self.macros.onReplayEnd(self);
+                                try self.sendUpdate();
+                            },
                             .save => try self.saveCurrentFile(),
                             .open => try self.openFileExplorer(),
                             .close => {
@@ -3966,6 +3992,13 @@ pub const Core = struct {
     /// Show a transient success toast in the status bar. Renders with
     /// a green ✓; for other severities use `setStatusLeveled` /
     /// `setStatusError`.
+    /// Apply exactly one undo step to the active buffer. Seam used by
+    /// macro rollback so kernel/macros.zig stays testable without the
+    /// full Core surface.
+    pub fn applyUndoOnce(self: *Core) !void {
+        try @import("commands/edit_commands.zig").EditCommands.cmdEditUndo(self);
+    }
+
     pub fn setStatus(
         self: *Core,
         comptime fmt: []const u8,
