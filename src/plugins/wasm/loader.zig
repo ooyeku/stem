@@ -877,6 +877,15 @@ test "runaway plugin call is contained by the fuel budget" {
     // Tighten the budget so exhaustion is instant; the mechanism under
     // test is identical at any budget size.
     wp.instance.limits.fuel = 100_000;
+
+    // The trap warning below is the expected result, not a problem. Let it
+    // through and the test runner prints it to stderr, which makes `zig
+    // build test` echo the test command back as though the step had
+    // failed. Errors still count toward the runner's failure check.
+    const prev_log_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev_log_level;
+
     try std.testing.expectError(error.OutOfFuel, wp.activate());
     try std.testing.expectEqual(State.failed, wp.state);
     // The failure is recorded, attributable, and shows the call burned
