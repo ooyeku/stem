@@ -61,6 +61,7 @@ test {
     _ = @import("plugins/process_loader.zig");
     _ = @import("plugins/wasm/loader.zig");
     _ = @import("kernel/macros.zig");
+    _ = @import("kernel/split_manager.zig");
     _ = @import("tools/plugin_cli.zig");
     _ = @import("tools/lsp_host_args.zig");
     _ = @import("lsp/transport.zig");
