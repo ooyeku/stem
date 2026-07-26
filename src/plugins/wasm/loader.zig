@@ -98,6 +98,21 @@ pub const Callbacks = struct {
 
 pub const State = enum { loaded, activated, deactivated, failed };
 
+// The plugin ABI, as Zig function types. Resolving an export through
+// `wick.guest.func` checks the wasm signature against these at resolve
+// time, so a plugin whose export has the wrong shape fails with
+// `error.SignatureMismatch` before any guest code runs — rather than
+// being invoked with the wrong arity and reading garbage locals.
+const ActivateFn = fn () void;
+/// Older plugins return a status code from `activate` instead of void.
+const ActivateStatusFn = fn () u32;
+const CommandFn = fn (u32, u32) void;
+const EventFn = fn (u32, u32, u32, u32) void;
+const ScratchFn = fn () u32;
+
+/// Scratch size assumed when a plugin doesn't export `__stem_scratch_size`.
+const default_scratch_size: u32 = 4 * 1024;
+
 /// Options for `stem_spawn_capture` — a forward-compatible shape so we
 /// can extend the wasm host import without churning every call site.
 pub const SpawnOpts = struct {
@@ -149,18 +164,30 @@ pub const WasmPlugin = struct {
     /// re-entrant; the host serializes calls.
     invoke_mu: Mutex = .{},
 
-    /// Run a plugin entry point through the interpreter, updating
-    /// `stats` on the way out. Callers hold `invoke_mu`.
-    fn invokeTracked(self: *WasmPlugin, idx: u32, args: []const u64, results: []u64) interp.Error!u32 {
+    /// Call a resolved plugin entry point, updating `stats` on the way
+    /// out. Callers hold `invoke_mu`.
+    fn trackedCall(
+        self: *WasmPlugin,
+        comptime Sig: type,
+        f: interp.Func(Sig),
+        args: interp.Func(Sig).Args,
+    ) interp.Error!interp.Func(Sig).Result {
         self.stats.calls += 1;
-        const rc = interp.invoke(&self.instance, idx, args, results) catch |err| {
+        const result = f.call(args) catch |err| {
             self.stats.traps += 1;
             self.stats.last_error = @errorName(err);
             self.recordFuelUsed();
             return err;
         };
         self.recordFuelUsed();
-        return rc;
+        return result;
+    }
+
+    fn onTrap(self: *WasmPlugin, entry_point: []const u8, err: anyerror) void {
+        // warn, not err: a trapped plugin call is a *contained* failure
+        // (recorded in `stats`, surfaced to the manager); err-level is
+        // reserved for host integrity.
+        log.warn("plugin '{s}' {s} trapped: {s}", .{ self.plugin_id, entry_point, @errorName(err) });
     }
 
     fn recordFuelUsed(self: *WasmPlugin) void {
@@ -175,10 +202,9 @@ pub const WasmPlugin = struct {
         // Best-effort: call `deactivate` if it exists and we haven't
         // already failed.
         if (self.state == .activated) {
-            if (self.module.findExport("deactivate", .func)) |idx| {
-                var results: [4]u64 = undefined;
-                _ = self.invokeTracked(idx, &.{}, results[0..0]) catch {};
-            }
+            if (interp.guest.func(&self.instance, "deactivate", ActivateFn)) |f| {
+                self.trackedCall(ActivateFn, f, .{}) catch {};
+            } else |_| {}
         }
         self.instance.deinit();
         self.module.deinit();
@@ -187,26 +213,32 @@ pub const WasmPlugin = struct {
 
     /// Invoke the plugin's exported `activate` function.
     pub fn activate(self: *WasmPlugin) !void {
-        const idx = self.module.findExport("activate", .func) orelse {
-            log.warn("plugin '{s}' missing 'activate' export", .{self.plugin_id});
-            self.state = .failed;
-            return error.MissingExport;
-        };
         self.invoke_mu.lock();
         defer self.invoke_mu.unlock();
-        var results: [4]u64 = undefined;
-        const ft = self.instance.funcType(idx) orelse return error.InvalidModule;
-        const rc = self.invokeTracked(idx, &.{}, results[0..ft.results.len]) catch |err| {
-            // warn, not err: a trapped plugin call is a *contained*
-            // failure (state -> .failed, error surfaced to the
-            // manager); err-level is reserved for host integrity.
-            log.warn("plugin '{s}' activate trapped: {s}", .{ self.plugin_id, @errorName(err) });
-            self.state = .failed;
-            return err;
-        };
-        _ = rc;
-        if (ft.results.len > 0 and results[0] != 0) {
-            log.warn("plugin '{s}' activate returned {d}", .{ self.plugin_id, results[0] });
+
+        var status: u32 = 0;
+        if (interp.guest.func(&self.instance, "activate", ActivateFn)) |f| {
+            self.trackedCall(ActivateFn, f, .{}) catch |err| {
+                self.onTrap("activate", err);
+                self.state = .failed;
+                return err;
+            };
+        } else |_| {
+            // Not the void shape — accept the status-code form too.
+            const f = interp.guest.func(&self.instance, "activate", ActivateStatusFn) catch |err| {
+                log.warn("plugin '{s}' has no usable 'activate' export ({s})", .{ self.plugin_id, @errorName(err) });
+                self.state = .failed;
+                return error.MissingExport;
+            };
+            status = self.trackedCall(ActivateStatusFn, f, .{}) catch |err| {
+                self.onTrap("activate", err);
+                self.state = .failed;
+                return err;
+            };
+        }
+
+        if (status != 0) {
+            log.warn("plugin '{s}' activate returned {d}", .{ self.plugin_id, status });
         }
         self.state = .activated;
     }
@@ -215,22 +247,23 @@ pub const WasmPlugin = struct {
     /// Copies the command id into the plugin's `__stem_scratch`
     /// region.
     pub fn dispatchCommand(self: *WasmPlugin, command_id: []const u8) !void {
-        const idx = self.module.findExport("handle_command", .func) orelse return error.MissingExport;
         self.invoke_mu.lock();
         defer self.invoke_mu.unlock();
 
-        const scratch = try self.scratchSlice();
-        if (command_id.len > scratch.len) return error.ScratchTooSmall;
-        @memcpy(scratch[0..command_id.len], command_id);
-        const scratch_ptr = self.scratchPtr() catch unreachable;
+        const f = interp.guest.func(&self.instance, "handle_command", CommandFn) catch |err| switch (err) {
+            error.ExportNotFound => return error.MissingExport,
+            else => return err,
+        };
 
-        var results: [4]u64 = undefined;
-        _ = self.invokeTracked(
-            idx,
-            &.{ @as(u64, scratch_ptr), @as(u64, command_id.len) },
-            results[0..0],
-        ) catch |err| {
-            log.warn("plugin '{s}' handle_command trapped: {s}", .{ self.plugin_id, @errorName(err) });
+        // `writeBytes` bounds-checks against linear memory; the scratch
+        // size check is what keeps the write inside the plugin's own
+        // buffer rather than somewhere else in its heap.
+        const scratch_ptr = try self.scratchPtr();
+        if (command_id.len > self.scratchSize()) return error.ScratchTooSmall;
+        try self.instance.writeBytes(scratch_ptr, command_id);
+
+        self.trackedCall(CommandFn, f, .{ scratch_ptr, @intCast(command_id.len) }) catch |err| {
+            self.onTrap("handle_command", err);
             return err;
         };
     }
@@ -239,31 +272,30 @@ pub const WasmPlugin = struct {
     /// data_ptr, data_len)` export. Silently no-ops if the plugin
     /// doesn't export the function (most plugins ignore events).
     pub fn dispatchEvent(self: *WasmPlugin, topic: []const u8, data: []const u8) !void {
-        const idx = self.module.findExport("handle_event", .func) orelse return;
         self.invoke_mu.lock();
         defer self.invoke_mu.unlock();
 
-        const scratch = try self.scratchSlice();
-        const total = topic.len + data.len;
-        if (total > scratch.len) return error.ScratchTooSmall;
-        @memcpy(scratch[0..topic.len], topic);
-        @memcpy(scratch[topic.len..total], data);
-        const scratch_ptr = self.scratchPtr() catch unreachable;
-        const topic_ptr = scratch_ptr;
-        const data_ptr = scratch_ptr + @as(u32, @intCast(topic.len));
+        // Most plugins ignore events, so a missing export is a no-op —
+        // but one that exists with the wrong shape is now a reported
+        // error instead of a call with mismatched arity.
+        const f = interp.guest.func(&self.instance, "handle_event", EventFn) catch |err| switch (err) {
+            error.ExportNotFound => return,
+            else => return err,
+        };
 
-        var results: [4]u64 = undefined;
-        _ = self.invokeTracked(
-            idx,
-            &.{
-                @as(u64, topic_ptr),
-                @as(u64, @intCast(topic.len)),
-                @as(u64, data_ptr),
-                @as(u64, @intCast(data.len)),
-            },
-            results[0..0],
-        ) catch |err| {
-            log.warn("plugin '{s}' handle_event trapped: {s}", .{ self.plugin_id, @errorName(err) });
+        const total = topic.len + data.len;
+        const scratch_ptr = try self.scratchPtr();
+        if (total > self.scratchSize()) return error.ScratchTooSmall;
+        try self.instance.writeBytes(scratch_ptr, topic);
+        try self.instance.writeBytes(scratch_ptr + @as(u32, @intCast(topic.len)), data);
+
+        self.trackedCall(EventFn, f, .{
+            scratch_ptr,
+            @intCast(topic.len),
+            scratch_ptr + @as(u32, @intCast(topic.len)),
+            @intCast(data.len),
+        }) catch |err| {
+            self.onTrap("handle_event", err);
             return err;
         };
     }
@@ -275,28 +307,19 @@ pub const WasmPlugin = struct {
     /// the buffer's length; if absent we default to 4 KiB. Linker-
     /// assigned global addresses can't be propagated as `const`
     /// values at Zig comptime, so we use a function call instead.
+    /// Host-internal, so deliberately not counted in `stats`: those
+    /// counters track plugin *logic* calls.
     fn scratchPtr(self: *WasmPlugin) !u32 {
-        const idx = self.module.findExport("__stem_scratch_addr", .func) orelse {
-            log.warn("plugin '{s}' missing __stem_scratch_addr export", .{self.plugin_id});
+        const f = interp.guest.func(&self.instance, "__stem_scratch_addr", ScratchFn) catch |err| {
+            log.warn("plugin '{s}' has no usable __stem_scratch_addr export ({s})", .{ self.plugin_id, @errorName(err) });
             return error.MissingScratch;
         };
-        var results: [1]u64 = undefined;
-        _ = try interp.invoke(&self.instance, idx, &.{}, &results);
-        return @truncate(results[0]);
+        return f.call(.{});
     }
 
     fn scratchSize(self: *WasmPlugin) u32 {
-        const idx = self.module.findExport("__stem_scratch_size", .func) orelse return 4 * 1024;
-        var results: [1]u64 = undefined;
-        _ = interp.invoke(&self.instance, idx, &.{}, &results) catch return 4 * 1024;
-        return @truncate(results[0]);
-    }
-
-    fn scratchSlice(self: *WasmPlugin) ![]u8 {
-        const ptr = try self.scratchPtr();
-        const len = self.scratchSize();
-        if (@as(u64, ptr) + len > self.instance.memory.len) return error.OutOfBounds;
-        return self.instance.memory[ptr .. ptr + len];
+        const f = interp.guest.func(&self.instance, "__stem_scratch_size", ScratchFn) catch return default_scratch_size;
+        return f.call(.{}) catch default_scratch_size;
     }
 };
 
@@ -743,6 +766,32 @@ const TestState = struct {
     }
 };
 
+fn testCallbacks(ts: *TestState) Callbacks {
+    return .{
+        .user_data = @ptrCast(ts),
+        .on_log = TestState.onLog,
+        .on_register_command = TestState.onReg,
+        .on_show_notification = TestState.onNote,
+        .on_open_buffer = TestState.onOpenBuf,
+        .on_spawn_capture = TestState.onSpawn,
+        .on_subscribe_event = TestState.onSubEv,
+        .on_read_file = TestState.onReadFile,
+        .on_write_file = TestState.onWriteFile,
+        .on_set_status_item = TestState.onSetSI,
+        .on_clear_status_item = TestState.onClearSI,
+        .on_set_panel = TestState.onSetPanel,
+        .on_clear_panel = TestState.onClearPanel,
+        .on_get_buffer_content = TestState.onGetBufContent,
+        .on_get_buffer_path = TestState.onGetBufPath,
+        .on_get_plugin_dashboard_json = TestState.onGetPluginDashboardJson,
+        .on_get_plugin_dashboard_report = TestState.onGetPluginDashboardReport,
+        .on_storage_read = TestState.onStorageRead,
+        .on_storage_write = TestState.onStorageWrite,
+        .on_load_plugin = TestState.onLoadPlugin,
+        .on_unload_plugin = TestState.onUnloadPlugin,
+    };
+}
+
 test "decode: integrate through loader path" {
     // Just exercise the interpreter through the loader's `decode` call
     // path — actual file I/O is covered by the integration test below.
@@ -768,29 +817,7 @@ test "load + activate + dispatchCommand against the built echo.wasm" {
 
     var ts: TestState = .{ .allocator = a };
     defer ts.deinit();
-    const cbs: Callbacks = .{
-        .user_data = @ptrCast(&ts),
-        .on_log = TestState.onLog,
-        .on_register_command = TestState.onReg,
-        .on_show_notification = TestState.onNote,
-        .on_open_buffer = TestState.onOpenBuf,
-        .on_spawn_capture = TestState.onSpawn,
-        .on_subscribe_event = TestState.onSubEv,
-        .on_read_file = TestState.onReadFile,
-        .on_write_file = TestState.onWriteFile,
-        .on_set_status_item = TestState.onSetSI,
-        .on_clear_status_item = TestState.onClearSI,
-        .on_set_panel = TestState.onSetPanel,
-        .on_clear_panel = TestState.onClearPanel,
-        .on_get_buffer_content = TestState.onGetBufContent,
-        .on_get_buffer_path = TestState.onGetBufPath,
-        .on_get_plugin_dashboard_json = TestState.onGetPluginDashboardJson,
-        .on_get_plugin_dashboard_report = TestState.onGetPluginDashboardReport,
-        .on_storage_read = TestState.onStorageRead,
-        .on_storage_write = TestState.onStorageWrite,
-        .on_load_plugin = TestState.onLoadPlugin,
-        .on_unload_plugin = TestState.onUnloadPlugin,
-    };
+    const cbs = testCallbacks(&ts);
 
     const wp = try load(a, io, "echo", abs_path, cbs);
     defer {
@@ -846,29 +873,7 @@ test "runaway plugin call is contained by the fuel budget" {
 
     var ts: TestState = .{ .allocator = a };
     defer ts.deinit();
-    const wp = try load(a, io, "runaway", abs_path, .{
-        .user_data = @ptrCast(&ts),
-        .on_log = TestState.onLog,
-        .on_register_command = TestState.onReg,
-        .on_show_notification = TestState.onNote,
-        .on_open_buffer = TestState.onOpenBuf,
-        .on_spawn_capture = TestState.onSpawn,
-        .on_subscribe_event = TestState.onSubEv,
-        .on_read_file = TestState.onReadFile,
-        .on_write_file = TestState.onWriteFile,
-        .on_set_status_item = TestState.onSetSI,
-        .on_clear_status_item = TestState.onClearSI,
-        .on_set_panel = TestState.onSetPanel,
-        .on_clear_panel = TestState.onClearPanel,
-        .on_get_buffer_content = TestState.onGetBufContent,
-        .on_get_buffer_path = TestState.onGetBufPath,
-        .on_get_plugin_dashboard_json = TestState.onGetPluginDashboardJson,
-        .on_get_plugin_dashboard_report = TestState.onGetPluginDashboardReport,
-        .on_storage_read = TestState.onStorageRead,
-        .on_storage_write = TestState.onStorageWrite,
-        .on_load_plugin = TestState.onLoadPlugin,
-        .on_unload_plugin = TestState.onUnloadPlugin,
-    });
+    const wp = try load(a, io, "runaway", abs_path, testCallbacks(&ts));
     defer {
         wp.deinit();
         a.destroy(wp);
@@ -893,4 +898,60 @@ test "runaway plugin call is contained by the fuel budget" {
     try std.testing.expectEqual(@as(u64, 1), wp.stats.traps);
     try std.testing.expectEqualStrings("OutOfFuel", wp.stats.last_error.?);
     try std.testing.expectEqual(@as(u64, 100_000), wp.stats.last_fuel_used);
+}
+
+// A plugin whose entry point has the wrong wasm signature is caught at
+// resolve time. Before typed guest calls the host looked the export up
+// by name only, then invoked it with the host's assumed arity — the
+// guest ran with garbage locals and no one found out.
+test "an entry point with the wrong signature is rejected, not miscalled" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const wrong_shape = [_]u8{
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        // types: 0: () -> (); 1: () -> i32
+        0x01, 0x08, 0x02, 0x60, 0x00, 0x00, 0x60, 0x00,
+        0x01, 0x7F,
+        // funcs: activate=type0, handle_command=type0 (WRONG: ABI is (i32,i32)->()), scratch=type1
+        0x03, 0x04, 0x03, 0x00, 0x00, 0x01,
+        // memory: 1 page
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // exports (payload: 1 count + 11 + 17 + 22 = 51 bytes)
+        0x07, 0x33, 0x03,
+        0x08, 0x61, 0x63, 0x74, 0x69, 0x76, 0x61, 0x74,
+        0x65, 0x00, 0x00, 0x0E, 0x68, 0x61, 0x6E, 0x64,
+        0x6C, 0x65, 0x5F, 0x63, 0x6F, 0x6D, 0x6D, 0x61,
+        0x6E, 0x64, 0x00, 0x01, 0x13, 0x5F, 0x5F, 0x73,
+        0x74, 0x65, 0x6D, 0x5F, 0x73, 0x63, 0x72, 0x61,
+        0x74, 0x63, 0x68, 0x5F, 0x61, 0x64, 0x64, 0x72,
+        0x00, 0x02,
+        // code: two empty bodies, then `i32.const 16`
+        0x0A, 0x0C, 0x03, 0x02, 0x00, 0x0B,
+        0x02, 0x00, 0x0B, 0x04, 0x00, 0x41, 0x10, 0x0B,
+    };
+
+    var tmp = try @import("../../test_utils.zig").Tempdir.init(a, io);
+    defer tmp.deinit();
+    try tmp.writeFile("wrong.wasm", &wrong_shape);
+    const abs_path = try tmp.joinPath(a, "wrong.wasm");
+    defer a.free(abs_path);
+
+    var ts: TestState = .{ .allocator = a };
+    defer ts.deinit();
+    const wp = try load(a, io, "wrong", abs_path, testCallbacks(&ts));
+    defer {
+        wp.deinit();
+        a.destroy(wp);
+    }
+
+    // `activate` matches the ABI, so the plugin still loads and runs.
+    try wp.activate();
+    try std.testing.expectEqual(State.activated, wp.state);
+
+    // `handle_command` does not, and says so instead of running.
+    try std.testing.expectError(error.SignatureMismatch, wp.dispatchCommand("x"));
+    try std.testing.expectEqual(@as(u64, 0), wp.stats.traps);
 }

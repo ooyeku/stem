@@ -9,8 +9,11 @@ with editors that have a twenty-year head start.
 
 The plan closes stem's known gaps against mature terminal editors
 (registers, system clipboard, macros, format robustness, plugin
-authoring, battle-testing) across three releases, but each gap is
-implemented *the stem way*: durable, supervised, and inspectable.
+authoring, battle-testing), each implemented *the stem way*: durable,
+supervised, and inspectable. Items have moved between releases and
+say so where they did — a roadmap that quietly rewrites its own
+history is the same kind of dishonest instrument as a counter that
+can't report a drop.
 
 ---
 
@@ -42,32 +45,16 @@ Slipped to 0.14.0, where it shipped — see that release below.
 
 ### System clipboard that works everywhere (OSC-52)
 
-Terminal editors live over SSH, inside tmux, on machines without a
-display server. Exec-based clipboard bridges (`pbcopy`, `xclip`) fail
-exactly where a terminal editor is most needed.
-
-- OSC-52 copy integration with capability detection and graceful
-  fallback to the internal clipboard
-- `pbcopy`/`wl-copy`/`xclip` bridge as a secondary path when available
-- Clipboard state visible in the control center (which backend is
-  active, last sync result) — no silent "why didn't that copy?"
-
-*Positioning check: dependable in hostile environments, with the
-failure mode observable instead of mysterious.*
+Did not ship. Tracked as
+[#1](https://github.com/ooyeku/stem/issues/1) and rescheduled — see
+0.15.0's deferral note, which batches it with the terminal
+compatibility matrix since both need capability detection.
 
 ### Named registers with durable storage
 
-Stem has a single unnamed clipboard. Mature modal editors have named
-registers; stem's version makes them crash-safe.
-
-- Vim-style named registers (`"a`–`"z`, append with `"A`–`"Z`) plus a
-  numbered yank ring
-- Registers persist per project through the checkpoint pipeline —
-  yanked text survives a crash and a restart, which no incumbent offers
-- Register picker in the command palette (inspect before you paste)
-
-*Positioning check: aligned — registers become durable editor state
-under the same recovery guarantees as sessions.*
+Did not ship. Tracked as
+[#3](https://github.com/ooyeku/stem/issues/3) and picked up in 0.15.0
+below, where it also makes 0.14.0's macros durable.
 
 ---
 
@@ -126,74 +113,122 @@ the message bus, which makes them better than a keystroke tape:
 *Positioning check: aligned — "all-or-nothing replay" is a reliability
 claim no incumbent macro system makes.*
 
-### Deterministic simulation testing
+### Did not ship: the "provable behavior" half
 
-Vigil ships a deterministic toolkit (`SimulatedClock`,
-`SimulatedTimerService`, `FaultInjector`); stem uses only a corner of
-it. This release makes time-dependent behavior provable:
+0.14.0 was themed *repeatable operations and provable behavior*. It
+shipped the repeatable half. Recorded here rather than quietly rolled
+forward, because the gap is the reason 0.15.0 looks the way it does:
 
-- Debounce, backoff, breaker, and watchdog logic tested against the
-  simulated clock — no sleeps, no flakes
-- Fault-injection tests for the LSP lifecycle: scripted crash storms
-  must open breakers, recover on schedule, and never lose a queued
-  `didOpen`
+- **Deterministic simulation testing.** Vigil ships a deterministic
+  toolkit (`SimulatedClock`, `SimulatedTimerService`, `FaultInjector`)
+  and stem still uses one corner of it — a single test exercising
+  vigil's own timer service. Stem's debounce, backoff, breaker, and
+  watchdog logic remains untested against a simulated clock.
+- **Fuzz corpus expansion.** A wasm-loader target landed; the session
+  format, LSP framing, and plugin manifests did not.
+- **Unicode robustness pass** and the **terminal compatibility
+  matrix** ([#5](https://github.com/ooyeku/stem/issues/5)) — not
+  started.
 
-### Battle-testing, phase one
-
-- Expand the fuzz corpus beyond piece-table/state/URIs to the session
-  format, LSP framing, and plugin manifests
-- Unicode robustness pass over cursor motion, rendering width, and
-  text objects (grapheme clusters, combining marks, East Asian width)
-- Begin a terminal compatibility matrix (kitty, alacritty, wezterm,
-  tmux, iTerm2, Terminal.app, Linux console) with documented results
-
-*Positioning check: aligned — a reliability claim obligates proof,
-not vibes.*
+All four carry into 0.15.0.
 
 ---
 
 ## 0.15.0 — Proven Under Fire
 
-Theme: hardening completed, and the plugin host becomes the most
-dependable extension surface in the terminal.
+Theme: verification you can trust. Not the runtime's honesty about
+itself — that shipped — but stem's honesty about *stem*.
 
-### Plugin host v1: reliability as the ecosystem strategy
+The motivating discovery came during 0.14.0's release cleanup. Zig only
+runs tests from files reachable from a test root, so a module can carry
+a full suite that never executes and nothing complains. Nine modules
+were in that state, `split_manager` — window splits — among them. Wiring
+them back in didn't just surface failures; it surfaced test doubles that
+had drifted out of sync with the interfaces they stand in for,
+assertions that asserted the opposite of real behavior, and a
+leak-checking helper that could only pass for code that allocated
+nothing.
 
-Stem cannot out-plugin Neovim by volume. It can be the host where a
-plugin crash is a contained, observable, recoverable event — and where
-authoring is low-friction:
+That is the same failure as the dishonest drop counter in the
+[architecture notes](architecture.md) — a number that couldn't report
+the thing it claimed to measure. Stem tells that story as a success.
+This release applies the lesson to stem's own verification.
 
-- **API stability contract**: manifest and SDK surface frozen for the
-  1.x line; breaking changes gated behind manifest versions
-- `stem plugin new` scaffolding (wasm and exec templates, SDK wired)
-- Supervised restart policies exposed per plugin (max restarts,
-  backoff, disable-on-poison) with breaker state in the dashboard
-- A curated plugin index — small, but every entry vetted to run under
-  supervision without dead-lettering
+### Trustworthy test wiring
 
-*Positioning check: scrutinized hard. "Grow an ecosystem" chases the
-incumbents on their terms and was cut; "the host that never lets a
-plugin take the editor down" is the differentiated version of the same
-gap.*
+- A build step that walks `src/`, finds every file containing a `test`
+  block, and fails the build when one isn't reachable from a test root.
+  Cheap, mechanical, and it permanently closes the hole above.
+- Audit the surviving test doubles against the interfaces they double;
+  the drift found so far was caught by accident, not by design.
 
-### Battle-testing, phase two
+*Positioning check: aligned — "N tests pass" has to be a claim, not a
+number.*
 
-- Chaos CI: fault-injection runs (killed LSPs, wedged plugins, full
-  queues, clock jumps) as a merge gate, built on the 0.14 simulation
-  harness
-- Terminal compatibility matrix completed and published in the README
-- Soak testing: multi-hour editing sessions under memory-leak and
-  file-descriptor tracking, with the runtime cockpit's own metrics as
-  the oracle
+### Deterministic simulation testing (carried from 0.14.0)
 
-### Cluster follow-through (stretch)
+- Debounce, backoff, breaker, and watchdog logic tested against
+  `SimulatedClock` — no sleeps, no flakes
+- Fault-injection tests for the LSP lifecycle: scripted crash storms
+  must open breakers, recover on schedule, and never lose a queued
+  `didOpen`
 
-`STEM_CLUSTER` presence shipped in 0.13. If the foundation proves
-stable, the first user-visible payoff: shared registers/clipboard
-across local stem instances via the distributed registry.
+This is foundational for the next item: chaos runs can't gate merges
+while the tests underneath them are timing-dependent.
 
-*Positioning check: aligned, and gated — ships only if presence
-telemetry from 0.13–0.14 shows the transport is dependable.*
+### Chaos CI as a merge gate
+
+- Fault-injection runs — killed LSPs, wedged plugins, full queues,
+  clock jumps — built on the simulation harness above
+- Fuzz corpus extended to the session format (now `std.json`, so the
+  round-trip is property-testable), LSP framing, and plugin manifests
+- Soak testing: multi-hour sessions under memory and file-descriptor
+  tracking, with the runtime cockpit's own metrics as the oracle
+
+### Named registers with a yank ring
+
+The largest remaining modal-editing gap
+([#3](https://github.com/ooyeku/stem/issues/3)), and it completes what
+0.14.0 started: macros currently live in per-session registers, so
+durable registers are what make "record a macro, crash, replay it"
+true.
+
+- Vim-style named registers (`"a`–`"z`, append with `"A`–`"Z`) plus a
+  numbered yank ring
+- Persisted per project through the checkpoint pipeline, under the same
+  recovery guarantees as sessions
+- Register picker in the command palette — inspect before you paste
+
+*Positioning check: aligned — durable editor state under the recovery
+guarantees the rest of stem already makes.*
+
+### Deferred out of this release
+
+Judgment calls worth stating, not silent omissions:
+
+- **Plugin host v1 / API stability contract.** Freezing the manifest
+  and SDK surface for the 1.x line is the right destination, but the
+  plugin ABI changed shape in 0.14.0 (entry points are now
+  signature-checked at resolve time). Freeze after chaos CI has
+  stressed the host, not before.
+- **A curated plugin index.** Needs an ecosystem that doesn't exist
+  yet.
+- **OSC-52 clipboard** ([#1](https://github.com/ooyeku/stem/issues/1))
+  and the **terminal compatibility matrix**
+  ([#5](https://github.com/ooyeku/stem/issues/5)). Both need terminal
+  capability detection; batching them into one cycle avoids building
+  that twice. Ship them together, here if there's room and in 0.16.0
+  otherwise.
+- **Cluster follow-through.** `STEM_CLUSTER` presence shipped in
+  0.13.0 and the payoff — shared registers across local instances —
+  stays gated on telemetry showing the transport is dependable. No
+  such evidence yet.
+
+### If the schedule tightens
+
+Cut the registers and ship a purely-hardening release. For a project
+that sells reliability, the wiring guard plus chaos CI is a defensible
+0.15.0 on its own.
 
 ---
 
